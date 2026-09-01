@@ -60,7 +60,7 @@ impl ComponentSessionStream {
     /// Receive the next authenticated named-stream event.
     pub async fn receive(&self) -> Result<StreamEvent> {
         self.ensure_current()?;
-        self.driver.receive_named_stream().await
+        self.driver.receive_named_stream_for(self.stream).await
     }
 
     /// Return logical receive credit after consuming stream data.

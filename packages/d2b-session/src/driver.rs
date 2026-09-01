@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fmt,
     sync::{
         Arc,
@@ -165,6 +165,15 @@ impl SessionDriverHandle {
             })
             .map_err(|_| disconnected())?;
         Ok(receive)
+    }
+
+    /// Receive the next event for one exact named stream.
+    ///
+    /// The driver demultiplexes events without removing events owned by any
+    /// other stream.
+    pub async fn receive_named_stream_for(&self, stream: StreamId) -> Result<StreamEvent> {
+        self.request(|reply| DriverCommand::ReceiveNamedStreamFor { stream, reply })
+            .await
     }
 }
 
@@ -730,6 +739,10 @@ enum DriverCommand {
         reply: Reply<()>,
     },
     ReceiveNamedStream(Reply<StreamEvent>),
+    ReceiveNamedStreamFor {
+        stream: StreamId,
+        reply: Reply<StreamEvent>,
+    },
     GrantNamedStreamCredit {
         stream: StreamId,
         bytes: u32,
@@ -769,7 +782,7 @@ struct DriverQueues {
     named_send_bytes: usize,
     ttrpc: EventQueue<Vec<u8>>,
     attachments: EventQueue<Vec<OwnedAttachment>>,
-    streams: EventQueue<StreamEvent>,
+    streams: NamedStreamEventQueue,
     control: EventQueue<SessionEvent>,
 }
 
@@ -780,7 +793,7 @@ impl DriverQueues {
             named_send_bytes: 0,
             ttrpc: EventQueue::new(engine.ttrpc_event_queue_limit()),
             attachments: EventQueue::new(engine.control_event_queue_limit()),
-            streams: EventQueue::new(engine.stream_event_queue_limit()),
+            streams: NamedStreamEventQueue::new(engine.stream_event_queue_limit()),
             control: EventQueue::new(engine.control_event_queue_limit()),
         }
     }
@@ -960,6 +973,100 @@ impl<T: EventBytes> EventQueue<T> {
     fn fail(self, error: SessionError) {
         for waiter in self.waiters {
             let _ = waiter.send(Err(error));
+        }
+    }
+}
+
+struct NamedStreamEventQueue {
+    events: EventQueue<StreamEvent>,
+    waiters: BTreeMap<StreamId, VecDeque<Reply<StreamEvent>>>,
+    waiter_count: usize,
+}
+
+impl NamedStreamEventQueue {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            events: EventQueue::new(max_bytes),
+            waiters: BTreeMap::new(),
+            waiter_count: 0,
+        }
+    }
+
+    fn receive(&mut self, waiter: Reply<StreamEvent>) -> Result<()> {
+        self.events.receive(waiter)
+    }
+
+    fn receive_for(&mut self, stream: StreamId, waiter: Reply<StreamEvent>) -> Result<()> {
+        if let Some(index) = self
+            .events
+            .events
+            .iter()
+            .position(|event| event.stream() == stream)
+        {
+            let event = self
+                .events
+                .events
+                .remove(index)
+                .ok_or_else(|| SessionError::new(SessionErrorCode::InternalInvariant))?;
+            self.events.queued_bytes = self.events.queued_bytes.saturating_sub(event.event_bytes());
+            match waiter.send(Ok(event)) {
+                Ok(()) => {}
+                Err(Ok(returned)) => {
+                    self.events.queued_bytes += returned.event_bytes();
+                    self.events.events.insert(index, returned);
+                }
+                Err(Err(_)) => {
+                    return Err(SessionError::new(SessionErrorCode::InternalInvariant));
+                }
+            }
+            return Ok(());
+        }
+
+        let waiters = self.waiters.entry(stream).or_default();
+        let before = waiters.len();
+        waiters.retain(|waiter| !waiter.is_closed());
+        self.waiter_count = self
+            .waiter_count
+            .saturating_sub(before.saturating_sub(waiters.len()));
+        if self.waiter_count >= DRIVER_COMMAND_CAPACITY {
+            if waiters.is_empty() {
+                self.waiters.remove(&stream);
+            }
+            return Err(backpressure());
+        }
+        waiters.push_back(waiter);
+        self.waiter_count += 1;
+        Ok(())
+    }
+
+    fn deliver(&mut self, mut event: StreamEvent) -> Result<()> {
+        let stream = event.stream();
+        let mut waiters = self.waiters.remove(&stream).unwrap_or_default();
+        self.waiter_count = self.waiter_count.saturating_sub(waiters.len());
+        while let Some(waiter) = waiters.pop_front() {
+            match waiter.send(Ok(event)) {
+                Ok(()) => {
+                    if !waiters.is_empty() {
+                        self.waiter_count += waiters.len();
+                        self.waiters.insert(stream, waiters);
+                    }
+                    return Ok(());
+                }
+                Err(Ok(returned)) => event = returned,
+                Err(Err(_)) => {
+                    return Err(SessionError::new(SessionErrorCode::InternalInvariant));
+                }
+            }
+        }
+        self.events.deliver(event)
+    }
+
+    fn fail(self, error: SessionError) {
+        self.events.fail(error);
+        for waiters in self.waiters.into_values() {
+            for waiter in waiters {
+                let _ = waiter.send(Err(error));
+            }
         }
     }
 }
@@ -1270,6 +1377,9 @@ async fn handle_command<T: OwnedTransport>(
             }
         }
         DriverCommand::ReceiveNamedStream(reply) => queues.streams.receive(reply)?,
+        DriverCommand::ReceiveNamedStreamFor { stream, reply } => {
+            queues.streams.receive_for(stream, reply)?
+        }
         DriverCommand::GrantNamedStreamCredit {
             stream,
             bytes,
@@ -2075,5 +2185,34 @@ mod tests {
         queue.receive(waiter).unwrap();
         queue.deliver(7_u8).unwrap();
         assert_eq!(receiver.try_recv().unwrap().unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn named_stream_waiters_are_delivered_only_their_stream_events() {
+        let first = StreamId::new(0x0100).unwrap();
+        let second = StreamId::new(0x0101).unwrap();
+        let mut queue = NamedStreamEventQueue::new(8);
+        let (first_waiter, first_events) = oneshot::channel();
+        let (second_waiter, second_events) = oneshot::channel();
+
+        queue.receive_for(first, first_waiter).unwrap();
+        queue.receive_for(second, second_waiter).unwrap();
+        queue
+            .deliver(StreamEvent::Data {
+                stream: second,
+                bytes: b"second".to_vec(),
+            })
+            .unwrap();
+        queue.deliver(StreamEvent::Reset { stream: first }).unwrap();
+
+        assert!(matches!(
+            first_events.await.unwrap().unwrap(),
+            StreamEvent::Reset { stream } if stream == first
+        ));
+        assert!(matches!(
+            second_events.await.unwrap().unwrap(),
+            StreamEvent::Data { stream, bytes }
+                if stream == second && bytes == b"second"
+        ));
     }
 }

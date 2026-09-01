@@ -26,8 +26,8 @@ use d2b_session::{
     ComponentSessionDriver, DeadlineBudget, FairScheduler, Fragmenter, HandshakeCredentials,
     HandshakeRole, KeepaliveAction, MetricEvent, MetricsSink, NamedStreamMux, NoiseHandshake,
     OutboundFrame, OwnedAttachment, OwnedTransport, OwnedTransportHandle, QueueClass, Reassembler,
-    RecordProtector, Secret32, SessionEngine, SessionEvent, SessionLifecycle, StreamEvent,
-    StreamId, StreamPhase, TransportDescriptor, TransportError, TransportPacket,
+    RecordProtector, Secret32, SessionDriverHandle, SessionEngine, SessionEvent, SessionLifecycle,
+    StreamEvent, StreamId, StreamPhase, TransportDescriptor, TransportError, TransportPacket,
     accept_generation_discovery_request, decode_generation_discovery_response,
     encode_generation_discovery_request, encode_generation_discovery_response, encode_offer,
     negotiate_offer,
@@ -990,6 +990,169 @@ async fn typed_owned_transport_handle_exposes_only_observe_and_close() {
     assert_eq!(handle.descriptor().class, TransportClass::ProviderStream);
     assert_eq!(format!("{handle:?}"), "OwnedTransportHandle(<redacted>)");
     handle.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn per_stream_receive_preserves_order_and_terminal_events() {
+    let (initiator, responder, _) = engine_pair().await;
+    let initiator: SessionDriverHandle = initiator.into_driver();
+    let responder = responder.into_driver();
+    let first = StreamId::new(0x0100).unwrap();
+    let second = StreamId::new(0x0101).unwrap();
+
+    for driver in [&initiator, &responder] {
+        driver.open_named_stream(first, 32, 32).await.unwrap();
+        driver.open_named_stream(second, 32, 32).await.unwrap();
+    }
+
+    responder
+        .send_named_stream(second, b"second-1".to_vec())
+        .await
+        .unwrap();
+    responder
+        .send_named_stream(first, b"first-1".to_vec())
+        .await
+        .unwrap();
+    responder
+        .send_named_stream(second, b"second-2".to_vec())
+        .await
+        .unwrap();
+    responder
+        .send_named_stream(first, b"first-2".to_vec())
+        .await
+        .unwrap();
+
+    for (stream, expected) in [
+        (first, b"first-1".as_slice()),
+        (first, b"first-2".as_slice()),
+        (second, b"second-1".as_slice()),
+        (second, b"second-2".as_slice()),
+    ] {
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            initiator.receive_named_stream_for(stream),
+        )
+        .await
+        .expect("stream event should arrive")
+        .expect("stream event should be valid");
+        assert!(matches!(
+            event,
+            StreamEvent::Data { stream: received, bytes }
+                if received == stream && bytes == expected
+        ));
+    }
+
+    responder.close_named_stream(second).await.unwrap();
+    responder.reset_named_stream(first).await.unwrap();
+
+    let first_terminal = tokio::time::timeout(
+        Duration::from_secs(1),
+        initiator.receive_named_stream_for(first),
+    )
+    .await
+    .expect("reset should arrive")
+    .expect("reset should be valid");
+    assert!(matches!(
+        first_terminal,
+        StreamEvent::Reset { stream } if stream == first
+    ));
+    let second_terminal = tokio::time::timeout(
+        Duration::from_secs(1),
+        initiator.receive_named_stream_for(second),
+    )
+    .await
+    .expect("close should arrive")
+    .expect("close should be valid");
+    assert!(matches!(
+        second_terminal,
+        StreamEvent::RemoteClosed { stream } if stream == second
+    ));
+}
+
+#[tokio::test]
+async fn per_stream_credit_and_backpressure_do_not_cross_streams() {
+    let (initiator, responder, _) = engine_pair().await;
+    let initiator = initiator.into_driver();
+    let responder = responder.into_driver();
+    let first = StreamId::new(0x0100).unwrap();
+    let second = StreamId::new(0x0101).unwrap();
+
+    for driver in [&initiator, &responder] {
+        driver.open_named_stream(first, 2, 2).await.unwrap();
+        driver.open_named_stream(second, 2, 2).await.unwrap();
+    }
+
+    responder
+        .send_named_stream(first, b"aa".to_vec())
+        .await
+        .unwrap();
+    responder
+        .send_named_stream(second, b"bb".to_vec())
+        .await
+        .unwrap();
+    for (stream, expected) in [(first, b"aa".as_slice()), (second, b"bb".as_slice())] {
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            initiator.receive_named_stream_for(stream),
+        )
+        .await
+        .expect("initial stream event should arrive")
+        .expect("initial stream event should be valid");
+        assert!(matches!(
+            event,
+            StreamEvent::Data { stream: received, bytes }
+                if received == stream && bytes == expected
+        ));
+    }
+
+    initiator
+        .grant_named_stream_credit(second, 2)
+        .await
+        .unwrap();
+    let mut blocked_first = tokio::spawn({
+        let responder = responder.clone();
+        async move { responder.send_named_stream(first, b"cc".to_vec()).await }
+    });
+    responder
+        .send_named_stream(second, b"dd".to_vec())
+        .await
+        .unwrap();
+    let second_event = tokio::time::timeout(
+        Duration::from_secs(1),
+        initiator.receive_named_stream_for(second),
+    )
+    .await
+    .expect("second stream should retain independent credit")
+    .expect("second stream event should be valid");
+    assert!(matches!(
+        second_event,
+        StreamEvent::Data { stream, bytes }
+            if stream == second && bytes == b"dd"
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut blocked_first)
+            .await
+            .is_err(),
+        "first stream must remain backpressured"
+    );
+
+    initiator.grant_named_stream_credit(first, 2).await.unwrap();
+    blocked_first
+        .await
+        .expect("first sender task should finish")
+        .expect("first stream should send after its own credit");
+    let first_event = tokio::time::timeout(
+        Duration::from_secs(1),
+        initiator.receive_named_stream_for(first),
+    )
+    .await
+    .expect("first stream should resume after its own credit")
+    .expect("first stream event should be valid");
+    assert!(matches!(
+        first_event,
+        StreamEvent::Data { stream, bytes }
+            if stream == first && bytes == b"cc"
+    ));
 }
 
 #[derive(Default)]
