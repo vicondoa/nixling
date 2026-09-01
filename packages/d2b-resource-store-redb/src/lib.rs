@@ -50,8 +50,8 @@ use crate::audit::NoopMutationAudit;
 use crate::metrics::{EmitterStoreTelemetry, NoopStoreTelemetry, StoreTelemetry};
 
 pub use actor::{
-    BackendSignals, GROUP_COMMIT_MAX, MAX_CONCURRENT_READS, READ_LIFETIME, READ_POOL_THREADS,
-    SharedChangeBatch, WRITE_QUEUE_CAPACITY,
+    BackendSignals, GROUP_COMMIT_MAX, LIST_READ_LIFETIME, MAX_CONCURRENT_READS, READ_LIFETIME,
+    READ_POOL_THREADS, SharedChangeBatch, WRITE_QUEUE_CAPACITY,
 };
 pub use backup::{
     BackupRow, BackupTable, LOGICAL_BACKUP_FORMAT_VERSION, LogicalBackup, MAX_LOGICAL_BACKUP_BYTES,

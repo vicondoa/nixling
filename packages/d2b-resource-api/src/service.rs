@@ -181,6 +181,20 @@ impl<S, U> core::fmt::Debug for ResourceService<S, U> {
     }
 }
 
+impl<S, U> ResourceService<S, U> {
+    pub(crate) fn checked_store(&self) -> crate::store::CheckedResourceStore<S> {
+        self.store.clone()
+    }
+
+    pub(crate) fn authorizer_arc(&self) -> Arc<NativeAuthorizer> {
+        Arc::clone(&self.authorizer)
+    }
+
+    pub(crate) fn zone_uid(&self) -> Option<ResourceUid> {
+        self.zone_uid.clone()
+    }
+}
+
 impl<S> ResourceService<S, UnavailableUpgradeDispatcher>
 where
     S: ResourceStoreBackend,

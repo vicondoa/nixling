@@ -2762,6 +2762,10 @@ async fn list_cursor_is_bound_to_snapshot_and_selector() {
     };
     let first = store.list(request(None, Vec::new())).await.unwrap();
     assert!(first.truncated);
+    let first_json = std::str::from_utf8(&first.resources[0].canonical_json).unwrap();
+    assert!(first_json.contains("\"metadata\""));
+    assert!(!first_json.contains("\"spec\""));
+    assert!(!first_json.contains("\"status\""));
     let cursor = first.next_cursor.unwrap();
     let error = store
         .list(request(

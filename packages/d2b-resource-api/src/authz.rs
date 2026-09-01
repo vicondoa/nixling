@@ -1274,6 +1274,13 @@ impl NativeAuthorizer {
         Ok(acceptor)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_store_seal_issuer_slot(
+        &self,
+    ) -> Arc<Mutex<Option<d2b_resource_store::mutation_seal::MutationSealIssuer>>> {
+        Arc::clone(&self.store_seal)
+    }
+
     pub fn replace_policy(
         &self,
         policy: PolicySet,

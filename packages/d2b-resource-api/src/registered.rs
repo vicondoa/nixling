@@ -20,16 +20,19 @@ use d2b_core_controller::{
     ReconcileContext, ReconcilePlan, ReconcileProjection, ReconcileResult, RegisteredControllerApi,
     ResourceKey, SourceError, StatusPersistence, WatchFailure,
 };
-use d2b_resource_store::mutation_seal::MutationSealIssuer;
 use d2b_resource_store::{
-    AdmittedAuthorization, AdmittedAuthorizationTarget, AdmittedVerb, ExpectedRevision,
-    MutationSealBody, PolicySnapshot, PreparedStoreMutation, ResourceMutationKind,
+    ExpectedRevision, ResourceAssignmentFence, ResourceAssignmentScope, ResourceMutationKind,
     StoreCommitResult, StoreError, StoreErrorKind, StoreFilter, StoreGetRequest, StoreListRequest,
     StoreMutation, StoreOperationContext, StoreProjection, StoreWatchRequest, StoredResource,
 };
 use d2b_resource_store_redb::{ChangeEvent, RedbResourceStore, SharedChangeBatch};
 use serde_json::Value;
 
+use crate::authz::{
+    ApiMethod, AuthorizationRequest, AuthorizationState, AuthorizationTarget, ResourceVerb,
+};
+use crate::service::{ResourceService, UpgradeDispatcher};
+use crate::store::{CheckedResourceStore, StoreBindingError};
 use crate::watch::{ResourceWatch, WatchService};
 
 /// A production `RegisteredControllerApi` backed by one owned redb store.
@@ -39,9 +42,7 @@ use crate::watch::{ResourceWatch, WatchService};
 /// is exposed through the Core source trait.
 pub struct RedbRegisteredControllerApi {
     store: Arc<RedbResourceStore>,
-    seal_issuer: MutationSealIssuer,
-    subject_ref: ResourceRef,
-    subject_uid: ResourceUid,
+    commit: Option<NativeCommitPath>,
     descriptor: Mutex<Option<ControllerDescriptor>>,
     watch: tokio::sync::Mutex<Option<ResourceWatch>>,
     pending: tokio::sync::Mutex<VecDeque<(ChangeRecord, OperationContext, ZoneRevision)>>,
@@ -53,11 +54,22 @@ pub struct RedbRegisteredControllerApi {
         Arc<Mutex<BTreeMap<String, Arc<d2b_resource_store_redb::AuthorityOperationCapability>>>>,
 }
 
+struct NativeCommitPath {
+    checked: Arc<CheckedResourceStore<crate::store::RedbBackend>>,
+    authorizer: Arc<crate::authz::NativeAuthorizer>,
+    subject: Arc<crate::AuthenticatedSubjectContext>,
+    state: AuthorizationState,
+    zone_uid: Option<ResourceUid>,
+    assignments: BTreeMap<ResourceRef, ResourceAssignmentFence>,
+    require_assignment: bool,
+}
+
 impl core::fmt::Debug for RedbRegisteredControllerApi {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
             .debug_struct("RedbRegisteredControllerApi")
             .field("has_store", &true)
+            .field("has_commit_path", &self.commit.is_some())
             .field(
                 "has_descriptor",
                 &self
@@ -72,31 +84,57 @@ impl core::fmt::Debug for RedbRegisteredControllerApi {
 }
 
 impl RedbRegisteredControllerApi {
-    /// Bind an adapter to a store and its paired mutation issuer.
-    pub fn new(store: Arc<RedbResourceStore>, seal_issuer: MutationSealIssuer) -> Self {
-        Self::with_identity(
+    /// Bind an adapter through the ResourceService's single native-authorizer
+    /// store binding and an authenticated controller identity.
+    pub fn with_identity<U>(
+        service: &ResourceService<crate::store::RedbBackend, U>,
+        subject: crate::AuthenticatedSubjectContext,
+        state: AuthorizationState,
+        assignments: Vec<(ResourceRef, ResourceAssignmentFence)>,
+    ) -> Result<Self, StoreBindingError>
+    where
+        U: UpgradeDispatcher,
+    {
+        let checked = service.checked_store();
+        let backend = checked.backend();
+        let store = backend.store_arc();
+        if subject.claims().zone_ref().resource_type().as_str() != "Zone"
+            || subject.authorization_state() != &state
+        {
+            return Err(StoreBindingError);
+        }
+        let zone = ZoneId::parse(subject.claims().zone_ref().name().as_str())
+            .map_err(|_| StoreBindingError)?;
+        if zone != *store.identity().zone() {
+            return Err(StoreBindingError);
+        }
+        Ok(Self {
             store,
-            seal_issuer,
-            ResourceRef::parse("Process/registered-controller")
-                .expect("the built-in controller subject is valid"),
-            ResourceUid::parse("99999999-9999-4999-8999-999999999999")
-                .expect("the built-in controller subject UID is valid"),
-        )
+            commit: Some(NativeCommitPath {
+                checked: Arc::new(checked),
+                authorizer: service.authorizer_arc(),
+                subject: Arc::new(subject),
+                state,
+                zone_uid: service.zone_uid(),
+                assignments: assignments.into_iter().collect(),
+                require_assignment: true,
+            }),
+            descriptor: Mutex::new(None),
+            watch: tokio::sync::Mutex::new(None),
+            pending: tokio::sync::Mutex::new(VecDeque::new()),
+            acknowledge_after: tokio::sync::Mutex::new(None),
+            watch_open: AtomicBool::new(false),
+            watch_stopped: AtomicBool::new(false),
+            watch_stop: tokio::sync::Notify::new(),
+            accepted: Arc::new(Mutex::new(BTreeMap::new())),
+        })
     }
 
-    /// Bind an adapter with the authenticated controller identity supplied by
-    /// the trusted composition root.
-    pub fn with_identity(
-        store: Arc<RedbResourceStore>,
-        seal_issuer: MutationSealIssuer,
-        subject_ref: ResourceRef,
-        subject_uid: ResourceUid,
-    ) -> Self {
+    #[cfg(test)]
+    fn for_test_watch(store: Arc<RedbResourceStore>) -> Self {
         Self {
             store,
-            seal_issuer,
-            subject_ref,
-            subject_uid,
+            commit: None,
             descriptor: Mutex::new(None),
             watch: tokio::sync::Mutex::new(None),
             pending: tokio::sync::Mutex::new(VecDeque::new()),
@@ -106,6 +144,40 @@ impl RedbRegisteredControllerApi {
             watch_stop: tokio::sync::Notify::new(),
             accepted: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    #[cfg(test)]
+    fn for_test_unassigned<U>(
+        service: &ResourceService<crate::store::RedbBackend, U>,
+        subject: crate::AuthenticatedSubjectContext,
+        state: AuthorizationState,
+    ) -> Result<Self, StoreBindingError>
+    where
+        U: UpgradeDispatcher,
+    {
+        let checked = service.checked_store();
+        let backend = checked.backend();
+        let store = backend.store_arc();
+        Ok(Self {
+            store,
+            commit: Some(NativeCommitPath {
+                checked: Arc::new(checked),
+                authorizer: service.authorizer_arc(),
+                subject: Arc::new(subject),
+                state,
+                zone_uid: service.zone_uid(),
+                assignments: BTreeMap::new(),
+                require_assignment: false,
+            }),
+            descriptor: Mutex::new(None),
+            watch: tokio::sync::Mutex::new(None),
+            pending: tokio::sync::Mutex::new(VecDeque::new()),
+            acknowledge_after: tokio::sync::Mutex::new(None),
+            watch_open: AtomicBool::new(false),
+            watch_stopped: AtomicBool::new(false),
+            watch_stop: tokio::sync::Notify::new(),
+            accepted: Arc::new(Mutex::new(BTreeMap::new())),
+        })
     }
 
     /// Borrow the store used by this adapter.
@@ -130,14 +202,6 @@ impl RedbRegisteredControllerApi {
             trace_id: None,
             deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
         }
-    }
-
-    async fn policy_snapshot(&self) -> Result<PolicySnapshot, SourceError> {
-        self.store
-            .runtime_metadata()
-            .await
-            .map(|metadata| metadata.policy_snapshot)
-            .map_err(|error| source_error(error, ZoneRevision::new(0)))
     }
 
     async fn list_all(
@@ -320,6 +384,7 @@ impl RedbRegisteredControllerApi {
             .commit_store_mutations(
                 context.target().zone(),
                 context.revision(),
+                context.target().uid(),
                 operation,
                 mutations,
             )
@@ -336,45 +401,79 @@ impl RedbRegisteredControllerApi {
         &self,
         zone: &ZoneId,
         fallback_revision: ZoneRevision,
+        context_uid: &ResourceUid,
         operation: StoreOperationContext,
         mutations: Vec<StoreMutation>,
     ) -> Result<CommitOutcome, SourceError> {
-        let policy_snapshot = self.policy_snapshot().await?;
-        let authorization = AdmittedAuthorization {
-            zone: zone.clone(),
-            subject_ref: self.subject_ref.clone(),
-            subject_uid: self.subject_uid.clone(),
-            targets: mutations
-                .iter()
-                .map(|mutation| AdmittedAuthorizationTarget {
-                    resource_type: mutation.target.resource_type().clone(),
-                    resource_name: Some(mutation.target.name().clone()),
-                    verb: admitted_verb(mutation.kind),
-                    subresource: match mutation.kind {
-                        ResourceMutationKind::UpdateStatus => Some("status".to_owned()),
-                        ResourceMutationKind::UpdateFinalizers => Some("finalizers".to_owned()),
-                        _ => None,
-                    },
-                    execution_ref: None,
-                })
-                .collect(),
+        let Some(commit) = self.commit.as_ref() else {
+            return Err(SourceError::Integrity);
         };
-        let prepared = mutations
-            .into_iter()
-            .map(|mutation| {
-                let (uid, digest) = prepared_identity(&mutation)?;
-                Ok(PreparedStoreMutation::new(mutation, uid, digest))
-            })
-            .collect::<Result<Vec<_>, SourceError>>()?;
-        let result = self
-            .store
-            .commit_verified(self.seal_issuer.seal(MutationSealBody {
-                mutations: prepared,
-                authorization,
-                policy_snapshot,
-                operation,
-            }))
-            .await;
+        let mut mutations = mutations;
+        for mutation in &mut mutations {
+            if let Some(fence) = commit.assignments.get(&mutation.target) {
+                if fence.resource_uid != *context_uid {
+                    return Err(SourceError::Integrity);
+                }
+                let mut fence = fence.clone();
+                match &mut fence.scope {
+                    ResourceAssignmentScope::Primary => {
+                        fence.resource_revision = match mutation.expected {
+                            ExpectedRevision::Exact(revision) => revision,
+                            ExpectedRevision::CreateAbsent => return Err(SourceError::Integrity),
+                        };
+                    }
+                    ResourceAssignmentScope::OwnerChild { owner_revision, .. } => {
+                        fence.resource_revision = fallback_revision;
+                        *owner_revision = fallback_revision;
+                    }
+                }
+                mutation.assignment = Some(fence);
+            } else if commit.require_assignment {
+                return Err(SourceError::Integrity);
+            }
+        }
+        let mut targets = Vec::with_capacity(mutations.len() * 2);
+        for mutation in &mutations {
+            targets.push(AuthorizationTarget {
+                resource_type: mutation.target.resource_type().clone(),
+                resource_name: Some(mutation.target.name().clone()),
+                verb: resource_verb(mutation.kind),
+                subresource: match mutation.kind {
+                    ResourceMutationKind::UpdateStatus => Some("status".to_owned()),
+                    ResourceMutationKind::UpdateFinalizers => Some("finalizers".to_owned()),
+                    _ => None,
+                },
+                execution_ref: commit.subject.claims().execution_ref().cloned(),
+            });
+            if let Some(owner) = mutation.owner.as_ref() {
+                targets.push(AuthorizationTarget {
+                    resource_type: owner.resource_type().clone(),
+                    resource_name: Some(owner.name().clone()),
+                    verb: ResourceVerb::Get,
+                    subresource: Some("owner".to_owned()),
+                    execution_ref: commit.subject.claims().execution_ref().cloned(),
+                });
+            }
+        }
+        let grant = commit
+            .authorizer
+            .authorize(
+                commit.subject.claims(),
+                &AuthorizationRequest {
+                    method: ApiMethod::CommitBatch,
+                    zone: zone.clone(),
+                    targets,
+                },
+                &commit.state,
+            )
+            .map_err(|_| SourceError::Integrity)?;
+        let admitted = if let Some(zone_uid) = commit.zone_uid.clone() {
+            grant.admit_with_zone_uid(mutations, operation, zone_uid)
+        } else {
+            grant.admit(mutations, operation)
+        }
+        .map_err(|_| SourceError::Integrity)?;
+        let result = commit.checked.commit(admitted).await;
         match result {
             Ok(StoreCommitResult { revision, .. }) => Ok(CommitOutcome::Committed(revision)),
             Err(error) if is_conflict(&error) => Ok(CommitOutcome::Conflict(
@@ -390,6 +489,37 @@ impl RedbRegisteredControllerApi {
             context.operation().operation_id(),
             context.attempt()
         )
+    }
+
+    fn effect_identity(
+        &self,
+        context: &ReconcileContext,
+        plan: &ReconcilePlan,
+    ) -> Result<(String, String, &'static str, Vec<String>), SourceError> {
+        let Some(commit) = self.commit.as_ref() else {
+            return Err(SourceError::Integrity);
+        };
+        let assignment = commit.assignments.get(context.target().resource_ref());
+        if commit.require_assignment && assignment.is_none() {
+            return Err(SourceError::Integrity);
+        }
+        if assignment.is_some_and(|assignment| assignment.resource_uid != *context.target().uid()) {
+            return Err(SourceError::Integrity);
+        }
+        let operation_class = operation_class(context);
+        let claim_digest = effect_claim_digest(
+            operation_class,
+            context.target().uid(),
+            context.generation(),
+            plan.effect_ids(),
+            assignment,
+        );
+        Ok((
+            format!("effect:{claim_digest}"),
+            claim_digest,
+            operation_class,
+            plan.effect_ids().to_vec(),
+        ))
     }
 
     async fn finalizer_first(
@@ -449,8 +579,11 @@ impl RedbRegisteredControllerApi {
         }
         let current = match self.read_target(projection.target()).await? {
             Ok(resource) => resource,
-            Err(_) => return Ok(()),
+            Err(revision) => return Err(SourceError::Conflict(revision)),
         };
+        if current.uid != *projection.target().uid() || current.revision != projection.revision() {
+            return Err(SourceError::Conflict(current.revision));
+        }
         let mut resource =
             d2b_contracts_resource::v3::CanonicalJsonValue::parse(&current.canonical_json)
                 .map_err(|_| SourceError::Integrity)?;
@@ -503,54 +636,29 @@ impl RedbRegisteredControllerApi {
             deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
         };
         match self
-            .commit_store_mutations(&current.zone, current.revision, operation, vec![mutation])
+            .commit_store_mutations(
+                &current.zone,
+                current.revision,
+                &current.uid,
+                operation,
+                vec![mutation],
+            )
             .await?
         {
             CommitOutcome::Committed(_) | CommitOutcome::CommittedStatusPending(_) => Ok(()),
-            CommitOutcome::Conflict(_) => Ok(()),
+            CommitOutcome::Conflict(revision) => Err(SourceError::Conflict(revision)),
         }
     }
 
-    async fn effect_capability(
+    fn effect_capability(
         &self,
         operation_id: &str,
-        revision: ZoneRevision,
     ) -> Result<Option<Arc<d2b_resource_store_redb::AuthorityOperationCapability>>, SourceError>
     {
-        if let Some(capability) = self
-            .accepted
+        self.accepted
             .lock()
-            .map_err(|_| SourceError::Integrity)?
-            .remove(operation_id)
-        {
-            return Ok(Some(capability));
-        }
-        let authority_id = format!("effect:{operation_id}");
-        let Some(row) = self
-            .store
-            .authority_operations()
-            .await
-            .map_err(|error| source_error(error, revision))?
-            .into_iter()
-            .find(|row| row.operation_id == authority_id)
-        else {
-            return Ok(None);
-        };
-        let payload: Value =
-            serde_json::from_slice(&row.payload).map_err(|_| SourceError::Integrity)?;
-        let claim_digest = payload
-            .get("claimDigest")
-            .and_then(Value::as_str)
-            .ok_or(SourceError::Integrity)?;
-        self.store
-            .resume_authority_operation(
-                authority_id,
-                &self.store.authority_binding_digest(claim_digest),
-            )
-            .await
-            .map(Arc::new)
-            .map(Some)
-            .map_err(|error| source_error(error, revision))
+            .map_err(|_| SourceError::Integrity)
+            .map(|mut accepted| accepted.remove(operation_id))
     }
 
     async fn record_effect_state(
@@ -559,13 +667,29 @@ impl RedbRegisteredControllerApi {
         revision: ZoneRevision,
         state: d2b_resource_store_redb::AuthorityOperationState,
     ) -> Result<(), SourceError> {
-        if let Some(capability) = self.effect_capability(operation_id, revision).await? {
+        if let Some(capability) = self.effect_capability(operation_id)? {
             capability
                 .record_effect(state)
                 .await
                 .map_err(|error| source_error(error, revision))?;
         }
         Ok(())
+    }
+}
+
+impl<U> ResourceService<crate::store::RedbBackend, U>
+where
+    U: UpgradeDispatcher,
+{
+    /// Construct the distinct Core source adapter from the service's existing
+    /// NativeAuthorizer/store binding and an explicit authenticated identity.
+    pub fn registered_controller_api(
+        &self,
+        subject: crate::AuthenticatedSubjectContext,
+        state: AuthorizationState,
+        assignments: Vec<(ResourceRef, ResourceAssignmentFence)>,
+    ) -> Result<RedbRegisteredControllerApi, StoreBindingError> {
+        RedbRegisteredControllerApi::with_identity(self, subject, state, assignments)
     }
 }
 
@@ -602,7 +726,7 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
                 .list_all(
                     self.store.identity().zone(),
                     descriptor.resource_types().cloned().collect(),
-                    StoreProjection::Full,
+                    StoreProjection::MetadataOnly,
                     "initial",
                 )
                 .await?;
@@ -776,9 +900,17 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
 
     fn write_starting(
         &self,
-        _context: &ReconcileContext,
+        context: &ReconcileContext,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
-        std::future::ready(Ok(()))
+        let operation_id = context.operation().operation_id().to_owned();
+        let accepted = Arc::clone(&self.accepted);
+        async move {
+            accepted
+                .lock()
+                .map_err(|_| SourceError::Integrity)?
+                .remove(&operation_id);
+            Ok(())
+        }
     }
 
     fn accept_effect(
@@ -786,36 +918,23 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
         context: &ReconcileContext,
         plan: &ReconcilePlan,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
-        let operation_id = context.operation().operation_id().to_owned();
-        let authority_operation_id = format!("effect:{operation_id}");
-        let effect_identity = plan.effect_ids().join("\0");
-        let claim_digest = canonical_digest(
-            "d2b:controller-effect-claim/v1",
-            format!(
-                "{}:{}:{}:{}:{}",
-                context.target().uid().as_str(),
-                context.generation().get(),
-                context.revision().get(),
-                plan.effect_count(),
-                effect_identity,
-            )
-            .as_bytes(),
-        );
+        let effect_identity = self.effect_identity(context, plan);
         let store = Arc::clone(&self.store);
         let accepted = self.accepted.clone();
         async move {
+            let (authority_operation_id, claim_digest, operation_class, effect_ids) =
+                effect_identity?;
             let payload = serde_json::to_vec(&serde_json::json!({
                 "version": 1,
                 "kind": "controller-effect",
                 "state": "pending",
-                "zone": context.target().zone().as_str(),
+                "operationClass": operation_class,
+                "effectIds": effect_ids,
                 "resourceUid": context.target().uid().as_str(),
                 "generation": context.generation().get(),
-                "revision": context.revision().get(),
-                "operationId": operation_id,
+                "operationId": authority_operation_id,
                 "claimDigest": claim_digest,
                 "storeBindingDigest": store.authority_binding_digest(&claim_digest),
-                "effectCount": plan.effect_count(),
             }))
             .map_err(|_| SourceError::Integrity)?;
             let capability = store
@@ -899,7 +1018,7 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
             self.record_effect_state(
                 context.operation().operation_id(),
                 context.revision(),
-                projection_state(projection.disposition()),
+                projection_state(projection.disposition(), projection.reason()),
             )
             .await?;
             if status_persistence != StatusPersistence::Pending {
@@ -1423,39 +1542,6 @@ fn merge_status(current: &[u8], candidate: &[u8]) -> Result<Vec<u8>, SourceError
     Ok(resource.to_canonical_bytes())
 }
 
-fn prepared_identity(
-    mutation: &StoreMutation,
-) -> Result<(Option<ResourceUid>, Option<String>), SourceError> {
-    let Some(bytes) = mutation.canonical_resource.as_deref() else {
-        return Ok((mutation.expected_uid.clone(), None));
-    };
-    let digest = if mutation.kind == ResourceMutationKind::Create {
-        let value = d2b_contracts_resource::v3::CanonicalJsonValue::parse(bytes)
-            .map_err(|_| SourceError::Integrity)?;
-        canonical_digest(
-            d2b_contracts_resource::v3::RESOURCE_ENVELOPE_DOMAIN_TAG,
-            &value.to_canonical_bytes(),
-        )
-    } else {
-        ResourceEnvelope::from_json(bytes)
-            .map_err(|_| SourceError::Integrity)?
-            .digest()
-            .map_err(|_| SourceError::Integrity)?
-    };
-    Ok((mutation.expected_uid.clone(), Some(digest)))
-}
-
-fn admitted_verb(kind: ResourceMutationKind) -> AdmittedVerb {
-    match kind {
-        ResourceMutationKind::Create => AdmittedVerb::Create,
-        ResourceMutationKind::UpdateSpec => AdmittedVerb::UpdateSpec,
-        ResourceMutationKind::UpdateStatus => AdmittedVerb::UpdateStatus,
-        ResourceMutationKind::UpdateMetadata => AdmittedVerb::UpdateMetadata,
-        ResourceMutationKind::UpdateFinalizers => AdmittedVerb::UpdateFinalizers,
-        ResourceMutationKind::Delete => AdmittedVerb::Delete,
-    }
-}
-
 fn is_conflict(error: &StoreError) -> bool {
     matches!(
         error.kind(),
@@ -1478,20 +1564,120 @@ const fn resource_phase_name(phase: ResourcePhase) -> &'static str {
     }
 }
 
+const fn resource_verb(kind: ResourceMutationKind) -> ResourceVerb {
+    match kind {
+        ResourceMutationKind::Create => ResourceVerb::Create,
+        ResourceMutationKind::UpdateSpec => ResourceVerb::UpdateSpec,
+        ResourceMutationKind::UpdateStatus => ResourceVerb::UpdateStatus,
+        ResourceMutationKind::UpdateMetadata => ResourceVerb::UpdateMetadata,
+        ResourceMutationKind::UpdateFinalizers => ResourceVerb::UpdateFinalizers,
+        ResourceMutationKind::Delete => ResourceVerb::Delete,
+    }
+}
+
+fn operation_class(context: &ReconcileContext) -> &'static str {
+    if context
+        .reasons()
+        .contains(d2b_core_controller::CoreTriggerReason::UpgradeRequested)
+    {
+        "upgrade"
+    } else if context
+        .reasons()
+        .contains(d2b_core_controller::CoreTriggerReason::DeletionRequested)
+        || context
+            .reasons()
+            .contains(d2b_core_controller::CoreTriggerReason::FinalizerRequired)
+    {
+        "finalize"
+    } else {
+        "reconcile"
+    }
+}
+
+fn append_text(material: &mut Vec<u8>, value: &str) {
+    material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    material.extend_from_slice(value.as_bytes());
+}
+
+fn append_assignment_identity(material: &mut Vec<u8>, fence: &ResourceAssignmentFence) {
+    append_text(material, fence.resource_uid.as_str());
+    material.extend_from_slice(&fence.provider_generation.get().to_be_bytes());
+    material.extend_from_slice(&fence.controller_generation.get().to_be_bytes());
+    append_text(material, &fence.controller_role.to_canonical_string());
+    append_text(material, &fence.target.to_canonical_string());
+    material.extend_from_slice(&fence.session_generation.get().to_be_bytes());
+    material.extend_from_slice(&fence.epoch.to_be_bytes());
+    match &fence.scope {
+        ResourceAssignmentScope::Primary => append_text(material, "primary"),
+        ResourceAssignmentScope::OwnerChild {
+            owner_ref,
+            owner_uid,
+            owner_generation,
+            ..
+        } => {
+            append_text(material, "owner-child");
+            append_text(material, &owner_ref.to_canonical_string());
+            append_text(material, owner_uid.as_str());
+            material.extend_from_slice(&owner_generation.get().to_be_bytes());
+        }
+    }
+}
+
+fn effect_claim_digest(
+    operation_class: &str,
+    resource_uid: &ResourceUid,
+    generation: ResourceGeneration,
+    effect_ids: &[String],
+    assignment: Option<&ResourceAssignmentFence>,
+) -> String {
+    let mut material = Vec::new();
+    append_text(&mut material, operation_class);
+    append_text(&mut material, resource_uid.as_str());
+    material.extend_from_slice(&generation.get().to_be_bytes());
+    for effect_id in effect_ids {
+        append_text(&mut material, effect_id);
+    }
+    match assignment {
+        Some(assignment) => append_assignment_identity(&mut material, assignment),
+        None => append_text(&mut material, "unassigned"),
+    }
+    canonical_digest("d2b:controller-effect-claim/v2", &material)
+}
+
 const fn projection_state(
     disposition: d2b_core_controller::ProjectionDisposition,
+    reason: d2b_core_controller::ReconcileReason,
 ) -> d2b_resource_store_redb::AuthorityOperationState {
     match disposition {
         d2b_core_controller::ProjectionDisposition::Converged => {
             d2b_resource_store_redb::AuthorityOperationState::EffectConfirmed
         }
-        d2b_core_controller::ProjectionDisposition::Failed => {
+        d2b_core_controller::ProjectionDisposition::Failed
+            if matches!(
+                reason,
+                d2b_core_controller::ReconcileReason::HandlerTerminal
+                    | d2b_core_controller::ReconcileReason::HandlerExhausted
+                    | d2b_core_controller::ReconcileReason::InvalidSpec
+            ) =>
+        {
             d2b_resource_store_redb::AuthorityOperationState::EffectTerminal
         }
-        d2b_core_controller::ProjectionDisposition::Progressing
+        d2b_core_controller::ProjectionDisposition::Failed
+            if matches!(
+                reason,
+                d2b_core_controller::ReconcileReason::HandlerRetryable
+                    | d2b_core_controller::ReconcileReason::DeadlineExceeded
+                    | d2b_core_controller::ReconcileReason::Cancelled
+                    | d2b_core_controller::ReconcileReason::ConflictExhausted
+            ) =>
+        {
+            d2b_resource_store_redb::AuthorityOperationState::EffectRetryable
+        }
+        d2b_core_controller::ProjectionDisposition::Failed
+        | d2b_core_controller::ProjectionDisposition::Progressing
         | d2b_core_controller::ProjectionDisposition::Blocked
         | d2b_core_controller::ProjectionDisposition::UpgradeRequired => {
-            d2b_resource_store_redb::AuthorityOperationState::EffectRetryable
+            d2b_resource_store_redb::AuthorityOperationState::Pending
         }
     }
 }
@@ -1506,8 +1692,10 @@ const fn result_state(
         }
         d2b_core_controller::ReconcileDisposition::Pending
         | d2b_core_controller::ReconcileDisposition::Degraded
-        | d2b_core_controller::ReconcileDisposition::RequeueAt
-        | d2b_core_controller::ReconcileDisposition::FailedRetryable => {
+        | d2b_core_controller::ReconcileDisposition::RequeueAt => {
+            d2b_resource_store_redb::AuthorityOperationState::Pending
+        }
+        d2b_core_controller::ReconcileDisposition::FailedRetryable => {
             d2b_resource_store_redb::AuthorityOperationState::EffectRetryable
         }
         d2b_core_controller::ReconcileDisposition::FailedTerminal => {
@@ -1544,11 +1732,21 @@ fn source_error(error: StoreError, fallback: ZoneRevision) -> SourceError {
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
+    use crate::authz::{
+        ApiCatalog, BindingScope, BootstrapPhase, BoundSubject, CompiledRole, CompiledRoleBinding,
+        NativeAuthorizer, PolicyRule, PolicySet, RelayGrantAuthority, ResourceVerb,
+    };
+    use crate::identity::issue_test_subject;
+    use d2b_contracts_resource::v3::identity::{
+        AuthenticatedSubjectContext as SessionClaims, BindingDigest, EvidenceClass, Locality,
+        ReconnectGeneration, ServiceName, SessionBinding, SessionPurpose, TranscriptHash,
+        TransportBinding,
+    };
     use d2b_contracts_resource::v3::{
         CanonicalJsonValue, ConfigurationGeneration, ControllerGeneration,
-        RESOURCE_ENVELOPE_DOMAIN_TAG, ResourceTypeName, Timestamp,
+        RESOURCE_ENVELOPE_DOMAIN_TAG, ResourceTypeName, SchemaFingerprint, Timestamp,
     };
     use d2b_core_controller::{
         ChangeField, ControllerExecutionPolicy, ControllerHealth, ControllerIdentity,
@@ -1557,9 +1755,17 @@ mod tests {
         ResourceRegistration, ResyncPolicy, UpgradePlan, UpgradeStage, ValidationResult,
         WatchSelector,
     };
-    use d2b_resource_store::mutation_seal::mutation_seal_pair;
-    use d2b_resource_store::{SealedMutation, StoreMutation, StoreSlot};
-    use d2b_resource_store_redb::{StoreIdentity, write_provisioning_marker};
+    use d2b_resource_store::mutation_seal::{MutationSealIssuer, mutation_seal_pair};
+    use d2b_resource_store::{
+        AdmittedAuthorization, AdmittedAuthorizationTarget, AdmittedVerb, ExpectedRevision,
+        MutationSealBody, PolicySnapshot, PreparedStoreMutation, SealedMutation, StoreMutation,
+        StoreSlot,
+    };
+    use d2b_resource_store_redb::{
+        BackupRow, DecodedKey, DecodedKeyComponent, DecodedValue, KeyComponent, KeySpace,
+        StoreIdentity, ValueKind, encode_key, encode_value, write_provisioning_marker,
+    };
+    use sha2::{Digest, Sha256};
 
     fn identity() -> StoreIdentity {
         StoreIdentity::new(
@@ -1642,8 +1848,31 @@ mod tests {
         owner: Option<&str>,
         operation_id: &str,
     ) -> SealedMutation {
+        issuer.seal(verified_create_body(target, canonical, owner, operation_id))
+    }
+
+    fn verified_create_from_slot(
+        slot: &Arc<Mutex<Option<MutationSealIssuer>>>,
+        target: ResourceRef,
+        canonical: Vec<u8>,
+        owner: Option<&str>,
+        operation_id: &str,
+    ) -> SealedMutation {
+        slot.lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .seal(verified_create_body(target, canonical, owner, operation_id))
+    }
+
+    fn verified_create_body(
+        target: ResourceRef,
+        canonical: Vec<u8>,
+        owner: Option<&str>,
+        operation_id: &str,
+    ) -> MutationSealBody {
         let digest = canonical_digest(RESOURCE_ENVELOPE_DOMAIN_TAG, &canonical);
-        issuer.seal(MutationSealBody {
+        MutationSealBody {
             mutations: vec![PreparedStoreMutation::new(
                 StoreMutation {
                     kind: ResourceMutationKind::Create,
@@ -1688,7 +1917,7 @@ mod tests {
                 trace_id: None,
                 deadline_ms: 1_000,
             },
-        })
+        }
     }
 
     async fn test_store() -> (
@@ -1718,6 +1947,376 @@ mod tests {
         (directory, Arc::new(store), issuer)
     }
 
+    async fn large_relist_store() -> (tempfile::TempDir, Arc<RedbResourceStore>) {
+        const RESOURCE_COUNT: usize = 10_000;
+        let (_source_directory, source, issuer) = test_store().await;
+        let mut seed_resource = CanonicalJsonValue::parse(&canonical_host("seed", None)).unwrap();
+        let CanonicalJsonValue::Object(seed_root) = &mut seed_resource else {
+            panic!("large relist seed root shape");
+        };
+        let CanonicalJsonValue::Object(seed_status) = seed_root.get_mut("status").unwrap() else {
+            panic!("large relist seed status shape");
+        };
+        seed_status.insert("startedAt".to_owned(), CanonicalJsonValue::Null);
+        source
+            .commit_verified(verified_create(
+                &issuer,
+                ResourceRef::parse("Host/seed").unwrap(),
+                seed_resource.to_canonical_bytes(),
+                None,
+                "relist-seed",
+            ))
+            .await
+            .unwrap();
+        let mut backup = source.logical_backup().await.unwrap();
+        let source = match Arc::try_unwrap(source) {
+            Ok(source) => source,
+            Err(_) => panic!("large relist source has outstanding references"),
+        };
+        source.shutdown().await.unwrap();
+
+        let resource_table = backup
+            .tables
+            .iter()
+            .find(|table| table.name == "resources")
+            .unwrap();
+        let base_resource_row = resource_table.rows[0].clone();
+        let base_resource_value = DecodedValue::decode(&base_resource_row.value).unwrap();
+        let mut base_record: Value =
+            serde_json::from_slice(base_resource_value.canonical_json()).unwrap();
+        let base_resource_key = DecodedKey::decode(&base_resource_row.key).unwrap();
+        let [
+            DecodedKeyComponent::Text(resource_type),
+            DecodedKeyComponent::Text(resource_name),
+        ] = base_resource_key.components()
+        else {
+            panic!("large relist resource key shape");
+        };
+        assert_eq!(resource_type, "Host");
+        assert_eq!(resource_name, "seed");
+        let controller_binding = base_record["controller_binding_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let mut resource_rows = Vec::with_capacity(RESOURCE_COUNT);
+        let mut type_rows = Vec::with_capacity(RESOURCE_COUNT);
+        let mut controller_rows = Vec::with_capacity(RESOURCE_COUNT);
+        for index in 0..RESOURCE_COUNT {
+            if index == 0 {
+                resource_rows.push(base_resource_row.clone());
+                let base_type = backup
+                    .tables
+                    .iter()
+                    .find(|table| table.name == "type_index")
+                    .unwrap()
+                    .rows[0]
+                    .clone();
+                type_rows.push(base_type);
+                let base_controller = backup
+                    .tables
+                    .iter()
+                    .find(|table| table.name == "controller_index")
+                    .unwrap()
+                    .rows[0]
+                    .clone();
+                controller_rows.push(base_controller);
+                continue;
+            }
+            let name = format!("relist-{index:05}");
+            let uid = ResourceUid::parse(format!("123e4567-e89b-42d3-a456-{index:012x}")).unwrap();
+            let mut resource = CanonicalJsonValue::parse(&canonical_host(&name, None)).unwrap();
+            let CanonicalJsonValue::Object(root) = &mut resource else {
+                panic!("large relist resource root shape");
+            };
+            let CanonicalJsonValue::Object(status) = root.get_mut("status").unwrap() else {
+                panic!("large relist status shape");
+            };
+            status.insert("startedAt".to_owned(), CanonicalJsonValue::Null);
+            let CanonicalJsonValue::Object(metadata) = root.get_mut("metadata").unwrap() else {
+                panic!("large relist metadata shape");
+            };
+            metadata.insert(
+                "uid".to_owned(),
+                CanonicalJsonValue::String(uid.as_str().to_owned()),
+            );
+            let canonical = resource.to_canonical_bytes();
+            let payload_digest = ResourceEnvelope::from_json(&canonical)
+                .unwrap()
+                .digest()
+                .unwrap();
+
+            base_record["canonical_json"] = serde_json::to_value(&canonical).unwrap();
+            base_record["payload_digest"] = Value::String(payload_digest);
+            let record_json = CanonicalJsonValue::parse(&serde_json::to_vec(&base_record).unwrap())
+                .unwrap()
+                .to_canonical_bytes();
+            let resource_key = encode_key(
+                KeySpace::Resources,
+                &[KeyComponent::Text("Host"), KeyComponent::Text(&name)],
+            )
+            .unwrap()
+            .into_bytes();
+            resource_rows.push(BackupRow {
+                key: resource_key,
+                value: encode_value(ValueKind::ResourceRecord, &record_json)
+                    .unwrap()
+                    .into_bytes(),
+            });
+
+            let uid_json = serde_json::to_vec(uid.as_str()).unwrap();
+            let type_key = encode_key(
+                KeySpace::TypeIndex,
+                &[KeyComponent::Text("Host"), KeyComponent::Text(&name)],
+            )
+            .unwrap()
+            .into_bytes();
+            type_rows.push(BackupRow {
+                key: type_key,
+                value: encode_value(ValueKind::TypeIndexRecord, &uid_json)
+                    .unwrap()
+                    .into_bytes(),
+            });
+
+            let controller_key = encode_key(
+                KeySpace::ControllerIndex,
+                &[
+                    KeyComponent::Text(&controller_binding),
+                    KeyComponent::Text("Host"),
+                    KeyComponent::Text(&name),
+                ],
+            )
+            .unwrap()
+            .into_bytes();
+            controller_rows.push(BackupRow {
+                key: controller_key,
+                value: encode_value(ValueKind::ControllerIndexRecord, &uid_json)
+                    .unwrap()
+                    .into_bytes(),
+            });
+        }
+        resource_rows.sort_by(|left, right| left.key.cmp(&right.key));
+        type_rows.sort_by(|left, right| left.key.cmp(&right.key));
+        controller_rows.sort_by(|left, right| left.key.cmp(&right.key));
+        for (table_name, rows) in [
+            ("resources", resource_rows),
+            ("type_index", type_rows),
+            ("controller_index", controller_rows),
+        ] {
+            let table = backup
+                .tables
+                .iter_mut()
+                .find(|table| table.name == table_name)
+                .unwrap();
+            table.rows = rows;
+            table.checksum = backup_checksum(&table.rows);
+        }
+        backup.validate().unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let store_identity = identity();
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(directory.path().join("store.redb"))
+            .unwrap();
+        let mut marker = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(directory.path().join("store.marker"))
+            .unwrap();
+        write_provisioning_marker(&mut marker, &store_identity).unwrap();
+        let (_issuer, acceptor) = mutation_seal_pair(store_identity.seal_identity());
+        let store =
+            RedbResourceStore::restore_owned(file, marker, backup, store_identity, acceptor)
+                .await
+                .unwrap();
+        (directory, Arc::new(store))
+    }
+
+    fn backup_checksum(rows: &[BackupRow]) -> String {
+        let mut digest = Sha256::new();
+        for row in rows {
+            digest.update((row.key.len() as u64).to_be_bytes());
+            digest.update(&row.key);
+            digest.update((row.value.len() as u64).to_be_bytes());
+            digest.update(&row.value);
+        }
+        format!("sha256:{:x}", digest.finalize())
+    }
+
+    async fn authorized_test_setup() -> (
+        tempfile::TempDir,
+        Arc<RedbResourceStore>,
+        ResourceService<crate::store::RedbBackend>,
+        crate::AuthenticatedSubjectContext,
+        AuthorizationState,
+        Arc<Mutex<Option<MutationSealIssuer>>>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(directory.path().join("store.redb"))
+            .unwrap();
+        let mut marker = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(directory.path().join("store.marker"))
+            .unwrap();
+        let store_identity = identity();
+        let catalog = ApiCatalog::standard();
+        let subject_claims = Arc::new(
+            SessionClaims::new(
+                ResourceRef::parse("User/alice").unwrap(),
+                ResourceUid::parse("33333333-3333-4333-8333-333333333333").unwrap(),
+                ResourceRef::parse("Zone/work").unwrap(),
+                EvidenceClass::UnixPeer,
+                SessionPurpose::parse("resource-api").unwrap(),
+                ServiceName::parse("d2b.resource.v3").unwrap(),
+                SessionBinding::new(
+                    SchemaFingerprint::parse(format!("sha256:{}", "1".repeat(64))).unwrap(),
+                    TransportBinding::new(
+                        Locality::Local,
+                        BindingDigest::parse(format!("sha256:{}", "2".repeat(64))).unwrap(),
+                    ),
+                    ReconnectGeneration::new(1).unwrap(),
+                    TranscriptHash::from_bytes([3; 32]),
+                ),
+            )
+            .with_controller_generation(ControllerGeneration::new(1).unwrap()),
+        );
+        let host = ResourceTypeName::parse("Host").unwrap();
+        let role = CompiledRole::new(
+            ResourceRef::parse("Role/reconciler-test").unwrap(),
+            vec![
+                PolicyRule::new(
+                    &catalog,
+                    [host.clone()],
+                    [
+                        ResourceVerb::Get,
+                        ResourceVerb::List,
+                        ResourceVerb::Watch,
+                        ResourceVerb::Create,
+                        ResourceVerb::UpdateSpec,
+                        ResourceVerb::UpdateMetadata,
+                        ResourceVerb::Delete,
+                    ],
+                    [],
+                    [],
+                    [],
+                    [ZoneId::parse("work").unwrap()],
+                    [],
+                )
+                .unwrap(),
+                PolicyRule::new(
+                    &catalog,
+                    [host.clone()],
+                    [ResourceVerb::UpdateStatus],
+                    [],
+                    ["status".to_owned()],
+                    [],
+                    [ZoneId::parse("work").unwrap()],
+                    [],
+                )
+                .unwrap(),
+                PolicyRule::new(
+                    &catalog,
+                    [host.clone()],
+                    [ResourceVerb::UpdateFinalizers],
+                    [],
+                    ["finalizers".to_owned()],
+                    [],
+                    [ZoneId::parse("work").unwrap()],
+                    [],
+                )
+                .unwrap(),
+                PolicyRule::new(
+                    &catalog,
+                    [host],
+                    [ResourceVerb::Get],
+                    [],
+                    ["owner".to_owned()],
+                    [],
+                    [ZoneId::parse("work").unwrap()],
+                    [],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let binding = CompiledRoleBinding::new(
+            role.role_ref.clone(),
+            [BoundSubject {
+                subject_ref: subject_claims.subject_ref().clone(),
+                subject_uid: subject_claims.subject_uid().clone(),
+            }],
+            BindingScope::default(),
+            RelayGrantAuthority::None,
+        )
+        .unwrap();
+        let authorizer = Arc::new(
+            NativeAuthorizer::new(
+                catalog,
+                Some(
+                    PolicySet::new(&ApiCatalog::standard(), 7, vec![role], vec![binding]).unwrap(),
+                ),
+            )
+            .unwrap(),
+        );
+        let acceptor = authorizer
+            .take_store_seal(store_identity.seal_identity())
+            .unwrap();
+        write_provisioning_marker(&mut marker, &store_identity).unwrap();
+        let store = Arc::new(
+            RedbResourceStore::provision_owned(file, marker, store_identity, acceptor)
+                .await
+                .unwrap(),
+        );
+        let backend = Arc::new(crate::store::RedbBackend::from_arc(Arc::clone(&store)));
+        let service = ResourceService::new_with_zone_uid(
+            backend,
+            authorizer.clone(),
+            Some(ResourceUid::parse("22222222-2222-4222-8222-222222222222").unwrap()),
+        )
+        .unwrap();
+        let state = AuthorizationState {
+            snapshot: PolicySnapshot {
+                policy_revision: 7,
+                api_catalog_revision: 8,
+                active_configuration_revision: ConfigurationGeneration::new(9).unwrap(),
+                controller_generation: None,
+            },
+            zone_policy_revision: ZoneRevision::new(7),
+            bootstrap_phase: BootstrapPhase::Disabled,
+            now_tick: 1,
+        };
+        let subject = issue_test_subject(subject_claims, state.clone());
+        let slot = authorizer.test_store_seal_issuer_slot();
+        (directory, store, service, subject, state, slot)
+    }
+
+    fn primary_assignment(
+        resource_uid: ResourceUid,
+        revision: ZoneRevision,
+    ) -> ResourceAssignmentFence {
+        ResourceAssignmentFence {
+            resource_uid,
+            resource_revision: revision,
+            provider_generation: ResourceGeneration::new(1).unwrap(),
+            controller_generation: ControllerGeneration::new(1).unwrap(),
+            controller_role: ResourceRef::parse("Process/controller").unwrap(),
+            target: ResourceRef::parse("Host/system").unwrap(),
+            session_generation: ReconnectGeneration::new(1).unwrap(),
+            epoch: 1,
+            scope: ResourceAssignmentScope::Primary,
+        }
+    }
+
     #[tokio::test]
     async fn registered_api_lists_and_delivers_store_changes_through_core_shape() {
         let (_directory, store, issuer) = test_store().await;
@@ -1737,7 +2336,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let api = RedbRegisteredControllerApi::new(Arc::clone(&store), issuer);
+
+        let api = RedbRegisteredControllerApi::for_test_watch(Arc::clone(&store));
         let descriptor = descriptor();
         api.register(&descriptor).await.unwrap();
         let initial = api.list_initial(&descriptor).await.unwrap();
@@ -1784,7 +2384,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let api = Arc::new(RedbRegisteredControllerApi::new(store, issuer));
+        let api = Arc::new(RedbRegisteredControllerApi::for_test_watch(store));
         let descriptor = descriptor();
         let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
         source.register(&descriptor).await.unwrap();
@@ -1818,6 +2418,8 @@ mod tests {
 
     struct MutationHandler {
         descriptor: ControllerDescriptor,
+        effect_only: bool,
+        fail_effect: Option<Arc<AtomicBool>>,
     }
 
     impl ResourceReconciler for MutationHandler {
@@ -1856,6 +2458,12 @@ mod tests {
             _dependencies: &[DependencySnapshot],
             _plan: &ReconcilePlan,
         ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+            if self.effect_only {
+                return std::future::ready(Ok(ReconcileResult::converged(
+                    resource.revision(),
+                    resource.generation(),
+                )));
+            }
             let mutation = MutationIntent::new(
                 resource.key().resource_ref().clone(),
                 Some(resource.key().uid().clone()),
@@ -1873,6 +2481,26 @@ mod tests {
                     .map_err(|_| TestHandlerError)
             });
             std::future::ready(mutation)
+        }
+
+        fn execute_effect(
+            &self,
+            _context: &ReconcileContext,
+            resource: &d2b_core_controller::ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+            _plan: &ReconcilePlan,
+        ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+            if self
+                .fail_effect
+                .as_ref()
+                .is_some_and(|failed| failed.swap(false, Ordering::AcqRel))
+            {
+                return std::future::ready(Err(TestHandlerError));
+            }
+            std::future::ready(Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            )))
         }
 
         fn observe(
@@ -1957,11 +2585,12 @@ mod tests {
 
     #[tokio::test]
     async fn registered_api_commits_finalizer_before_handler_mutation() {
-        let (_directory, store, issuer) = test_store().await;
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
         let target = ResourceRef::parse("Host/owner").unwrap();
         store
-            .commit_verified(verified_create(
-                &issuer,
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
                 target,
                 canonical_host("owner", None),
                 None,
@@ -1969,12 +2598,16 @@ mod tests {
             ))
             .await
             .unwrap();
-        let api = Arc::new(RedbRegisteredControllerApi::new(Arc::clone(&store), issuer));
+        let api = Arc::new(
+            RedbRegisteredControllerApi::for_test_unassigned(&service, subject, state).unwrap(),
+        );
         let descriptor = descriptor();
         let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
         let runner = d2b_core_controller::Runner::new(
             Arc::new(MutationHandler {
                 descriptor: descriptor.clone(),
+                effect_only: false,
+                fail_effect: None,
             }),
             Arc::clone(&source),
             d2b_core_controller::RunnerConfig {
@@ -2026,6 +2659,345 @@ mod tests {
             store.runtime_metadata().await.unwrap().current_revision,
             ZoneRevision::new(2)
         );
+        assert!(store.authority_operations().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn registered_api_uses_explicit_identity_and_shared_authorizer_seal_for_effects() {
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
+        let target = ResourceRef::parse("Host/owner").unwrap();
+        store
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
+                target.clone(),
+                canonical_host("owner", None),
+                None,
+                "create-owner",
+            ))
+            .await
+            .unwrap();
+        let stored = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let uid = stored.uid.clone();
+        let assignment = primary_assignment(uid.clone(), stored.revision);
+        let api = Arc::new(
+            service
+                .registered_controller_api(subject, state, vec![(target.clone(), assignment)])
+                .unwrap(),
+        );
+        let descriptor = descriptor();
+        let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
+        let runner = d2b_core_controller::Runner::new(
+            Arc::new(MutationHandler {
+                descriptor: descriptor.clone(),
+                effect_only: true,
+                fail_effect: None,
+            }),
+            Arc::clone(&source),
+            d2b_core_controller::RunnerConfig {
+                policy_revision: 7,
+                api_revision: 8,
+                configuration_revision: ConfigurationGeneration::new(9).unwrap(),
+                deadline_tick: 5_000,
+                max_attempts: 3,
+            },
+        )
+        .run();
+        let runner_task = tokio::spawn(runner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let rows = store.authority_operations().await.unwrap();
+                if rows.iter().any(|row| {
+                    row.state == d2b_resource_store_redb::AuthorityOperationState::EffectConfirmed
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        source.close_watch().unwrap();
+        let report = runner_task.await.unwrap().unwrap();
+        assert!(report.checkpointed >= 1);
+        let rows = store.authority_operations().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].state,
+            d2b_resource_store_redb::AuthorityOperationState::EffectConfirmed
+        );
+        let payload: Value = serde_json::from_slice(&rows[0].payload).unwrap();
+        assert_eq!(payload["resourceUid"], uid.as_str());
+        assert_eq!(payload["operationClass"], "reconcile");
+    }
+
+    #[tokio::test]
+    async fn production_mutations_fail_closed_without_a_matching_assignment_fence() {
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
+        let target = ResourceRef::parse("Host/owner").unwrap();
+        store
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
+                target.clone(),
+                canonical_host("owner", None),
+                None,
+                "create-owner",
+            ))
+            .await
+            .unwrap();
+        let stored = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let api = service
+            .registered_controller_api(subject, state, Vec::new())
+            .unwrap();
+        let key = ResourceKey::new(stored.zone, stored.resource_ref, stored.uid);
+        assert_eq!(
+            api.persist_outcome(&ReconcileProjection::new(
+                key,
+                ZoneRevision::new(1),
+                ResourcePhase::Failed,
+                d2b_core_controller::ProjectionDisposition::Failed,
+                d2b_core_controller::ReconcileReason::HandlerTerminal,
+                false,
+            ))
+            .await
+            .unwrap_err(),
+            SourceError::Integrity
+        );
+    }
+
+    #[tokio::test]
+    async fn relist_rejoins_a_pending_effect_without_creating_a_duplicate_row() {
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
+        let target = ResourceRef::parse("Host/owner").unwrap();
+        store
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
+                target.clone(),
+                canonical_host("owner", None),
+                None,
+                "create-owner",
+            ))
+            .await
+            .unwrap();
+        let stored = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let assignment = primary_assignment(stored.uid.clone(), stored.revision);
+        let second_subject = issue_test_subject(subject.claims().clone(), state.clone());
+        let api = Arc::new(
+            service
+                .registered_controller_api(
+                    subject,
+                    state.clone(),
+                    vec![(target.clone(), assignment.clone())],
+                )
+                .unwrap(),
+        );
+        let descriptor = descriptor();
+        let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
+        let first_failure = Arc::new(AtomicBool::new(true));
+        let first_runner = d2b_core_controller::Runner::new(
+            Arc::new(MutationHandler {
+                descriptor: descriptor.clone(),
+                effect_only: true,
+                fail_effect: Some(first_failure),
+            }),
+            Arc::clone(&source),
+            d2b_core_controller::RunnerConfig {
+                policy_revision: 7,
+                api_revision: 8,
+                configuration_revision: ConfigurationGeneration::new(9).unwrap(),
+                deadline_tick: 5_000,
+                max_attempts: 1,
+            },
+        )
+        .run();
+        let first_task = tokio::spawn(first_runner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let rows = store.authority_operations().await.unwrap();
+                if rows.len() == 1
+                    && rows[0].state == d2b_resource_store_redb::AuthorityOperationState::Pending
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        source.close_watch().unwrap();
+        first_task.await.unwrap().unwrap();
+
+        let api = Arc::new(
+            service
+                .registered_controller_api(
+                    second_subject,
+                    state,
+                    vec![(target.clone(), assignment)],
+                )
+                .unwrap(),
+        );
+        let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
+        let second_task = tokio::spawn(
+            d2b_core_controller::Runner::new(
+                Arc::new(MutationHandler {
+                    descriptor: descriptor.clone(),
+                    effect_only: true,
+                    fail_effect: None,
+                }),
+                Arc::clone(&source),
+                d2b_core_controller::RunnerConfig {
+                    policy_revision: 7,
+                    api_revision: 8,
+                    configuration_revision: ConfigurationGeneration::new(9).unwrap(),
+                    deadline_tick: 5_000,
+                    max_attempts: 1,
+                },
+            )
+            .run(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let rows = store.authority_operations().await.unwrap();
+                if rows.len() == 1
+                    && rows[0].state
+                        == d2b_resource_store_redb::AuthorityOperationState::EffectConfirmed
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        source.close_watch().unwrap();
+        second_task.await.unwrap().unwrap();
+        let rows = store.authority_operations().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].state,
+            d2b_resource_store_redb::AuthorityOperationState::EffectConfirmed
+        );
+    }
+
+    #[tokio::test]
+    async fn core_redb_relist_handles_ten_thousand_resources_with_one_hundred_watches() {
+        const RESOURCE_COUNT: usize = 10_000;
+        const WATCH_COUNT: usize = 100;
+        let (_directory, store) = large_relist_store().await;
+        let effect_ids = vec!["relist-proof".to_owned()];
+        let resource_uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let claim_digest = effect_claim_digest(
+            "reconcile",
+            &resource_uid,
+            ResourceGeneration::new(1).unwrap(),
+            &effect_ids,
+            None,
+        );
+        let operation_id = format!("effect:{claim_digest}");
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "kind": "controller-effect",
+            "state": "pending",
+            "operationClass": "reconcile",
+            "effectIds": effect_ids,
+            "resourceUid": resource_uid.as_str(),
+            "generation": 1,
+            "operationId": operation_id,
+            "claimDigest": claim_digest,
+            "storeBindingDigest": store.authority_binding_digest(&claim_digest),
+        }))
+        .unwrap();
+        store
+            .prepare_authority_operation(operation_id.clone(), payload, &claim_digest)
+            .await
+            .unwrap();
+        let descriptor = descriptor();
+        let snapshot_revision = store.runtime_metadata().await.unwrap().current_revision;
+        let mut sources = Vec::with_capacity(WATCH_COUNT);
+        for _ in 0..WATCH_COUNT {
+            let api = Arc::new(RedbRegisteredControllerApi::for_test_watch(Arc::clone(
+                &store,
+            )));
+            let source = CoreControllerSource::new(descriptor.clone(), api);
+            source.register(&descriptor).await.unwrap();
+            source
+                .open_watch(&descriptor, snapshot_revision)
+                .await
+                .unwrap();
+            sources.push(source);
+        }
+        assert_eq!(
+            store.watch_signals().unwrap().current_registrations,
+            WATCH_COUNT as u64
+        );
+
+        let started = Instant::now();
+        let initial = sources[0].list_initial(&descriptor).await.unwrap();
+        sources[0]
+            .open_watch(&descriptor, initial.snapshot_revision)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(initial.resources.len(), RESOURCE_COUNT);
+        assert!(
+            elapsed <= Duration::from_secs(5),
+            "Core+redb relist/rebuild took {elapsed:?} for {RESOURCE_COUNT} resources and {WATCH_COUNT} watches"
+        );
+        let rows = store.authority_operations().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].operation_id, operation_id);
+        assert_eq!(
+            rows[0].state,
+            d2b_resource_store_redb::AuthorityOperationState::Pending
+        );
+        drop(sources);
     }
 
     #[test]
@@ -2044,11 +3016,12 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_projection_persists_only_bounded_status_observation() {
-        let (_directory, store, issuer) = test_store().await;
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
         let target = ResourceRef::parse("Host/owner").unwrap();
         store
-            .commit_verified(verified_create(
-                &issuer,
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
                 target.clone(),
                 canonical_host("owner", None),
                 None,
@@ -2077,7 +3050,8 @@ mod tests {
             stored.resource_ref.clone(),
             stored.uid.clone(),
         );
-        let api = RedbRegisteredControllerApi::new(store.clone(), issuer);
+        let api =
+            RedbRegisteredControllerApi::for_test_unassigned(&service, subject, state).unwrap();
         api.persist_outcome(&ReconcileProjection::new(
             key,
             stored.revision,
@@ -2107,5 +3081,139 @@ mod tests {
         let value: Value = serde_json::from_slice(&updated.canonical_json).unwrap();
         assert_eq!(value["status"]["phase"], "Failed");
         assert_eq!(updated.revision, ZoneRevision::new(2));
+    }
+
+    #[test]
+    fn effect_lifecycle_keeps_running_pending_and_only_marks_uncertainty_retryable() {
+        assert_eq!(
+            result_state(d2b_core_controller::ReconcileDisposition::Pending),
+            d2b_resource_store_redb::AuthorityOperationState::Pending
+        );
+        assert_eq!(
+            result_state(d2b_core_controller::ReconcileDisposition::RequeueAt),
+            d2b_resource_store_redb::AuthorityOperationState::Pending
+        );
+        assert_eq!(
+            result_state(d2b_core_controller::ReconcileDisposition::Degraded),
+            d2b_resource_store_redb::AuthorityOperationState::Pending
+        );
+        assert_eq!(
+            result_state(d2b_core_controller::ReconcileDisposition::FailedRetryable),
+            d2b_resource_store_redb::AuthorityOperationState::EffectRetryable
+        );
+        assert_eq!(
+            result_state(d2b_core_controller::ReconcileDisposition::Converged),
+            d2b_resource_store_redb::AuthorityOperationState::EffectConfirmed
+        );
+        assert_eq!(
+            result_state(d2b_core_controller::ReconcileDisposition::Finalized),
+            d2b_resource_store_redb::AuthorityOperationState::EffectConfirmed
+        );
+        assert_eq!(
+            result_state(d2b_core_controller::ReconcileDisposition::FailedTerminal),
+            d2b_resource_store_redb::AuthorityOperationState::EffectTerminal
+        );
+
+        assert_eq!(
+            projection_state(
+                d2b_core_controller::ProjectionDisposition::Progressing,
+                d2b_core_controller::ReconcileReason::ReconcilePass,
+            ),
+            d2b_resource_store_redb::AuthorityOperationState::Pending
+        );
+        assert_eq!(
+            projection_state(
+                d2b_core_controller::ProjectionDisposition::Failed,
+                d2b_core_controller::ReconcileReason::HandlerRetryable,
+            ),
+            d2b_resource_store_redb::AuthorityOperationState::EffectRetryable
+        );
+        assert_eq!(
+            projection_state(
+                d2b_core_controller::ProjectionDisposition::Failed,
+                d2b_core_controller::ReconcileReason::HandlerTerminal,
+            ),
+            d2b_resource_store_redb::AuthorityOperationState::EffectTerminal
+        );
+    }
+
+    #[test]
+    fn effect_identity_ignores_resource_revisions_but_keeps_assignment_fences() {
+        let resource_uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let target = ResourceRef::parse("Host/system").unwrap();
+        let controller = ResourceRef::parse("Process/controller").unwrap();
+        let mut fence = ResourceAssignmentFence {
+            resource_uid: resource_uid.clone(),
+            resource_revision: ZoneRevision::new(7),
+            provider_generation: ResourceGeneration::new(2).unwrap(),
+            controller_generation: ControllerGeneration::new(3).unwrap(),
+            controller_role: controller,
+            target,
+            session_generation: ReconnectGeneration::new(4).unwrap(),
+            epoch: 5,
+            scope: ResourceAssignmentScope::Primary,
+        };
+        let effects = vec!["effect-a".to_owned(), "effect-b".to_owned()];
+        let first = effect_claim_digest(
+            "reconcile",
+            &resource_uid,
+            ResourceGeneration::new(6).unwrap(),
+            &effects,
+            Some(&fence),
+        );
+        fence.resource_revision = ZoneRevision::new(99);
+        let second = effect_claim_digest(
+            "reconcile",
+            &resource_uid,
+            ResourceGeneration::new(6).unwrap(),
+            &effects,
+            Some(&fence),
+        );
+        assert_eq!(first, second);
+
+        fence.scope = ResourceAssignmentScope::OwnerChild {
+            owner_ref: ResourceRef::parse("Host/owner").unwrap(),
+            owner_uid: resource_uid.clone(),
+            owner_revision: ZoneRevision::new(7),
+            owner_generation: ResourceGeneration::new(6).unwrap(),
+        };
+        let owner_first = effect_claim_digest(
+            "reconcile",
+            &resource_uid,
+            ResourceGeneration::new(6).unwrap(),
+            &effects,
+            Some(&fence),
+        );
+        if let ResourceAssignmentScope::OwnerChild { owner_revision, .. } = &mut fence.scope {
+            *owner_revision = ZoneRevision::new(99);
+        }
+        let owner_second = effect_claim_digest(
+            "reconcile",
+            &resource_uid,
+            ResourceGeneration::new(6).unwrap(),
+            &effects,
+            Some(&fence),
+        );
+        assert_eq!(owner_first, owner_second);
+
+        fence.epoch = 6;
+        let changed_assignment = effect_claim_digest(
+            "reconcile",
+            &resource_uid,
+            ResourceGeneration::new(6).unwrap(),
+            &effects,
+            Some(&fence),
+        );
+        assert_ne!(first, changed_assignment);
+        assert_ne!(
+            first,
+            effect_claim_digest(
+                "reconcile",
+                &resource_uid,
+                ResourceGeneration::new(7).unwrap(),
+                &effects,
+                Some(&fence),
+            )
+        );
     }
 }

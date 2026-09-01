@@ -15,7 +15,7 @@ use d2b_resource_store::{
     StoreInspectSchemaRequest, StoreListRequest, StoreListResult, StoreProjection,
     StoreResolveRequest, StoreResolvedIdentity, StoredResource, StoredSchema,
 };
-use redb::{Database, ReadableDatabase, ReadableTable};
+use redb::{Database, ReadableDatabase};
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
 use crate::BrokerEvidenceIndex;
@@ -52,6 +52,8 @@ pub const READ_POOL_THREADS: usize = 4;
 pub const MAX_CONCURRENT_READS: usize = 16;
 /// Worker-enforced lifetime ceiling for an admitted read transaction.
 pub const READ_LIFETIME: Duration = Duration::from_millis(250);
+/// Worker-enforced lifetime ceiling for one bounded relist page.
+pub const LIST_READ_LIFETIME: Duration = Duration::from_secs(1);
 
 pub(crate) type CommitFence = Arc<dyn Fn() -> Result<(), StoreError> + Send + Sync>;
 
@@ -1881,21 +1883,33 @@ impl ReadPool {
         operation: &'static str,
         make: impl FnOnce(oneshot::Sender<Result<T, StoreError>>) -> ReadCommand,
     ) -> Result<T, StoreError> {
-        self.submit_with_hold(operation, make, None).await
+        self.submit_with_hold_for(operation, make, None, READ_LIFETIME)
+            .await
     }
 
-    async fn submit_with_hold<T>(
+    async fn submit_with_lifetime<T>(
+        &self,
+        operation: &'static str,
+        make: impl FnOnce(oneshot::Sender<Result<T, StoreError>>) -> ReadCommand,
+        lifetime: Duration,
+    ) -> Result<T, StoreError> {
+        self.submit_with_hold_for(operation, make, None, lifetime)
+            .await
+    }
+
+    async fn submit_with_hold_for<T>(
         &self,
         operation: &'static str,
         make: impl FnOnce(oneshot::Sender<Result<T, StoreError>>) -> ReadCommand,
         hold: Option<ReadHold>,
+        lifetime: Duration,
     ) -> Result<T, StoreError> {
         let started = Instant::now();
         let permit = Arc::clone(&self.permits)
             .try_acquire_owned()
             .map_err(|_| backpressure())?;
         let (response, receiver) = oneshot::channel();
-        let deadline = Instant::now() + READ_LIFETIME;
+        let deadline = Instant::now() + lifetime;
         let worker = usize::try_from(
             self.next_worker.fetch_add(1, Ordering::Relaxed) % READ_POOL_THREADS as u64,
         )
@@ -1913,7 +1927,7 @@ impl ReadPool {
                     crate::transaction::integrity("read-pool-closed")
                 }
             })?;
-        let result = tokio::time::timeout(READ_LIFETIME + Duration::from_millis(25), receiver)
+        let result = tokio::time::timeout(lifetime + Duration::from_millis(25), receiver)
             .await
             .map_err(|_| timeout())?
             .map_err(|_| crate::transaction::integrity("read-response-closed"))?;
@@ -1945,8 +1959,12 @@ impl ReadPool {
         request: StoreListRequest,
     ) -> Result<StoreListResult, StoreError> {
         self.validate_zone(&request.zone)?;
-        self.submit("list", |response| ReadCommand::List { request, response })
-            .await
+        self.submit_with_lifetime(
+            "list",
+            |response| ReadCommand::List { request, response },
+            LIST_READ_LIFETIME,
+        )
+        .await
     }
 
     pub(crate) async fn resolve(
@@ -1998,7 +2016,7 @@ impl ReadPool {
         release: std::sync::mpsc::Receiver<()>,
         completed: oneshot::Sender<()>,
     ) -> Result<(), StoreError> {
-        self.submit_with_hold(
+        self.submit_with_hold_for(
             "scan",
             |response| ReadCommand::NeverRespond { response },
             Some(ReadHold {
@@ -2006,6 +2024,7 @@ impl ReadPool {
                 release,
                 completed,
             }),
+            READ_LIFETIME,
         )
         .await
     }
@@ -2266,20 +2285,20 @@ fn read_list(
             if cursor.snapshot_revision != snapshot_revision {
                 return Err(crate::transaction::revision_expired(snapshot_revision));
             }
-            Some(cursor.after_key)
+            cursor.after_key
         }
-        None => None,
+        None => Vec::new(),
     };
     let page_size = usize::try_from(request.page_size)
         .map_err(crate::transaction::integrity)?
         .max(1);
-    for row in table.iter().map_err(crate::transaction::integrity)? {
+    for row in table
+        .range(after_key.as_slice()..)
+        .map_err(crate::transaction::integrity)?
+    {
         check_deadline(deadline)?;
         let (key, value) = row.map_err(crate::transaction::integrity)?;
-        if after_key
-            .as_ref()
-            .is_some_and(|after_key| key.value() <= after_key.as_slice())
-        {
+        if !after_key.is_empty() && key.value() <= after_key.as_slice() {
             continue;
         }
         let resource_ref = crate::transaction::resource_ref_from_key(key.value())?;
@@ -2301,18 +2320,29 @@ fn read_list(
         {
             continue;
         }
-        let record: ResourceRecord = decode(ValueKind::ResourceRecord, value.value())?;
-        let mut resource = stored_resource(&request.zone, &resource_ref, &record)?;
+        let (mut resource, owner_uid) = if request.projection == StoreProjection::MetadataOnly {
+            stored_metadata_resource_from_frame(&request.zone, &resource_ref, value.value())?
+        } else {
+            let record: ResourceRecord = decode(ValueKind::ResourceRecord, value.value())?;
+            let owner_uid = record.owner_uid.clone();
+            (
+                stored_resource(&request.zone, &resource_ref, &record)?,
+                owner_uid,
+            )
+        };
         if !filters_match(
             &request.filters,
             resource_type,
             name,
             &resource.uid,
-            record.owner_uid.as_deref(),
+            owner_uid.as_deref(),
         ) {
             continue;
         }
-        project_resource(&mut resource, request.projection)?;
+
+        if request.projection != StoreProjection::MetadataOnly {
+            project_resource(&mut resource, request.projection)?;
+        }
         resources.push((key.value().to_vec(), resource));
         if resources.len() > page_size {
             break;
@@ -2344,6 +2374,97 @@ fn read_list(
         next_cursor,
         truncated,
     })
+}
+
+fn stored_metadata_resource_from_frame(
+    zone: &ZoneId,
+    resource_ref: &ResourceRef,
+    frame: &[u8],
+) -> Result<(StoredResource, Option<String>), StoreError> {
+    // Resource rows are validated at admission and when the store opens. The
+    // metadata-only relist path decodes just the bounded fields it returns so
+    // large snapshot rebuilds do not parse each full envelope twice.
+    if frame.len() < 7
+        || frame[0] != crate::values::VALUE_FORMAT_VERSION
+        || u16::from_be_bytes([frame[1], frame[2]]) != ValueKind::ResourceRecord.discriminant()
+    {
+        return Err(crate::transaction::integrity("table-value-kind-mismatch"));
+    }
+    let payload_length =
+        usize::try_from(u32::from_be_bytes([frame[3], frame[4], frame[5], frame[6]]))
+            .map_err(crate::transaction::integrity)?;
+    if payload_length > crate::values::MAX_VALUE_PAYLOAD_BYTES || frame.len() != 7 + payload_length
+    {
+        return Err(crate::transaction::integrity("value-frame-length-mismatch"));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&frame[7..])
+        .map_err(|_| crate::transaction::integrity("stored-resource-envelope-invalid"))?;
+    let canonical_json = value
+        .get("canonical_json")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-canonical-json-missing"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or_else(|| {
+                    crate::transaction::integrity("stored-resource-canonical-json-invalid")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let payload_digest = value
+        .get("payload_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-payload-digest-missing"))?
+        .to_owned();
+    let owner_uid = value
+        .get("owner_uid")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let resource: serde_json::Value = serde_json::from_slice(&canonical_json)
+        .map_err(|_| crate::transaction::integrity("stored-resource-envelope-invalid"))?;
+    let metadata = resource
+        .get("metadata")
+        .cloned()
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-metadata-missing"))?;
+    let uid = metadata
+        .get("uid")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-uid-invalid"))?;
+    let generation = metadata
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| d2b_contracts_resource::v3::ResourceGeneration::new(value).ok())
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-generation-invalid"))?;
+    let revision = metadata
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .map(ZoneRevision::new)
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-revision-invalid"))?;
+    let resource_type = resource
+        .get("type")
+        .cloned()
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-type-missing"))?;
+    let canonical_json = serde_json::to_vec(&serde_json::json!({
+        "apiVersion": "resources.d2bus.org/v3",
+        "metadata": metadata,
+        "type": resource_type,
+    }))
+    .map_err(|_| crate::transaction::integrity("stored-resource-metadata-invalid"))?;
+    Ok((
+        StoredResource {
+            resource_ref: resource_ref.clone(),
+            zone: zone.clone(),
+            uid,
+            generation,
+            revision,
+            canonical_json,
+            payload_digest,
+        },
+        owner_uid,
+    ))
 }
 
 struct ListCursor {
