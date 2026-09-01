@@ -69,8 +69,8 @@ pub use migration::{
     upgrade_owned_after_backup,
 };
 pub use ownership::{
-    MAX_OWNER_CHAIN_DEPTH, OwnerBinding, OwnerIndex, OwnerIndexMutation, OwnershipError,
-    ReverseOwnerEntry,
+    MAX_OWNER_CHAIN_DEPTH, OwnerBinding, OwnerChangeEvent, OwnerIndex, OwnerIndexMutation,
+    OwnershipError, ReverseOwnerEntry,
 };
 pub use revision_log::{
     MAX_COMPACTION_BYTES_PER_TRANSACTION, MAX_COMPACTION_ROWS_PER_TRANSACTION,
@@ -955,8 +955,9 @@ impl RedbResourceStore {
                 "authority-operation-claim-envelope-invalid",
             ));
         }
+        let request_digest = transaction::authority_payload_digest_value(&envelope)?;
         self.writer
-            .authority_prepare(operation_id.clone(), payload)
+            .authority_prepare(operation_id.clone(), payload, request_digest)
             .await?;
         Ok(AuthorityOperationCapability {
             store: Arc::clone(self),

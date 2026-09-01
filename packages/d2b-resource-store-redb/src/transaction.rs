@@ -348,6 +348,7 @@ pub enum ChangeEvent {
     SpecUpdated,
     StatusUpdated,
     MetadataUpdated,
+    FinalizersUpdated,
     DeletionRequested,
     Deleted,
 }
@@ -389,6 +390,12 @@ pub struct ChangeEntry {
     event: ChangeEvent,
     old_generation: Option<ResourceGeneration>,
     new_generation: Option<ResourceGeneration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_owner_ref: Option<ResourceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_owner_uid: Option<ResourceUid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_ref: Option<ResourceRef>,
     owner_uid: Option<ResourceUid>,
     payload_digest: String,
     canonical_resource: Option<Vec<u8>>,
@@ -406,6 +413,12 @@ struct ChangeEntryWire {
     event: ChangeEvent,
     old_generation: Option<ResourceGeneration>,
     new_generation: Option<ResourceGeneration>,
+    #[serde(default)]
+    previous_owner_ref: Option<ResourceRef>,
+    #[serde(default)]
+    previous_owner_uid: Option<ResourceUid>,
+    #[serde(default)]
+    owner_ref: Option<ResourceRef>,
     owner_uid: Option<ResourceUid>,
     payload_digest: String,
     canonical_resource: Option<Vec<u8>>,
@@ -419,7 +432,7 @@ impl<'de> Deserialize<'de> for ChangeEntry {
         D: serde::Deserializer<'de>,
     {
         let wire = ChangeEntryWire::deserialize(deserializer)?;
-        Self::new(
+        let entry = Self::new(
             wire.ordinal,
             wire.resource_type,
             wire.resource_name,
@@ -433,7 +446,12 @@ impl<'de> Deserialize<'de> for ChangeEntry {
             wire.operation_id.0,
             wire.correlation_id.0,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(serde::de::Error::custom)?;
+        Ok(entry.with_owners(
+            wire.previous_owner_ref,
+            wire.previous_owner_uid,
+            wire.owner_ref,
+        ))
     }
 }
 
@@ -468,12 +486,27 @@ impl ChangeEntry {
             event,
             old_generation,
             new_generation,
+            previous_owner_ref: None,
+            previous_owner_uid: None,
+            owner_ref: None,
             owner_uid,
             payload_digest,
             canonical_resource,
             operation_id: ChangeIdentity::parse(operation_id)?,
             correlation_id: ChangeIdentity::parse(correlation_id)?,
         })
+    }
+
+    pub(crate) fn with_owners(
+        mut self,
+        previous_owner_ref: Option<ResourceRef>,
+        previous_owner_uid: Option<ResourceUid>,
+        owner_ref: Option<ResourceRef>,
+    ) -> Self {
+        self.previous_owner_ref = previous_owner_ref;
+        self.previous_owner_uid = previous_owner_uid;
+        self.owner_ref = owner_ref;
+        self
     }
 
     pub const fn ordinal(&self) -> u32 {
@@ -494,6 +527,38 @@ impl ChangeEntry {
 
     pub fn owner_uid(&self) -> Option<&ResourceUid> {
         self.owner_uid.as_ref()
+    }
+
+    pub fn previous_owner_ref(&self) -> Option<&ResourceRef> {
+        self.previous_owner_ref.as_ref()
+    }
+
+    pub fn previous_owner_uid(&self) -> Option<&ResourceUid> {
+        self.previous_owner_uid.as_ref()
+    }
+
+    pub fn owner_ref(&self) -> Option<&ResourceRef> {
+        self.owner_ref.as_ref()
+    }
+
+    pub const fn old_generation(&self) -> Option<ResourceGeneration> {
+        self.old_generation
+    }
+
+    pub const fn new_generation(&self) -> Option<ResourceGeneration> {
+        self.new_generation
+    }
+
+    pub fn canonical_resource(&self) -> Option<&[u8]> {
+        self.canonical_resource.as_deref()
+    }
+
+    pub fn operation_id(&self) -> &str {
+        self.operation_id.as_str()
+    }
+
+    pub fn correlation_id(&self) -> &str {
+        self.correlation_id.as_str()
     }
 
     pub const fn event(&self) -> ChangeEvent {
@@ -1737,10 +1802,15 @@ fn validate_change_batch(batch: &ChangeBatch, meta: &StoreMeta) -> Result<(), St
                     || envelope.metadata().uid() != &entry.resource_uid
                     || envelope.metadata().revision() != batch.revision()
                     || envelope.digest().ok().as_deref() != Some(entry.payload_digest.as_str())
+                    || entry
+                        .owner_ref
+                        .as_ref()
+                        .is_some_and(|owner| envelope.metadata().owner_ref() != Some(owner))
             })
         }) || entry.event == ChangeEvent::Deleted && entry.canonical_resource.is_some()
             || entry.new_generation.is_none() && entry.event != ChangeEvent::Deleted
             || entry.old_generation.is_none() && !matches!(entry.event, ChangeEvent::Created)
+            || entry.previous_owner_ref.is_some() != entry.previous_owner_uid.is_some()
             || entry.operation_id.as_str().is_empty()
             || entry.correlation_id.as_str().is_empty()
     }) || batch.revision().get() > meta.current_revision
@@ -2022,6 +2092,7 @@ pub(crate) fn authority_prepare(
     database: &Database,
     operation_id: &str,
     payload: Vec<u8>,
+    request_digest: String,
 ) -> Result<(), StoreError> {
     if operation_id.is_empty() || operation_id.len() > 512 {
         return Err(integrity("authority-operation-id-invalid"));
@@ -2029,7 +2100,9 @@ pub(crate) fn authority_prepare(
     if payload.is_empty() || payload.len() > 64 * 1024 {
         return Err(integrity("authority-operation-payload-invalid"));
     }
-    let request_digest = canonical_digest("d2b:authority-operation/v1", &payload);
+    if !valid_digest(&request_digest) {
+        return Err(integrity("authority-operation-digest-invalid"));
+    }
     let key = operation_key(operation_id)?;
     let mut write = database.begin_write().map_err(integrity)?;
     set_full_durability(&mut write)?;
@@ -2043,7 +2116,27 @@ pub(crate) fn authority_prepare(
             .transpose()?
     };
     if let Some(existing) = existing {
-        let _ = existing;
+        let Some(authority) = existing.authority else {
+            return Err(conflict(
+                current_revision,
+                0,
+                "authority-operation-id-reused",
+            ));
+        };
+        if authority_payload_digest(&authority.payload)? == request_digest {
+            if matches!(
+                authority.state.as_str(),
+                "effect-confirmed" | "effect-terminal" | "released" | "closed"
+            ) {
+                return Err(conflict(
+                    current_revision,
+                    0,
+                    "authority-operation-id-reused",
+                ));
+            }
+            write.abort().map_err(integrity)?;
+            return Ok(());
+        }
         return Err(conflict(
             current_revision,
             0,
@@ -2071,6 +2164,27 @@ pub(crate) fn authority_prepare(
         .insert(key.as_slice(), value.as_slice())
         .map_err(integrity)?;
     write.commit().map_err(integrity)
+}
+
+pub(crate) fn authority_payload_digest(payload: &[u8]) -> Result<String, StoreError> {
+    let value: serde_json::Value = serde_json::from_slice(payload)
+        .map_err(|_| integrity("authority-operation-payload-invalid"))?;
+    authority_payload_digest_value(&value)
+}
+
+pub(crate) fn authority_payload_digest_value(
+    value: &serde_json::Value,
+) -> Result<String, StoreError> {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "state".to_owned(),
+            serde_json::Value::String("pending".to_owned()),
+        );
+    }
+    let normalized =
+        serde_json::to_vec(&value).map_err(|_| integrity("authority-operation-payload-invalid"))?;
+    Ok(canonical_digest("d2b:authority-operation/v1", &normalized))
 }
 
 pub(crate) fn authority_update(
@@ -2929,6 +3043,13 @@ fn apply_prepared(
             .map(|bytes| decode::<ResourceRecord>(ValueKind::ResourceRecord, bytes.value()))
             .transpose()?
     };
+    let previous_envelope = previous
+        .as_ref()
+        .map(|record| {
+            ResourceEnvelope::from_json(&record.canonical_json)
+                .map_err(|_| integrity("stored-resource-envelope-invalid"))
+        })
+        .transpose()?;
     let previous_resource = previous
         .as_ref()
         .map(|record| stored_resource(&mutation.zone, &mutation.target, record))
@@ -2943,8 +3064,11 @@ fn apply_prepared(
             ));
         };
         let old_record = previous.as_ref().expect("previous resource was checked");
-        let old_envelope = ResourceEnvelope::from_json(&old_record.canonical_json)
-            .map_err(|_| integrity("stored-resource-envelope-invalid"))?;
+        let old_envelope = previous_envelope
+            .as_ref()
+            .ok_or_else(|| integrity("stored-resource-envelope-invalid"))?;
+        let old_owner_ref = old_envelope.metadata().owner_ref().cloned();
+        let old_owner_uid = parse_optional_uid(old_record.owner_uid.as_deref())?;
         if !deletion_requested(&old_record.canonical_json)?
             && (has_finalizers(&old_record.canonical_json)?
                 || owned_children_remain(write, &mutation.target)?
@@ -2984,12 +3108,17 @@ fn apply_prepared(
                     ChangeEvent::DeletionRequested,
                     Some(old.generation),
                     Some(resource.generation),
-                    parse_optional_uid(old_record.owner_uid.as_deref())?,
+                    old_owner_uid.clone(),
                     payload_digest,
                     Some(canonical_json),
                     operation_id.to_owned(),
                     correlation_id.to_owned(),
-                )?,
+                )?
+                .with_owners(
+                    old_owner_ref.clone(),
+                    old_owner_uid.clone(),
+                    old_owner_ref,
+                ),
             ));
         }
         if has_finalizers(&old_record.canonical_json)? {
@@ -3029,12 +3158,13 @@ fn apply_prepared(
                 ChangeEvent::Deleted,
                 Some(old.generation),
                 None,
-                parse_optional_uid(old_record.owner_uid.as_deref())?,
+                old_owner_uid.clone(),
                 old.payload_digest.clone(),
                 None,
                 operation_id.to_owned(),
                 correlation_id.to_owned(),
-            )?,
+            )?
+            .with_owners(old_owner_ref, old_owner_uid, None),
         ));
     }
 
@@ -3050,10 +3180,8 @@ fn apply_prepared(
     ) {
         mutation.owner.clone()
     } else {
-        previous_resource
+        previous_envelope
             .as_ref()
-            .and(previous.as_ref())
-            .and_then(|record| ResourceEnvelope::from_json(&record.canonical_json).ok())
             .and_then(|envelope| envelope.metadata().owner_ref().cloned())
     };
     if envelope.resource_type() != mutation.target.resource_type()
@@ -3067,14 +3195,22 @@ fn apply_prepared(
         Some(owner_ref) => Some(resolve_uid_in_write(write, owner_ref)?.as_str().to_owned()),
         None => None,
     };
+    let previous_owner_ref = previous_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.metadata().owner_ref().cloned());
+    let previous_owner_uid = previous
+        .as_ref()
+        .map(|record| parse_optional_uid(record.owner_uid.as_deref()))
+        .transpose()?
+        .flatten();
     if let (Some(previous_resource), Some(previous_record)) = (&previous_resource, &previous) {
-        let previous_envelope = ResourceEnvelope::from_json(&previous_record.canonical_json)
-            .map_err(|_| integrity("stored-resource-envelope-invalid"))?;
         remove_indexes(
             write,
             previous_resource,
             previous_record,
-            &previous_envelope,
+            previous_envelope
+                .as_ref()
+                .ok_or_else(|| integrity("stored-resource-envelope-invalid"))?,
         )?;
     }
     let payload_digest = envelope.digest().map_err(integrity)?;
@@ -3131,7 +3267,8 @@ fn apply_prepared(
                 None,
                 operation_id.to_owned(),
                 correlation_id.to_owned(),
-            )?,
+            )?
+            .with_owners(previous_owner_ref, previous_owner_uid, None),
         ));
     }
     let producer = endpoint_producer(&envelope)?;
@@ -3148,9 +3285,8 @@ fn apply_prepared(
         ResourceMutationKind::Create => ChangeEvent::Created,
         ResourceMutationKind::UpdateSpec => ChangeEvent::SpecUpdated,
         ResourceMutationKind::UpdateStatus => ChangeEvent::StatusUpdated,
-        ResourceMutationKind::UpdateMetadata | ResourceMutationKind::UpdateFinalizers => {
-            ChangeEvent::MetadataUpdated
-        }
+        ResourceMutationKind::UpdateMetadata => ChangeEvent::MetadataUpdated,
+        ResourceMutationKind::UpdateFinalizers => ChangeEvent::FinalizersUpdated,
         ResourceMutationKind::Delete => unreachable!("delete returned above"),
     };
     Ok((
@@ -3170,7 +3306,8 @@ fn apply_prepared(
             Some(canonical_json),
             operation_id.to_owned(),
             correlation_id.to_owned(),
-        )?,
+        )?
+        .with_owners(previous_owner_ref, previous_owner_uid, effective_owner),
     ))
 }
 
@@ -5022,7 +5159,8 @@ mod tests {
     use super::*;
     use d2b_contracts_resource::v3::identity::ReconnectGeneration;
     use d2b_contracts_resource::v3::{
-        ConfigurationGeneration, ResourceGeneration, ResourcePhase, ResourceTypeName, Timestamp,
+        ConfigurationGeneration, ResourceGeneration, ResourceName, ResourcePhase, ResourceTypeName,
+        Timestamp,
     };
     use d2b_resource_store::{
         AdmittedAuthorizationTarget, AdmittedVerb, ResourceAssignmentFence,
@@ -6709,6 +6847,44 @@ mod tests {
             entry.ordinal = u32::try_from(ordinal).unwrap();
         }
         assert!(ChangeBatch::new(ZoneRevision::new(1), entries).is_err());
+    }
+
+    #[test]
+    fn change_entries_retain_old_and_new_owner_bindings() {
+        let old_owner = ResourceRef::parse("Host/old-owner").unwrap();
+        let new_owner = ResourceRef::parse("Host/new-owner").unwrap();
+        let entry = ChangeEntry::new(
+            0,
+            ResourceTypeName::parse("Process").unwrap(),
+            ResourceName::parse("worker").unwrap(),
+            ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            ChangeEvent::MetadataUpdated,
+            Some(ResourceGeneration::new(1).unwrap()),
+            Some(ResourceGeneration::new(2).unwrap()),
+            Some(ResourceUid::parse("123e4567-e89b-42d3-a456-426614174002").unwrap()),
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            Some(RESOURCE.to_vec()),
+            "reparent".to_owned(),
+            "reparent-correlation".to_owned(),
+        )
+        .unwrap()
+        .with_owners(
+            Some(old_owner.clone()),
+            Some(ResourceUid::parse("123e4567-e89b-42d3-a456-426614174001").unwrap()),
+            Some(new_owner.clone()),
+        );
+        let encoded = serde_json::to_vec(&entry).unwrap();
+        let decoded: ChangeEntry = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.previous_owner_ref(), Some(&old_owner));
+        assert_eq!(decoded.owner_ref(), Some(&new_owner));
+        assert_eq!(
+            decoded.previous_owner_uid().unwrap().as_str(),
+            "123e4567-e89b-42d3-a456-426614174001"
+        );
+        assert_eq!(
+            decoded.owner_uid().unwrap().as_str(),
+            "123e4567-e89b-42d3-a456-426614174002"
+        );
     }
 
     #[test]

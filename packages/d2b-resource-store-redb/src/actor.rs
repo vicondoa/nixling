@@ -549,6 +549,7 @@ impl WriterHandle {
         &self,
         operation_id: String,
         payload: Vec<u8>,
+        request_digest: String,
     ) -> Result<(), StoreError> {
         let (response, receiver) = oneshot::channel();
         self.sender
@@ -557,6 +558,7 @@ impl WriterHandle {
             .send(WriterCommand::AuthorityPrepare {
                 operation_id,
                 payload,
+                request_digest,
                 response,
             })
             .await
@@ -845,6 +847,7 @@ enum WriterCommand {
     AuthorityPrepare {
         operation_id: String,
         payload: Vec<u8>,
+        request_digest: String,
         response: oneshot::Sender<Result<(), StoreError>>,
     },
     AuthorityUpdate {
@@ -1159,9 +1162,11 @@ impl WriterActor {
                 WriterCommand::AuthorityPrepare {
                     operation_id,
                     payload,
+                    request_digest,
                     response,
                 } => {
-                    let result = authority_prepare(&self.database, &operation_id, payload);
+                    let result =
+                        authority_prepare(&self.database, &operation_id, payload, request_digest);
                     if let Err(error) = &result
                         && error.kind() == d2b_resource_store::StoreErrorKind::StoreIntegrityFailure
                     {

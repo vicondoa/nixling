@@ -14,6 +14,7 @@ mod identity;
 pub mod metrics;
 pub mod quota_gate;
 pub mod service;
+pub mod registered;
 mod store;
 pub mod watch;
 pub mod zone_service;
@@ -26,6 +27,7 @@ pub use adapter::{
 pub use admission::{AdmissionError, AdmittedMutation};
 pub use authz::{AuthorizationLease, StoreSealHandoffError};
 pub use client::ResourceApiClient;
+pub use registered::RedbRegisteredControllerApi;
 pub use d2b_resource_store::PreparedStoreMutation;
 pub use identity::AuthenticatedSubjectContext;
 pub use service::{GuestLifecycleAdmission, ResourceService};

@@ -70,8 +70,8 @@ impl core::fmt::Display for WatchError {
 
 impl std::error::Error for WatchError {}
 
-/// Pure watch policy state. The production post-commit dispatcher remains an
-/// external dependency and is not implemented here.
+/// Pure watch policy state used by the Core watch boundary. The production
+/// store adapter supplies durable post-commit revisions to this policy.
 #[derive(Debug)]
 pub struct WatchHandler {
     max_watches: usize,

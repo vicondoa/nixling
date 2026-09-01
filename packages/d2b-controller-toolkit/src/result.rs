@@ -595,6 +595,11 @@ impl ReconcilePlan {
     pub fn effect_count(&self) -> usize {
         self.effect_ids.len()
     }
+
+    /// Borrow the exact bounded effect identities for durable admission.
+    pub fn effect_ids(&self) -> &[String] {
+        &self.effect_ids
+    }
 }
 
 impl core::fmt::Debug for ReconcilePlan {

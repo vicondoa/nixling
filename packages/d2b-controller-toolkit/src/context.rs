@@ -222,8 +222,8 @@ impl core::fmt::Debug for Cancellation {
 
 /// Typed durable-commit evidence consumed by an expedited pass.
 ///
-/// The toolkit exposes no public constructor or fields. Production issuance
-/// remains unavailable until a trusted durable commit adapter lands.
+/// The fields remain private. The toolkit's trusted source adapter issues
+/// proofs only after verifying the matching committed revision.
 ///
 /// Foreign controller code cannot forge a committed proof:
 ///
@@ -253,7 +253,6 @@ pub struct CommittedRevisionProof {
 }
 
 impl CommittedRevisionProof {
-    #[cfg(test)]
     pub(crate) fn issue(
         zone: ZoneId,
         resource_uid: ResourceUid,

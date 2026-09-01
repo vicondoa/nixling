@@ -3680,13 +3680,29 @@ async fn authority_operation_lifecycle_is_durable_and_restart_visible() {
         "claim": "opaque",
         "state": "pending",
         "claimDigest": claim_digest.clone(),
-        "storeBindingDigest": binding_digest,
+        "storeBindingDigest": binding_digest.clone(),
     }))
     .unwrap();
     let capability = store
         .prepare_authority_operation("authority-owner".to_owned(), payload, &claim_digest)
         .await
         .unwrap();
+    let duplicate_payload = serde_json::to_vec(&serde_json::json!({
+        "operationId": "authority-owner",
+        "claim": "opaque",
+        "state": "pending",
+        "claimDigest": claim_digest.clone(),
+        "storeBindingDigest": store.authority_binding_digest(&claim_digest),
+    }))
+    .unwrap();
+    store
+        .prepare_authority_operation(
+            "authority-owner".to_owned(),
+            duplicate_payload,
+            &claim_digest,
+        )
+        .await
+        .expect("same accepted operation is idempotent");
     capability
         .record_effect(AuthorityOperationState::EffectConfirmed)
         .await
@@ -3722,6 +3738,26 @@ async fn authority_operation_lifecycle_is_durable_and_restart_visible() {
     capability.release().await.unwrap();
     let released = reopened.authority_operations().await.unwrap();
     assert_eq!(released[0].state, AuthorityOperationState::Released);
+    let closed_payload = serde_json::to_vec(&serde_json::json!({
+        "operationId": "authority-owner",
+        "claim": "opaque",
+        "state": "pending",
+        "claimDigest": claim_digest.clone(),
+        "storeBindingDigest": binding_digest.clone(),
+    }))
+    .unwrap();
+    assert_eq!(
+        reopened
+            .prepare_authority_operation(
+                "authority-owner".to_owned(),
+                closed_payload,
+                &claim_digest
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        d2b_resource_store::StoreErrorKind::ResourceConflict
+    );
     drop(capability);
     std::sync::Arc::try_unwrap(reopened)
         .unwrap()

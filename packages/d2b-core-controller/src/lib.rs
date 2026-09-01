@@ -61,6 +61,17 @@ pub use controllers::{
     AggregateHealth, CoreHandlerKind, CoreHandlerRegistry, CurrencyAggregation,
     CurrencyAggregationError, HandlerOutcome, HandlerPhase, HandlerStatus,
 };
+pub use d2b_controller_toolkit::{
+    CommitDecision, CommitOutcome, ControllerDescriptor, ControllerExecutionPolicy,
+    ControllerHealth, ControllerIdentity, ControllerSource, ControllerVerb, DependencySnapshot,
+    DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot, InitialList, InitialResource,
+    MutationIntent, MutationIntentKind, ObservationResult, OperationContext, ProjectionDisposition,
+    ReconcileContext, ReconcileDisposition, ReconcilePlan, ReconcileProjection, ReconcileReason,
+    ReconcileResult, ResourceKey, ResourceMutationBatch, ResourceReconciler, ResourceRegistration,
+    ResourceSnapshot, ResyncPolicy, Runner, RunnerConfig, SourceError, StatusPersistence,
+    UpdateAssessment, UpdateAssessmentState, UpgradePlan, UpgradeStage, ValidationResult,
+    WatchEvent, WatchFailure,
+};
 pub use dependencies::{
     DependencyError, DependencyEvent, DependencyIndex, DependencyTeardownPlan, DependencyTrigger,
     UpgradeOrder,

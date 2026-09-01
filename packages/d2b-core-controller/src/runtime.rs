@@ -5,23 +5,23 @@ use std::{
     future::Future,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
 use d2b_contracts_resource::v3::ZoneRevision;
 use d2b_controller_toolkit::{
-    CommitDecision, CommitOutcome, ControllerDescriptor, ControllerHealth, ControllerSource,
-    DependencySnapshot, DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot,
-    HandlerFailure, InitialList, ObservationResult, OperationContext, ReconcileContext,
-    ReconcilePlan, ReconcileProjection, ReconcileReason, ReconcileResult, ResourceKey,
-    ResourceReconciler, ResourceSnapshot, SourceError, StatusPersistence, UpdateAssessment,
-    UpdateAssessmentState, UpgradePlan, ValidationResult, WatchEvent, WatchFailure,
+    CommitOutcome, ControllerDescriptor, ControllerHealth, ControllerSource, DependencySnapshot,
+    DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot, HandlerFailure, InitialList,
+    ObservationResult, OperationContext, ReconcileContext, ReconcilePlan, ReconcileProjection,
+    ReconcileReason, ReconcileResult, ResourceKey, ResourceReconciler, ResourceSnapshot,
+    SourceError, StatusPersistence, UpdateAssessment, UpdateAssessmentState, UpgradePlan,
+    ValidationResult, WatchEvent, WatchFailure,
 };
 
 use crate::{
     ChangeRecord, ControllerHint, ControllerLeaseKey, FairAdmission, HintAdmissionError,
-    HintAdmissionOutcome, SuppressionDecision,
+    HintAdmissionOutcome, SuppressionDecision, WatchPlan,
 };
 
 /// Core adapter construction or hint dispatch failure.
@@ -58,15 +58,20 @@ pub struct CoreAdmissionCounts {
     pub backpressure: usize,
 }
 
-mod registered_api {
-    pub trait Sealed {}
+fn validate_watch_plan(descriptor: &ControllerDescriptor) -> bool {
+    WatchPlan::new(
+        descriptor.resource_types().cloned().collect(),
+        descriptor.watch_selectors().to_vec(),
+        descriptor.consumes_owner_triggers(),
+    )
+    .is_ok()
 }
 
 /// Registered resource/store-watch operations available to one controller.
 ///
-/// Implementations are sealed until the production store backend exists.
+/// Implementations are trusted adapters over the production resource plane.
 /// Outcome and checkpoint writes must be durable and revision-idempotent.
-pub trait RegisteredControllerApi: registered_api::Sealed + Send + Sync + 'static {
+pub trait RegisteredControllerApi: Send + Sync + 'static {
     fn register(
         &self,
         descriptor: &ControllerDescriptor,
@@ -83,6 +88,29 @@ pub trait RegisteredControllerApi: registered_api::Sealed + Send + Sync + 'stati
         after_revision: ZoneRevision,
     ) -> impl Future<Output = Result<(), SourceError>> + Send;
 
+    /// Stop a live adapter watch without dropping an admitted Core hint.
+    fn stop_watch(&self) {}
+
+    /// Whether `receive_watch_change` is backed by a live store stream.
+    ///
+    /// Test-only adapters can leave this disabled and inject changes through
+    /// [`CoreControllerSource::dispatch_change`].
+    fn has_watch_stream(&self) -> bool {
+        false
+    }
+
+    /// Receive one raw store change for Core-owned validation and admission.
+    ///
+    /// The Core source applies suppression, lease, coalescing, and fair queue
+    /// policy. `None` is a clean stream close; recoverable stream failures are
+    /// returned as the toolkit's typed watch failure.
+    fn receive_watch_change(
+        &self,
+    ) -> impl Future<Output = Result<Option<(ChangeRecord, OperationContext)>, WatchFailure>> + Send
+    {
+        std::future::ready(Err(WatchFailure::Fatal))
+    }
+
     fn read_fresh(
         &self,
         key: &ResourceKey,
@@ -92,6 +120,29 @@ pub trait RegisteredControllerApi: registered_api::Sealed + Send + Sync + 'stati
         &self,
         context: &ReconcileContext,
     ) -> impl Future<Output = Result<(), SourceError>> + Send;
+
+    fn accept_effect(
+        &self,
+        _context: &ReconcileContext,
+        _plan: &ReconcilePlan,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    fn complete_effect(
+        &self,
+        _context: &ReconcileContext,
+        _result: &ReconcileResult,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    fn verify_expedited_commit(
+        &self,
+        _context: &ReconcileContext,
+    ) -> impl Future<Output = Result<bool, SourceError>> + Send {
+        std::future::ready(Ok(false))
+    }
 
     fn commit_result(
         &self,
@@ -138,6 +189,7 @@ pub struct CoreControllerSource<A> {
     watch: Mutex<WatchState>,
     watch_signal_tx: tokio::sync::mpsc::Sender<()>,
     watch_signal_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<()>>,
+    watch_stream_enabled: AtomicBool,
     admitted: AtomicUsize,
     coalesced: AtomicUsize,
     backpressure: AtomicUsize,
@@ -167,6 +219,7 @@ where
             }),
             watch_signal_tx,
             watch_signal_rx: tokio::sync::Mutex::new(watch_signal_rx),
+            watch_stream_enabled: AtomicBool::new(false),
             admitted: AtomicUsize::new(0),
             coalesced: AtomicUsize::new(0),
             backpressure: AtomicUsize::new(0),
@@ -185,6 +238,13 @@ where
             return Ok(CoreDispatchOutcome::Suppressed(decision));
         }
         if controller != self.controller {
+            return Err(CoreSourceError::Hint(HintAdmissionError::InvalidHint));
+        }
+        if !self
+            .descriptor
+            .resource_types()
+            .any(|resource_type| resource_type == change.target.resource_ref().resource_type())
+        {
             return Err(CoreSourceError::Hint(HintAdmissionError::InvalidHint));
         }
         let target = change.target.clone();
@@ -243,10 +303,12 @@ where
 
     /// Close the watch after all bounded admitted changes drain.
     pub fn close_watch(&self) -> Result<(), CoreSourceError> {
+        self.api.stop_watch();
         self.watch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .closed = true;
+        self.watch_stream_enabled.store(false, Ordering::Release);
         match self.watch_signal_tx.try_send(()) {
             Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(())) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
@@ -273,7 +335,7 @@ where
         &self,
         descriptor: &ControllerDescriptor,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
-        let valid = descriptor == &self.descriptor;
+        let valid = descriptor == &self.descriptor && validate_watch_plan(descriptor);
         async move {
             if !valid {
                 return Err(SourceError::Integrity);
@@ -286,7 +348,14 @@ where
         &self,
         descriptor: &ControllerDescriptor,
     ) -> impl Future<Output = Result<InitialList, SourceError>> + Send {
-        self.api.list_initial(descriptor)
+        let valid = descriptor == &self.descriptor && validate_watch_plan(descriptor);
+        let future = self.api.list_initial(descriptor);
+        async move {
+            if !valid {
+                return Err(SourceError::Integrity);
+            }
+            future.await
+        }
     }
 
     fn open_watch(
@@ -294,7 +363,18 @@ where
         descriptor: &ControllerDescriptor,
         after_revision: ZoneRevision,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
-        self.api.open_watch(descriptor, after_revision)
+        let valid = descriptor == &self.descriptor && validate_watch_plan(descriptor);
+        let future = self.api.open_watch(descriptor, after_revision);
+        async move {
+            if !valid {
+                return Err(SourceError::Integrity);
+            }
+            let result = future.await;
+            if result.is_ok() && self.api.has_watch_stream() {
+                self.watch_stream_enabled.store(true, Ordering::Release);
+            }
+            result
+        }
     }
 
     async fn receive_watch(&self) -> Result<WatchEvent, WatchFailure> {
@@ -319,6 +399,20 @@ where
             if let Some(event) = event {
                 return Ok(event);
             }
+            if self.watch_stream_enabled.load(Ordering::Acquire) {
+                match self.api.receive_watch_change().await? {
+                    Some((change, operation)) => {
+                        match self.dispatch_change(self.controller.clone(), change, operation) {
+                            Ok(CoreDispatchOutcome::Suppressed(_))
+                            | Ok(CoreDispatchOutcome::Admitted)
+                            | Ok(CoreDispatchOutcome::Coalesced) => continue,
+                            Err(CoreSourceError::WatchClosed) => return Ok(WatchEvent::Closed),
+                            Err(_) => return Err(WatchFailure::Fatal),
+                        }
+                    }
+                    None => return Ok(WatchEvent::Closed),
+                }
+            }
             if self.watch_signal_rx.lock().await.recv().await.is_none() {
                 return Ok(WatchEvent::Closed);
             }
@@ -339,11 +433,27 @@ where
         self.api.write_starting(context)
     }
 
-    async fn await_expedited_commit(
+    fn accept_effect(
         &self,
-        _context: &ReconcileContext,
-    ) -> Result<CommitDecision, SourceError> {
-        Ok(CommitDecision::Abort)
+        context: &ReconcileContext,
+        plan: &ReconcilePlan,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.api.accept_effect(context, plan)
+    }
+
+    fn complete_effect(
+        &self,
+        context: &ReconcileContext,
+        result: &ReconcileResult,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.api.complete_effect(context, result)
+    }
+
+    fn verify_expedited_commit(
+        &self,
+        context: &ReconcileContext,
+    ) -> impl Future<Output = Result<bool, SourceError>> + Send {
+        self.api.verify_expedited_commit(context)
     }
 
     fn commit_result(
@@ -634,8 +744,6 @@ mod tests {
             outcomes.push_back((key.0, key.1, projection.reason()));
         }
     }
-
-    impl registered_api::Sealed for TestRegisteredApi {}
 
     impl RegisteredControllerApi for TestRegisteredApi {
         fn register(

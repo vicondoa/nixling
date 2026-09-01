@@ -102,6 +102,15 @@ impl WatchSelector {
                         .owner_uid()
                         .is_some_and(|owner_uid| value == owner_uid.as_str())
                 }),
+                "resource-or-owner.type" => filter.values.iter().any(|value| {
+                    value == entry.resource_type().as_str()
+                        || entry
+                            .owner_ref()
+                            .is_some_and(|owner| value == owner.resource_type().as_str())
+                        || entry
+                            .previous_owner_ref()
+                            .is_some_and(|owner| value == owner.resource_type().as_str())
+                }),
                 _ => false,
             })
     }
@@ -656,7 +665,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use d2b_contracts_resource::v3::{ResourceGeneration, ResourceUid};
+    use d2b_contracts_resource::v3::{ResourceGeneration, ResourceRef, ResourceUid};
     use redb::ReadableTableMetadata;
     use std::fs::OpenOptions;
 
@@ -754,6 +763,56 @@ mod tests {
         )
         .unwrap();
         assert!(!selector.matches(&other));
+    }
+
+    #[test]
+    fn replay_selector_matches_owned_children_without_widening_unrelated_types() {
+        let owner_uid = ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap();
+        let selector = WatchSelector::new(
+            [],
+            [],
+            [StoreFilter {
+                field: "resource-or-owner.type".to_owned(),
+                values: vec!["Host".to_owned()],
+            }],
+        );
+        let entry = crate::transaction::ChangeEntry::new(
+            0,
+            ResourceTypeName::parse("Process").unwrap(),
+            ResourceName::parse("worker").unwrap(),
+            ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            crate::transaction::ChangeEvent::Created,
+            None,
+            Some(ResourceGeneration::new(1).unwrap()),
+            Some(owner_uid.clone()),
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            None,
+            "operation".to_owned(),
+            "correlation".to_owned(),
+        )
+        .unwrap()
+        .with_owners(
+            Some(ResourceRef::parse("Host/owner").unwrap()),
+            Some(owner_uid),
+            Some(ResourceRef::parse("Host/owner").unwrap()),
+        );
+        assert!(selector.matches(&entry));
+        let unrelated = crate::transaction::ChangeEntry::new(
+            0,
+            ResourceTypeName::parse("Process").unwrap(),
+            ResourceName::parse("other").unwrap(),
+            ResourceUid::parse("123e4567-e89b-42d3-a456-426614174002").unwrap(),
+            crate::transaction::ChangeEvent::Created,
+            None,
+            Some(ResourceGeneration::new(1).unwrap()),
+            None,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            None,
+            "operation-other".to_owned(),
+            "correlation-other".to_owned(),
+        )
+        .unwrap();
+        assert!(!selector.matches(&unrelated));
     }
 
     #[test]

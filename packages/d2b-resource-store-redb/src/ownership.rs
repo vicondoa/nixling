@@ -3,9 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use d2b_contracts_resource::v3::{ResourceRef, ResourceUid, ZoneRevision};
-use d2b_controller_toolkit::owner_hints::{
-    MAX_OWNER_HINT_DEPTH, OwnedResourceChangedHint, OwnerChangeEvent,
-};
+pub use d2b_controller_toolkit::owner_hints::OwnerChangeEvent;
+use d2b_controller_toolkit::owner_hints::{MAX_OWNER_HINT_DEPTH, OwnedResourceChangedHint};
 
 /// Maximum accepted singular owner-chain depth.
 pub const MAX_OWNER_CHAIN_DEPTH: usize = MAX_OWNER_HINT_DEPTH;

@@ -301,10 +301,42 @@ pub trait ControllerSource: Send + Sync + 'static {
         std::future::ready(Ok(()))
     }
 
+    /// Persist the terminal lifecycle state of an accepted ordinary effect.
+    fn complete_effect(
+        &self,
+        _context: &ReconcileContext,
+        _result: &ReconcileResult,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    /// Verify that the fresh target is the durable commit associated with the
+    /// expedited operation.
+    fn verify_expedited_commit(
+        &self,
+        _context: &ReconcileContext,
+    ) -> impl Future<Output = Result<bool, SourceError>> + Send {
+        std::future::ready(Ok(false))
+    }
+
+    /// Convert trusted durable verification into the private commit proof.
     fn await_expedited_commit(
         &self,
         context: &ReconcileContext,
-    ) -> impl Future<Output = Result<CommitDecision, SourceError>> + Send;
+    ) -> impl Future<Output = Result<CommitDecision, SourceError>> + Send {
+        async move {
+            if !self.verify_expedited_commit(context).await? {
+                return Ok(CommitDecision::Abort);
+            }
+            Ok(CommitDecision::Committed(CommittedRevisionProof::issue(
+                context.target().zone().clone(),
+                context.target().uid().clone(),
+                context.generation(),
+                context.revision(),
+                context.operation().operation_id().to_owned(),
+            )))
+        }
+    }
 
     fn commit_result(
         &self,
@@ -1983,6 +2015,11 @@ where
                 {
                     return WorkerOutcome::SourceFailed(error);
                 }
+                if !context.is_expedited() {
+                    if let Err(error) = source.complete_effect(context, &result).await {
+                        return WorkerOutcome::SourceFailed(error);
+                    }
+                }
                 if let Err(error) = source.checkpoint(context, revision).await {
                     return WorkerOutcome::SourceFailed(error);
                 }
@@ -2007,6 +2044,11 @@ where
                 {
                     return WorkerOutcome::SourceFailed(error);
                 }
+                if !context.is_expedited() {
+                    if let Err(error) = source.complete_effect(context, &result).await {
+                        return WorkerOutcome::SourceFailed(error);
+                    }
+                }
                 if let Err(error) = source.checkpoint(context, revision).await {
                     return WorkerOutcome::SourceFailed(error);
                 }
@@ -2027,6 +2069,11 @@ where
 
     if let Err(error) = persist_projection(source, context, &result, None).await {
         return WorkerOutcome::SourceFailed(error);
+    }
+    if !context.is_expedited() {
+        if let Err(error) = source.complete_effect(context, &result).await {
+            return WorkerOutcome::SourceFailed(error);
+        }
     }
     if let Some(next_tick) = result.next_tick()
         && let Err(error) = source.schedule_requeue(context.target(), next_tick).await
