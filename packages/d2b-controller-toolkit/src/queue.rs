@@ -321,19 +321,30 @@ impl PendingQueue {
     pub fn retry(&self, work: QueuedWork, revision: ZoneRevision) -> Result<(), QueueError> {
         let key = work.key.clone();
         let operation_id = work.operation.operation_id().to_owned();
+        let retry_revision = revision.max(work.high_water_revision);
         self.finish(&key)?;
-        let mut hint = QueueHint::new(
-            key,
-            revision.max(work.high_water_revision),
-            work.reasons,
-            work.lane,
-            work.operation,
-        )?;
-        hint.reasons.insert(TriggerReason::RetryDue);
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if work.lane == PriorityLane::Ordinary
+            && let Some(entry) = state.resources.get_mut(&key)
+            && let Some(pending) = entry.ordinary.as_mut()
+        {
+            if pending.operation != work.operation {
+                return Ok(());
+            }
+            if retry_revision > pending.high_water_revision {
+                pending.high_water_revision = retry_revision;
+            }
+            pending.reasons.union_with(&work.reasons);
+            pending.reasons.insert(TriggerReason::RetryDue);
+            pending.attempt = work.attempt.saturating_add(1);
+            return Ok(());
+        }
+        let mut hint =
+            QueueHint::new(key, retry_revision, work.reasons, work.lane, work.operation)?;
+        hint.reasons.insert(TriggerReason::RetryDue);
         let outcome = Self::push_locked(
             &mut state,
             hint,
@@ -778,6 +789,80 @@ mod tests {
         assert_eq!(retry.attempt(), 2);
         assert_eq!(retry.high_water_revision(), ZoneRevision::new(5));
         assert!(retry.reasons().contains(TriggerReason::RetryDue));
+    }
+
+    #[test]
+    fn ordinary_conflict_retry_preserves_a_newer_pending_operation() {
+        let queue = PendingQueue::new(2, 1);
+        let target = key("app", 0);
+        queue
+            .push(hint(
+                target.clone(),
+                5,
+                TriggerReason::ManualReconcile,
+                PriorityLane::Ordinary,
+                "op-a",
+            ))
+            .unwrap();
+        let running = queue.pop_ready().unwrap();
+        queue
+            .push(hint(
+                target.clone(),
+                6,
+                TriggerReason::SpecGenerationChanged,
+                PriorityLane::Ordinary,
+                "op-b",
+            ))
+            .unwrap();
+
+        queue.retry(running, ZoneRevision::new(6)).unwrap();
+
+        let successor = queue.pop_ready().unwrap();
+        assert_eq!(successor.operation().operation_id(), "op-b");
+        assert_eq!(successor.high_water_revision(), ZoneRevision::new(6));
+        assert_eq!(successor.attempt(), 1);
+        assert!(
+            successor
+                .reasons()
+                .contains(TriggerReason::SpecGenerationChanged)
+        );
+        assert!(!successor.reasons().contains(TriggerReason::RetryDue));
+        queue.finish(&target).unwrap();
+        assert!(queue.pop_ready().is_none());
+    }
+
+    #[test]
+    fn ordinary_conflict_retry_increments_a_matching_pending_operation() {
+        let queue = PendingQueue::new(2, 1);
+        let target = key("app", 0);
+        queue
+            .push(hint(
+                target.clone(),
+                5,
+                TriggerReason::ManualReconcile,
+                PriorityLane::Ordinary,
+                "op-a",
+            ))
+            .unwrap();
+        let running = queue.pop_ready().unwrap();
+        queue
+            .push(hint(
+                target.clone(),
+                6,
+                TriggerReason::OwnedResourceChanged,
+                PriorityLane::Ordinary,
+                "op-a",
+            ))
+            .unwrap();
+
+        queue.retry(running, ZoneRevision::new(6)).unwrap();
+
+        let retry = queue.pop_ready().unwrap();
+        assert_eq!(retry.operation().operation_id(), "op-a");
+        assert_eq!(retry.high_water_revision(), ZoneRevision::new(6));
+        assert_eq!(retry.attempt(), 2);
+        assert!(retry.reasons().contains(TriggerReason::RetryDue));
+        queue.finish(&target).unwrap();
     }
 
     #[test]
