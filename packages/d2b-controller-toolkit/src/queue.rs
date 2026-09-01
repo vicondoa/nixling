@@ -142,6 +142,9 @@ impl PendingWork {
         if hint.high_water_revision > self.high_water_revision {
             self.high_water_revision = hint.high_water_revision;
         }
+        if hint.high_water_revision >= self.high_water_revision {
+            self.operation = hint.operation.clone();
+        }
         self.reasons.union_with(&hint.reasons);
     }
 
@@ -505,6 +508,44 @@ mod tests {
         assert_eq!(work.high_water_revision(), ZoneRevision::new(7));
         assert!(work.reasons().contains(TriggerReason::DependencyChanged));
         assert!(work.reasons().contains(TriggerReason::DeletionRequested));
+    }
+
+    #[test]
+    fn ordinary_coalescing_keeps_the_newest_operation_identity() {
+        let queue = PendingQueue::new(2, 1);
+        let target = key("app", 0);
+        queue
+            .push(hint(
+                target.clone(),
+                3,
+                TriggerReason::DependencyChanged,
+                PriorityLane::Ordinary,
+                "old-operation",
+            ))
+            .unwrap();
+        queue
+            .push(hint(
+                target.clone(),
+                4,
+                TriggerReason::OwnedResourceChanged,
+                PriorityLane::Ordinary,
+                "new-operation",
+            ))
+            .unwrap();
+        queue
+            .push(hint(
+                target,
+                4,
+                TriggerReason::ManualReconcile,
+                PriorityLane::Ordinary,
+                "same-revision-operation",
+            ))
+            .unwrap();
+
+        let work = queue.pop_ready().unwrap();
+        assert_eq!(work.high_water_revision(), ZoneRevision::new(4));
+        assert_eq!(work.operation().operation_id(), "same-revision-operation");
+        assert!(work.reasons().contains(TriggerReason::OwnedResourceChanged));
     }
 
     #[test]

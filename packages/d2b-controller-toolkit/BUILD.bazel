@@ -57,7 +57,7 @@ rust_test(
         "benches/support/reaction.rs",
     ],
     compile_data = ["Cargo.toml"],
-    tags = ["bench", "manual"],
+    tags = ["bench", "manual", "exclusive"],
     visibility = ["//visibility:public"],
     deps = [
         "//packages/d2b-contracts-resource:d2b_contracts_resource",
@@ -86,7 +86,7 @@ rust_test(
     name = "reaction_test",
     compile_data = ["Cargo.toml"],
     crate = ":reaction",
-    tags = ["manual"],
+    tags = ["manual", "exclusive"],
 )
 # keep
 filegroup(

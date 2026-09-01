@@ -155,6 +155,16 @@ impl OperationContext {
     pub fn idempotency_key(&self) -> &str {
         &self.idempotency_key
     }
+
+    /// Borrow the request correlation ID.
+    pub fn correlation_id(&self) -> &str {
+        &self.correlation_id
+    }
+
+    /// Borrow the optional trace ID.
+    pub fn trace_id(&self) -> Option<&str> {
+        self.trace_id.as_deref()
+    }
 }
 
 impl core::fmt::Debug for OperationContext {

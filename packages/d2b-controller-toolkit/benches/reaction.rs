@@ -6,6 +6,10 @@
 //! `system-minijail` Process Provider. The effect backend is hermetic and
 //! records the Provider effect boundary; store, API, bus, session stream,
 //! queue, handler, and status paths are production implementations.
+//!
+//! The existing `ProductionControllerSource` remains an in-handler regression
+//! profile. Its acceptance hook records ordering only; the Core source and
+//! durable operation-ledger profile are owned by the production adapter.
 
 #[path = "support/reaction.rs"]
 mod bus_support;
@@ -65,6 +69,8 @@ struct HandlerRecord {
 }
 
 struct ReactionMetrics {
+    effect_acceptances:
+        Mutex<BTreeMap<(ResourceUid, ResourceGeneration, ZoneRevision, String), Instant>>,
     handlers: Mutex<BTreeMap<ResourceUid, HandlerRecord>>,
     launches: Mutex<Vec<(ResourceUid, Instant)>>,
     active_launches: AtomicUsize,
@@ -75,12 +81,37 @@ struct ReactionMetrics {
 impl ReactionMetrics {
     fn new() -> Self {
         Self {
+            effect_acceptances: Mutex::new(BTreeMap::new()),
             handlers: Mutex::new(BTreeMap::new()),
             launches: Mutex::new(Vec::new()),
             active_launches: AtomicUsize::new(0),
             max_active_launches: AtomicUsize::new(0),
             next_identity: AtomicUsize::new(1),
         }
+    }
+
+    fn record_effect_acceptance(&self, context: &ReconcileContext) {
+        let mut acceptances = self
+            .effect_acceptances
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        acceptances
+            .entry((
+                context.target().uid().clone(),
+                context.generation(),
+                context.revision(),
+                context.operation().operation_id().to_owned(),
+            ))
+            .or_insert_with(Instant::now);
+    }
+
+    fn effect_acceptances(&self) -> Vec<(ResourceUid, Instant)> {
+        self.effect_acceptances
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|((resource_uid, _, _, _), accepted_at)| (resource_uid.clone(), *accepted_at))
+            .collect()
     }
 
     fn record_handler_key_at(&self, key: &ResourceKey, started_at: Instant) {
@@ -376,6 +407,19 @@ impl ResourceReconciler for ProcessReconciler {
 
     fn reconcile(
         &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        std::future::ready(Ok(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        )))
+    }
+
+    fn execute_effect(
+        &self,
         context: &ReconcileContext,
         resource: &ResourceSnapshot,
         _dependencies: &[DependencySnapshot],
@@ -659,6 +703,7 @@ impl ControllerSource for ProductionControllerSource {
                     .await
                     .map_err(|_| WatchFailure::Disconnected)?
             };
+            let frame_received_at = Instant::now();
             let payload: serde_json::Value =
                 serde_json::from_slice(frame.payload()).map_err(|_| WatchFailure::Fatal)?;
             let mut events = VecDeque::new();
@@ -694,7 +739,7 @@ impl ControllerSource for ProductionControllerSource {
                     resource_ref,
                     resource_uid,
                 );
-                self.metrics.record_handler_key_at(&key, Instant::now());
+                self.metrics.record_handler_key_at(&key, frame_received_at);
                 let revision = payload["revision"]
                     .as_u64()
                     .map(ZoneRevision::new)
@@ -748,6 +793,15 @@ impl ControllerSource for ProductionControllerSource {
     async fn write_starting(&self, context: &ReconcileContext) -> Result<(), SourceError> {
         let _ = context;
         Ok(())
+    }
+
+    fn accept_effect(
+        &self,
+        context: &ReconcileContext,
+        _plan: &ReconcilePlan,
+    ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
+        self.metrics.record_effect_acceptance(context);
+        std::future::ready(Ok(()))
     }
 
     fn await_expedited_commit(
@@ -912,9 +966,13 @@ async fn run_profile(profile: usize) {
         .clone();
     let handlers = metrics.handlers();
     let launches = metrics.launches();
+    let effect_acceptances = metrics.effect_acceptances();
+    let effect_acceptance_count = effect_acceptances.len();
     assert_eq!(handlers.len(), profile);
     assert_eq!(launches.len(), profile);
+    assert_eq!(effect_acceptance_count, profile);
     let launch_by_uid = launches.into_iter().collect::<BTreeMap<_, _>>();
+    let acceptance_by_uid = effect_acceptances.into_iter().collect::<BTreeMap<_, _>>();
     assert_eq!(launch_by_uid.len(), profile);
 
     let handler_samples = handlers
@@ -932,6 +990,17 @@ async fn run_profile(profile: usize) {
                 .saturating_duration_since(commit_times[&handler.resource_ref])
         })
         .collect::<Vec<_>>();
+    for handler in &handlers {
+        let accepted_at = acceptance_by_uid[&handler.resource_uid];
+        assert!(
+            accepted_at >= commit_times[&handler.resource_ref],
+            "ledger acceptance was recorded before the durable resource commit"
+        );
+        assert!(
+            accepted_at <= launch_by_uid[&handler.resource_uid],
+            "worker launch preceded durable ledger acceptance"
+        );
+    }
     let handler_p95 = percentile(&handler_samples, 95);
     let launch_p95 = percentile(&launch_samples, 95);
     assert!(
@@ -969,7 +1038,7 @@ async fn run_profile(profile: usize) {
     assert_eq!(watch_signals.budget_used, 0);
 
     println!(
-        "reaction profile={profile} handler_raw_us={} handler_p95_us={:.3} launch_raw_us={} launch_p95_us={:.3} max_active={} dispatched={} checkpointed={} status_commits={} shared_batches={} fanout_references={}",
+        "reaction profile={profile} handler_raw_us={} handler_p95_us={:.3} launch_raw_us={} launch_p95_us={:.3} max_active={} dispatched={} checkpointed={} effect_acceptances={} status_commits={} shared_batches={} fanout_references={}",
         raw_micros(&handler_samples),
         handler_p95.as_secs_f64() * 1_000_000.0,
         raw_micros(&launch_samples),
@@ -977,6 +1046,7 @@ async fn run_profile(profile: usize) {
         metrics.max_active_launches(),
         report.dispatched,
         report.checkpointed,
+        effect_acceptance_count,
         status_revisions.len(),
         backend_signals.shared_immutable_batches,
         backend_signals.fanout_references,

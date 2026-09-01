@@ -288,6 +288,19 @@ pub trait ControllerSource: Send + Sync + 'static {
         context: &ReconcileContext,
     ) -> impl Future<Output = Result<(), SourceError>> + Send;
 
+    /// Durably accept the planned effect before the handler can start it.
+    ///
+    /// This is an operation-ledger transaction, not a Resource API mutation.
+    /// Implementations must make acceptance idempotent for the context's
+    /// operation identity.
+    fn accept_effect(
+        &self,
+        _context: &ReconcileContext,
+        _plan: &ReconcilePlan,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        std::future::ready(Ok(()))
+    }
+
     fn await_expedited_commit(
         &self,
         context: &ReconcileContext,
@@ -390,6 +403,7 @@ pub trait ResourceReconciler: Send + Sync + 'static {
         dependencies: &[DependencySnapshot],
     ) -> impl Future<Output = Result<ReconcilePlan, Self::Error>> + Send;
 
+    /// Prepare resource mutations and the pass disposition without effects.
     fn reconcile(
         &self,
         context: &ReconcileContext,
@@ -398,17 +412,57 @@ pub trait ResourceReconciler: Send + Sync + 'static {
         plan: &ReconcilePlan,
     ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send;
 
+    /// Execute an accepted external effect and return its observation/status.
+    fn execute_effect(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+        plan: &ReconcilePlan,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        async move { self.reconcile(context, resource, dependencies, plan).await }
+    }
+
     fn observe(
         &self,
         context: &ReconcileContext,
         resource: &ResourceSnapshot,
     ) -> impl Future<Output = Result<ObservationResult, Self::Error>> + Send;
 
+    /// Legacy finalizer handler. New implementations split preparation and
+    /// cleanup through [`Self::prepare_finalize`] and
+    /// [`Self::execute_finalize`].
     fn finalize(
         &self,
         context: &ReconcileContext,
         deleting_resource: &ResourceSnapshot,
     ) -> impl Future<Output = Result<FinalizeResult, Self::Error>> + Send;
+
+    /// Prepare finalization without starting cleanup effects.
+    fn prepare_finalize(
+        &self,
+        _context: &ReconcileContext,
+        deleting_resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        std::future::ready(Ok(ReconcileResult::converged(
+            deleting_resource.revision(),
+            deleting_resource.generation(),
+        )))
+    }
+
+    /// Execute finalization after operation acceptance.
+    fn execute_finalize(
+        &self,
+        context: &ReconcileContext,
+        deleting_resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        async move {
+            Ok(self
+                .finalize(context, deleting_resource)
+                .await?
+                .into_result())
+        }
+    }
 
     fn health(&self) -> impl Future<Output = Result<ControllerHealth, Self::Error>> + Send;
 
@@ -1600,22 +1654,9 @@ where
         .await;
     }
 
-    if !event_only {
-        match source.write_starting(&context).await {
-            Ok(()) => {}
-            Err(SourceError::Conflict(revision)) => {
-                return WorkerOutcome::Retry {
-                    revision,
-                    reason: ReconcileReason::ConflictExhausted,
-                };
-            }
-            Err(error) => return WorkerOutcome::SourceFailed(error),
-        }
-    }
-
     if deleting {
-        let result = match reconciler.finalize(&context, &target).await {
-            Ok(result) => result.into_result(),
+        let prepared = match reconciler.prepare_finalize(&context, &target).await {
+            Ok(result) => result,
             Err(error) => {
                 return handler_outcome(
                     reconciler.as_ref(),
@@ -1625,6 +1666,46 @@ where
                 );
             }
         };
+        if prepared.requires_commit() {
+            return persist_result(source.as_ref(), &context, prepared).await;
+        }
+        let finalize_plan =
+            ReconcilePlan::new(vec!["finalize".to_owned()], false).expect("bounded finalize plan");
+        if !event_only {
+            match source.accept_effect(&context, &finalize_plan).await {
+                Ok(()) => {}
+                Err(SourceError::Conflict(revision)) => {
+                    return WorkerOutcome::Retry {
+                        revision,
+                        reason: ReconcileReason::ConflictExhausted,
+                    };
+                }
+                Err(error) => return WorkerOutcome::SourceFailed(error),
+            }
+        }
+        let mut result = match reconciler.execute_finalize(&context, &target).await {
+            Ok(result) => result,
+            Err(error) => {
+                return handler_outcome(
+                    reconciler.as_ref(),
+                    &error,
+                    target.key(),
+                    target.revision(),
+                );
+            }
+        };
+        if event_only && result.projection().is_none() {
+            result = prepared;
+        }
+        if result.mutation_batch().is_some() {
+            return WorkerOutcome::Terminal {
+                projection: failure_projection(
+                    target.key().clone(),
+                    target.revision(),
+                    ReconcileReason::HandlerTerminal,
+                ),
+            };
+        }
         return persist_result(source.as_ref(), &context, result).await;
     }
 
@@ -1643,6 +1724,18 @@ where
                 );
             }
         };
+        let acceptance_plan =
+            ReconcilePlan::new(vec!["upgrade".to_owned()], false).expect("bounded upgrade plan");
+        match source.accept_effect(&context, &acceptance_plan).await {
+            Ok(()) => {}
+            Err(SourceError::Conflict(revision)) => {
+                return WorkerOutcome::Retry {
+                    revision,
+                    reason: ReconcileReason::ConflictExhausted,
+                };
+            }
+            Err(error) => return WorkerOutcome::SourceFailed(error),
+        }
         let result = match reconciler
             .execute_upgrade(&context, &target, &dependencies, &plan)
             .await
@@ -1657,6 +1750,15 @@ where
                 );
             }
         };
+        if result.mutation_batch().is_some() {
+            return WorkerOutcome::Terminal {
+                projection: failure_projection(
+                    target.key().clone(),
+                    target.revision(),
+                    ReconcileReason::HandlerTerminal,
+                ),
+            };
+        }
         return persist_result(source.as_ref(), &context, result).await;
     }
 
@@ -1741,7 +1843,7 @@ where
         .await;
     }
 
-    let result = match reconciler
+    let prepared = match reconciler
         .reconcile(&context, &target, &dependencies, &plan)
         .await
     {
@@ -1750,6 +1852,47 @@ where
             return handler_outcome(reconciler.as_ref(), &error, target.key(), target.revision());
         }
     };
+    if prepared.requires_commit() {
+        return persist_result(source.as_ref(), &context, prepared).await;
+    }
+
+    let result = if plan.effect_count() > 0 {
+        match source.accept_effect(&context, &plan).await {
+            Ok(()) => {}
+            Err(SourceError::Conflict(revision)) => {
+                return WorkerOutcome::Retry {
+                    revision,
+                    reason: ReconcileReason::ConflictExhausted,
+                };
+            }
+            Err(error) => return WorkerOutcome::SourceFailed(error),
+        }
+        match reconciler
+            .execute_effect(&context, &target, &dependencies, &plan)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return handler_outcome(
+                    reconciler.as_ref(),
+                    &error,
+                    target.key(),
+                    target.revision(),
+                );
+            }
+        }
+    } else {
+        prepared
+    };
+    if result.mutation_batch().is_some() {
+        return WorkerOutcome::Terminal {
+            projection: failure_projection(
+                target.key().clone(),
+                target.revision(),
+                ReconcileReason::HandlerTerminal,
+            ),
+        };
+    }
     persist_result(source.as_ref(), &context, result).await
 }
 
@@ -1765,6 +1908,11 @@ where
         || result.processed_generation() != context.generation()
         || result.projection().is_some_and(|projection| {
             projection.target() != context.target() || projection.revision() != context.revision()
+        })
+        || result.mutation_batch().is_some_and(|batch| {
+            batch
+                .validate_against(context.target(), context.revision())
+                .is_err()
         })
     {
         return WorkerOutcome::Terminal {
@@ -1829,7 +1977,10 @@ where
                 if revision < context.revision() {
                     return WorkerOutcome::SourceFailed(SourceError::Integrity);
                 }
-                if let Err(error) = persist_projection(source, context, &result, None).await {
+                if context.is_expedited()
+                    && result.mutation_batch().is_none()
+                    && let Err(error) = persist_projection(source, context, &result, None).await
+                {
                     return WorkerOutcome::SourceFailed(error);
                 }
                 if let Err(error) = source.checkpoint(context, revision).await {
@@ -1844,9 +1995,15 @@ where
                 if revision < context.revision() {
                     return WorkerOutcome::SourceFailed(SourceError::Integrity);
                 }
-                if let Err(error) =
-                    persist_projection(source, context, &result, Some(StatusPersistence::Pending))
-                        .await
+                if context.is_expedited()
+                    && result.mutation_batch().is_none()
+                    && let Err(error) = persist_projection(
+                        source,
+                        context,
+                        &result,
+                        Some(StatusPersistence::Pending),
+                    )
+                    .await
                 {
                     return WorkerOutcome::SourceFailed(error);
                 }
@@ -1951,8 +2108,9 @@ mod tests {
     use super::*;
     use crate::{
         ControllerExecutionPolicy, ControllerSelector, ControllerVerb, DescriptorError,
-        DisruptionClass, ResourceRegistration, ResyncPolicy, SelectorField, StatusPersistence,
-        UpgradeStage,
+        DisruptionClass, MutationIntent, MutationIntentKind, ReconcileDisposition,
+        ResourceMutationBatch, ResourceRegistration, ResyncPolicy, SelectorField,
+        StatusPersistence, UpgradeStage,
     };
 
     type FreshMap = BTreeMap<ResourceKey, FreshSnapshot>;
@@ -1985,10 +2143,12 @@ mod tests {
         read_notify: tokio::sync::Notify,
         abort_expedited: AtomicBool,
         expedited_gate_error: AtomicBool,
+        effect_acceptance_conflicts_remaining: AtomicUsize,
         conflicts_remaining: AtomicUsize,
         commit_status_pending: AtomicBool,
         commit_revision: AtomicU64,
         commits: AtomicUsize,
+        effect_acceptances: AtomicUsize,
         expedited_completions: AtomicUsize,
         pending_completions: AtomicUsize,
         persisted_outcomes: Mutex<Vec<ReconcileProjection>>,
@@ -2019,10 +2179,12 @@ mod tests {
                     read_notify: tokio::sync::Notify::new(),
                     abort_expedited: AtomicBool::new(false),
                     expedited_gate_error: AtomicBool::new(false),
+                    effect_acceptance_conflicts_remaining: AtomicUsize::new(0),
                     conflicts_remaining: AtomicUsize::new(0),
                     commit_status_pending: AtomicBool::new(false),
                     commit_revision: AtomicU64::new(10),
                     commits: AtomicUsize::new(0),
+                    effect_acceptances: AtomicUsize::new(0),
                     expedited_completions: AtomicUsize::new(0),
                     pending_completions: AtomicUsize::new(0),
                     persisted_outcomes: Mutex::new(Vec::new()),
@@ -2102,6 +2264,23 @@ mod tests {
             _context: &ReconcileContext,
         ) -> impl Future<Output = Result<(), SourceError>> + Send {
             self.starting.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        }
+
+        fn accept_effect(
+            &self,
+            _context: &ReconcileContext,
+            _plan: &ReconcilePlan,
+        ) -> impl Future<Output = Result<(), SourceError>> + Send {
+            let remaining = self
+                .effect_acceptance_conflicts_remaining
+                .load(Ordering::SeqCst);
+            if remaining > 0 {
+                self.effect_acceptance_conflicts_remaining
+                    .fetch_sub(1, Ordering::SeqCst);
+                return std::future::ready(Err(SourceError::Conflict(ZoneRevision::new(9))));
+            }
+            self.effect_acceptances.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(()))
         }
 
@@ -2227,6 +2406,7 @@ mod tests {
         handler_failure_terminal: AtomicBool,
         block_handlers: AtomicBool,
         no_op_after_first: AtomicBool,
+        mutation_only: AtomicBool,
         assessment_state: Mutex<UpdateAssessmentState>,
         requeue_at: Mutex<Option<u64>>,
     }
@@ -2311,14 +2491,25 @@ mod tests {
                 return std::future::ready(Err(FakeError));
             }
             let count = self.plan_count.fetch_add(1, Ordering::SeqCst);
+            let mutation_only = self.mutation_only.load(Ordering::SeqCst);
+            let requeue_at = self
+                .requeue_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some();
             std::future::ready(
                 ReconcilePlan::new(
-                    if count > 0 && self.no_op_after_first.load(Ordering::SeqCst) {
+                    if mutation_only || requeue_at {
+                        Vec::new()
+                    } else if count > 0 && self.no_op_after_first.load(Ordering::SeqCst) {
                         Vec::new()
                     } else {
                         vec!["effect".to_owned()]
                     },
-                    count > 0 && self.no_op_after_first.load(Ordering::SeqCst),
+                    !mutation_only
+                        && !requeue_at
+                        && count > 0
+                        && self.no_op_after_first.load(Ordering::SeqCst),
                 )
                 .map_err(|_| FakeError),
             )
@@ -2326,20 +2517,40 @@ mod tests {
 
         async fn reconcile(
             &self,
-            context: &ReconcileContext,
+            _context: &ReconcileContext,
             resource: &ResourceSnapshot,
             _dependencies: &[DependencySnapshot],
             _plan: &ReconcilePlan,
         ) -> Result<ReconcileResult, Self::Error> {
-            context.authorize_effect().map_err(|_| FakeError)?;
-            self.enter(resource.key(), "reconcile").await;
-            self.reconcile_count.fetch_add(1, Ordering::SeqCst);
+            if self.mutation_only.load(Ordering::SeqCst) {
+                self.enter(resource.key(), "reconcile").await;
+                self.reconcile_count.fetch_add(1, Ordering::SeqCst);
+                let mutation = MutationIntent::new(
+                    resource.key().resource_ref().clone(),
+                    Some(resource.key().uid().clone()),
+                    Some(resource.revision()),
+                    MutationIntentKind::UpdateSpec,
+                    Some(b"{}".to_vec()),
+                )
+                .map_err(|_| FakeError)?;
+                return ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    Some(ResourceMutationBatch::new(vec![mutation]).map_err(|_| FakeError)?),
+                    None,
+                    ReconcileDisposition::Converged,
+                    None,
+                    None,
+                    StatusPersistence::NotRequested,
+                )
+                .map_err(|_| FakeError);
+            }
             let requeue_at = *self
                 .requeue_at
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(next_tick) = requeue_at {
-                ReconcileResult::new(
+                return ReconcileResult::new(
                     resource.revision(),
                     resource.generation(),
                     None,
@@ -2349,18 +2560,34 @@ mod tests {
                     None,
                     StatusPersistence::NotRequested,
                 )
-            } else {
-                ReconcileResult::new(
-                    resource.revision(),
-                    resource.generation(),
-                    None,
-                    Some(b"{}".to_vec()),
-                    ReconcileDisposition::Pending,
-                    None,
-                    None,
-                    StatusPersistence::Pending,
-                )
+                .map_err(|_| FakeError);
             }
+            Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ))
+        }
+
+        async fn execute_effect(
+            &self,
+            context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+            _plan: &ReconcilePlan,
+        ) -> Result<ReconcileResult, Self::Error> {
+            context.authorize_effect().map_err(|_| FakeError)?;
+            self.enter(resource.key(), "reconcile").await;
+            self.reconcile_count.fetch_add(1, Ordering::SeqCst);
+            ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                None,
+                Some(b"{}".to_vec()),
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::Pending,
+            )
             .map_err(|_| FakeError)
         }
 
@@ -2387,29 +2614,31 @@ mod tests {
                 return std::future::ready(Err(FakeError));
             }
             self.finalizer_count.fetch_add(1, Ordering::SeqCst);
-            let projection = ReconcileProjection::new(
-                resource.key().clone(),
-                resource.revision(),
-                ResourcePhase::Deleted,
-                ProjectionDisposition::Converged,
-                ReconcileReason::Deleted,
-                resource.canonical_json().is_empty(),
-            );
-            let projection = {
-                ReconcileResult::new(
+            std::future::ready(finalizer_result(resource).map(FinalizeResult::new))
+        }
+
+        fn prepare_finalize(
+            &self,
+            _context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+        ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+            let result = if resource.canonical_json().is_empty() {
+                finalizer_result(resource)
+            } else {
+                Ok(ReconcileResult::converged(
                     resource.revision(),
                     resource.generation(),
-                    None,
-                    None,
-                    ReconcileDisposition::Finalized,
-                    None,
-                    Some(projection),
-                    StatusPersistence::NotRequested,
-                )
-                .map_err(|_| FakeError)
-            }
-            .map(FinalizeResult::new);
-            std::future::ready(projection)
+                ))
+            };
+            std::future::ready(result)
+        }
+
+        async fn execute_finalize(
+            &self,
+            context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+        ) -> Result<ReconcileResult, Self::Error> {
+            Ok(self.finalize(context, resource).await?.into_result())
         }
 
         fn health(&self) -> impl Future<Output = Result<ControllerHealth, Self::Error>> + Send {
@@ -2474,6 +2703,28 @@ mod tests {
                 resource.generation(),
             ))
         }
+    }
+
+    fn finalizer_result(resource: &ResourceSnapshot) -> Result<ReconcileResult, FakeError> {
+        let projection = ReconcileProjection::new(
+            resource.key().clone(),
+            resource.revision(),
+            ResourcePhase::Deleted,
+            ProjectionDisposition::Converged,
+            ReconcileReason::Deleted,
+            resource.canonical_json().is_empty(),
+        );
+        ReconcileResult::new(
+            resource.revision(),
+            resource.generation(),
+            None,
+            None,
+            ReconcileDisposition::Finalized,
+            None,
+            Some(projection),
+            StatusPersistence::NotRequested,
+        )
+        .map_err(|_| FakeError)
     }
 
     fn key(name: &str, suffix: u8) -> ResourceKey {
@@ -2602,6 +2853,7 @@ mod tests {
             handler_failure_terminal: AtomicBool::new(false),
             block_handlers: AtomicBool::new(true),
             no_op_after_first: AtomicBool::new(false),
+            mutation_only: AtomicBool::new(false),
             assessment_state: Mutex::new(UpdateAssessmentState::Current),
             requeue_at: Mutex::new(None),
         });
@@ -2688,6 +2940,51 @@ mod tests {
             watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
             assert_eq!(runner.await.unwrap().unwrap().checkpointed, 1);
         });
+    }
+
+    #[test]
+    fn effect_acceptance_precedes_handler_effects() {
+        let (reconciler, entered, source, watch_tx) = harness(vec![key("app", 1)], 1);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 1);
+        reconciler.release(1);
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        runner.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn effect_acceptance_conflict_reenters_before_starting_handler() {
+        let (reconciler, _entered, source, watch_tx) = harness(vec![key("app", 1)], 1);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source
+            .effect_acceptance_conflicts_remaining
+            .store(1, Ordering::SeqCst);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+        let report = runner.join().unwrap().unwrap();
+        assert_eq!(report.dispatched, 2);
+        assert_eq!(report.conflicts_retried, 1);
+        assert_eq!(reconciler.reconcile_count.load(Ordering::SeqCst), 1);
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mutation_only_pass_skips_effect_acceptance() {
+        let (reconciler, _entered, source, watch_tx) = harness(vec![key("app", 1)], 1);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        reconciler.mutation_only.store(true, Ordering::SeqCst);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+        let report = runner.join().unwrap().unwrap();
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 0);
+        assert_eq!(source.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(reconciler.reconcile_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3004,9 +3301,11 @@ mod tests {
             entered.recv_timeout(Duration::from_millis(100)).is_err(),
             "effect started before durable commit proof"
         );
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 0);
         assert_eq!(source.expedited_completions.load(Ordering::SeqCst), 0);
         source.release_commit_gate();
         entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 1);
         reconciler.release(1);
         watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
 
@@ -3043,6 +3342,7 @@ mod tests {
         let report = runner.join().unwrap().unwrap();
         assert!(entered.try_recv().is_err());
         assert_eq!(reconciler.reconcile_count.load(Ordering::SeqCst), 0);
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 0);
         assert_eq!(source.commits.load(Ordering::SeqCst), 0);
         assert_eq!(source.starting.load(Ordering::SeqCst), 0);
         assert_eq!(report.checkpointed, 0);
@@ -3198,6 +3498,7 @@ mod tests {
         let report = runner.join().unwrap().unwrap();
         assert_eq!(report.dispatched, 2);
         assert_eq!(reconciler.reconcile_count.load(Ordering::SeqCst), 1);
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 1);
         assert_eq!(source.commits.load(Ordering::SeqCst), 1);
     }
 
@@ -3217,6 +3518,74 @@ mod tests {
         let report = runner.join().unwrap().unwrap();
         assert_eq!(report.conflicts_retried, 1);
         assert_eq!(source.commits.load(Ordering::SeqCst), 2);
+        assert_eq!(source.checkpoints.load(Ordering::SeqCst), 1);
+        assert_eq!(source.starting.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn committed_mutation_defers_projection_until_fresh_reentry() {
+        let target = key("app", 1);
+        let (_reconciler, _entered, source, _watch_tx) = harness(Vec::new(), 1);
+        let (target_snapshot, dependencies) = match resource(target.clone(), 4) {
+            FreshSnapshot::Present {
+                target,
+                dependencies,
+            } => (target, dependencies),
+            FreshSnapshot::Deleted { .. } => unreachable!(),
+        };
+        let context = ReconcileContext::ordinary(
+            identity(),
+            &target_snapshot,
+            &dependencies,
+            TriggerSet::new([TriggerReason::ManualReconcile]),
+            target_snapshot.revision(),
+            OperationContext::new("mutation", "mutation", "mutation", None).unwrap(),
+            1,
+            30_000,
+            Cancellation::default(),
+            1,
+            2,
+            ConfigurationGeneration::new(3).unwrap(),
+        )
+        .unwrap();
+        let mutation = MutationIntent::new(
+            target_snapshot.key().resource_ref().clone(),
+            Some(target_snapshot.key().uid().clone()),
+            Some(target_snapshot.revision()),
+            MutationIntentKind::UpdateSpec,
+            Some(b"{}".to_vec()),
+        )
+        .unwrap();
+        let projection = ReconcileProjection::new(
+            target_snapshot.key().clone(),
+            target_snapshot.revision(),
+            ResourcePhase::Ready,
+            ProjectionDisposition::Converged,
+            ReconcileReason::ReconcilePass,
+            false,
+        );
+        let result = ReconcileResult::new(
+            target_snapshot.revision(),
+            target_snapshot.generation(),
+            Some(ResourceMutationBatch::new(vec![mutation]).unwrap()),
+            Some(b"{}".to_vec()),
+            ReconcileDisposition::Converged,
+            None,
+            Some(projection),
+            StatusPersistence::Pending,
+        )
+        .unwrap();
+
+        let outcome = block_on(persist_result(source.as_ref(), &context, result));
+        assert!(matches!(
+            outcome,
+            WorkerOutcome::Done {
+                checkpointed: true,
+                status_pending: true
+            }
+        ));
+        assert_eq!(source.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(source.persisted_outcomes.lock().unwrap().len(), 0);
         assert_eq!(source.checkpoints.load(Ordering::SeqCst), 1);
     }
 
@@ -3400,7 +3769,7 @@ mod tests {
     fn reconcile_and_upgrade_for_one_resource_are_serialized() {
         let target = key("app", 1);
         let (reconciler, entered, source, watch_tx) = harness(vec![target.clone()], 2);
-        let runner = run_in_thread(Arc::clone(&reconciler), source);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
 
         let (_, action) = entered.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(action, "reconcile");
@@ -3426,6 +3795,7 @@ mod tests {
         runner.join().unwrap().unwrap();
         assert_eq!(reconciler.upgrade_count.load(Ordering::SeqCst), 1);
         assert_eq!(reconciler.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -3730,6 +4100,7 @@ mod tests {
             handler_failure_terminal: AtomicBool::new(false),
             block_handlers: AtomicBool::new(false),
             no_op_after_first: AtomicBool::new(false),
+            mutation_only: AtomicBool::new(false),
             assessment_state: Mutex::new(UpdateAssessmentState::Current),
             requeue_at: Mutex::new(None),
         });
