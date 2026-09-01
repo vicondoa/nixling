@@ -231,17 +231,17 @@ impl GuestResourceRuntime {
         descriptor_digest: SchemaFingerprint,
         approved_types: impl IntoIterator<Item = ResourceTypeName>,
     ) -> Result<GuestResourceSeedSession, GuestResourceRuntimeError> {
-        let (store, adapter) = self.bind_session_parts(route)?;
         let approved_types = approved_types.into_iter().collect::<BTreeSet<_>>();
-        if approved_types.is_empty()
+        if is_zero_fingerprint(&descriptor_digest)
+            || approved_types.is_empty()
             || approved_types
                 .iter()
                 .any(|resource_type| !GUEST_SEED_RESOURCE_TYPES.contains(&resource_type.as_str()))
         {
             return Err(GuestResourceRuntimeError::SeedPolicy);
         }
+        let (_store, adapter) = self.bind_session_parts(route)?;
         Ok(GuestResourceSeedSession {
-            store,
             adapter,
             guest_ref: self.identity.guest_ref().clone(),
             guest_uid: self.identity.guest_uid().clone(),
@@ -300,7 +300,6 @@ pub struct GuestResourceSession {
 
 /// Narrow target-local Resource API capability used by Guest-local seeding.
 pub struct GuestResourceSeedSession {
-    store: Arc<SessionBoundStore>,
     adapter: Arc<ResourceBusAdapter<SessionBoundStore, UnavailableUpgradeDispatcher>>,
     guest_ref: ResourceRef,
     guest_uid: ResourceUid,
@@ -390,11 +389,6 @@ impl GuestResourceSeedSession {
         self.validate_watch(&request)?;
         Ok(self.adapter.client().watch(request).await)
     }
-
-    /// Borrow the session-fenced store for target-local controller wiring.
-    pub fn store_backend(&self) -> Arc<SessionBoundStore> {
-        Arc::clone(&self.store)
-    }
 }
 
 impl core::fmt::Debug for GuestResourceSession {
@@ -458,6 +452,13 @@ impl core::fmt::Display for GuestResourceRuntimeError {
 }
 
 impl std::error::Error for GuestResourceRuntimeError {}
+
+fn is_zero_fingerprint(value: &SchemaFingerprint) -> bool {
+    value
+        .as_str()
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|byte| byte == b'0'))
+}
 
 struct GuestStoreState {
     revision: u64,

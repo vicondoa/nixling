@@ -17,7 +17,13 @@ use std::{
 use d2b_contracts_provider::v3::{
     ComponentDescriptor, ComponentExecution, ComponentType, ControllerTargetKind, EffectPortClass,
 };
-use d2b_contracts_resource::v3::{ControllerGeneration, ResourceGeneration, ResourceRef};
+use d2b_contracts_resource::v3::{
+    ControllerGeneration, ResourceGeneration, ResourceRef, ResourceUid,
+};
+use d2b_contracts_zone_session::v3::component_session::OperationId;
+use d2b_provider::{
+    OperationLedger, OperationLedgerAdmission, OperationLedgerError, OperationLedgerRow,
+};
 use d2b_session::{AuthenticatedComponentSession, AuthenticatedSessionRouteBinding};
 
 const STARTING: u8 = 0;
@@ -140,6 +146,41 @@ impl ProviderSessionAdmission {
         &self,
     ) -> d2b_contracts_resource::v3::identity::ReconnectGeneration {
         self.route.reconnect_generation()
+    }
+
+    /// Admit or rejoin one operation under this exact session generation.
+    ///
+    /// The ledger owns operation identity and desired-generation checks; this
+    /// proof supplies only the authenticated reconnect generation.
+    pub fn admit_operation(
+        &self,
+        ledger: &mut OperationLedger,
+        resource_uid: ResourceUid,
+        desired_generation: ResourceGeneration,
+        operation_id: OperationId,
+    ) -> Result<OperationLedgerAdmission, OperationLedgerError> {
+        ledger.admit(
+            resource_uid,
+            desired_generation,
+            operation_id,
+            self.reconnect_generation(),
+        )
+    }
+
+    /// Rebind one matching operation row to this session generation.
+    pub fn rebind_operation<'a>(
+        &self,
+        ledger: &'a mut OperationLedger,
+        resource_uid: ResourceUid,
+        desired_generation: ResourceGeneration,
+        operation_id: OperationId,
+    ) -> Result<&'a OperationLedgerRow, OperationLedgerError> {
+        ledger.rebind(
+            resource_uid,
+            desired_generation,
+            operation_id,
+            self.reconnect_generation(),
+        )
     }
 }
 
@@ -642,9 +683,10 @@ mod tests {
     use d2b_contracts_provider::v3::{
         ArtifactDigest, BinaryRef, ComponentTargetCapability, EffectPortClass,
     };
-    use d2b_contracts_resource::v3::ResourceRef;
     use d2b_contracts_resource::v3::execution_policy::{BoundedToken, ExecutionDomain};
     use d2b_contracts_resource::v3::identity::ResourceTypeName;
+    use d2b_contracts_resource::v3::{ResourceGeneration, ResourceRef, ResourceUid};
+    use d2b_contracts_zone_session::v3::component_session::OperationId;
 
     fn signed_controller_descriptor() -> ComponentDescriptor {
         let digest = ArtifactDigest::parse(format!("sha256:{}", "a".repeat(64))).unwrap();
@@ -978,5 +1020,42 @@ mod tests {
             ),
             Err(ProviderRuntimeError::ControllerDescriptorInvalid)
         ));
+    }
+
+    #[test]
+    fn session_admission_rejoins_a_matching_operation_row() {
+        let route = AuthenticatedSessionRouteBinding::for_test(
+            Some(ResourceRef::parse("Provider/test").unwrap()),
+            "d2b.provider.v3",
+            4,
+            Some(1),
+            Some(1),
+        );
+        let admission = ProviderSessionAdmission { route };
+        let mut ledger = OperationLedger::new();
+        let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let operation = OperationId::new(vec![0x55; 16]).unwrap();
+        let desired = ResourceGeneration::new(3).unwrap();
+
+        assert_eq!(
+            admission.admit_operation(&mut ledger, uid.clone(), desired, operation.clone()),
+            Ok(OperationLedgerAdmission::New)
+        );
+        assert_eq!(
+            admission.admit_operation(&mut ledger, uid.clone(), desired, operation.clone()),
+            Ok(OperationLedgerAdmission::Existing)
+        );
+        let next = AuthenticatedSessionRouteBinding::for_test(
+            Some(ResourceRef::parse("Provider/test").unwrap()),
+            "d2b.provider.v3",
+            5,
+            Some(1),
+            Some(1),
+        );
+        let next_admission = ProviderSessionAdmission { route: next };
+        let row = next_admission
+            .rebind_operation(&mut ledger, uid, desired, operation)
+            .expect("new session generation rebinds the matching row");
+        assert_eq!(row.session_generation().get(), 5);
     }
 }

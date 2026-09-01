@@ -53,6 +53,7 @@ mod registration;
 mod runtime;
 mod server;
 mod session_runtime;
+mod typed_boundary;
 mod values;
 
 pub mod conformance;
@@ -97,6 +98,7 @@ pub use session_runtime::{
     AuthenticatedProviderFrameCodec, AuthenticatedProviderRequest, run_authenticated_provider,
     serve_authenticated_component_session, validate_provider_route,
 };
+pub use typed_boundary::{ComponentSessionService, TransportProvider};
 pub use values::{
     ProviderHealth, ProviderHealthState, ProviderInspection, ProviderObservability, ProviderValues,
     ValuesError,

@@ -269,7 +269,7 @@ where
         result
     }
 
-    /// Serve decoded Provider RPC frames from one authenticated
+    /// Serve decoded Provider frames from one authenticated
     /// ComponentSession until cancellation or transport close.
     ///
     /// Callers must bind the authenticated route before entering this loop.

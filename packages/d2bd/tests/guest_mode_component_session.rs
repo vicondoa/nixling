@@ -3,7 +3,7 @@ use d2b_contracts_resource::v3::{
     identity::{ReconnectGeneration, SessionPurpose},
 };
 use d2b_contracts_zone_session::v3::component_session::{
-    EndpointPolicy, EndpointPurpose, EndpointRole, ServicePackage,
+    ComponentSessionBoundary, EndpointPolicy, EndpointPurpose, EndpointRole, ServicePackage,
 };
 use d2b_session::{
     HandshakeCredentials, Secret32, SessionAuthorizationRequest, SessionEngine, SessionVerb,
@@ -289,10 +289,79 @@ async fn authenticated_guest_session_binds_readiness_and_stale_binding_fails_clo
     assert_eq!(route.responder_role(), policy.responder_role);
     assert_eq!(route.endpoint_locality(), policy.transport_binding.locality);
     assert_eq!(route.transport_class(), policy.transport_binding.transport);
+    let descriptor = route
+        .component_descriptor(ComponentSessionBoundary::ResourceService)
+        .expect("typed ResourceService descriptor");
+    assert!(descriptor.is_resource_service());
+    assert_eq!(descriptor.reconnect_generation(), 2);
     let resource_session = resource_runtime
         .bind_session(&route)
         .expect("authenticated session binds Resource API");
     assert_eq!(resource_session.generation(), 2);
+    assert_eq!(
+        resource_runtime
+            .bind_seed_session(
+                &route,
+                SchemaFingerprint::parse(format!("sha256:{}", "0".repeat(64)))
+                    .expect("zero descriptor digest"),
+                ["Process"].into_iter().map(|resource_type| {
+                    ResourceTypeName::parse(resource_type).expect("seed type")
+                }),
+            )
+            .expect_err("zero descriptor evidence must be refused"),
+        GuestResourceRuntimeError::SeedPolicy
+    );
+    let seed_session = resource_runtime
+        .bind_seed_session(
+            &route,
+            SchemaFingerprint::parse(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+            )
+            .expect("seed descriptor digest"),
+            ["Process", "Endpoint"]
+                .into_iter()
+                .map(|resource_type| ResourceTypeName::parse(resource_type).expect("seed type")),
+        )
+        .expect("seed session");
+    let seed_services = seed_session.ttrpc_services();
+    let seed_service = seed_services
+        .get("d2b.resource.v3.ResourceService")
+        .expect("seed ResourceService");
+    assert_eq!(seed_services.len(), 1);
+    assert!(seed_service.methods.contains_key("CommitBatch"));
+    assert!(seed_service.methods.contains_key("Watch"));
+    assert_eq!(seed_service.methods.len(), 2);
+    assert!(seed_service.streams.is_empty());
+
+    let authenticated_services = resource_session.ttrpc_services();
+    let authenticated_service = authenticated_services
+        .get("d2b.resource.v3.ResourceService")
+        .expect("authenticated ResourceService");
+    assert_eq!(authenticated_services.len(), 1);
+    for method in [
+        "Get",
+        "List",
+        "Watch",
+        "Create",
+        "UpdateSpec",
+        "UpdateStatus",
+        "UpdateMetadata",
+        "UpdateFinalizers",
+        "Delete",
+        "CommitBatch",
+        "ResolveRef",
+        "InspectSchema",
+        "Upgrade",
+    ] {
+        assert!(
+            authenticated_service.methods.contains_key(method),
+            "authenticated ResourceService lacks {method}"
+        );
+    }
+    assert!(
+        authenticated_service.methods.len() > seed_service.methods.len(),
+        "seed method restriction must not leak into authenticated sessions"
+    );
     let wrong_service = SessionAuthorizationRequest::new(
         SessionVerb::Invoke,
         d2b_contracts_resource::v3::identity::ServiceName::parse("d2b.controller.v3")

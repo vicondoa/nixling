@@ -144,6 +144,59 @@ pub trait OwnedTransport: Send + 'static {
     async fn close(&mut self) -> std::result::Result<(), TransportError>;
 }
 
+/// An opaque, single-owner transport handle returned by a typed Transport
+/// Provider operation.
+///
+/// The handle exposes only the transport descriptor and the ability to
+/// consume or close the owned carriage. It carries no ZoneLink state,
+/// authorization claims, or raw locator.
+pub struct OwnedTransportHandle(Option<Box<dyn OwnedTransport>>);
+
+impl OwnedTransportHandle {
+    /// Wrap one owned transport without exposing its implementation type.
+    pub fn new<T>(transport: T) -> Self
+    where
+        T: OwnedTransport,
+    {
+        Self(Some(Box::new(transport)))
+    }
+
+    /// Wrap an already erased owned transport.
+    pub fn from_box(transport: Box<dyn OwnedTransport>) -> Self {
+        Self(Some(transport))
+    }
+
+    /// Borrow the immutable carriage descriptor.
+    pub fn descriptor(&self) -> TransportDescriptor {
+        self.0
+            .as_ref()
+            .expect("an owned transport handle is consumed only once")
+            .descriptor()
+    }
+
+    /// Consume the handle and return the session-owned transport.
+    pub fn into_owned_transport(mut self) -> Box<dyn OwnedTransport> {
+        self.0
+            .take()
+            .expect("an owned transport handle is consumed only once")
+    }
+
+    /// Close the owned carriage and consume the handle.
+    pub async fn close(mut self) -> std::result::Result<(), TransportError> {
+        self.0
+            .take()
+            .expect("an owned transport handle is consumed only once")
+            .close()
+            .await
+    }
+}
+
+impl fmt::Debug for OwnedTransportHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OwnedTransportHandle(<redacted>)")
+    }
+}
+
 struct SerializedReader {
     transport: std::sync::Arc<Mutex<Box<dyn OwnedTransport>>>,
 }

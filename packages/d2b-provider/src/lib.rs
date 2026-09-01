@@ -20,13 +20,10 @@
 //! [`InFlightPermit`] is a concurrency slot, and forwarding admissions are
 //! runtime-issued route evidence, not transferable capabilities.
 //!
-//! It also does not name the Provider trait-object catalog. The ADR45
-//! `ProviderInstance` sum type and the `RpcProviderProxy` payload and
-//! response enums are built from Provider method DTOs owned by
-//! `d2b-contracts`, and the v3 replacements for those DTOs do not exist yet.
-//! Rather than invent them here, [`ProviderRegistry`] is generic over the
-//! Zone runtime's own instance handle, and [`ProviderClass`] preserves the
-//! eleven frozen Provider families as a discriminant.
+//! It also does not name the Provider trait-object catalog. Rather than
+//! inventing a universal RPC or proxy surface, [`ProviderRegistry`] is
+//! generic over the Zone runtime's own instance handle, and [`ProviderClass`]
+//! preserves the eleven frozen Provider families as a discriminant.
 
 #![deny(missing_docs)]
 
@@ -37,12 +34,12 @@ mod error;
 mod forwarding;
 mod identity;
 mod installation;
+mod operation_ledger;
 mod registry;
 mod session;
 pub mod share_adapter;
 
 pub mod instance;
-pub mod rpc;
 
 pub use agent::{
     MAX_AGENT_AUDIT_EVENTS, MAX_AGENT_IN_FLIGHT, MAX_AGENT_TIMEOUT_MS, ProviderAgent,
@@ -50,7 +47,10 @@ pub use agent::{
     ProviderAgentRequest, ProviderAgentResponse, ProviderAgentService,
 };
 pub use context::{CancellationToken, OwnedOperationContext};
-pub use descriptor::ProviderDescriptor;
+pub use descriptor::{
+    DEFAULT_REPAIR_INTERVAL_MS, MAX_AUDIO_NOTIFICATION_REPAIR_WINDOW_MS,
+    MAX_DEVICE_REPAIR_WINDOW_MS, MAX_REPAIR_WINDOW_MS, ProviderDescriptor, RepairPolicy,
+};
 pub use error::{ProviderRuntimeError, RegistryBuildError};
 pub use forwarding::{
     ForwardTarget, ForwardedCall, ProviderForwardRequest, ZoneRouteFailClosedReason,
@@ -64,6 +64,10 @@ pub use identity::{
 pub use installation::{
     InstalledProvider, ProviderReadiness, RequiredProviderApi, TargetInstallProfile,
     admit_installation, admit_installation_for_target,
+};
+pub use operation_ledger::{
+    MAX_OPERATION_LEDGER_ROWS, OperationLedger, OperationLedgerAdmission, OperationLedgerError,
+    OperationLedgerRow, OperationLedgerState,
 };
 pub use registry::{
     AdmissionOptions, AdmittedProvider, InFlightPermit, MAX_REGISTRY_DRAIN_MS, ProviderRegistry,

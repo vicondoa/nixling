@@ -11,10 +11,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use d2b_contracts_provider::v3::provider_registry::ProviderBindingAxis;
+use d2b_contracts_provider::v3::{SpecifiedProviderMethod, provider_registry::ProviderBindingAxis};
 use d2b_contracts_resource::v3::identity::ServiceName;
 use d2b_contracts_resource::v3::{CanonicalJsonObject, ZoneId};
-use d2b_contracts_zone_session::v3::ProviderMethod;
 use tokio::{
     sync::{Semaphore, mpsc},
     time::{Duration, timeout},
@@ -31,7 +30,7 @@ pub const MAX_AGENT_TIMEOUT_MS: u64 = 900_000;
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderAgentRequest {
     service: ServiceName,
-    method: ProviderMethod,
+    method: SpecifiedProviderMethod,
     payload: CanonicalJsonObject,
     timeout_ms: u64,
 }
@@ -40,7 +39,7 @@ impl ProviderAgentRequest {
     /// Construct a bounded request.
     pub fn new(
         service: ServiceName,
-        method: ProviderMethod,
+        method: SpecifiedProviderMethod,
         payload: CanonicalJsonObject,
         timeout_ms: u64,
     ) -> Result<Self, ProviderAgentError> {
@@ -61,7 +60,7 @@ impl ProviderAgentRequest {
     }
 
     /// Return the closed method.
-    pub const fn method(&self) -> ProviderMethod {
+    pub const fn method(&self) -> SpecifiedProviderMethod {
         self.method
     }
 
@@ -121,7 +120,7 @@ pub enum ProviderAgentOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderAgentAuditEvent {
     outcome: ProviderAgentOutcome,
-    method: ProviderMethod,
+    method: SpecifiedProviderMethod,
     axis: ProviderBindingAxis,
 }
 
@@ -129,7 +128,7 @@ impl ProviderAgentAuditEvent {
     /// Construct an event with only closed metadata.
     pub const fn new(
         outcome: ProviderAgentOutcome,
-        method: ProviderMethod,
+        method: SpecifiedProviderMethod,
         axis: ProviderBindingAxis,
     ) -> Self {
         Self {
@@ -145,7 +144,7 @@ impl ProviderAgentAuditEvent {
     }
 
     /// Return the method.
-    pub const fn method(self) -> ProviderMethod {
+    pub const fn method(self) -> SpecifiedProviderMethod {
         self.method
     }
 
@@ -344,7 +343,7 @@ mod tests {
     fn request(service: &str) -> ProviderAgentRequest {
         ProviderAgentRequest::new(
             ServiceName::parse(service).unwrap(),
-            ProviderMethod::AssessUpdate,
+            SpecifiedProviderMethod::AssessUpdate,
             CanonicalJsonObject::parse(br#"{"ok":true}"#).unwrap(),
             1_000,
         )
@@ -370,7 +369,7 @@ mod tests {
         assert_eq!(
             ProviderAgentRequest::new(
                 ServiceName::parse("d2b.provider.v3").unwrap(),
-                ProviderMethod::AssessUpdate,
+                SpecifiedProviderMethod::AssessUpdate,
                 CanonicalJsonObject::empty(),
                 0,
             )

@@ -14,8 +14,8 @@ use d2b_contracts_resource::v3::{ResourceRef, ResourceUid, ZoneId};
 use d2b_contracts_zone_session::v3::component_session::{
     AttachmentAccess, AttachmentCreditClass, AttachmentDescriptor, AttachmentKind,
     AttachmentPolicy, AttachmentPurpose, BootstrapIdentityBinding, BootstrapPskBinding, BoundedVec,
-    CancelAck, CancelRequest, CancelResult, ChannelId, CloseReason, EndpointPolicy,
-    EndpointPolicyIdentity, EndpointPurpose, EndpointRole, HandshakeOffer,
+    CancelAck, CancelRequest, CancelResult, ChannelId, CloseReason, ComponentSessionDescriptor,
+    EndpointPolicy, EndpointPolicyIdentity, EndpointPurpose, EndpointRole, HandshakeOffer,
     IdentityEvidenceRequirement, KernelObjectType, LimitProfile, Locality,
     MAX_LOGICAL_MESSAGE_BYTES, MAX_REQUEST_LIFETIME_MS, MetricLabels, MetricReason, MetricResult,
     NoiseProfile, OperationId, PurposeClass, RecordKind, Remediation, RequestEnvelope, RequestId,
@@ -25,17 +25,52 @@ use d2b_session::{
     AttachmentPayload, AttachmentValidationError, BootstrapAdmission, BootstrapPsk,
     ComponentSessionDriver, DeadlineBudget, FairScheduler, Fragmenter, HandshakeCredentials,
     HandshakeRole, KeepaliveAction, MetricEvent, MetricsSink, NamedStreamMux, NoiseHandshake,
-    OutboundFrame, OwnedAttachment, OwnedTransport, QueueClass, Reassembler, RecordProtector,
-    Secret32, SessionEngine, SessionEvent, SessionLifecycle, StreamEvent, StreamId, StreamPhase,
-    TransportDescriptor, TransportError, TransportPacket, accept_generation_discovery_request,
-    decode_generation_discovery_response, encode_generation_discovery_request,
-    encode_generation_discovery_response, encode_offer, negotiate_offer,
+    OutboundFrame, OwnedAttachment, OwnedTransport, OwnedTransportHandle, QueueClass, Reassembler,
+    RecordProtector, Secret32, SessionEngine, SessionEvent, SessionLifecycle, StreamEvent,
+    StreamId, StreamPhase, TransportDescriptor, TransportError, TransportPacket,
+    accept_generation_discovery_request, decode_generation_discovery_response,
+    encode_generation_discovery_request, encode_generation_discovery_response, encode_offer,
+    negotiate_offer,
 };
+
 use snow::{
     params::DHChoice,
     resolvers::{CryptoResolver, DefaultResolver},
 };
 use tokio::sync::mpsc;
+
+#[test]
+fn typed_component_session_descriptors_keep_resource_and_component_boundaries_distinct() {
+    let resource = ComponentSessionDescriptor::resource([0x11; 32], 7).unwrap();
+    assert!(resource.is_resource_service());
+    assert!(!resource.is_service_stream());
+    assert_eq!(resource.service(), ServicePackage::ResourceV3);
+    assert_eq!(resource.reconnect_generation(), 7);
+
+    let service =
+        ComponentSessionDescriptor::service_stream(ServicePackage::ProviderV3, [0x22; 32], 8)
+            .unwrap();
+    assert!(service.is_service_stream());
+    assert!(!service.is_resource_service());
+
+    let transport = ComponentSessionDescriptor::transport([0x33; 32], 9).unwrap();
+    assert!(transport.is_transport());
+    assert_eq!(transport.service(), ServicePackage::ProviderV3);
+    assert!(
+        ComponentSessionDescriptor::service_stream(ServicePackage::ResourceV3, [0x22; 32], 8,)
+            .is_err()
+    );
+
+    let endpoint = policy(&offer(NoiseProfile::Nn25519ChaChaPolySha256));
+    let endpoint_descriptor = ComponentSessionDescriptor::from_endpoint_policy(
+        &endpoint,
+        d2b_contracts_zone_session::v3::component_session::ComponentSessionBoundary::ResourceService,
+    )
+    .unwrap();
+    endpoint_descriptor
+        .matches_endpoint_policy(&endpoint)
+        .expect("descriptor and endpoint policy agree");
+}
 
 fn bootstrap_identity(subject: &str, purpose: &str) -> BootstrapIdentityBinding {
     BootstrapIdentityBinding {
@@ -947,6 +982,14 @@ async fn owned_transport_is_portable_and_payload_debug_is_redacted() {
     );
     transport.close().await.unwrap();
     assert!(transport.closed);
+}
+
+#[tokio::test]
+async fn typed_owned_transport_handle_exposes_only_observe_and_close() {
+    let handle = OwnedTransportHandle::new(MemoryTransport::default());
+    assert_eq!(handle.descriptor().class, TransportClass::ProviderStream);
+    assert_eq!(format!("{handle:?}"), "OwnedTransportHandle(<redacted>)");
+    handle.close().await.unwrap();
 }
 
 #[derive(Default)]

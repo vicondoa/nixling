@@ -14,13 +14,12 @@ use std::{
     time::Duration,
 };
 
+use d2b_contracts_provider::v3::SpecifiedProviderMethod;
 use d2b_contracts_resource::v3::identity::ServiceName;
 use d2b_contracts_resource::v3::{
     CanonicalJsonObject, ResourceRef, execution_policy::BoundedToken,
 };
-use d2b_contracts_zone_session::v3::{
-    ProviderMethod, component_session::RequestId, zone_routing::ZonePath,
-};
+use d2b_contracts_zone_session::v3::{component_session::RequestId, zone_routing::ZonePath};
 use d2b_session::{AuthenticatedSessionRouteBinding, Cancellation, ComponentSessionDriver};
 use tokio::sync::Notify;
 
@@ -33,7 +32,7 @@ pub const MAX_SERVER_IN_FLIGHT: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedServiceDescriptor {
     package: ServiceName,
-    methods: Vec<ProviderMethod>,
+    methods: Vec<SpecifiedProviderMethod>,
 }
 
 impl GeneratedServiceDescriptor {
@@ -42,12 +41,12 @@ impl GeneratedServiceDescriptor {
         Self {
             package: ServiceName::parse("d2b.provider.v3").expect("closed service package"),
             methods: vec![
-                ProviderMethod::OpenTransport,
-                ProviderMethod::CloseTransport,
-                ProviderMethod::ObserveTransport,
-                ProviderMethod::AssessUpdate,
-                ProviderMethod::PlanUpgrade,
-                ProviderMethod::ExecuteUpgrade,
+                SpecifiedProviderMethod::OpenTransport,
+                SpecifiedProviderMethod::CloseTransport,
+                SpecifiedProviderMethod::ObserveTransport,
+                SpecifiedProviderMethod::AssessUpdate,
+                SpecifiedProviderMethod::PlanUpgrade,
+                SpecifiedProviderMethod::ExecuteUpgrade,
             ],
         }
     }
@@ -58,7 +57,7 @@ impl GeneratedServiceDescriptor {
     }
 
     /// Borrow the closed generated method list.
-    pub fn methods(&self) -> &[ProviderMethod] {
+    pub fn methods(&self) -> &[SpecifiedProviderMethod] {
         &self.methods
     }
 }

@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use d2b_contracts_provider::v3::SpecifiedProviderMethod;
 use d2b_contracts_resource::v3::ZoneRevision;
 use d2b_contracts_resource::v3::identity::{
     AuthenticatedSubjectContext, BindingDigest, EvidenceClass, Locality, ReconnectGeneration,
@@ -265,6 +266,23 @@ fn a_session_identity_requires_authenticated_provider_evidence() {
     assert_eq!(
         SessionIdentity::from_authenticated(work, &subject(None, service())).err(),
         Some(ProviderRuntimeError::MissingProviderBinding)
+    );
+}
+
+#[test]
+fn provider_identity_can_bind_an_exact_reconnect_generation() {
+    let work = zone(&["work"]);
+    let identity = identity(&work, "runtime-a");
+    assert_eq!(
+        identity.session_generation(),
+        ReconnectGeneration::new(1).unwrap()
+    );
+    let descriptor = descriptor(&work, "runtime-a", 1, &["start"])
+        .with_session_generation(ReconnectGeneration::new(2).unwrap())
+        .unwrap();
+    assert_eq!(
+        identity.matches_descriptor(&descriptor),
+        Err(ProviderRuntimeError::SessionIdentityMismatch)
     );
 }
 
@@ -621,4 +639,182 @@ fn redacted_debug_surfaces_leak_no_identity_or_target() {
     let rendered = format!("{request:?}");
     assert!(!rendered.contains("worker"));
     assert!(!rendered.contains("payments"));
+}
+
+#[test]
+fn descriptor_repair_policy_is_bounded_or_explicitly_proven_safe_to_opt_out() {
+    let device = descriptor(&zone(&["work"]), "device-gpu", 1, &["observe"]);
+    assert_eq!(
+        device.repair_policy().retry_after_ms(),
+        d2b_provider::DEFAULT_REPAIR_INTERVAL_MS
+    );
+    assert_eq!(
+        device.repair_policy().max_elapsed_ms(),
+        d2b_provider::MAX_DEVICE_REPAIR_WINDOW_MS
+    );
+    assert!(device.repair_policy().has_bounded_repair());
+
+    let opt_out = d2b_provider::RepairPolicy::opt_out();
+    assert!(opt_out.has_opt_out_evidence());
+    assert!(opt_out.validate(ProviderClass::Runtime).is_ok());
+    assert!(
+        d2b_provider::RepairPolicy::opt_out_without_restart_relist()
+            .validate(ProviderClass::Runtime)
+            .is_err()
+    );
+}
+
+#[test]
+fn operation_ledger_rebinds_matching_rows_without_reaccepting_or_changing_desired_generation() {
+    let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+    let other_uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174001").unwrap();
+    let desired = ResourceGeneration::new(4).unwrap();
+    let next_desired = ResourceGeneration::new(5).unwrap();
+    let first_session = ReconnectGeneration::new(1).unwrap();
+    let next_session = ReconnectGeneration::new(2).unwrap();
+    let later_session = ReconnectGeneration::new(3).unwrap();
+    let operation = OperationId::new(vec![0x41; 16]).unwrap();
+    let later_operation = OperationId::new(vec![0x42; 16]).unwrap();
+    let mut ledger = d2b_provider::OperationLedger::new();
+
+    assert_eq!(
+        ledger.admit(uid.clone(), desired, operation.clone(), first_session),
+        Ok(d2b_provider::OperationLedgerAdmission::New)
+    );
+    assert_eq!(
+        ledger.admit(uid.clone(), desired, operation.clone(), next_session),
+        Ok(d2b_provider::OperationLedgerAdmission::Existing)
+    );
+    let row = ledger.row(&operation).unwrap();
+    assert_eq!(row.resource_uid(), &uid);
+    assert_eq!(row.desired_generation(), desired);
+    assert_eq!(row.session_generation(), next_session);
+    assert_eq!(row.state(), d2b_provider::OperationLedgerState::Accepted);
+    ledger
+        .transition(
+            &uid,
+            desired,
+            &operation,
+            next_session,
+            d2b_provider::OperationLedgerState::Running,
+        )
+        .unwrap();
+    assert_eq!(
+        ledger.admit(uid.clone(), desired, later_operation, later_session),
+        Ok(d2b_provider::OperationLedgerAdmission::New)
+    );
+    assert_eq!(
+        ledger.admit(uid.clone(), desired, operation.clone(), later_session),
+        Ok(d2b_provider::OperationLedgerAdmission::Existing)
+    );
+    assert_eq!(
+        ledger.row(&operation).unwrap().state(),
+        d2b_provider::OperationLedgerState::Running
+    );
+    assert_eq!(
+        ledger.admit(uid.clone(), desired, operation.clone(), next_session),
+        Err(d2b_provider::OperationLedgerError::StaleSessionGeneration)
+    );
+    assert_eq!(
+        ledger.admit(uid.clone(), next_desired, operation.clone(), later_session),
+        Err(d2b_provider::OperationLedgerError::DesiredGenerationMismatch)
+    );
+    assert_eq!(
+        ledger.admit(uid.clone(), desired, operation.clone(), next_session),
+        Err(d2b_provider::OperationLedgerError::StaleSessionGeneration)
+    );
+    assert_eq!(
+        ledger.admit(other_uid, desired, operation, later_session),
+        Err(d2b_provider::OperationLedgerError::OperationIdReplay)
+    );
+    assert_eq!(ledger.len(), 2);
+}
+
+#[test]
+fn typed_transport_descriptor_requires_only_the_carriage_methods() {
+    let work = zone(&["work"]);
+    let capabilities =
+        ProviderCapabilitySet::from_specified(SpecifiedProviderMethod::TRANSPORT_CARRIAGE)
+            .expect("typed transport methods");
+    let descriptor = ProviderDescriptor::new_transport(
+        work.clone(),
+        provider_ref("transport-unix"),
+        ProviderImplementationId::parse("transport-unix").unwrap(),
+        generation(1),
+        provider_generation(1),
+        capabilities,
+    )
+    .expect("typed transport descriptor");
+    assert_eq!(
+        descriptor.boundary(),
+        d2b_contracts_zone_session::v3::component_session::ComponentSessionBoundary::Transport
+    );
+    assert!(
+        descriptor
+            .capabilities()
+            .contains_specified_method(SpecifiedProviderMethod::OpenTransport)
+    );
+
+    let wrong = ProviderCapabilitySet::new([method("open-transport")]).unwrap();
+    assert_eq!(
+        ProviderDescriptor::new_transport(
+            work,
+            provider_ref("transport-unix"),
+            ProviderImplementationId::parse("transport-unix").unwrap(),
+            generation(1),
+            provider_generation(1),
+            wrong,
+        )
+        .unwrap_err(),
+        RegistryBuildError::InvalidDescriptor
+    );
+}
+
+#[test]
+fn resource_and_service_only_provider_descriptors_use_different_boundaries() {
+    let work = zone(&["work"]);
+    let resource = ProviderDescriptor::new(
+        work.clone(),
+        provider_ref("resource-owner"),
+        ProviderClass::Runtime,
+        ProviderImplementationId::parse("resource-owner").unwrap(),
+        generation(1),
+        provider_generation(1),
+        ServiceName::parse("d2b.resource.v3").unwrap(),
+        capabilities(&["get"]),
+    )
+    .expect("resource service descriptor");
+    assert_eq!(
+        resource.boundary(),
+        d2b_contracts_zone_session::v3::component_session::ComponentSessionBoundary::ResourceService
+    );
+    let service = ProviderDescriptor::new_service_session(
+        work.clone(),
+        provider_ref("display-wayland"),
+        ProviderClass::Display,
+        ProviderImplementationId::parse("display-wayland").unwrap(),
+        generation(1),
+        provider_generation(1),
+        ServiceName::parse("d2b.display.v3").unwrap(),
+        capabilities(&["observe"]),
+    )
+    .expect("service-only descriptor");
+    assert_eq!(
+        service.boundary(),
+        d2b_contracts_zone_session::v3::component_session::ComponentSessionBoundary::ServiceStream
+    );
+    assert_eq!(
+        ProviderDescriptor::new_service_session(
+            work,
+            provider_ref("resource-service"),
+            ProviderClass::Display,
+            ProviderImplementationId::parse("resource-service").unwrap(),
+            generation(1),
+            provider_generation(1),
+            ServiceName::parse("d2b.resource.v3").unwrap(),
+            capabilities(&["observe"]),
+        )
+        .unwrap_err(),
+        RegistryBuildError::InvalidDescriptor
+    );
 }
