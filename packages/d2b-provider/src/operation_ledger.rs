@@ -62,6 +62,8 @@ pub enum OperationLedgerError {
     InvalidStateTransition,
     /// A requested reconnect generation was zero.
     InvalidSessionGeneration,
+    /// The authenticated session route owner is no longer live.
+    SessionNotLive,
 }
 
 impl core::fmt::Display for OperationLedgerError {
@@ -73,6 +75,7 @@ impl core::fmt::Display for OperationLedgerError {
             Self::StaleSessionGeneration => "provider-operation-session-generation-stale",
             Self::InvalidStateTransition => "provider-operation-state-transition-invalid",
             Self::InvalidSessionGeneration => "provider-operation-session-generation-invalid",
+            Self::SessionNotLive => "provider-operation-session-not-live",
         })
     }
 }

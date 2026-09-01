@@ -159,6 +159,9 @@ impl ProviderSessionAdmission {
         desired_generation: ResourceGeneration,
         operation_id: OperationId,
     ) -> Result<OperationLedgerAdmission, OperationLedgerError> {
+        if !self.route.liveness().is_live() {
+            return Err(OperationLedgerError::SessionNotLive);
+        }
         ledger.admit(
             resource_uid,
             desired_generation,
@@ -175,6 +178,9 @@ impl ProviderSessionAdmission {
         desired_generation: ResourceGeneration,
         operation_id: OperationId,
     ) -> Result<&'a OperationLedgerRow, OperationLedgerError> {
+        if !self.route.liveness().is_live() {
+            return Err(OperationLedgerError::SessionNotLive);
+        }
         ledger.rebind(
             resource_uid,
             desired_generation,
@@ -401,7 +407,7 @@ impl ProviderEntrypoint {
         &self,
         route: &AuthenticatedSessionRouteBinding,
     ) -> Result<(), ProviderRuntimeError> {
-        if !self.route_matches_expected(route) {
+        if !route.liveness().is_live() || !self.route_matches_expected(route) {
             return Err(ProviderRuntimeError::SessionUnauthenticated);
         }
         Ok(())
@@ -420,7 +426,8 @@ impl ProviderEntrypoint {
         let previous = self
             .ready_route()
             .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
-        if !self.route_matches_expected(&route)
+        if !route.liveness().is_live()
+            || !self.route_matches_expected(&route)
             || !same_controller_identity(&previous, &route)
             || route.reconnect_generation() <= previous.reconnect_generation()
         {
@@ -459,7 +466,12 @@ impl ProviderEntrypoint {
                 .0
                 .lock()
                 .ok()
-                .is_some_and(|state| state.ready_route.is_some())
+                .is_some_and(|state| {
+                    state
+                        .ready_route
+                        .as_ref()
+                        .is_some_and(|route| route.liveness().is_live())
+                })
     }
 
     /// Check that assignment authority is bound to the exact ready session.
@@ -472,7 +484,7 @@ impl ProviderEntrypoint {
             .lock()
             .ok()
             .and_then(|state| state.ready_route.clone())
-            .is_some_and(|ready| ready == *route)
+            .is_some_and(|ready| ready.liveness().is_live() && ready == *route)
     }
 
     /// Return redacted routing metadata for the current ready session.
@@ -505,7 +517,8 @@ impl ProviderEntrypoint {
         let Some(previous) = state.ready_route.as_ref() else {
             return Err(ProviderRuntimeError::SessionUnauthenticated);
         };
-        if !same_controller_identity(previous, &admission.route)
+        if !admission.route.liveness().is_live()
+            || !same_controller_identity(previous, &admission.route)
             || admission.route.reconnect_generation() <= previous.reconnect_generation()
         {
             return Err(ProviderRuntimeError::SessionUnauthenticated);
@@ -541,6 +554,8 @@ impl ProviderEntrypoint {
         if !Arc::ptr_eq(&registration.state, &self.state)
             || state.admitted == 0
             || self.lifecycle() != ProviderLifecycle::Starting
+            || !live_route.liveness().is_live()
+            || !session.route.liveness().is_live()
             || !self.route_matches_expected(live_route)
             || session.route.reconnect_generation().get() == 0
             || session.route.controller_generation().is_none()
@@ -893,7 +908,7 @@ mod tests {
             "d2b.provider.v3",
         )
         .unwrap();
-        let first = AuthenticatedSessionRouteBinding::for_test(
+        let first = AuthenticatedSessionRouteBinding::for_test_dead(
             Some(ResourceRef::parse("Provider/test").unwrap()),
             "d2b.provider.v3",
             1,
@@ -916,6 +931,7 @@ mod tests {
             })
             .expect("new reconnect generation");
         assert!(runtime.is_ready_for_route(&next));
+        assert!(runtime.is_controller_ready());
         assert_eq!(
             runtime.rebind_authenticated_route(ProviderSessionAdmission { route: first }),
             Err(ProviderRuntimeError::SessionUnauthenticated)
@@ -1057,5 +1073,61 @@ mod tests {
             .rebind_operation(&mut ledger, uid, desired, operation)
             .expect("new session generation rebinds the matching row");
         assert_eq!(row.session_generation().get(), 5);
+    }
+
+    #[test]
+    fn dead_session_route_cannot_admit_or_rebind_an_operation() {
+        let live_route = AuthenticatedSessionRouteBinding::for_test(
+            Some(ResourceRef::parse("Provider/test").unwrap()),
+            "d2b.provider.v3",
+            4,
+            Some(1),
+            Some(1),
+        );
+        let live_admission = ProviderSessionAdmission { route: live_route };
+        let mut ledger = OperationLedger::new();
+        let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let operation = OperationId::new(vec![0x66; 16]).unwrap();
+        let desired = ResourceGeneration::new(3).unwrap();
+
+        assert_eq!(
+            live_admission.admit_operation(
+                &mut ledger,
+                uid.clone(),
+                desired,
+                operation.clone(),
+            ),
+            Ok(OperationLedgerAdmission::New)
+        );
+
+        let dead_route = AuthenticatedSessionRouteBinding::for_test_dead(
+            Some(ResourceRef::parse("Provider/test").unwrap()),
+            "d2b.provider.v3",
+            5,
+            Some(1),
+            Some(1),
+        );
+        let dead_admission = ProviderSessionAdmission { route: dead_route };
+        assert_eq!(
+            dead_admission.admit_operation(
+                &mut ledger,
+                uid.clone(),
+                desired,
+                operation.clone(),
+            ),
+            Err(OperationLedgerError::SessionNotLive)
+        );
+        assert_eq!(
+            dead_admission.rebind_operation(&mut ledger, uid, desired, operation),
+            Err(OperationLedgerError::SessionNotLive)
+        );
+        assert_eq!(
+            ledger
+                .row(&OperationId::new(vec![0x66; 16]).unwrap())
+                .expect("original operation row remains")
+                .session_generation()
+                .get(),
+            4
+        );
     }
 }

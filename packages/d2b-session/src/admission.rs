@@ -1353,6 +1353,26 @@ impl AuthenticatedSessionRouteBinding {
                 .map(|generation| ControllerGeneration::new(generation).expect("test generation")),
         }
     }
+
+    /// Build a test-only route whose authenticated owner has already closed.
+    #[cfg(feature = "test-support")]
+    pub fn for_test_dead(
+        provider_ref: Option<ResourceRef>,
+        service: &str,
+        reconnect_generation: u64,
+        provider_generation: Option<u64>,
+        controller_generation: Option<u64>,
+    ) -> Self {
+        let route = Self::for_test(
+            provider_ref,
+            service,
+            reconnect_generation,
+            provider_generation,
+            controller_generation,
+        );
+        route.liveness.invalidate();
+        route
+    }
 }
 
 impl fmt::Debug for AuthenticatedSessionRouteBinding {

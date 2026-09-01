@@ -1547,6 +1547,30 @@ mod tests {
         assert!(listed.resources.is_empty());
     }
 
+    #[test]
+    fn session_bound_store_rejects_an_old_session_generation() {
+        let zone = ZoneId::parse("work").expect("zone");
+        let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").expect("store UID");
+        let store_identity = StoreSealIdentity::new(
+            d2b_resource_store::StoreSlot::new(STORE_SLOT).expect("store slot"),
+            zone.clone(),
+            uid,
+        );
+        let (_, acceptor) = d2b_resource_store::mutation_seal::mutation_seal_pair(store_identity);
+        let store = Arc::new(GuestResourceStore::new_in_memory(zone, acceptor));
+        let active_generation = Arc::new(Mutex::new(Some(2)));
+        let bound = SessionBoundStore {
+            store,
+            active_generation,
+            generation: 1,
+        };
+
+        let error = bound
+            .ensure_current()
+            .expect_err("an older session generation must be fenced");
+        assert_eq!(error.kind(), StoreErrorKind::ResourcePlaneUnavailable);
+    }
+
     #[tokio::test]
     async fn partial_target_local_store_is_quarantined_without_repair() {
         let directory = tempfile::tempdir().expect("state directory");
