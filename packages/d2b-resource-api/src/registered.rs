@@ -1691,11 +1691,11 @@ const fn result_state(
             d2b_resource_store_redb::AuthorityOperationState::EffectConfirmed
         }
         d2b_core_controller::ReconcileDisposition::Pending
+        | d2b_core_controller::ReconcileDisposition::Degraded
         | d2b_core_controller::ReconcileDisposition::RequeueAt => {
             d2b_resource_store_redb::AuthorityOperationState::Pending
         }
-        d2b_core_controller::ReconcileDisposition::Degraded
-        | d2b_core_controller::ReconcileDisposition::FailedRetryable => {
+        d2b_core_controller::ReconcileDisposition::FailedRetryable => {
             d2b_resource_store_redb::AuthorityOperationState::EffectRetryable
         }
         d2b_core_controller::ReconcileDisposition::FailedTerminal => {
@@ -3095,7 +3095,7 @@ mod tests {
         );
         assert_eq!(
             result_state(d2b_core_controller::ReconcileDisposition::Degraded),
-            d2b_resource_store_redb::AuthorityOperationState::EffectRetryable
+            d2b_resource_store_redb::AuthorityOperationState::Pending
         );
         assert_eq!(
             result_state(d2b_core_controller::ReconcileDisposition::FailedRetryable),
@@ -3118,6 +3118,20 @@ mod tests {
             projection_state(
                 d2b_core_controller::ProjectionDisposition::Progressing,
                 d2b_core_controller::ReconcileReason::ReconcilePass,
+            ),
+            d2b_resource_store_redb::AuthorityOperationState::Pending
+        );
+        assert_eq!(
+            projection_state(
+                d2b_core_controller::ProjectionDisposition::Blocked,
+                d2b_core_controller::ReconcileReason::ReconcilePass,
+            ),
+            d2b_resource_store_redb::AuthorityOperationState::Pending
+        );
+        assert_eq!(
+            projection_state(
+                d2b_core_controller::ProjectionDisposition::UpgradeRequired,
+                d2b_core_controller::ReconcileReason::UpgradeRequired,
             ),
             d2b_resource_store_redb::AuthorityOperationState::Pending
         );
