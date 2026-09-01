@@ -843,13 +843,63 @@ in
   };
 
   "provider-catalog/extra-provider-id-fails-closed" = {
-    expr = lib.hasInfix "outside the closed 27-row Provider matrix"
+    expr = lib.hasInfix "outside the closed 27-row"
       (matrixFailure {
         extra-provider = {
           artifactId = "not-in-the-provider-matrix";
         };
       });
     expected = true;
+  };
+
+  "provider-catalog/non-matrix-artifact-stays-artifact-only" = {
+    expr =
+      let
+        u20Cfg = (mkEvalCatalog [{
+          d2b.artifacts = {
+            acceptance-provider = artifactFor "acceptance-provider";
+            runtime-cloud-hypervisor = artifactFor "runtime-cloud-hypervisor";
+            volume-acceptance-provider =
+              artifactFor "volume-acceptance-provider";
+          };
+          d2b.providerCatalog.runtime-cloud-hypervisor = {
+            artifactId = "runtime-cloud-hypervisor";
+          };
+        }]).config;
+        catalogCfg = (mkEvalCatalog [{
+          d2b.artifacts.acceptance-provider =
+            artifactFor "acceptance-provider";
+          d2b.providerCatalog = {
+            acceptance-provider = {
+              artifactId = "acceptance-provider";
+            };
+          };
+        }]).config;
+        matrixFailures = lib.filter
+          (failure:
+            !failure.assertion
+            && lib.hasInfix
+              "outside the closed 27-row"
+              failure.message)
+          catalogCfg.assertions;
+      in {
+        artifactIds = u20Cfg.d2b._providerCatalog.ids;
+        providerCatalogIds = map (entry: entry.artifactId)
+          (lib.attrValues u20Cfg.d2b.providerCatalog);
+        fixtureAssertionsPass = lib.all (assertion: assertion.assertion)
+          u20Cfg.assertions;
+        providerCatalogRejected = matrixFailures != [ ];
+      };
+    expected = {
+      artifactIds = [
+        "acceptance-provider"
+        "runtime-cloud-hypervisor"
+        "volume-acceptance-provider"
+      ];
+      providerCatalogIds = [ "runtime-cloud-hypervisor" ];
+      fixtureAssertionsPass = true;
+      providerCatalogRejected = true;
+    };
   };
 
   # A missing frozen field is rejected, and the message names it.

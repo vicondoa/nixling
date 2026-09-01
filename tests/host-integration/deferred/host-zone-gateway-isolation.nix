@@ -160,17 +160,8 @@ pkgs.testers.runNixOSTest {
           inherit (volumeProviderArtifact) package type catalog;
         };
       };
-      d2b.providerCatalog = {
-        acceptance-provider = {
-          artifactId = "acceptance-provider";
-        };
-        runtime-cloud-hypervisor = {
-          artifactId = "runtime-cloud-hypervisor";
-        };
-        volume-acceptance-provider = {
-          artifactId = "volume-acceptance-provider";
-        };
-      };
+      # Acceptance-only packages remain artifact-only fixtures; their
+      # identities are not rows in the closed Provider matrix.
       d2b.zones.local-root.trustedPublishers.d2b-u20-acceptance.signingKey =
         acceptancePublisherKey;
       d2b.zones.local-root.trustedPublishers.d2b-cloud-hypervisor.signingKey =
