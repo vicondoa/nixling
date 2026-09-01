@@ -1,6 +1,6 @@
 # Focused positive and negative coverage for the eval-time Provider runtime
 # boundary assertions.
-{ lib, ... }@ctx:
+{ lib, pkgs, ... }:
 
 let
   providerRuntimeContracts =
@@ -16,6 +16,14 @@ let
             default = [ ];
           };
           options.d2b.zones = lib.mkOption {
+            type = lib.types.attrsOf lib.types.anything;
+            default = { };
+          };
+          options.d2b._artifactCatalogV3 = lib.mkOption {
+            type = lib.types.attrsOf lib.types.anything;
+            default = { };
+          };
+          options.d2b._bundle = lib.mkOption {
             type = lib.types.attrsOf lib.types.anything;
             default = { };
           };
@@ -508,16 +516,24 @@ in
     expected = true;
   };
 
-  "provider-runtime-contracts-accepts-matching-artifact-catalog-digest" = {
+  "provider-runtime-contracts-accepts-matching-activation-artifact-catalog-digest" = {
     expr = lib.filter (assertion: !assertion.assertion)
       (mkEvalContracts [
         contractBase
         ({ ... }: {
-          d2b._providerRuntimeValidation = {
-            expectedArtifactCatalogDigest =
+          d2b._artifactCatalogV3 = {
+            catalogDigest =
               "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-            activatedArtifactCatalogDigest =
-              "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+          };
+          d2b._bundle = {
+            zoneResourceBundles = {
+              "local-root" = {
+                path = pkgs.writeText "matching-resource-bundle" (builtins.toJSON {
+                  artifactCatalogDigest =
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+                });
+              };
+            };
           };
         })
       ]).config.assertions;
@@ -525,18 +541,35 @@ in
   };
 
   "provider-runtime-contracts-rejects-activation-artifact-catalog-digest-mismatch" = {
-    expr = hasFailure "activation-time artifactCatalogDigest must match" [
-      contractBase
-      ({ ... }: {
-        d2b._providerRuntimeValidation = {
-          expectedArtifactCatalogDigest =
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-          activatedArtifactCatalogDigest =
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        };
-      })
-    ];
+    expr =
+      let
+        failures = lib.filter (assertion: !assertion.assertion)
+          (mkEvalContracts [
+            contractBase
+            ({ ... }: {
+              d2b._artifactCatalogV3 = {
+                catalogDigest =
+                  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+              };
+              d2b._bundle = {
+                zoneResourceBundles = {
+                  "local-root" = {
+                    path = pkgs.writeText "mismatched-resource-bundle"
+                      (builtins.toJSON {
+                        artifactCatalogDigest =
+                          "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+                      });
+                  };
+                };
+              };
+            })
+          ]).config.assertions;
+      in
+      lib.any
+        (assertion:
+          lib.hasInfix "activation-time artifactCatalogDigest" assertion.message
+          && lib.hasInfix "canonical activation bundle" assertion.message)
+        failures;
     expected = true;
   };
-
 }

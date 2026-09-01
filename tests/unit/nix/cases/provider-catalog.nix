@@ -97,6 +97,10 @@ let
               type = lib.types.anything;
               default = { };
             };
+          options.d2b.providerCatalog = lib.mkOption {
+            type = lib.types.attrsOf lib.types.anything;
+            default = { };
+          };
         }
       ] ++ modules;
       specialArgs = { inherit pkgs; };
@@ -228,6 +232,14 @@ let
           type = "provider";
           inherit catalog;
         };
+      }]).config;
+      failures = lib.filter (assertion: !assertion.assertion)
+        evaluated.assertions;
+    in (lib.head failures).message;
+  matrixFailure = providerCatalog:
+    let
+      evaluated = (mkEvalCatalog [{
+        d2b.providerCatalog = providerCatalog;
       }]).config;
       failures = lib.filter (assertion: !assertion.assertion)
         evaluated.assertions;
@@ -633,7 +645,17 @@ in
   "provider-catalog/entry-fields-are-the-frozen-set" = {
     expr = lib.sort (a: b: a < b)
       (lib.attrNames (lib.head catalog.publicEntries).entry);
-    expected = lib.sort (a: b: a < b) (shape.fields ++ shape.trustFields);
+    expected = lib.sort (a: b: a < b) shape.fields;
+  };
+
+  "provider-catalog/public-projection-omits-private-trust-fields" = {
+    expr = lib.all
+      (entry:
+        lib.all
+          (field: !(builtins.hasAttr field entry.entry))
+          shape.trustFields)
+      catalog.publicEntries;
+    expected = true;
   };
 
   "provider-catalog/signed-placement-and-runtime-contract-is-retained" = {
@@ -792,7 +814,9 @@ in
       let
         message = trustFailure
           ((entryFor "publisher-root") // {
-            signature.publisherRoot = "different-root";
+            signature = lib.recursiveUpdate
+              (entryFor "publisher-root").signature
+              { publisherRoot = "different-root"; };
           });
       in lib.hasInfix "publisher root must match publisher" message;
     expected = true;
@@ -806,6 +830,25 @@ in
             signatureId = "different-signature";
           });
       in lib.hasInfix "signature ID aliases disagree" message;
+    expected = true;
+  };
+
+  "provider-catalog/revocation-status-fails-closed" = {
+    expr =
+      let
+        message = trustFailure
+          ((entryFor "revocation-status") // { revocationStatus = "revoked"; });
+      in lib.hasInfix "revocation status must be clear" message;
+    expected = true;
+  };
+
+  "provider-catalog/extra-provider-id-fails-closed" = {
+    expr = lib.hasInfix "outside the closed 27-row Provider matrix"
+      (matrixFailure {
+        extra-provider = {
+          artifactId = "not-in-the-provider-matrix";
+        };
+      });
     expected = true;
   };
 

@@ -51,6 +51,7 @@ let
     "conformanceAttestationDigest"
   ];
   catalogFields = shape.fields ++ signedContractFields ++ trustContractFields;
+  publicCatalogFields = shape.fields ++ signedContractFields;
   providerIds = shape.providerIds or [ ];
   fixedBootstrapProviderIds = shape.fixedBootstrapProviderIds or [ ];
 
@@ -122,13 +123,20 @@ let
 
   # The public projection. `storePath` is private catalog data retained for
   # activation and is stripped here, because a resource spec, status, or audit
-  # record never exposes a store path.
-  publicEntries = map (e: { inherit (e) id type entry; }) entries;
+  # record never exposes a store path or the private trust envelope.
+  publicEntries = map
+    (e: {
+      inherit (e) id type;
+      entry = lib.filterAttrs
+        (fieldName: _: lib.elem fieldName publicCatalogFields)
+        e.entry;
+    })
+    entries;
 
   # The provider catalog is a separate public document.  It carries only the
   # frozen package metadata; private store locations remain in the artifact
   # catalog used by activation.
-  providerEntries = lib.filter (entry: entry.type == "provider") entries;
+  providerEntries = lib.filter (entry: entry.type == "provider") publicEntries;
   providerCatalogEntries = lib.sort
     (left: right:
       let

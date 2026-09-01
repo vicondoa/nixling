@@ -7,44 +7,32 @@
 
 let
   cfg = config.d2b;
-  validation = cfg._providerRuntimeValidation or { };
   digestPattern = "sha256:[0-9a-f]{64}";
 
   validDigest = value:
     builtins.isString value && builtins.match digestPattern value != null;
 
-  configuredArtifactCatalogAssertions =
-    let
-      expected = validation.expectedArtifactCatalogDigest or null;
-      activated = validation.activatedArtifactCatalogDigest or null;
-      configured = expected != null || activated != null;
-    in
-    lib.optionals configured [
-      {
-        assertion = validDigest expected;
-        message = ''
-          d2b._providerRuntimeValidation.expectedArtifactCatalogDigest must
-          be a lowercase sha256 digest.
-        '';
-      }
-      {
-        assertion = validDigest activated;
-        message = ''
-          d2b._providerRuntimeValidation.activatedArtifactCatalogDigest must
-          be a lowercase sha256 digest.
-        '';
-      }
-      {
-        assertion = expected != null
-          && activated != null
-          && expected == activated;
-        message = ''
-          activation-time artifactCatalogDigest must match the committed
-          artifact catalog digest; refusing to apply a different catalog.
-        '';
-      }
-    ];
+  attrOr = attrs: name: fallback:
+    if builtins.isAttrs attrs && builtins.hasAttr name attrs
+    then attrs.${name}
+    else fallback;
 
+  appliedCatalogDigest = bundle:
+    let
+      path = attrOr bundle "path" null;
+      parsed =
+        if path == null
+        then { success = true; value = { }; }
+        else builtins.tryEval
+          (builtins.fromJSON (builtins.readFile path));
+    in
+    if parsed.success && builtins.isAttrs parsed.value
+    then attrOr parsed.value "artifactCatalogDigest" null
+    else null;
+
+  # The path is the canonical activation/application artifact. Reading its
+  # emitted JSON keeps this check independent from the eval-time `data`
+  # projection, which is only a copy of the catalog digest.
   bundleArtifactCatalogAssertions =
     let
       artifactCatalog =
@@ -55,15 +43,13 @@ let
     in
     lib.optionals (catalogDigest != null) (lib.mapAttrsToList
       (zoneName: bundle:
-        let
-          data = if builtins.isAttrs bundle then bundle.data or { } else { };
-          bundleDigest = data.artifactCatalogDigest or null;
+        let bundleDigest = appliedCatalogDigest bundle;
         in {
           assertion = validDigest bundleDigest
             && bundleDigest == catalogDigest;
           message = ''
             d2b.zones.${zoneName} activation-time artifactCatalogDigest must
-            match the committed artifact catalog digest.
+            match the digest emitted in the canonical activation bundle.
           '';
         })
       bundles);
@@ -74,11 +60,6 @@ let
       type = builtins.elemAt parts 0;
       name = builtins.elemAt parts 1;
     } else null;
-
-  attrOr = attrs: name: fallback:
-    if builtins.isAttrs attrs && builtins.hasAttr name attrs
-    then attrs.${name}
-    else fallback;
 
   secretKey = key:
     builtins.elem key [
@@ -621,25 +602,7 @@ let
     ++ lib.concatMap zoneLinkAssertions zoneLinkRows;
 in
 {
-  options.d2b._providerRuntimeValidation = {
-    expectedArtifactCatalogDigest = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      internal = true;
-      visible = false;
-      description = "Committed artifact catalog digest expected at activation.";
-    };
-    activatedArtifactCatalogDigest = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      internal = true;
-      visible = false;
-      description = "Artifact catalog digest observed by activation.";
-    };
-  };
-
   config.assertions =
     allAssertions
-    ++ configuredArtifactCatalogAssertions
     ++ bundleArtifactCatalogAssertions;
 }
