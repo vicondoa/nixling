@@ -1155,6 +1155,31 @@ async fn per_stream_credit_and_backpressure_do_not_cross_streams() {
     ));
 }
 
+#[tokio::test]
+async fn local_reset_completes_a_parked_per_stream_receive() {
+    let (initiator, responder, _) = engine_pair().await;
+    let initiator = initiator.into_driver();
+    let responder = responder.into_driver();
+    let stream = StreamId::new(0x0100).unwrap();
+    initiator.open_named_stream(stream, 8, 8).await.unwrap();
+    responder.open_named_stream(stream, 8, 8).await.unwrap();
+
+    let parked = tokio::spawn({
+        let initiator = initiator.clone();
+        async move { initiator.receive_named_stream_for(stream).await }
+    });
+    initiator.reset_named_stream(stream).await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(1), parked)
+        .await
+        .expect("local reset should complete the parked receive")
+        .expect("parked receive task should not panic")
+        .expect("parked receive should succeed");
+    assert!(matches!(
+        event,
+        StreamEvent::Reset { stream: received } if received == stream
+    ));
+}
+
 #[derive(Default)]
 struct CapturingMetrics(Mutex<Vec<(MetricEvent, MetricLabels, u64)>>);
 
@@ -1825,6 +1850,10 @@ async fn driver_handle_is_clonable_object_safe_and_leaves_ttrpc_correlation_to_a
         initiator.receive_named_stream().await.unwrap(),
         StreamEvent::Reset { stream: received } if received == blocked_stream
     ));
+    assert!(matches!(
+        responder.receive_named_stream().await.unwrap(),
+        StreamEvent::Reset { stream: received } if received == blocked_stream
+    ));
     assert_eq!(
         pending_send.await.unwrap().unwrap_err().code(),
         SessionErrorCode::Cancelled
@@ -1844,6 +1873,10 @@ async fn driver_handle_is_clonable_object_safe_and_leaves_ttrpc_correlation_to_a
         "stale queued data must not cross stream reuse"
     );
     initiator.reset_named_stream(stream).await.unwrap();
+    assert!(matches!(
+        initiator.receive_named_stream().await.unwrap(),
+        StreamEvent::Reset { stream: received } if received == stream
+    ));
     assert!(matches!(
         responder.receive_named_stream().await.unwrap(),
         StreamEvent::Reset { stream: received } if received == stream

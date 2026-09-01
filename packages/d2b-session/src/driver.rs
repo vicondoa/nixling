@@ -997,6 +997,7 @@ impl NamedStreamEventQueue {
     }
 
     fn receive_for(&mut self, stream: StreamId, waiter: Reply<StreamEvent>) -> Result<()> {
+        self.reap_closed_waiters();
         if let Some(index) = self
             .events
             .events
@@ -1022,24 +1023,16 @@ impl NamedStreamEventQueue {
             return Ok(());
         }
 
-        let waiters = self.waiters.entry(stream).or_default();
-        let before = waiters.len();
-        waiters.retain(|waiter| !waiter.is_closed());
-        self.waiter_count = self
-            .waiter_count
-            .saturating_sub(before.saturating_sub(waiters.len()));
         if self.waiter_count >= DRIVER_COMMAND_CAPACITY {
-            if waiters.is_empty() {
-                self.waiters.remove(&stream);
-            }
             return Err(backpressure());
         }
-        waiters.push_back(waiter);
+        self.waiters.entry(stream).or_default().push_back(waiter);
         self.waiter_count += 1;
         Ok(())
     }
 
     fn deliver(&mut self, mut event: StreamEvent) -> Result<()> {
+        self.reap_closed_waiters();
         let stream = event.stream();
         let mut waiters = self.waiters.remove(&stream).unwrap_or_default();
         self.waiter_count = self.waiter_count.saturating_sub(waiters.len());
@@ -1059,6 +1052,16 @@ impl NamedStreamEventQueue {
             }
         }
         self.events.deliver(event)
+    }
+
+    fn reap_closed_waiters(&mut self) {
+        let mut waiter_count = 0_usize;
+        self.waiters.retain(|_, waiters| {
+            waiters.retain(|waiter| !waiter.is_closed());
+            waiter_count = waiter_count.saturating_add(waiters.len());
+            !waiters.is_empty()
+        });
+        self.waiter_count = waiter_count;
     }
 
     fn fail(self, error: SessionError) {
@@ -1420,7 +1423,11 @@ async fn handle_command<T: OwnedTransport>(
             };
             engine.begin_write_batch(None);
             let result = engine.reset_named_stream(stream).await;
+            let reset_succeeded = result.is_ok();
             complete_after_write(engine, batch, priority_writes, writer_fence, reply, result).await;
+            if reset_succeeded {
+                queues.streams.deliver(StreamEvent::Reset { stream })?;
+            }
         }
         DriverCommand::DriveKeepalive { now, reply } => {
             let batch = match reserve_write_batch(write_commands, priority_writes) {
@@ -2211,6 +2218,36 @@ mod tests {
         ));
         assert!(matches!(
             second_events.await.unwrap().unwrap(),
+            StreamEvent::Data { stream, bytes }
+                if stream == second && bytes == b"second"
+        ));
+    }
+
+    #[tokio::test]
+    async fn closed_waiters_on_one_stream_do_not_consume_another_streams_capacity() {
+        let first = StreamId::new(0x0100).unwrap();
+        let second = StreamId::new(0x0101).unwrap();
+        let mut queue = NamedStreamEventQueue::new(8);
+        let mut cancelled = Vec::with_capacity(DRIVER_COMMAND_CAPACITY);
+        for _ in 0..DRIVER_COMMAND_CAPACITY {
+            let (waiter, receiver) = oneshot::channel();
+            queue.receive_for(first, waiter).unwrap();
+            cancelled.push(receiver);
+        }
+        drop(cancelled);
+
+        let (waiter, receiver) = oneshot::channel();
+        queue
+            .receive_for(second, waiter)
+            .expect("closed waiters on first stream should be reaped");
+        queue
+            .deliver(StreamEvent::Data {
+                stream: second,
+                bytes: b"second".to_vec(),
+            })
+            .unwrap();
+        assert!(matches!(
+            receiver.await.unwrap().unwrap(),
             StreamEvent::Data { stream, bytes }
                 if stream == second && bytes == b"second"
         ));
