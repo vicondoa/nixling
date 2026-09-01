@@ -507,4 +507,36 @@ in
     ];
     expected = true;
   };
+
+  "provider-runtime-contracts-accepts-matching-artifact-catalog-digest" = {
+    expr = lib.filter (assertion: !assertion.assertion)
+      (mkEvalContracts [
+        contractBase
+        ({ ... }: {
+          d2b._providerRuntimeValidation = {
+            expectedArtifactCatalogDigest =
+              "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            activatedArtifactCatalogDigest =
+              "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+          };
+        })
+      ]).config.assertions;
+    expected = [ ];
+  };
+
+  "provider-runtime-contracts-rejects-activation-artifact-catalog-digest-mismatch" = {
+    expr = hasFailure "activation-time artifactCatalogDigest must match" [
+      contractBase
+      ({ ... }: {
+        d2b._providerRuntimeValidation = {
+          expectedArtifactCatalogDigest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+          activatedArtifactCatalogDigest =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        };
+      })
+    ];
+    expected = true;
+  };
+
 }

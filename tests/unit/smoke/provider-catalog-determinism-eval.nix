@@ -75,10 +75,21 @@ let
   artifactFor = name: {
     package = pkgs.writeText "artifact-${name}" name;
     type = "provider";
-    catalog = entryFor name;
+    catalog = (entryFor name) // {
+      publisher = "d2b-official";
+      signature = {
+        signatureId = "${name}-signature";
+        publisherRoot = "d2b-official";
+      };
+      rootEpoch = 1;
+      revocationStatus = "clear";
+      denyStatus = "clear";
+    };
   };
 
   names = [ "provider-audio" "provider-storage" "provider-wayland" ];
+  providerMatrix = shape.providerMatrix;
+  providerMatrixIds = map (row: row.provider) providerMatrix;
 
   digestProvider = pkgs.runCommand "artifact-provider-digest" { } ''
     mkdir -p "$out/bin" "$out/share/d2b/provider"
@@ -160,6 +171,11 @@ let
   identical = catalogA == catalogB;
   controlDiffers = catalogA != catalogDifferent;
   nonEmpty = catalogA != "" && lib.hasInfix "provider-wayland" catalogA;
+  matrixClosed =
+    builtins.length providerMatrix == 27
+    && providerMatrixIds == shape.providerIds
+    && builtins.length (lib.unique providerMatrixIds) == 27
+    && shape.fixedBootstrapProviderIds == [ "system-core" "system-minijail" ];
 
   failures =
     (lib.optional (!identical)
@@ -167,7 +183,9 @@ let
     ++ (lib.optional (!controlDiffers)
       "the negative control produced identical bytes; the comparison is vacuous")
     ++ (lib.optional (!nonEmpty)
-      "the compiled catalog is empty; the comparison would be trivially true");
+      "the compiled catalog is empty; the comparison would be trivially true")
+    ++ (lib.optional (!matrixClosed)
+      "the closed Provider matrix is missing, reordered, or duplicated");
 in
 if failures != [ ] then
   throw ''
@@ -182,6 +200,9 @@ else
     negativeControlDiffers = true;
     catalogBytes = builtins.stringLength catalogA;
     artifactIds = names;
+    providerMatrixRows = builtins.length providerMatrix;
+    providerMatrixIds = providerMatrixIds;
+    fixedBootstrapProviderIds = shape.fixedBootstrapProviderIds;
     digestContract = {
       entries = digestCatalog.entries;
       providerPath = toString digestProvider;

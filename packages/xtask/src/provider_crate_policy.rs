@@ -18,8 +18,301 @@ use serde::{Deserialize, Serialize};
 const PROVIDER_PREFIX: &str = "d2b-provider-";
 const NON_PROVIDER_PREFIXED: &[&str] = &[
     "d2b-provider",
+    "d2b-provider-config-nixos",
     "d2b-provider-supervisor",
     "d2b-provider-toolkit",
+];
+
+/// One row in the accepted Provider catalog.
+///
+/// The matrix is deliberately kept beside the workspace policy.  Cargo
+/// metadata proves which crates exist, while this closed table proves that a
+/// crate, dossier, owner-local test, and aggregate target describe the same
+/// accepted Provider identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderMatrixRow {
+    pub(crate) identity: &'static str,
+    pub(crate) crate_name: &'static str,
+    pub(crate) source_path: &'static str,
+    pub(crate) test_path: &'static str,
+    pub(crate) dossier_path: &'static str,
+    pub(crate) bazel_target: &'static str,
+    pub(crate) unit: &'static str,
+    pub(crate) bootstrap: bool,
+}
+
+/// The closed initial Provider matrix from the generic reconciler plan.
+pub(crate) const PROVIDER_MATRIX: &[ProviderMatrixRow] = &[
+    ProviderMatrixRow {
+        identity: "system-core",
+        crate_name: "d2b-provider-system-core",
+        source_path: "packages/d2b-provider-system-core/src/host_reconciler.rs",
+        test_path: "packages/d2b-provider-system-core/tests/host_reconciliation.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-system-core.md",
+        bazel_target: "//packages/d2b-provider-system-core:all-tests",
+        unit: "U5",
+        bootstrap: true,
+    },
+    ProviderMatrixRow {
+        identity: "system-systemd",
+        crate_name: "d2b-provider-system-systemd",
+        source_path: "packages/d2b-provider-system-systemd/src/controller.rs",
+        test_path: "packages/d2b-provider-system-systemd/tests/controller.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-system-systemd.md",
+        bazel_target: "//packages/d2b-provider-system-systemd:all-tests",
+        unit: "U5",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "system-minijail",
+        crate_name: "d2b-provider-system-minijail",
+        source_path: "packages/d2b-provider-system-minijail/src/launch.rs",
+        test_path: "packages/d2b-provider-system-minijail/tests/conformance.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-system-minijail.md",
+        bazel_target: "//packages/d2b-provider-system-minijail:all-tests",
+        unit: "U5",
+        bootstrap: true,
+    },
+    ProviderMatrixRow {
+        identity: "runtime-cloud-hypervisor",
+        crate_name: "d2b-provider-runtime-cloud-hypervisor",
+        source_path: "packages/d2b-provider-runtime-cloud-hypervisor/src/controller.rs",
+        test_path: "packages/d2b-provider-runtime-cloud-hypervisor/tests/reconcile_state_machine_test.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-runtime-cloud-hypervisor.md",
+        bazel_target: "//packages/d2b-provider-runtime-cloud-hypervisor:all-tests",
+        unit: "U6",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "runtime-qemu-media",
+        crate_name: "d2b-provider-runtime-qemu-media",
+        source_path: "packages/d2b-provider-runtime-qemu-media/src/controller/reconcile.rs",
+        test_path: "packages/d2b-provider-runtime-qemu-media/tests/lifecycle.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-runtime-qemu-media.md",
+        bazel_target: "//packages/d2b-provider-runtime-qemu-media:all-tests",
+        unit: "U6",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "runtime-azure-container-apps",
+        crate_name: "d2b-provider-runtime-azure-container-apps",
+        source_path: "packages/d2b-provider-runtime-azure-container-apps/src/controller.rs",
+        test_path: "packages/d2b-provider-runtime-azure-container-apps/tests/provider_lifecycle.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-runtime-azure-container-apps.md",
+        bazel_target: "//packages/d2b-provider-runtime-azure-container-apps:all-tests",
+        unit: "U6",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "runtime-azure-virtual-machine",
+        crate_name: "d2b-provider-runtime-azure-virtual-machine",
+        source_path: "packages/d2b-provider-runtime-azure-virtual-machine/src/controller/mod.rs",
+        test_path: "packages/d2b-provider-runtime-azure-virtual-machine/tests/lifecycle_hermetic.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-runtime-azure-virtual-machine.md",
+        bazel_target: "//packages/d2b-provider-runtime-azure-virtual-machine:all-tests",
+        unit: "U6",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "volume-local",
+        crate_name: "d2b-provider-volume-local",
+        source_path: "packages/d2b-provider-volume-local/src/controller.rs",
+        test_path: "packages/d2b-provider-volume-local/tests/volume_local.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-volume-local.md",
+        bazel_target: "//packages/d2b-provider-volume-local:all-tests",
+        unit: "U7",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "volume-virtiofs",
+        crate_name: "d2b-provider-volume-virtiofs",
+        source_path: "packages/d2b-provider-volume-virtiofs/src/controller.rs",
+        test_path: "packages/d2b-provider-volume-virtiofs/tests/lifecycle.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-volume-virtiofs.md",
+        bazel_target: "//packages/d2b-provider-volume-virtiofs:all-tests",
+        unit: "U7",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "network-local",
+        crate_name: "d2b-provider-network-local",
+        source_path: "packages/d2b-provider-network-local/src/controller.rs",
+        test_path: "packages/d2b-provider-network-local/tests/reconcile.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-network-local.md",
+        bazel_target: "//packages/d2b-provider-network-local:all-tests",
+        unit: "U8",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "device-tpm",
+        crate_name: "d2b-provider-device-tpm",
+        source_path: "packages/d2b-provider-device-tpm/src/resource_controller.rs",
+        test_path: "packages/d2b-provider-device-tpm/tests/resource_controller.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-device-tpm.md",
+        bazel_target: "//packages/d2b-provider-device-tpm:all-tests",
+        unit: "U8",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "device-usbip",
+        crate_name: "d2b-provider-device-usbip",
+        source_path: "packages/d2b-provider-device-usbip/src/controller.rs",
+        test_path: "packages/d2b-provider-device-usbip/tests/service_binding_lifecycle.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-device-usbip.md",
+        bazel_target: "//packages/d2b-provider-device-usbip:all-tests",
+        unit: "U8",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "device-security-key",
+        crate_name: "d2b-provider-device-security-key",
+        source_path: "packages/d2b-provider-device-security-key/src/controller.rs",
+        test_path: "packages/d2b-provider-device-security-key/tests/lease_state_machine.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-device-security-key.md",
+        bazel_target: "//packages/d2b-provider-device-security-key:all-tests",
+        unit: "U8",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "device-gpu",
+        crate_name: "d2b-provider-device-gpu",
+        source_path: "packages/d2b-provider-device-gpu/src/controller.rs",
+        test_path: "packages/d2b-provider-device-gpu/tests/combined_reconcile.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-device-gpu.md",
+        bazel_target: "//packages/d2b-provider-device-gpu:all-tests",
+        unit: "U8",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "display-wayland",
+        crate_name: "d2b-provider-display-wayland",
+        source_path: "packages/d2b-provider-display-wayland/src/controller.rs",
+        test_path: "packages/d2b-provider-display-wayland/tests/provider_behavior.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-display-wayland.md",
+        bazel_target: "//packages/d2b-provider-display-wayland:all-tests",
+        unit: "U9",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "audio-pipewire",
+        crate_name: "d2b-provider-audio-pipewire",
+        source_path: "packages/d2b-provider-audio-pipewire/src/controller.rs",
+        test_path: "packages/d2b-provider-audio-pipewire/tests/controller.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-audio-pipewire.md",
+        bazel_target: "//packages/d2b-provider-audio-pipewire:all-tests",
+        unit: "U9",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "clipboard-wayland",
+        crate_name: "d2b-provider-clipboard-wayland",
+        source_path: "packages/d2b-provider-clipboard-wayland/src/controller/mod.rs",
+        test_path: "packages/d2b-provider-clipboard-wayland/tests/provider_behavior.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-clipboard-wayland.md",
+        bazel_target: "//packages/d2b-provider-clipboard-wayland:all-tests",
+        unit: "U9",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "notification-desktop",
+        crate_name: "d2b-provider-notification-desktop",
+        source_path: "packages/d2b-provider-notification-desktop/src/controller.rs",
+        test_path: "packages/d2b-provider-notification-desktop/tests/provider_behavior.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-notification-desktop.md",
+        bazel_target: "//packages/d2b-provider-notification-desktop:all-tests",
+        unit: "U9",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "shell-terminal",
+        crate_name: "d2b-provider-shell-terminal",
+        source_path: "packages/d2b-provider-shell-terminal/src/service/controller.rs",
+        test_path: "packages/d2b-provider-shell-terminal/tests/controller_reconcile.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-shell-terminal.md",
+        bazel_target: "//packages/d2b-provider-shell-terminal:all-tests",
+        unit: "U9",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "credential-secret-service",
+        crate_name: "d2b-provider-credential-secret-service",
+        source_path: "packages/d2b-provider-credential-secret-service/src/controller.rs",
+        test_path: "packages/d2b-provider-credential-secret-service/tests/session.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-credential-secret-service.md",
+        bazel_target: "//packages/d2b-provider-credential-secret-service:all-tests",
+        unit: "U10",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "credential-entra",
+        crate_name: "d2b-provider-credential-entra",
+        source_path: "packages/d2b-provider-credential-entra/src/controller.rs",
+        test_path: "packages/d2b-provider-credential-entra/tests/controller.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-credential-entra.md",
+        bazel_target: "//packages/d2b-provider-credential-entra:all-tests",
+        unit: "U10",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "credential-managed-identity",
+        crate_name: "d2b-provider-credential-managed-identity",
+        source_path: "packages/d2b-provider-credential-managed-identity/src/controller.rs",
+        test_path: "packages/d2b-provider-credential-managed-identity/tests/binding.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-credential-managed-identity.md",
+        bazel_target: "//packages/d2b-provider-credential-managed-identity:all-tests",
+        unit: "U10",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "transport-unix",
+        crate_name: "d2b-provider-transport-unix",
+        source_path: "packages/d2b-provider-transport-unix/src/portal.rs",
+        test_path: "packages/d2b-provider-transport-unix/tests/transport.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-transport-unix.md",
+        bazel_target: "//packages/d2b-provider-transport-unix:all-tests",
+        unit: "U11",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "transport-vsock",
+        crate_name: "d2b-provider-transport-vsock",
+        source_path: "packages/d2b-provider-transport-vsock/src/service.rs",
+        test_path: "packages/d2b-provider-transport-vsock/tests/service.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-transport-vsock.md",
+        bazel_target: "//packages/d2b-provider-transport-vsock:all-tests",
+        unit: "U11",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "transport-azure-relay",
+        crate_name: "d2b-provider-transport-azure-relay",
+        source_path: "packages/d2b-provider-transport-azure-relay/src/relay_transport.rs",
+        test_path: "packages/d2b-provider-transport-azure-relay/tests/fake_relay_transport.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-transport-azure-relay.md",
+        bazel_target: "//packages/d2b-provider-transport-azure-relay:all-tests",
+        unit: "U11",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "observability-otel",
+        crate_name: "d2b-provider-observability-otel",
+        source_path: "packages/d2b-provider-observability-otel/src/controller.rs",
+        test_path: "packages/d2b-provider-observability-otel/tests/binding_controller.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-observability-otel.md",
+        bazel_target: "//packages/d2b-provider-observability-otel:all-tests",
+        unit: "U12",
+        bootstrap: false,
+    },
+    ProviderMatrixRow {
+        identity: "activation-nixos",
+        crate_name: "d2b-provider-activation-nixos",
+        source_path: "packages/d2b-provider-activation-nixos/src/controller.rs",
+        test_path: "packages/d2b-provider-activation-nixos/tests/reconcile.rs",
+        dossier_path: "docs/specs/providers/ADR-046-provider-activation-nixos.md",
+        bazel_target: "//packages/d2b-provider-activation-nixos:all-tests",
+        unit: "U12",
+        bootstrap: false,
+    },
 ];
 // These exact README-only integration placeholders are recorded in the
 // existing Provider-state canon. They are not exemptions from the four
@@ -114,6 +407,14 @@ impl Diagnostic {
         }
     }
 
+    fn matrix_path(error: &'static str, crate_name: &str, path: &str) -> Self {
+        Self {
+            error,
+            crate_name: diagnostic_name(crate_name),
+            missing: Some(vec![path.to_owned()]),
+        }
+    }
+
     fn render(&self) -> String {
         serde_json::to_string(self).expect("fixed Provider policy diagnostic serializes")
     }
@@ -126,7 +427,100 @@ pub fn check(repo_root: &Path) -> Result<(), String> {
         .canonicalize()
         .map_err(|_| "provider-crate-layout-input-unreadable".to_owned())?;
     let members = cargo_workspace_members(&repo_root)?;
-    check_members(&repo_root, members)
+    check_members(&repo_root, members.clone())?;
+    check_closed_matrix(&repo_root, &members)
+}
+
+fn check_closed_matrix(
+    repo_root: &Path,
+    members: &[WorkspaceMember],
+) -> Result<(), String> {
+    let expected: BTreeSet<&str> = PROVIDER_MATRIX
+        .iter()
+        .map(|row| row.crate_name)
+        .collect();
+    let actual: BTreeSet<&str> = members
+        .iter()
+        .filter(|member| provider_name_kind(&member.package_name) == ProviderNameKind::Provider)
+        .map(|member| member.package_name.as_str())
+        .collect();
+    let mut violations = Vec::new();
+
+    for crate_name in expected.difference(&actual) {
+        violations.push(Diagnostic::simple(
+            "provider-matrix-row-missing",
+            crate_name,
+        ));
+    }
+    for crate_name in actual.difference(&expected) {
+        violations.push(Diagnostic::simple(
+            "provider-matrix-row-unexpected",
+            crate_name,
+        ));
+    }
+
+    for row in PROVIDER_MATRIX {
+        let Some(member) = members
+            .iter()
+            .find(|member| member.package_name == row.crate_name)
+        else {
+            continue;
+        };
+
+        let dossier = repo_root.join(row.dossier_path);
+        if !dossier.is_file() {
+            violations.push(Diagnostic::matrix_path(
+                "provider-matrix-dossier-missing",
+                row.crate_name,
+                row.dossier_path,
+            ));
+        } else {
+            let expected_spec_id = format!("| Spec ID | `ADR-046-provider-{}` |", row.identity);
+            let spec_id_count = fs::read_to_string(&dossier)
+                .map(|text| {
+                    text.lines()
+                        .filter(|line| line.trim() == expected_spec_id)
+                        .count()
+                })
+                .unwrap_or(0);
+            if spec_id_count != 1 {
+                violations.push(Diagnostic::simple(
+                    "provider-matrix-dossier-identity-mismatch",
+                    row.crate_name,
+                ));
+            }
+        }
+
+        let build = member.crate_dir.join("BUILD.bazel");
+        let has_aggregate_target = fs::read_to_string(&build)
+            .map(|text| text.contains("name = \"all-tests\""))
+            .unwrap_or(false);
+        if !has_aggregate_target {
+            violations.push(Diagnostic::matrix_path(
+                "provider-matrix-test-target-missing",
+                row.crate_name,
+                row.bazel_target,
+            ));
+        }
+    }
+
+    violations.sort_by(|left, right| {
+        left.crate_name
+            .cmp(&right.crate_name)
+            .then_with(|| left.error.cmp(right.error))
+            .then_with(|| left.missing.cmp(&right.missing))
+    });
+    violations.dedup();
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations
+            .iter()
+            .map(Diagnostic::render)
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
 }
 
 fn check_members(repo_root: &Path, members: Vec<WorkspaceMember>) -> Result<(), String> {
@@ -357,7 +751,9 @@ fn diagnostic_name(name: &str) -> String {
 }
 
 fn is_provider_directory(repo_root: &Path, crate_dir: &Path, package_name: &str) -> bool {
-    let packages_dir = repo_root.join("packages");
+    let Some(packages_dir) = repo_root.join("packages").canonicalize().ok() else {
+        return false;
+    };
     crate_dir.parent() == Some(packages_dir.as_path())
         && crate_dir
             .file_name()
@@ -634,6 +1030,52 @@ mod tests {
         let fixture = Fixture::new("clean");
         assert_eq!(check_fixture(&fixture.root), Ok(()));
         assert_eq!(check_fixture(&fixture.root), Ok(()));
+    }
+
+    #[test]
+    fn the_provider_matrix_is_closed_and_has_two_bootstrap_rows() {
+        assert_eq!(PROVIDER_MATRIX.len(), 27);
+
+        let identities: BTreeSet<_> = PROVIDER_MATRIX
+            .iter()
+            .map(|row| row.identity)
+            .collect();
+        let crates: BTreeSet<_> = PROVIDER_MATRIX
+            .iter()
+            .map(|row| row.crate_name)
+            .collect();
+        assert_eq!(identities.len(), PROVIDER_MATRIX.len());
+        assert_eq!(crates.len(), PROVIDER_MATRIX.len());
+        assert_eq!(
+            PROVIDER_MATRIX
+                .iter()
+                .filter(|row| row.bootstrap)
+                .map(|row| row.identity)
+                .collect::<Vec<_>>(),
+            vec!["system-core", "system-minijail"]
+        );
+        for row in PROVIDER_MATRIX {
+            assert_eq!(row.crate_name, format!("d2b-provider-{}", row.identity));
+            assert!(row.bazel_target.ends_with(":all-tests"));
+            assert!(row.dossier_path.ends_with(&format!(
+                "ADR-046-provider-{}.md",
+                row.identity
+            )));
+            assert!(row.source_path.starts_with("packages/"));
+            assert!(row.test_path.starts_with("packages/"));
+            assert!(matches!(row.unit, "U5" | "U6" | "U7" | "U8" | "U9" | "U10" | "U11" | "U12"));
+        }
+    }
+
+    #[test]
+    fn the_committed_tree_matches_every_provider_matrix_row() {
+        let root = repo_root().expect("resolve repository root");
+        let members = cargo_workspace_members(root).expect("read workspace metadata");
+        assert_eq!(
+            check_closed_matrix(root, &members),
+            Ok(()),
+            "the committed Provider matrix must have one dossier and aggregate target per row"
+        );
     }
 
     #[test]

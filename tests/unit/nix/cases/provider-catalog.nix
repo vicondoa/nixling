@@ -128,7 +128,16 @@ let
         (map (field: lib.nameValuePair field "${name}/${field}")
           (lib.filter (field: !(lib.elem field shape.digestFields)) shape.fields));
     in
-    digestFields // plainFields;
+    digestFields // plainFields // {
+      publisher = "d2b-official";
+      signature = {
+        signatureId = "${name}-signature";
+        publisherRoot = "d2b-official";
+      };
+      rootEpoch = 1;
+      revocationStatus = "clear";
+      denyStatus = "clear";
+    };
 
   artifactFor = name: {
     package = pkgs.writeText "artifact-${name}" name;
@@ -180,6 +189,16 @@ let
   };
 
   cfg = (mkEvalCatalog [ authored ]).config;
+  mixedCatalogCfg = (mkEvalCatalog [{
+    d2b.artifacts = {
+      provider = artifactFor "provider";
+      system = {
+        package = pkgs.writeText "provider-catalog-system" "system";
+        type = "nixos-system";
+        catalog = null;
+      };
+    };
+  }]).config;
   catalog = cfg.d2b._providerCatalog;
   signedCfg = (mkEvalCatalog [{
     d2b.artifacts.provider-signed = {
@@ -201,6 +220,18 @@ let
       d2b.artifacts = artifacts;
     }]).config;
     in lib.head (lib.filter (assertion: !assertion.assertion) evaluated.assertions);
+  trustFailure = catalog:
+    let
+      evaluated = (mkEvalCatalog [{
+        d2b.artifacts.trust-test = {
+          package = pkgs.writeText "provider-trust-test" "provider-trust-test";
+          type = "provider";
+          inherit catalog;
+        };
+      }]).config;
+      failures = lib.filter (assertion: !assertion.assertion)
+        evaluated.assertions;
+    in (lib.head failures).message;
 
   # The same three artifacts, authored in a different order and built from a
   # reversed list rather than a literal attribute set. The compiled catalog
@@ -602,7 +633,7 @@ in
   "provider-catalog/entry-fields-are-the-frozen-set" = {
     expr = lib.sort (a: b: a < b)
       (lib.attrNames (lib.head catalog.publicEntries).entry);
-    expected = lib.sort (a: b: a < b) shape.fields;
+    expected = lib.sort (a: b: a < b) (shape.fields ++ shape.trustFields);
   };
 
   "provider-catalog/signed-placement-and-runtime-contract-is-retained" = {
@@ -675,6 +706,107 @@ in
       "runtime-marketplace"
       "version-range-solving"
     ];
+  };
+
+  "provider-catalog/closed-27-row-matrix" = {
+    expr = {
+      rowCount = builtins.length shape.providerMatrix;
+      idCount = builtins.length shape.providerIds;
+      idsMatchRows =
+        shape.providerIds == map (row: row.provider) shape.providerMatrix;
+      rowsUnique =
+        builtins.length (lib.unique shape.providerIds)
+        == builtins.length shape.providerIds;
+      bootstrapIds = shape.fixedBootstrapProviderIds;
+      bootstrapRows = map (row: row.provider)
+        (lib.filter (row: row.bootstrap) shape.providerMatrix);
+      layout = shape.artifactLayout;
+    };
+    expected = {
+      rowCount = 27;
+      idCount = 27;
+      idsMatchRows = true;
+      rowsUnique = true;
+      bootstrapIds = [ "system-core" "system-minijail" ];
+      bootstrapRows = [ "system-core" "system-minijail" ];
+      layout = {
+        executableDirectory = "bin";
+        metadataDirectory = "share/d2b/provider";
+        multiBinary = true;
+        requiredFiles = [
+          "share/d2b/provider/provider-manifest.json"
+          "share/d2b/provider/provider-manifest.json.sig"
+          "share/d2b/provider/config-schema.json"
+        ];
+        noBinaryBootstrapProvider = "system-core";
+        fixedBootstrapProviders = [ "system-core" "system-minijail" ];
+      };
+    };
+  };
+
+  "provider-catalog/provider-only-projection-excludes-system-artifacts" = {
+    expr = {
+      artifactIds = map (entry: entry.id)
+        mixedCatalogCfg.d2b._providerCatalog.providerCatalogEntries;
+      publicCatalogIds = map (entry: entry.artifactId)
+        mixedCatalogCfg.d2b._providerCatalog.providerCatalogData.entries;
+    };
+    expected = {
+      artifactIds = [ "provider" ];
+      publicCatalogIds = [ "provider" ];
+    };
+  };
+
+  "provider-catalog/trust-epoch-alias-mismatch-fails-closed" = {
+    expr =
+      let
+        message = trustFailure
+          ((entryFor "trust-epoch") // {
+            trustEpoch = 2;
+            rootEpoch = 1;
+          });
+      in lib.hasInfix "trust epoch" message;
+    expected = true;
+  };
+
+  "provider-catalog/revocation-ref-shape-fails-closed" = {
+    expr =
+      let
+        message = trustFailure
+          ((entryFor "revocation-ref") // { revocationRef = 7; });
+      in lib.hasInfix "revocationRef" message;
+    expected = true;
+  };
+
+  "provider-catalog/deny-status-fails-closed" = {
+    expr =
+      let
+        message = trustFailure
+          ((entryFor "deny-status") // { denyStatus = "denied"; });
+      in lib.hasInfix "deny status must be clear" message;
+    expected = true;
+  };
+
+  "provider-catalog/publisher-root-mismatch-fails-closed" = {
+    expr =
+      let
+        message = trustFailure
+          ((entryFor "publisher-root") // {
+            signature.publisherRoot = "different-root";
+          });
+      in lib.hasInfix "publisher root must match publisher" message;
+    expected = true;
+  };
+
+  "provider-catalog/signature-id-alias-mismatch-fails-closed" = {
+    expr =
+      let
+        message = trustFailure
+          ((entryFor "signature-id") // {
+            signatureId = "different-signature";
+          });
+      in lib.hasInfix "signature ID aliases disagree" message;
+    expected = true;
   };
 
   # A missing frozen field is rejected, and the message names it.

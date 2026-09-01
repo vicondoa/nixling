@@ -7,6 +7,66 @@
 
 let
   cfg = config.d2b;
+  validation = cfg._providerRuntimeValidation or { };
+  digestPattern = "sha256:[0-9a-f]{64}";
+
+  validDigest = value:
+    builtins.isString value && builtins.match digestPattern value != null;
+
+  configuredArtifactCatalogAssertions =
+    let
+      expected = validation.expectedArtifactCatalogDigest or null;
+      activated = validation.activatedArtifactCatalogDigest or null;
+      configured = expected != null || activated != null;
+    in
+    lib.optionals configured [
+      {
+        assertion = validDigest expected;
+        message = ''
+          d2b._providerRuntimeValidation.expectedArtifactCatalogDigest must
+          be a lowercase sha256 digest.
+        '';
+      }
+      {
+        assertion = validDigest activated;
+        message = ''
+          d2b._providerRuntimeValidation.activatedArtifactCatalogDigest must
+          be a lowercase sha256 digest.
+        '';
+      }
+      {
+        assertion = expected != null
+          && activated != null
+          && expected == activated;
+        message = ''
+          activation-time artifactCatalogDigest must match the committed
+          artifact catalog digest; refusing to apply a different catalog.
+        '';
+      }
+    ];
+
+  bundleArtifactCatalogAssertions =
+    let
+      artifactCatalog =
+        cfg._artifactCatalogV3 or { };
+      catalogDigest = artifactCatalog.catalogDigest or null;
+      bundles =
+        (cfg._bundle or { }).zoneResourceBundles or { };
+    in
+    lib.optionals (catalogDigest != null) (lib.mapAttrsToList
+      (zoneName: bundle:
+        let
+          data = if builtins.isAttrs bundle then bundle.data or { } else { };
+          bundleDigest = data.artifactCatalogDigest or null;
+        in {
+          assertion = validDigest bundleDigest
+            && bundleDigest == catalogDigest;
+          message = ''
+            d2b.zones.${zoneName} activation-time artifactCatalogDigest must
+            match the committed artifact catalog digest.
+          '';
+        })
+      bundles);
 
   parseRef = value:
     let parts = if builtins.isString value then lib.splitString "/" value else [ ];
@@ -561,5 +621,25 @@ let
     ++ lib.concatMap zoneLinkAssertions zoneLinkRows;
 in
 {
-  config.assertions = allAssertions;
+  options.d2b._providerRuntimeValidation = {
+    expectedArtifactCatalogDigest = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      internal = true;
+      visible = false;
+      description = "Committed artifact catalog digest expected at activation.";
+    };
+    activatedArtifactCatalogDigest = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      internal = true;
+      visible = false;
+      description = "Artifact catalog digest observed by activation.";
+    };
+  };
+
+  config.assertions =
+    allAssertions
+    ++ configuredArtifactCatalogAssertions
+    ++ bundleArtifactCatalogAssertions;
 }
