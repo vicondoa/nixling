@@ -617,28 +617,6 @@ fn resource_has_finalizer(
         }))
 }
 
-fn finalizer_removal_payload(
-    resource: &ResourceSnapshot,
-    expected: &str,
-) -> Result<Option<Vec<u8>>, CoreReconcileError> {
-    let mut value = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
-        .map_err(|_| CoreReconcileError)?;
-    let Some(finalizers) = value
-        .pointer_mut("/metadata/finalizers")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return Ok(None);
-    };
-    let original_len = finalizers.len();
-    finalizers.retain(|value| value.as_str() != Some(expected));
-    if finalizers.len() == original_len {
-        return Ok(None);
-    }
-    serde_json::to_vec(&value)
-        .map(Some)
-        .map_err(|_| CoreReconcileError)
-}
-
 fn status_candidate(resource: &ResourceSnapshot) -> Result<Vec<u8>, CoreReconcileError> {
     let value = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
         .map_err(|_| CoreReconcileError)?;
@@ -801,7 +779,7 @@ impl ResourceReconciler for CoreResourceReconciler {
                     deleting_resource.generation(),
                 ));
             };
-            let Some(desired) = finalizer_removal_payload(deleting_resource, finalizer)? else {
+            if !resource_has_finalizer(deleting_resource, finalizer)? {
                 return Ok(ReconcileResult::converged(
                     deleting_resource.revision(),
                     deleting_resource.generation(),
@@ -812,7 +790,7 @@ impl ResourceReconciler for CoreResourceReconciler {
                 Some(deleting_resource.key().uid().clone()),
                 Some(deleting_resource.revision()),
                 MutationIntentKind::UpdateFinalizers,
-                Some(desired),
+                None,
             )
             .map_err(|_| CoreReconcileError)?;
             let batch =
@@ -910,8 +888,8 @@ mod tests {
     };
     use d2b_controller_toolkit::{
         ControllerExecutionPolicy, ControllerIdentity, ControllerSelector, ControllerVerb,
-        ProjectionDisposition, ResourceRegistration, ResyncPolicy, Runner, RunnerConfig,
-        SelectorField, TriggerReason,
+        InitialResource, ProjectionDisposition, ResourceRegistration, ResyncPolicy, Runner,
+        RunnerConfig, SelectorField, TriggerReason,
     };
 
     use super::*;
@@ -924,6 +902,7 @@ mod tests {
         snapshots: Mutex<BTreeMap<ResourceKey, FreshSnapshot>>,
         starting: Mutex<BTreeSet<(ResourceKey, ZoneRevision)>>,
         commits: Mutex<BTreeSet<(ResourceKey, ZoneRevision)>>,
+        committed_results: Mutex<Vec<ReconcileResult>>,
         checkpoints: Mutex<BTreeSet<(ResourceKey, ZoneRevision)>>,
         checkpoint_calls: AtomicUsize,
         checkpoint_notify: tokio::sync::Notify,
@@ -937,6 +916,7 @@ mod tests {
                 snapshots: Mutex::new(snapshots),
                 starting: Mutex::new(BTreeSet::new()),
                 commits: Mutex::new(BTreeSet::new()),
+                committed_results: Mutex::new(Vec::new()),
                 checkpoints: Mutex::new(BTreeSet::new()),
                 checkpoint_calls: AtomicUsize::new(0),
                 checkpoint_notify: tokio::sync::Notify::new(),
@@ -956,6 +936,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .len()
+        }
+
+        fn committed_results(&self) -> Vec<ReconcileResult> {
+            self.committed_results
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
 
         fn checkpoint_count(&self) -> usize {
@@ -1045,12 +1032,16 @@ mod tests {
         fn commit_result(
             &self,
             context: &ReconcileContext,
-            _result: &ReconcileResult,
+            result: &ReconcileResult,
         ) -> impl Future<Output = Result<CommitOutcome, SourceError>> + Send {
             self.commits
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert((context.target().clone(), context.revision()));
+            self.committed_results
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(result.clone());
             std::future::ready(Ok(CommitOutcome::Committed(context.revision())))
         }
 
@@ -1471,13 +1462,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn core_finalizer_removal_keeps_foreign_finalizers_for_every_owner() {
-        let key = key("deleting", 7);
-        for registration in CORE_RESOURCE_CONTROLLER_REGISTRATIONS {
+    #[tokio::test]
+    async fn core_finalize_removes_one_exact_finalizer_for_every_owner() {
+        let identity = descriptor(8).identity().clone();
+        let descriptors =
+            core_controller_descriptors(identity).expect("fixed Core descriptors are valid");
+        let mut finalizer_count = 0;
+        for (index, (registration, descriptor)) in descriptors.into_iter().enumerate() {
             let Some(finalizer) = registration.finalizer() else {
                 continue;
             };
+            finalizer_count += 1;
+            assert_eq!(descriptor.finalizers(), &[finalizer.to_owned()]);
+            let key = ResourceKey::new(
+                ZoneId::parse("work").unwrap(),
+                ResourceRef::parse(&format!("{}/deleting-{index}", registration.resource_type()))
+                    .unwrap(),
+                ResourceUid::parse(format!(
+                    "123e4567-e89b-42d3-a456-{index:012}"
+                ))
+                .unwrap(),
+            );
             let resource = ResourceSnapshot::new(
                 key.clone(),
                 ZoneRevision::new(4),
@@ -1485,45 +1490,134 @@ mod tests {
                 serde_json::to_vec(&serde_json::json!({
                     "metadata": {
                         "finalizers": [finalizer, "foreign.finalizer"]
-                    }
+                    },
+                    "status": {}
                 }))
                 .unwrap(),
                 true,
             );
-            let payload = finalizer_removal_payload(&resource, finalizer)
-                .unwrap()
-                .expect("owned finalizer is present");
-            let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-            let finalizers = value
-                .pointer("/metadata/finalizers")
-                .and_then(serde_json::Value::as_array)
-                .unwrap();
-            assert_eq!(
-                finalizers,
-                &[serde_json::Value::String("foreign.finalizer".to_owned())]
+            let api = TestRegisteredApi::new(
+                InitialList {
+                    resources: vec![InitialResource::new(key.clone(), resource.revision())],
+                    snapshot_revision: resource.revision(),
+                },
+                BTreeMap::from([(
+                    key,
+                    FreshSnapshot::Present {
+                        target: resource,
+                        dependencies: Vec::new(),
+                    },
+                )]),
+            );
+            let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
+            let task = tokio::spawn(
+                Runner::new(
+                    CoreResourceReconciler::for_handler(descriptor, registration.handler()),
+                    Arc::clone(&source),
+                    RunnerConfig {
+                        policy_revision: 1,
+                        api_revision: 1,
+                        configuration_revision: ConfigurationGeneration::new(1).unwrap(),
+                        deadline_tick: 5_000,
+                        max_attempts: 1,
+                    },
+                )
+                .run(),
+            );
+            api.wait_for_checkpoint_calls(1).await;
+            source.close_watch().unwrap();
+            let report = task.await.unwrap().unwrap();
+            assert_eq!(report.checkpointed, 1);
+            let result = api
+                .committed_results()
+                .into_iter()
+                .next()
+                .expect("finalizer removal was committed");
+            let mutation = result
+                .mutation_batch()
+                .expect("present Core finalizer requires one mutation")
+                .mutations()
+                .first()
+                .expect("finalizer mutation is present");
+            assert_eq!(mutation.kind(), MutationIntentKind::UpdateFinalizers);
+            assert!(
+                mutation.canonical_resource().is_none(),
+                "finalizer removal must use the typed delta path"
             );
         }
+        assert_eq!(finalizer_count, 7);
     }
 
-    #[test]
-    fn absent_or_empty_core_finalizer_is_already_cleared() {
-        let key = key("already-cleared", 8);
-        for finalizers in [Vec::<&str>::new(), vec!["foreign.finalizer"]] {
+    #[tokio::test]
+    async fn absent_or_empty_core_finalizer_is_already_cleared() {
+        let identity = descriptor(8).identity().clone();
+        let (registration, descriptor) = core_controller_descriptors(identity)
+            .unwrap()
+            .into_iter()
+            .find(|(registration, _)| registration.finalizer().is_some())
+            .unwrap();
+        for (index, finalizers) in [Vec::<&str>::new(), vec!["foreign.finalizer"]]
+            .into_iter()
+            .enumerate()
+        {
+            let key = ResourceKey::new(
+                ZoneId::parse("work").unwrap(),
+                ResourceRef::parse(&format!(
+                    "{}/already-cleared-{index}",
+                    registration.resource_type()
+                ))
+                .unwrap(),
+                ResourceUid::parse(format!(
+                    "123e4567-e89b-42d3-a456-{:012}",
+                    index + 100
+                ))
+                .unwrap(),
+            );
             let resource = ResourceSnapshot::new(
                 key.clone(),
                 ZoneRevision::new(4),
                 ResourceGeneration::new(2).unwrap(),
                 serde_json::to_vec(&serde_json::json!({
-                    "metadata": {"finalizers": finalizers}
+                    "metadata": {"finalizers": finalizers},
+                    "status": {}
                 }))
                 .unwrap(),
                 true,
             );
-            assert!(
-                finalizer_removal_payload(&resource, "core.finalizer")
-                    .unwrap()
-                    .is_none()
+            let api = TestRegisteredApi::new(
+                InitialList {
+                    resources: vec![InitialResource::new(key.clone(), resource.revision())],
+                    snapshot_revision: resource.revision(),
+                },
+                BTreeMap::from([(
+                    key,
+                    FreshSnapshot::Present {
+                        target: resource,
+                        dependencies: Vec::new(),
+                    },
+                )]),
             );
+            let source = CoreControllerSource::new(descriptor.clone(), api);
+            let task = tokio::spawn(
+                Runner::new(
+                    CoreResourceReconciler::for_handler(descriptor.clone(), registration.handler()),
+                    Arc::clone(&source),
+                    RunnerConfig {
+                        policy_revision: 1,
+                        api_revision: 1,
+                        configuration_revision: ConfigurationGeneration::new(1).unwrap(),
+                        deadline_tick: 5_000,
+                        max_attempts: 1,
+                    },
+                )
+                .run(),
+            );
+            source.close_watch().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
         }
     }
 
