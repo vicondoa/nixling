@@ -12,3 +12,6 @@
   shared Runner finalizer is removed.
 - Make child readiness and cleanup durable across Resource API passes, with
   Core-issued GPU authority and identity fences instead of synthetic grants.
+- Persist the four rendered Network config files through the owned Volume
+  projection, with exact byte, provenance, owner, mode, assignment, and marker
+  fencing.

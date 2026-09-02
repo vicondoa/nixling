@@ -63,7 +63,9 @@ use d2b_contracts_resource::v3::{
     CanonicalJsonValue, ControllerGeneration, DesiredLifecycle,
     PlacementTargetKind, ResourceBundleGenerationId, ResourceEnvelope, ResourceGeneration,
     ResourceName, ResourcePhase, ResourceRef, ResourceTypeName, ResourceUid, ZoneId, ZoneRevision,
+    network::NetworkProvenance,
     process::ProcessSpec,
+    volume::{EntryType, VolumeSpec},
 };
 use d2b_contracts_resource::v3::{
     guest::GuestSpec,
@@ -990,6 +992,41 @@ impl DaemonSharedProviderEffects {
             .map_err(|_| SharedProviderEffectError::Unavailable)
     }
 
+    async fn network_assignment(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<ResourceAssignmentFence, SharedProviderEffectError> {
+        let assignment = runtime
+            .store
+            .assignment_fence(self.zone.clone(), resource.key().resource_ref().clone())
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let session_generation = runtime
+            .core_controller_subject
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .as_ref()
+            .map(|subject| subject.reconnect_generation())
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let host_ref = ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        if assignment.epoch == 0
+            || assignment.resource_uid != *resource.key().uid()
+            || assignment.provider_generation != context.identity.provider_generation()
+            || assignment.controller_generation != context.identity.controller_generation()
+            || assignment.controller_role != *context.identity.controller_ref()
+            || assignment.target != host_ref
+            || assignment.session_generation != session_generation
+            || !matches!(assignment.scope, ResourceAssignmentScope::Primary)
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        Ok(assignment)
+    }
+
     fn gpu_digest(
         domain: &str,
         context: &SharedProviderEffectContext,
@@ -1349,12 +1386,24 @@ fn tpm_state_intent(
     )
 }
 
+#[derive(Clone)]
+struct SharedRunnerNetworkContentFence {
+    owner_ref: ResourceRef,
+    provenance: NetworkProvenance,
+    assignment: ResourceAssignmentFence,
+    controller_ref: ResourceRef,
+    controller_generation: ControllerGeneration,
+    provider_generation: ResourceGeneration,
+    session_generation: ReconnectGeneration,
+}
+
 struct SharedRunnerNetworkResources {
     runtime: Arc<ZoneResourceRuntime>,
     owner_ref: ResourceRef,
     guest_ref: ResourceRef,
     volume_ref: ResourceRef,
     agent_ref: ResourceRef,
+    content_fence: Option<SharedRunnerNetworkContentFence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1378,7 +1427,13 @@ impl SharedRunnerNetworkResources {
                 .expect("Network config Volume ref is valid"),
             agent_ref: ResourceRef::parse(&format!("Process/{agent_name}"))
                 .expect("derived Network agent ref is valid"),
+            content_fence: None,
         }
+    }
+
+    fn with_content_fence(mut self, fence: SharedRunnerNetworkContentFence) -> Self {
+        self.content_fence = Some(fence);
+        self
     }
 
     fn client(
@@ -1472,6 +1527,7 @@ impl SharedRunnerNetworkResources {
             value.pointer("/metadata/ownerRef").and_then(Value::as_str)
                 == Some(self.owner_ref.to_canonical_string().as_str())
                 && value.pointer("/status/phase").and_then(Value::as_str) == Some("Ready")
+                && network_config_content_projection_ready(value)
         });
         let guest_ready = guest.as_ref().is_some_and(|value| {
             value.pointer("/metadata/ownerRef").and_then(Value::as_str)
@@ -1506,6 +1562,14 @@ impl NetworkResourcePort for SharedRunnerNetworkResources {
         spec: &d2b_contracts_resource::v3::volume::VolumeSpec,
     ) -> Result<(), NetworkEffectError> {
         let mut value = serde_json::to_value(spec).map_err(|_| NetworkEffectError::ConfigVolume)?;
+        if let Some(current) = self.current(&self.volume_ref).await?
+            && let Some(provider) = current.pointer("/spec/provider")
+        {
+            value
+                .as_object_mut()
+                .ok_or(NetworkEffectError::ConfigVolume)?
+                .insert("provider".to_owned(), provider.clone());
+        }
         value
             .as_object_mut()
             .ok_or(NetworkEffectError::ConfigVolume)?
@@ -1523,12 +1587,52 @@ impl NetworkResourcePort for SharedRunnerNetworkResources {
 
     async fn write_volume_content(
         &self,
-        _content: &d2b_provider_network_local::controller::NetworkConfigContent,
+        content: &d2b_provider_network_local::controller::NetworkConfigContent,
     ) -> Result<(), NetworkEffectError> {
-        self.current(&self.volume_ref)
+        let fence = self
+            .content_fence
+            .as_ref()
+            .ok_or(NetworkEffectError::NetworkAdmissionMismatch)?;
+        if fence.owner_ref != self.owner_ref
+            || content.provenance() != Some(&fence.provenance)
+        {
+            return Err(NetworkEffectError::NetworkAdmissionMismatch);
+        }
+        let current = self
+            .current(&self.volume_ref)
             .await?
-            .map(|_| ())
-            .ok_or(NetworkEffectError::ConfigVolume)
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        if current.pointer("/metadata/ownerRef").and_then(Value::as_str)
+            != Some(self.owner_ref.to_canonical_string().as_str())
+            || current.pointer("/metadata/zone").and_then(Value::as_str)
+                != Some(self.runtime.zone.as_str())
+            || current.pointer("/spec/providerRef").and_then(Value::as_str)
+                != Some("Provider/volume-local")
+        {
+            return Err(NetworkEffectError::NetworkAdmissionMismatch);
+        }
+        let mut spec = current
+            .get("spec")
+            .cloned()
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        validate_network_config_volume_spec(&spec)?;
+        let assignment = self
+            .runtime
+            .store
+            .assignment_fence(self.runtime.zone.clone(), self.owner_ref.clone())
+            .await
+            .map_err(|_| NetworkEffectError::NetworkAdmissionMismatch)?
+            .ok_or(NetworkEffectError::NetworkAdmissionMismatch)?;
+        if !network_assignment_matches(&assignment, fence) {
+            return Err(NetworkEffectError::NetworkAdmissionMismatch);
+        }
+        spec = network_config_spec_with_content(spec, content, fence, &self.owner_ref)?;
+        self.upsert(
+            &self.volume_ref,
+            spec,
+            "shared-network-volume-content-write",
+        )
+        .await
     }
 
     async fn upsert_guest(
@@ -1637,6 +1741,238 @@ impl NetworkResourcePort for SharedRunnerNetworkResources {
         self.delete(&self.volume_ref, "shared-network-volume-delete")
             .await
     }
+}
+
+const NETWORK_CONFIG_VOLUME_SCHEMA_ID: &str = "volume-local.d2bus.org/Volume/spec";
+const NETWORK_CONFIG_VOLUME_SCHEMA_VERSION: &str = "1.0";
+const NETWORK_CONFIG_CONTENT_KIND: &str = "network-config";
+const NETWORK_CONFIG_FILE_OWNER: &str = "User/net-local-controller";
+const NETWORK_CONFIG_FILE_MODE: &str = "0640";
+
+fn validate_network_config_volume_spec(spec: &Value) -> Result<(), NetworkEffectError> {
+    let provider_ref = spec
+        .get("providerRef")
+        .and_then(Value::as_str)
+        .ok_or(NetworkEffectError::ConfigVolume)?;
+    if provider_ref != "Provider/volume-local" {
+        return Err(NetworkEffectError::NetworkAdmissionMismatch);
+    }
+    let mut base = spec.clone();
+    if let Some(base) = base.as_object_mut() {
+        base.remove("providerRef");
+        base.remove("updatePolicy");
+        base.remove("provider");
+    }
+    let volume: VolumeSpec =
+        serde_json::from_value(base).map_err(|_| NetworkEffectError::ConfigVolume)?;
+    let required = [
+        "dnsmasq.conf",
+        "nftables.rules",
+        "routing.conf",
+        "attachments.json",
+    ];
+    if !required.iter().all(|path| {
+        volume.layout().iter().any(|entry| {
+            entry.path() == *path
+                && entry.entry_type() == EntryType::File
+                && entry.owner_ref().to_canonical_string() == NETWORK_CONFIG_FILE_OWNER
+                && entry.group_ref().to_canonical_string() == NETWORK_CONFIG_FILE_OWNER
+                && entry.mode() == NETWORK_CONFIG_FILE_MODE
+        })
+    }) {
+        return Err(NetworkEffectError::ConfigVolume);
+    }
+    Ok(())
+}
+
+fn network_config_content_projection_ready(value: &Value) -> bool {
+    let Some(provider) = value.pointer("/spec/provider") else {
+        return false;
+    };
+    let Some(spec) = value.get("spec") else {
+        return false;
+    };
+    if validate_network_config_volume_spec(spec).is_err() {
+        return false;
+    }
+    if provider.get("schemaId").and_then(Value::as_str)
+        != Some(NETWORK_CONFIG_VOLUME_SCHEMA_ID)
+        || provider.get("schemaVersion").and_then(Value::as_str)
+            != Some(NETWORK_CONFIG_VOLUME_SCHEMA_VERSION)
+        || provider
+            .pointer("/settings/kind")
+            .and_then(Value::as_str)
+            != Some(NETWORK_CONFIG_CONTENT_KIND)
+        || provider
+            .pointer("/settings/ownershipMarker")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || provider
+            .pointer("/settings/networkRef")
+            .and_then(Value::as_str)
+            .is_none()
+        || provider
+            .pointer("/settings/fileOwner")
+            .and_then(Value::as_str)
+            != Some(NETWORK_CONFIG_FILE_OWNER)
+        || provider
+            .pointer("/settings/fileGroup")
+            .and_then(Value::as_str)
+            != Some(NETWORK_CONFIG_FILE_OWNER)
+        || provider
+            .pointer("/settings/fileMode")
+            .and_then(Value::as_str)
+            != Some(NETWORK_CONFIG_FILE_MODE)
+    {
+        return false;
+    }
+    [
+        "dnsmasq.conf",
+        "nftables.rules",
+        "routing.conf",
+        "attachments.json",
+    ]
+    .iter()
+    .all(|path| {
+        provider
+            .pointer(&format!("/settings/files/{path}"))
+            .and_then(Value::as_array)
+            .is_some_and(|bytes| !bytes.is_empty())
+    })
+}
+
+fn network_config_provider_matches(
+    provider: &Value,
+    owner_ref: &ResourceRef,
+    marker: &str,
+) -> bool {
+    provider.get("schemaId").and_then(Value::as_str)
+        == Some(NETWORK_CONFIG_VOLUME_SCHEMA_ID)
+        && provider.get("schemaVersion").and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_VOLUME_SCHEMA_VERSION)
+        && provider
+            .pointer("/settings/kind")
+            .and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_CONTENT_KIND)
+        && provider
+            .pointer("/settings/ownershipMarker")
+            .and_then(Value::as_str)
+            == Some(marker)
+        && provider
+            .pointer("/settings/networkRef")
+            .and_then(Value::as_str)
+            == Some(owner_ref.to_canonical_string().as_str())
+        && provider
+            .pointer("/settings/fileOwner")
+            .and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_FILE_OWNER)
+        && provider
+            .pointer("/settings/fileGroup")
+            .and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_FILE_OWNER)
+        && provider
+            .pointer("/settings/fileMode")
+            .and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_FILE_MODE)
+}
+
+fn network_config_spec_with_content(
+    mut spec: Value,
+    content: &d2b_provider_network_local::controller::NetworkConfigContent,
+    fence: &SharedRunnerNetworkContentFence,
+    owner_ref: &ResourceRef,
+) -> Result<Value, NetworkEffectError> {
+    validate_network_config_volume_spec(&spec)?;
+    let marker = d2b_contracts_resource::v3::derive_network_ownership_marker(
+        &fence.provenance,
+        "network-config",
+    );
+    if spec
+        .get("provider")
+        .is_some_and(|provider| !network_config_provider_matches(provider, owner_ref, &marker))
+    {
+        return Err(NetworkEffectError::NetworkAdmissionMismatch);
+    }
+    let provider = network_config_provider_extension(content, owner_ref, fence, &marker)?;
+    spec.as_object_mut()
+        .ok_or(NetworkEffectError::ConfigVolume)?
+        .insert("provider".to_owned(), provider);
+    Ok(spec)
+}
+
+fn network_assignment_matches(
+    actual: &ResourceAssignmentFence,
+    expected: &SharedRunnerNetworkContentFence,
+) -> bool {
+    actual.resource_uid == expected.assignment.resource_uid
+        && actual.resource_revision == expected.assignment.resource_revision
+        && actual.provider_generation == expected.provider_generation
+        && actual.controller_generation == expected.controller_generation
+        && actual.controller_role == expected.controller_ref
+        && actual.target
+            == ResourceRef::parse(CORE_CONTROLLER_HOST_REF).expect("Host ref")
+        && actual.session_generation == expected.session_generation
+        && actual.epoch == expected.assignment.epoch
+        && matches!(actual.scope, ResourceAssignmentScope::Primary)
+}
+
+fn network_config_provider_extension(
+    content: &d2b_provider_network_local::controller::NetworkConfigContent,
+    owner_ref: &ResourceRef,
+    fence: &SharedRunnerNetworkContentFence,
+    marker: &str,
+) -> Result<Value, NetworkEffectError> {
+    let files = serde_json::json!({
+        "dnsmasq.conf": content.dnsmasq,
+        "nftables.rules": content.nftables,
+        "routing.conf": content.routing,
+        "attachments.json": content.attachments,
+    });
+    let total_bytes = [&content.dnsmasq, &content.nftables, &content.routing, &content.attachments]
+        .into_iter()
+        .map(Vec::len)
+        .sum::<usize>();
+    if total_bytes == 0
+        || total_bytes > d2b_provider_network_local::controller::CONFIG_VOLUME_MAX_BYTES as usize
+    {
+        return Err(NetworkEffectError::ConfigVolume);
+    }
+    Ok(serde_json::json!({
+        "schemaId": NETWORK_CONFIG_VOLUME_SCHEMA_ID,
+        "schemaVersion": NETWORK_CONFIG_VOLUME_SCHEMA_VERSION,
+        "settings": {
+            "kind": NETWORK_CONFIG_CONTENT_KIND,
+            "networkRef": owner_ref,
+            "ownershipMarker": marker,
+            "fileOwner": NETWORK_CONFIG_FILE_OWNER,
+            "fileGroup": NETWORK_CONFIG_FILE_OWNER,
+            "fileMode": NETWORK_CONFIG_FILE_MODE,
+            "contentDigest": format!("sha256:{}", hex_digest(&content.digest())),
+            "provenance": fence.provenance,
+            "assignmentFence": {
+                "resourceUid": fence.assignment.resource_uid,
+                "resourceRevision": fence.assignment.resource_revision,
+                "providerGeneration": fence.assignment.provider_generation,
+                "controllerGeneration": fence.assignment.controller_generation,
+                "controllerRole": fence.assignment.controller_role,
+                "target": fence.assignment.target,
+                "sessionGeneration": fence.assignment.session_generation,
+                "epoch": fence.assignment.epoch,
+                "scope": "primary",
+            },
+            "files": files,
+        },
+    }))
+}
+
+fn hex_digest(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 async fn upsert_shared_provider_child(
@@ -2291,15 +2627,6 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         let resolver = crate::load_bundle_resolver(&self.state)
             .map_err(|_| SharedProviderEffectError::Unavailable)?;
         let runtime = self.runtime()?;
-        let children = SharedRunnerNetworkResources::new(
-            Arc::clone(&runtime),
-            resource.key().resource_ref().clone(),
-            resource.key().uid(),
-        );
-        let readiness = children
-            .readiness()
-            .await
-            .map_err(|_| SharedProviderEffectError::Unavailable)?;
         let generation = resource.generation();
         let admission = self
             .network_admission(
@@ -2311,6 +2638,38 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             &context.operation_id,
         )
         .await?;
+        let provenance = NetworkProvenance::new(
+        admission.key().zone_uid().clone(),
+        admission.key().network_uid().clone(),
+        admission.key().network_generation(),
+        admission.key().attachment_generation(),
+        admission.key().bundle_generation().clone(),
+        );
+        let assignment = self.network_assignment(&runtime, context, resource).await?;
+        let children = SharedRunnerNetworkResources::new(
+        Arc::clone(&runtime),
+        resource.key().resource_ref().clone(),
+        resource.key().uid(),
+        )
+        .with_content_fence(SharedRunnerNetworkContentFence {
+        owner_ref: resource.key().resource_ref().clone(),
+        provenance,
+        assignment,
+        controller_ref: context.identity.controller_ref().clone(),
+        controller_generation: context.identity.controller_generation(),
+        provider_generation: context.identity.provider_generation(),
+        session_generation: runtime
+            .core_controller_subject
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .as_ref()
+            .map(|subject| subject.reconnect_generation())
+            .ok_or(SharedProviderEffectError::Unavailable)?,
+        });
+        let readiness = children
+        .readiness()
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
         let broker_context = crate::resolve_network_effect_context(
             &value,
             &resolver,
@@ -16646,6 +17005,100 @@ mod tests {
             .expect("U12 runner stop");
         assert!(runtime.u12_runner_tasks.lock().unwrap().is_empty());
         runtime.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn daemon_shared_provider_effects_network_content_path_round_trips_and_preserves_foreign_marker()
+    {
+        let zone_uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let network_uid = ResourceUid::parse("223e4567-e89b-42d3-a456-426614174000").unwrap();
+        let owner_ref = ResourceRef::parse("Network/work").unwrap();
+        let bundle_generation = ResourceBundleGenerationId::parse(
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let provenance = NetworkProvenance::new(
+            zone_uid,
+            network_uid.clone(),
+            ResourceGeneration::new(2).unwrap(),
+            ResourceGeneration::new(3).unwrap(),
+            bundle_generation,
+        );
+        let network_spec = d2b_contracts_resource::v3::network::NetworkSpec::minimal(
+            d2b_contracts_resource::v3::network::Ipv4Cidr::parse("10.20.0.0/24").unwrap(),
+            d2b_contracts_resource::v3::network::Ipv4Cidr::parse("192.0.2.0/30").unwrap(),
+            d2b_contracts_resource::v3::execution_policy::BoundedToken::parse("net-vm-base")
+                .unwrap(),
+        )
+        .unwrap();
+        let content = d2b_provider_network_local::controller::render_config_with_provenance(
+            &network_spec,
+            &provenance,
+        )
+        .unwrap();
+        let assignment = ResourceAssignmentFence {
+            resource_uid: network_uid,
+            resource_revision: ZoneRevision::new(4),
+            provider_generation: ResourceGeneration::new(7).unwrap(),
+            controller_generation: ControllerGeneration::new(3).unwrap(),
+            controller_role: ResourceRef::parse("Process/network-local-controller").unwrap(),
+            target: ResourceRef::parse(CORE_CONTROLLER_HOST_REF).unwrap(),
+            session_generation: ReconnectGeneration::new(5).unwrap(),
+            epoch: 9,
+            scope: ResourceAssignmentScope::Primary,
+        };
+        let fence = SharedRunnerNetworkContentFence {
+            owner_ref: owner_ref.clone(),
+            provenance,
+            assignment,
+            controller_ref: ResourceRef::parse("Process/network-local-controller").unwrap(),
+            controller_generation: ControllerGeneration::new(3).unwrap(),
+            provider_generation: ResourceGeneration::new(7).unwrap(),
+            session_generation: ReconnectGeneration::new(5).unwrap(),
+        };
+        let mut spec = serde_json::to_value(
+            d2b_provider_network_local::controller::config_volume_spec("host-system", None)
+                .unwrap(),
+        )
+        .unwrap();
+        spec.as_object_mut()
+            .unwrap()
+            .insert("providerRef".to_owned(), Value::String("Provider/volume-local".to_owned()));
+        let projected =
+            network_config_spec_with_content(spec, &content, &fence, &owner_ref).unwrap();
+        let envelope = json!({ "spec": projected });
+        assert!(network_config_content_projection_ready(&envelope));
+        for (path, bytes) in [
+            ("dnsmasq.conf", &content.dnsmasq),
+            ("nftables.rules", &content.nftables),
+            ("routing.conf", &content.routing),
+            ("attachments.json", &content.attachments),
+        ] {
+            assert_eq!(
+                envelope
+                    .pointer(&format!("/spec/provider/settings/files/{path}"))
+                    .unwrap(),
+                &serde_json::to_value(bytes).unwrap()
+            );
+        }
+        let mut foreign = envelope["spec"].clone();
+        foreign["provider"]["settings"]["ownershipMarker"] =
+            Value::String("foreign-marker".to_owned());
+        let before = serde_json::to_vec(&foreign).unwrap();
+        let marker = d2b_contracts_resource::v3::derive_network_ownership_marker(
+            &fence.provenance,
+            "network-config",
+        );
+        assert!(!network_config_provider_matches(
+            &foreign["provider"],
+            &owner_ref,
+            &marker
+        ));
+        assert_eq!(
+            network_config_spec_with_content(foreign.clone(), &content, &fence, &owner_ref),
+            Err(NetworkEffectError::NetworkAdmissionMismatch)
+        );
+        assert_eq!(serde_json::to_vec(&foreign).unwrap(), before);
     }
 
     #[test]
