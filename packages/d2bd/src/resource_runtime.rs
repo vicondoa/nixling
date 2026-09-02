@@ -2127,6 +2127,8 @@ pub struct ZoneResourceRuntime {
     core_controller_subject: Mutex<Option<AuthenticatedSubjectContext>>,
     core_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     core_runner_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    core_runner_events: Arc<Mutex<Vec<&'static str>>>,
     core: Mutex<CoreProcess>,
     readiness: ZoneRuntimeReadiness,
     policy_installed: bool,
@@ -2888,6 +2890,8 @@ impl ZoneResourceRuntime {
             core_controller_subject: Mutex::new(core_controller_subject),
             core_runner_tasks: Mutex::new(Vec::new()),
             core_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            core_runner_events: Arc::new(Mutex::new(Vec::new())),
             core: Mutex::new(core),
             readiness: ZoneRuntimeReadiness {
                 store_ready: true,
@@ -4084,6 +4088,11 @@ impl ZoneResourceRuntime {
     }
 
     async fn stop_core_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        #[cfg(test)]
+        self.core_runner_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push("stop-enter");
         let tasks = {
             let mut tasks = self
                 .core_runner_tasks
@@ -4095,12 +4104,28 @@ impl ZoneResourceRuntime {
             task.abort();
             let _ = task.await;
         }
+        #[cfg(test)]
+        self.core_runner_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push("stop-exit");
         Ok(())
     }
 
     async fn start_core_controller_runners(&self) -> Result<(), ResourceRuntimeError> {
         let _runner_guard = self.core_runner_lock.lock().await;
-        self.start_core_controller_runners_locked(false).await
+        #[cfg(test)]
+        self.core_runner_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push("start-enter");
+        let result = self.start_core_controller_runners_locked(false).await;
+        #[cfg(test)]
+        self.core_runner_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push("start-exit");
+        result
     }
 
     async fn start_core_controller_runners_locked(
@@ -4172,6 +4197,7 @@ impl ZoneResourceRuntime {
                 .authorizer
                 .issue_authenticated_subject(subject_context.clone(), authorization_state.clone())
                 .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+            let registered_resource_type = registration.resource_type().to_owned();
             let resource_assignments = assignments
                 .iter()
                 .filter(|(target, _)| {
@@ -4186,20 +4212,38 @@ impl ZoneResourceRuntime {
                 let store = Arc::clone(&resolver_store);
                 let zone = resolver_zone.clone();
                 let authority = Arc::clone(&resolver_authority);
+                let resource_type = registered_resource_type.clone();
                 Box::pin(async move {
-                    let stored = store
-                        .assignment_fence(zone.clone(), target)
+                    if target.resource_type().as_str() != resource_type {
+                        return Err(SourceError::Integrity);
+                    }
+                    if let Some(stored) = store
+                        .assignment_fence(zone, target.clone())
                         .await
                         .map_err(|error| match error.kind() {
                             StoreErrorKind::Backpressure
-                            | StoreErrorKind::StoreBackpressure => {
-                                SourceError::Backpressure
-                            }
+                            | StoreErrorKind::StoreBackpressure => SourceError::Backpressure,
                             StoreErrorKind::Timeout => SourceError::Timeout,
                             _ => SourceError::Unavailable,
-                        })?;
-                    if stored.is_some_and(|fence| fence.resource_uid != uid) {
-                        return Err(SourceError::Integrity);
+                        })?
+                    {
+                        if stored.resource_uid != uid
+                            || stored.epoch > authority.epoch
+                            || (stored.epoch == authority.epoch
+                                && (stored.provider_generation != authority.provider_generation
+                                    || stored.controller_generation
+                                        != authority.controller_generation
+                                    || stored.controller_role != authority.controller_role
+                                    || stored.target != authority.target
+                                    || stored.session_generation != authority.session_generation))
+                        {
+                            return Err(SourceError::Integrity);
+                        }
+                        if stored.epoch == authority.epoch
+                            && stored.resource_revision != revision
+                        {
+                            return Err(SourceError::Conflict(stored.resource_revision));
+                        }
                     }
                     Ok(ResourceAssignmentFence {
                         resource_uid: uid,
@@ -11320,6 +11364,56 @@ mod tests {
             })
             .unwrap()
             .state
+    }
+
+    #[tokio::test]
+    async fn core_runner_start_rotation_is_serialized() {
+        let fixture = PublicationStoreFixture::new().await;
+        let bundle = publication_bundle(&fixture.zone, fixture.identity.zone_uid(), "rotation");
+        let mut runtime = fixture.open(&bundle).await;
+        runtime.readiness.resource_api_ready = false;
+        runtime
+            .core_runner_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            }));
+        {
+            let _runner_guard = runtime.core_runner_lock.lock().await;
+            runtime.stop_core_controller_runners_locked().await.unwrap();
+        }
+        assert!(
+            runtime
+                .core_runner_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
+
+        let first = runtime.start_core_controller_runners();
+        let second = runtime.start_core_controller_runners();
+        let (first, second) = tokio::join!(first, second);
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(
+            runtime
+                .core_runner_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            [
+                "stop-enter",
+                "stop-exit",
+                "start-enter",
+                "start-exit",
+                "start-enter",
+                "start-exit"
+            ]
+        );
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
