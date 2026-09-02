@@ -6,10 +6,12 @@
 //! already composed Provider supervisors.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
-    pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,23 +21,36 @@ use d2b_contracts_resource::v3::{
     ResourceRef, ResourceTypeName, ResourceUid, SchemaFingerprint, ZoneId, ZoneRevision,
     process::{EphemeralProcessSpec, ProcessSpec, RestartClass},
 };
+use d2b_core_controller::{
+    ChangeField as SelectorField, ChangeRecord, CommitOutcome, ControllerDescriptor,
+    ControllerExecutionPolicy, ControllerIdentity, ControllerVerb, CoreTriggerReason,
+    DependencySnapshot, DrainResult, FinalizeResult, FreshSnapshot, InitialList, InitialResource,
+    MutationIntentKind,
+    ObservationResult, OperationContext, ProcessSchedulingClass, ReconcileContext,
+    ReconcileDisposition, ReconcilePlan, ReconcileReason, ReconcileResult, RegisteredControllerApi,
+    ResourceKey, ResourceMutationBatch, ResourceReconciler, ResourceRegistration, ResourceSnapshot,
+    ResyncPolicy, SourceError, StatusPersistence, UpdateAssessment,
+    UpdateAssessmentState, UpgradePlan, ValidationResult, WatchFailure,
+    WatchSelector as ControllerSelector,
+};
 use d2b_process_conformance::{AdoptionCandidate, GuestExecutionBinding};
-use d2b_resource_api::watch::ResourceWatch;
 use d2b_resource_api::{
     RedbBackend, ResourceApiClient, ResourceStoreBackend,
     service::{UnavailableUpgradeDispatcher, UpgradeDispatcher},
+    watch::ResourceWatch,
 };
 use d2b_resource_store::{
     StoreErrorKind, StoreGetRequest, StoreListRequest, StoreOperationContext, StoreProjection,
     StoreWatchRequest, StoredResource,
 };
-use d2b_resource_store_redb::RedbResourceStore;
+use d2b_resource_store_redb::{ChangeEvent, RedbResourceStore, SharedChangeBatch};
 use sha2::{Digest, Sha256};
 
 use crate::process_provider_runtime::{
     GUEST_EXECUTION_UNAVAILABLE, ProcessResourceContext, ProductionProcessProviders,
-    ProviderAdoption, ProviderLiveness,
+    ProviderAdoption, ProviderLiveness, execution_target_allowed,
 };
+use d2bd_runtime::guest_resource_runtime::SessionBoundStore;
 use d2bd_runtime::target_runtime::DaemonMode;
 
 const PROCESS_TYPE: &str = "Process";
@@ -43,28 +58,13 @@ const EPHEMERAL_PROCESS_TYPE: &str = "EphemeralProcess";
 const MINIJAIL_PROVIDER: &str = "system-minijail";
 const SYSTEMD_PROVIDER: &str = "system-systemd";
 const PROCESS_RUNTIME_FINALIZER: &str = "process-runtime.d2bus.org/cleanup";
+const MINIJAIL_PROCESS_FINALIZER: &str = "process.system-minijail/cleanup";
+const SYSTEMD_PROCESS_FINALIZER: &str = "process.system-systemd/cleanup";
+#[allow(dead_code)]
 const WAYLAND_SESSION_TYPE: &str = "display-wayland.d2bus.org.WaylandSession";
+#[allow(dead_code)]
 const WAYLAND_SESSION_FINALIZER: &str = "display-wayland.d2bus.org/proxy-stopped";
 pub(crate) const PROCESS_RESTART_ANNOTATION: &str = "d2b.d2bus.org/restart-generation";
-
-pub(crate) type ProcessWatchHook =
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'static>> + Send + Sync>;
-pub(crate) type ProcessProviderIdentityHook = Arc<
-    dyn Fn(
-            BTreeSet<ResourceRef>,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            BTreeMap<ResourceRef, (ResourceUid, ResourceGeneration)>,
-                            (),
-                        >,
-                    > + Send
-                    + 'static,
-            >,
-        > + Send
-        + Sync,
->;
 
 /// Stable failures for the daemon-owned generic process path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +182,7 @@ impl DesiredRecord {
             && self.provider_assignment_generation == other.provider_assignment_generation
             && restart_annotation(&self.resource) == restart_annotation(&other.resource)
             && self.provider_ref == other.provider_ref
+            && self.owner_ref() == other.owner_ref()
             && self.process == other.process
             && self.controller_provider_uid == other.controller_provider_uid
             && self.controller_provider_generation == other.controller_provider_generation
@@ -213,11 +214,48 @@ impl DesiredRecord {
                 value,
                 CanonicalJsonValue::Array(values)
                     if values.iter().any(|value| {
-                        matches!(value, CanonicalJsonValue::String(value) if value == PROCESS_RUNTIME_FINALIZER)
+                        matches!(
+                            value,
+                            CanonicalJsonValue::String(value)
+                                if process_finalizer_names()
+                                    .iter()
+                                    .any(|expected| value == expected)
+                        )
                     })
             )
         })
     }
+}
+
+const fn process_finalizer_names() -> [&'static str; 3] {
+    [
+        PROCESS_RUNTIME_FINALIZER,
+        MINIJAIL_PROCESS_FINALIZER,
+        SYSTEMD_PROCESS_FINALIZER,
+    ]
+}
+
+fn process_finalizer(provider_ref: &ResourceRef) -> Option<&'static str> {
+    match provider_ref.name().as_str() {
+        MINIJAIL_PROVIDER => Some(MINIJAIL_PROCESS_FINALIZER),
+        SYSTEMD_PROVIDER => Some(SYSTEMD_PROCESS_FINALIZER),
+        _ => None,
+    }
+}
+
+fn active_process_finalizer(record: &DesiredRecord) -> Option<&'static str> {
+    let value = metadata_value(&record.resource, "finalizers")?;
+    let CanonicalJsonValue::Array(values) = value else {
+        return None;
+    };
+    process_finalizer(&record.provider_ref)
+        .into_iter()
+        .chain([PROCESS_RUNTIME_FINALIZER])
+        .find(|expected| {
+            values.iter().any(
+                |value| matches!(value, CanonicalJsonValue::String(value) if value == expected),
+            )
+        })
 }
 
 /// Durable generic process registry for one Zone.
@@ -244,6 +282,7 @@ pub(crate) struct ProcessResourceRuntime {
     guest_descriptor_digests: BTreeMap<ResourceRef, SchemaFingerprint>,
     owner_uids: BTreeMap<ResourceRef, ResourceUid>,
     status_client: Option<Arc<dyn ProcessResourceClient>>,
+    last_adopted: Option<bool>,
 }
 
 impl core::fmt::Debug for ProcessResourceRuntime {
@@ -313,6 +352,7 @@ impl ProcessResourceRuntime {
             guest_descriptor_digests: BTreeMap::new(),
             owner_uids: BTreeMap::new(),
             status_client: None,
+            last_adopted: None,
         }
     }
 
@@ -361,6 +401,40 @@ impl ProcessResourceRuntime {
         C: ProcessResourceClient + 'static,
     {
         self.status_client = Some(status_client);
+    }
+
+    fn without_status_client(&mut self) {
+        self.status_client = None;
+    }
+
+    fn for_pass(&self) -> Self {
+        Self {
+            zone: self.zone.clone(),
+            target: self.target.clone(),
+            providers: Arc::clone(&self.providers),
+            records: BTreeMap::new(),
+            terminal: BTreeSet::new(),
+            terminal_failed: BTreeSet::new(),
+            restart_counts: BTreeMap::new(),
+            started_at: BTreeMap::new(),
+            completed_at: BTreeMap::new(),
+            next_restart_at: BTreeMap::new(),
+            controller_generation: self.controller_generation,
+            controller_provider_identities: self.controller_provider_identities.clone(),
+            guest_execution: self.guest_execution.clone(),
+            zone_uid: self.zone_uid.clone(),
+            policy_revision: self.policy_revision,
+            target_owner_ref: self.target_owner_ref.clone(),
+            target_ref: self.target_ref.clone(),
+            guest_descriptor_digests: self.guest_descriptor_digests.clone(),
+            owner_uids: self.owner_uids.clone(),
+            status_client: self.status_client.clone(),
+            last_adopted: None,
+        }
+    }
+
+    fn last_adopted(&self) -> Option<bool> {
+        self.last_adopted
     }
 
     fn context<'a>(&self, record: &'a DesiredRecord) -> ProcessResourceContext<'a> {
@@ -450,21 +524,26 @@ impl ProcessResourceRuntime {
         let mut desired = desired.into_values().collect::<Vec<_>>();
         desired.sort_by_key(|record| {
             (
-                !record.deletion_requested(),
-                is_static_controller(record),
+                ProcessSchedulingClass::classify(
+                    record.deletion_requested(),
+                    is_static_controller(record),
+                )
+                .rank(),
                 record.key(),
             )
         });
         for mut record in desired {
             let key = record.resource.resource_ref.clone();
-            let provider_identity = if is_static_controller(&record) {
+            let provider_identity_ref = if is_static_controller(&record) {
                 record
                     .owner_ref()
                     .filter(|owner| owner.resource_type().as_str() == "Provider")
-                    .and_then(|owner| self.controller_provider_identities.get(&owner).cloned())
             } else {
-                None
+                Some(record.provider_ref.clone())
             };
+            let provider_identity = provider_identity_ref
+                .as_ref()
+                .and_then(|provider| self.controller_provider_identities.get(provider).cloned());
             record.controller_provider_uid = provider_identity.as_ref().map(|(uid, _)| uid.clone());
             record.controller_provider_generation =
                 provider_identity.map(|(_, generation)| generation);
@@ -533,13 +612,11 @@ impl ProcessResourceRuntime {
             }
 
             if record.deletion_requested() {
-                if record.is_running()
-                    && !self.providers.has_active_resource_in_zone(
-                        &self.zone,
-                        self.zone_uid.as_ref(),
-                        &key,
-                    )
-                {
+                if !self.providers.has_active_resource_in_zone(
+                    &self.zone,
+                    self.zone_uid.as_ref(),
+                    &key,
+                ) {
                     match &record.process {
                         DesiredProcess::Process(spec) => {
                             let adoption_result = self
@@ -635,12 +712,13 @@ impl ProcessResourceRuntime {
                     .await
                     .map_err(map_provider_error)?;
                 self.completed_at.insert(key.clone(), Instant::now());
+                self.terminal_failed.insert(key.clone());
                 self.terminal.insert(key.clone());
                 record = self
                     .publish_status(
                         &record,
-                        ResourcePhase::Succeeded,
-                        Some(OutcomeState::success(
+                        ResourcePhase::Failed,
+                        Some(OutcomeState::failure(
                             "runtime-deadline",
                             "ephemeral process reached its runtime deadline",
                         )),
@@ -683,6 +761,7 @@ impl ProcessResourceRuntime {
                 self.next_restart_at.remove(&key);
                 match self.start_record(&record).await {
                     Ok(adopted) => {
+                        self.last_adopted = Some(adopted);
                         self.started_at.insert(key.clone(), Instant::now());
                         record = self
                             .publish_status(
@@ -694,6 +773,9 @@ impl ProcessResourceRuntime {
                         self.records.insert(key, record);
                     }
                     Err(error) => {
+                        if self.status_client.is_none() {
+                            return Err(error);
+                        }
                         self.handle_start_failure(key, record, error).await?;
                     }
                 }
@@ -794,6 +876,7 @@ impl ProcessResourceRuntime {
                 .await?;
             match self.start_record(&record).await {
                 Ok(adopted) => {
+                    self.last_adopted = Some(adopted);
                     self.started_at.insert(key.clone(), Instant::now());
                     record = self
                         .publish_status(
@@ -805,6 +888,9 @@ impl ProcessResourceRuntime {
                     self.records.insert(key, record);
                 }
                 Err(error) => {
+                    if self.status_client.is_none() {
+                        return Err(error);
+                    }
                     self.handle_start_failure(key, record, error).await?;
                 }
             }
@@ -825,6 +911,17 @@ impl ProcessResourceRuntime {
                 if spec.adoption_policy()
                     == d2b_contracts_resource::v3::process::AdoptionPolicy::NeverAdopt =>
             {
+                if self.providers.has_active_resource_in_zone(
+                    &self.zone,
+                    self.zone_uid.as_ref(),
+                    &record.resource.resource_ref,
+                ) {
+                    self.stop_record(record).await?;
+                    self.providers
+                        .finalize_resource(self.context(record))
+                        .await
+                        .map_err(map_provider_error)?;
+                }
                 ProviderAdoption::Absent
             }
             DesiredProcess::Process(spec) => self
@@ -1022,7 +1119,9 @@ impl ProcessResourceRuntime {
         if record.has_runtime_finalizer() {
             return Ok(record.clone());
         }
-        update_finalizers(client.as_ref(), record, true).await
+        let finalizer =
+            process_finalizer(&record.provider_ref).unwrap_or(PROCESS_RUNTIME_FINALIZER);
+        update_finalizers(client.as_ref(), record, finalizer, true).await
     }
 
     async fn remove_finalizer(
@@ -1035,7 +1134,10 @@ impl ProcessResourceRuntime {
         if !record.has_runtime_finalizer() {
             return Ok(record.clone());
         }
-        update_finalizers(client.as_ref(), record, false).await
+        let finalizer = active_process_finalizer(record).unwrap_or_else(|| {
+            process_finalizer(&record.provider_ref).unwrap_or(PROCESS_RUNTIME_FINALIZER)
+        });
+        update_finalizers(client.as_ref(), record, finalizer, false).await
     }
 
     fn ephemeral_ttl_elapsed(&self, key: &ResourceRef, record: &DesiredRecord) -> bool {
@@ -1047,6 +1149,9 @@ impl ProcessResourceRuntime {
         }
         if self.terminal_failed.contains(key) && spec.incident_hold() {
             return false;
+        }
+        if ephemeral_status_ttl_elapsed(&record.resource, &record.process) {
+            return true;
         }
         let Some(completed_at) = self.completed_at.get(key) else {
             return false;
@@ -1120,6 +1225,682 @@ impl ProcessResourceRuntime {
         };
         Ok(())
     }
+}
+
+/// Build the one shared descriptor for the Process Provider family.
+pub(crate) fn process_controller_descriptor(
+    identity: ControllerIdentity,
+) -> Result<ControllerDescriptor, ProcessResourceRuntimeError> {
+    let process = ResourceTypeName::parse(PROCESS_TYPE)
+        .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+    let ephemeral = ResourceTypeName::parse(EPHEMERAL_PROCESS_TYPE)
+        .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+    let resources = vec![
+        ResourceRegistration::new(process.clone(), vec![1], 5_000, 3)
+            .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?,
+        ResourceRegistration::new(ephemeral.clone(), vec![1], 5_000, 3)
+            .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?,
+    ];
+    let selectors = [process, ephemeral]
+        .into_iter()
+        .flat_map(|resource_type| {
+            [
+                SelectorField::Spec,
+                SelectorField::Status,
+                SelectorField::Metadata,
+                SelectorField::Finalizers,
+                SelectorField::Deletion,
+            ]
+            .into_iter()
+            .map(move |field| ControllerSelector::new(resource_type.clone(), field, None))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+    let dependency_selectors = [PROCESS_TYPE, EPHEMERAL_PROCESS_TYPE]
+        .into_iter()
+        .map(|resource_type| {
+            ControllerSelector::new(
+                ResourceTypeName::parse(resource_type).expect("static Process resource type"),
+                SelectorField::Metadata,
+                None,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+    ControllerDescriptor::new(
+        identity,
+        resources,
+        vec!["process".to_owned()],
+        vec!["system".to_owned(), "user".to_owned()],
+        vec![
+            ControllerVerb::ReadSpec,
+            ControllerVerb::ReadStatus,
+            ControllerVerb::WriteStatus,
+            ControllerVerb::AddFinalizer,
+            ControllerVerb::RemoveFinalizer,
+        ],
+        selectors,
+        dependency_selectors,
+        false,
+        Vec::new(),
+        vec!["d2b.process.v3".to_owned()],
+        vec!["resources.d2bus.org/v3".to_owned()],
+        ControllerExecutionPolicy::new(
+            8,
+            8,
+            256,
+            8,
+            256,
+            ResyncPolicy::new(None, 5_000)
+                .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?,
+        )
+        .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?,
+    )
+    .map_err(|_| ProcessResourceRuntimeError::InvalidResource)
+}
+
+/// Typed Process/EphemeralProcess handler hosted by the shared Runner.
+pub(crate) struct ProcessResourceReconciler {
+    descriptor: ControllerDescriptor,
+    runtime: Arc<ProcessResourceRuntime>,
+}
+
+impl std::fmt::Debug for ProcessResourceReconciler {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProcessResourceReconciler")
+            .field("descriptor", &self.descriptor)
+            .finish()
+    }
+}
+
+impl ProcessResourceReconciler {
+    /// Bind one Process Provider family handler to the daemon's effect ports.
+    pub(crate) fn new(
+        descriptor: ControllerDescriptor,
+        runtime: ProcessResourceRuntime,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor,
+            runtime: Arc::new(runtime),
+        })
+    }
+
+    fn stored_resource(
+        &self,
+        resource: &ResourceSnapshot,
+    ) -> Result<StoredResource, ProcessResourceRuntimeError> {
+        let envelope = ResourceEnvelope::from_json(resource.canonical_json())
+            .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+        let payload_digest = envelope
+            .digest()
+            .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+        Ok(StoredResource {
+            resource_ref: resource.key().resource_ref().clone(),
+            zone: resource.key().zone().clone(),
+            uid: resource.key().uid().clone(),
+            generation: resource.generation(),
+            revision: resource.revision(),
+            canonical_json: resource.canonical_json().to_vec(),
+            payload_digest,
+        })
+    }
+
+    fn desired(
+        &self,
+        resource: &ResourceSnapshot,
+    ) -> Result<Option<(StoredResource, ResourceRef, DesiredProcess)>, ProcessResourceRuntimeError>
+    {
+        if !matches!(
+            resource.key().resource_ref().resource_type().as_str(),
+            PROCESS_TYPE | EPHEMERAL_PROCESS_TYPE
+        ) {
+            return Err(ProcessResourceRuntimeError::InvalidResource);
+        }
+        let stored = self.stored_resource(resource)?;
+        let envelope = ResourceEnvelope::from_json(resource.canonical_json())
+            .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+        let provider_ref = envelope
+            .spec()
+            .provider_ref()
+            .cloned()
+            .ok_or(ProcessResourceRuntimeError::InvalidResource)?;
+        if provider_ref.resource_type().as_str() != "Provider" {
+            return Err(ProcessResourceRuntimeError::InvalidResource);
+        }
+        if !matches!(
+            provider_ref.name().as_str(),
+            MINIJAIL_PROVIDER | SYSTEMD_PROVIDER
+        ) {
+            return Err(ProcessResourceRuntimeError::UnsupportedProvider);
+        }
+        let execution_ref = envelope
+            .spec()
+            .base()
+            .get("executionRef")
+            .and_then(|value| match value {
+                CanonicalJsonValue::String(value) => ResourceRef::parse(value).ok(),
+                _ => None,
+            })
+            .ok_or(ProcessResourceRuntimeError::InvalidResource)?;
+        let target_matches = if let Some(target) = self.runtime.target.as_ref() {
+            execution_ref == *target
+        } else {
+            execution_ref.resource_type().as_str() == "Host"
+        };
+        if !target_matches
+            || !execution_target_allowed(self.runtime.providers.mode(), &execution_ref)
+        {
+            return Ok(None);
+        }
+        let process = match resource.key().resource_ref().resource_type().as_str() {
+            PROCESS_TYPE => DesiredProcess::Process(
+                serde_json::from_slice(&envelope.spec().base().to_canonical_bytes())
+                    .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?,
+            ),
+            EPHEMERAL_PROCESS_TYPE => DesiredProcess::Ephemeral(
+                serde_json::from_slice(&envelope.spec().base().to_canonical_bytes())
+                    .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?,
+            ),
+            _ => unreachable!("resource type was checked above"),
+        };
+        Ok(Some((stored, provider_ref, process)))
+    }
+
+    fn desired_record(
+        &self,
+        resource: &ResourceSnapshot,
+    ) -> Result<Option<DesiredRecord>, ProcessResourceRuntimeError> {
+        let Some((stored, provider_ref, process)) = self.desired(resource)? else {
+            return Ok(None);
+        };
+        let provider_identity_ref = if is_static_controller_from_resource(&stored, &process) {
+            metadata_owner_ref_for_resource(&stored)
+        } else {
+            Some(provider_ref.clone())
+        };
+        let provider_identity = provider_identity_ref
+            .as_ref()
+            .and_then(|provider| self.runtime.controller_provider_identities.get(provider))
+            .cloned();
+        Ok(Some(DesiredRecord {
+            resource: stored,
+            provider_ref,
+            process,
+            zone_uid: self.runtime.zone_uid.clone(),
+            policy_revision: self.runtime.policy_revision,
+            provider_assignment_generation: self
+                .runtime
+                .guest_execution
+                .as_ref()
+                .map(GuestExecutionBinding::provider_generation),
+            controller_provider_uid: provider_identity.as_ref().map(|(uid, _)| uid.clone()),
+            controller_provider_generation: provider_identity.map(|(_, generation)| generation),
+        }))
+    }
+
+    fn no_op(&self) -> ReconcilePlan {
+        ReconcilePlan::new(Vec::new(), true).expect("empty Process plan is bounded")
+    }
+
+    fn effect_plan(&self) -> ReconcilePlan {
+        ReconcilePlan::new(vec!["process-lifecycle".to_owned()], false)
+            .expect("Process effect plan is bounded")
+    }
+
+    fn needs_effect(
+        &self,
+        stored: &StoredResource,
+        provider_ref: &ResourceRef,
+        process: &DesiredProcess,
+    ) -> bool {
+        let key = &stored.resource_ref;
+        let running = match process {
+            DesiredProcess::Process(spec) => {
+                spec.desired_lifecycle()
+                    == d2b_contracts_resource::v3::process::DesiredLifecycle::Running
+            }
+            DesiredProcess::Ephemeral(_) => true,
+        };
+        if !running {
+            return self.runtime.providers.has_active_resource_in_zone(
+                &self.runtime.zone,
+                self.runtime.zone_uid.as_ref(),
+                key,
+            );
+        }
+        let phase = status_phase(stored);
+        let observed_generation = status_observed_generation(stored);
+        let active = self.runtime.providers.has_active_resource_in_zone(
+            &self.runtime.zone,
+            self.runtime.zone_uid.as_ref(),
+            key,
+        );
+        if matches!(process, DesiredProcess::Ephemeral(_))
+            && matches!(
+                phase,
+                Some(ResourcePhase::Succeeded | ResourcePhase::Failed)
+            )
+            && !ephemeral_status_ttl_elapsed(stored, process)
+        {
+            return false;
+        }
+        !active
+            || observed_generation != Some(stored.generation)
+            || !matches!(phase, Some(ResourcePhase::Ready))
+            || active_process_finalizer_for_values(stored, provider_ref).is_none()
+    }
+}
+
+impl ResourceReconciler for ProcessResourceReconciler {
+    type Error = ProcessResourceRuntimeError;
+
+    fn classify_error(&self, error: &Self::Error) -> d2b_core_controller::HandlerFailure {
+        match error {
+            ProcessResourceRuntimeError::InvalidResource
+            | ProcessResourceRuntimeError::UnsupportedProvider => {
+                d2b_core_controller::HandlerFailure::terminal()
+            }
+            _ => d2b_core_controller::HandlerFailure::retryable(),
+        }
+    }
+
+    fn describe(&self) -> impl Future<Output = Result<ControllerDescriptor, Self::Error>> + Send {
+        std::future::ready(Ok(self.descriptor.clone()))
+    }
+
+    fn validate_spec(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ValidationResult, Self::Error>> + Send {
+        std::future::ready(
+            self.desired(resource)
+                .map(|_| ValidationResult::Valid)
+                .or_else(|_| {
+                    Ok(ValidationResult::Invalid {
+                        reason: ReconcileReason::InvalidSpec,
+                    })
+                }),
+        )
+    }
+
+    async fn plan(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<ReconcilePlan, Self::Error> {
+        let Some((stored, provider_ref, process)) = self.desired(resource)? else {
+            return Ok(self.no_op());
+        };
+        if active_process_finalizer_for_values(&stored, &provider_ref).is_none() {
+            return Ok(ReconcilePlan::new(Vec::new(), false)
+                .expect("finalizer enrollment plan is bounded"));
+        }
+        if static_controller_waits_for_workload_cleanup(resource, dependencies) {
+            return Ok(self.no_op());
+        }
+        if matches!(process, DesiredProcess::Ephemeral(_))
+            && matches!(
+                status_phase(&stored),
+                Some(ResourcePhase::Succeeded | ResourcePhase::Failed)
+            )
+            && ephemeral_status_ttl_elapsed(&stored, &process)
+        {
+            return Ok(
+                ReconcilePlan::new(Vec::new(), false).expect("ephemeral cleanup plan is bounded")
+            );
+        }
+        if !self.needs_effect(&stored, &provider_ref, &process) {
+            return Ok(self.no_op());
+        }
+        Ok(self.effect_plan())
+    }
+
+    fn reconcile(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let result = (|| {
+            let Some((stored, provider_ref, process)) = self.desired(resource)? else {
+                return Ok(ReconcileResult::converged(
+                    resource.revision(),
+                    resource.generation(),
+                ));
+            };
+            if active_process_finalizer_for_values(&stored, &provider_ref).is_none() {
+                let finalizer =
+                    process_finalizer(&provider_ref).unwrap_or(PROCESS_RUNTIME_FINALIZER);
+                let canonical = finalizer_candidate(resource.canonical_json(), finalizer, true)?;
+                let mutation = d2b_core_controller::MutationIntent::new(
+                    resource.key().resource_ref().clone(),
+                    Some(resource.key().uid().clone()),
+                    Some(resource.revision()),
+                    d2b_core_controller::MutationIntentKind::UpdateFinalizers,
+                    Some(canonical),
+                )
+                .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+                let batch = ResourceMutationBatch::new(vec![mutation])
+                    .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+                return ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    Some(batch),
+                    None,
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    StatusPersistence::NotRequested,
+                )
+                .map_err(|_| ProcessResourceRuntimeError::InvalidResource);
+            }
+            if matches!(process, DesiredProcess::Ephemeral(_))
+                && matches!(
+                    status_phase(&stored),
+                    Some(ResourcePhase::Succeeded | ResourcePhase::Failed)
+                )
+                && ephemeral_status_ttl_elapsed(&stored, &process)
+            {
+                let mutation = d2b_core_controller::MutationIntent::new(
+                    resource.key().resource_ref().clone(),
+                    Some(resource.key().uid().clone()),
+                    Some(resource.revision()),
+                    d2b_core_controller::MutationIntentKind::Delete,
+                    None,
+                )
+                .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+                let batch = ResourceMutationBatch::new(vec![mutation])
+                    .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+                return ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    Some(batch),
+                    None,
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    StatusPersistence::NotRequested,
+                )
+                .map_err(|_| ProcessResourceRuntimeError::InvalidResource);
+            }
+            Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ))
+        })();
+        std::future::ready(result)
+    }
+
+    fn execute_effect(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let result = async {
+            let Some(record) = self.desired_record(resource)? else {
+                return Ok(ReconcileResult::converged(
+                    resource.revision(),
+                    resource.generation(),
+                ));
+            };
+            let mut runtime = self.runtime.for_pass();
+            runtime.without_status_client();
+            runtime.reconcile(vec![record.resource.clone()]).await?;
+            let adopted = runtime.last_adopted().unwrap_or(false);
+            let active = runtime.providers.has_active_resource_in_zone(
+                &runtime.zone,
+                runtime.zone_uid.as_ref(),
+                &record.resource.resource_ref,
+            );
+            let (phase, outcome) = match &record.process {
+                DesiredProcess::Process(spec)
+                    if spec.desired_lifecycle()
+                        == d2b_contracts_resource::v3::process::DesiredLifecycle::Stopped =>
+                {
+                    (
+                        ResourcePhase::Succeeded,
+                        OutcomeState::success("process-stopped", "process lifecycle is stopped"),
+                    )
+                }
+                DesiredProcess::Ephemeral(_) if !active => (
+                    ResourcePhase::Succeeded,
+                    OutcomeState::success(
+                        "process-exited",
+                        "ephemeral process reached a terminal exit",
+                    ),
+                ),
+                _ if active => (ResourcePhase::Ready, OutcomeState::ready(adopted)),
+                _ => (
+                    ResourcePhase::Failed,
+                    OutcomeState::failure(
+                        "provider-start-failed",
+                        "the Provider did not retain a verified process identity",
+                    ),
+                ),
+            };
+            let canonical = status_payload(&record, phase, 0, Some(outcome))?;
+            let status = status_candidate_from_resource(&canonical)?;
+            ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                None,
+                Some(status),
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::Pending,
+            )
+            .map_err(|_| ProcessResourceRuntimeError::InvalidResource)
+        };
+        result
+    }
+
+    fn observe(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ObservationResult, Self::Error>> + Send {
+        std::future::ready(Ok(ObservationResult::new(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        ))))
+    }
+
+    fn finalize(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<FinalizeResult, Self::Error>> + Send {
+        std::future::ready(Ok(FinalizeResult::new(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        ))))
+    }
+
+    fn prepare_finalize(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        std::future::ready(Ok(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        )))
+    }
+
+    fn execute_finalize(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let result = async {
+            if resource.canonical_json().is_empty() {
+                return Ok(ReconcileResult::converged(
+                    resource.revision(),
+                    resource.generation(),
+                ));
+            }
+            let Some(record) = self.desired_record(resource)? else {
+                return Ok(ReconcileResult::converged(
+                    resource.revision(),
+                    resource.generation(),
+                ));
+            };
+            let mut runtime = self.runtime.for_pass();
+            runtime.without_status_client();
+            runtime.reconcile(vec![record.resource.clone()]).await?;
+            let Some(finalizer) =
+                active_process_finalizer_for_values(&record.resource, &record.provider_ref)
+            else {
+                return Ok(ReconcileResult::converged(
+                    resource.revision(),
+                    resource.generation(),
+                ));
+            };
+            let canonical = finalizer_candidate(resource.canonical_json(), finalizer, false)?;
+            let mutation = d2b_core_controller::MutationIntent::new(
+                resource.key().resource_ref().clone(),
+                Some(resource.key().uid().clone()),
+                Some(resource.revision()),
+                MutationIntentKind::UpdateFinalizers,
+                Some(canonical),
+            )
+            .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+            let batch = ResourceMutationBatch::new(vec![mutation])
+                .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+            Ok(ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                Some(batch),
+                None,
+                ReconcileDisposition::Finalized,
+                None,
+                None,
+                StatusPersistence::NotRequested,
+            )
+            .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?)
+        };
+        result
+    }
+
+    fn health(
+        &self,
+    ) -> impl Future<Output = Result<d2b_core_controller::ControllerHealth, Self::Error>> + Send
+    {
+        std::future::ready(Ok(d2b_core_controller::ControllerHealth::Healthy))
+    }
+
+    fn drain(
+        &self,
+        _deadline_tick: u64,
+    ) -> impl Future<Output = Result<DrainResult, Self::Error>> + Send {
+        std::future::ready(Ok(DrainResult::Drained))
+    }
+
+    fn assess_update(
+        &self,
+        _context: &ReconcileContext,
+        _resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl Future<Output = Result<UpdateAssessment, Self::Error>> + Send {
+        std::future::ready(
+            UpdateAssessment::new(UpdateAssessmentState::Current, Vec::new(), true)
+                .map_err(|_| ProcessResourceRuntimeError::InvalidResource),
+        )
+    }
+
+    fn plan_upgrade(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl Future<Output = Result<UpgradePlan, Self::Error>> + Send {
+        std::future::ready(
+            UpgradePlan::new(
+                d2b_core_controller::DisruptionClass::None,
+                true,
+                vec![d2b_core_controller::UpgradeStage::Recycle(
+                    resource.key().resource_ref().clone(),
+                )],
+            )
+            .map_err(|_| ProcessResourceRuntimeError::InvalidResource),
+        )
+    }
+
+    fn execute_upgrade(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &UpgradePlan,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        std::future::ready(Ok(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        )))
+    }
+}
+
+fn static_controller_waits_for_workload_cleanup(
+    resource: &ResourceSnapshot,
+    dependencies: &[DependencySnapshot],
+) -> bool {
+    if !snapshot_is_static_controller(resource) {
+        return false;
+    }
+    dependencies.iter().any(|dependency| {
+        let resource = dependency.resource();
+        matches!(
+            resource.key().resource_ref().resource_type().as_str(),
+            PROCESS_TYPE | EPHEMERAL_PROCESS_TYPE
+        ) && resource.deleting()
+            && !snapshot_is_static_controller(resource)
+    })
+}
+
+fn snapshot_is_static_controller(resource: &ResourceSnapshot) -> bool {
+    let Ok(envelope) = ResourceEnvelope::from_json(resource.canonical_json()) else {
+        return false;
+    };
+    let Some(owner) = envelope.metadata().owner_ref() else {
+        return false;
+    };
+    if owner.resource_type().as_str() != "Provider" {
+        return false;
+    }
+    serde_json::from_slice::<ProcessSpec>(&envelope.spec().base().to_canonical_bytes())
+        .ok()
+        .is_some_and(|spec| {
+            spec.execution().process_class()
+                == d2b_contracts_resource::v3::process::ProcessClass::Controller
+        })
+}
+
+fn is_static_controller_from_resource(
+    resource: &StoredResource,
+    process: &DesiredProcess,
+) -> bool {
+    let DesiredProcess::Process(spec) = process else {
+        return false;
+    };
+    spec.execution().process_class()
+        == d2b_contracts_resource::v3::process::ProcessClass::Controller
+        && metadata_owner_ref_for_resource(resource)
+            .is_some_and(|owner| owner.resource_type().as_str() == "Provider")
+}
+
+fn metadata_owner_ref_for_resource(resource: &StoredResource) -> Option<ResourceRef> {
+    let value = metadata_value(resource, "ownerRef")?;
+    let CanonicalJsonValue::String(value) = value else {
+        return None;
+    };
+    ResourceRef::parse(&value).ok()
 }
 
 fn launch_timeout(process: &DesiredProcess) -> Duration {
@@ -1223,6 +2004,161 @@ fn status_phase(resource: &StoredResource) -> Option<ResourcePhase> {
     }
 }
 
+fn status_observed_generation(resource: &StoredResource) -> Option<ResourceGeneration> {
+    let value = CanonicalJsonValue::parse(&resource.canonical_json).ok()?;
+    let CanonicalJsonValue::Object(root) = value else {
+        return None;
+    };
+    let CanonicalJsonValue::Object(status) = root.get("status")? else {
+        return None;
+    };
+    let CanonicalJsonValue::Integer(generation) = status.get("observedGeneration")? else {
+        return None;
+    };
+    u64::try_from(*generation)
+        .ok()
+        .and_then(|generation| ResourceGeneration::new(generation).ok())
+}
+
+fn active_process_finalizer_for_values(
+    resource: &StoredResource,
+    provider_ref: &ResourceRef,
+) -> Option<&'static str> {
+    let value = metadata_value(resource, "finalizers")?;
+    let CanonicalJsonValue::Array(values) = value else {
+        return None;
+    };
+    process_finalizer(provider_ref)
+        .into_iter()
+        .chain([PROCESS_RUNTIME_FINALIZER])
+        .find(|expected| {
+            values.iter().any(
+                |value| matches!(value, CanonicalJsonValue::String(value) if value == *expected),
+            )
+        })
+}
+
+fn timestamp_millis(value: &str) -> Option<u128> {
+    if value.len() != 24
+        || value.as_bytes().get(4) != Some(&b'-')
+        || value.as_bytes().get(7) != Some(&b'-')
+        || value.as_bytes().get(10) != Some(&b'T')
+        || value.as_bytes().get(13) != Some(&b':')
+        || value.as_bytes().get(16) != Some(&b':')
+        || value.as_bytes().get(19) != Some(&b'.')
+        || value.as_bytes().get(23) != Some(&b'Z')
+    {
+        return None;
+    }
+    let number = |start: usize, end: usize| value.get(start..end)?.parse::<i64>().ok();
+    let year = number(0, 4)?;
+    let month = number(5, 7)?;
+    let day = number(8, 10)?;
+    let hour = number(11, 13)?;
+    let minute = number(14, 16)?;
+    let second = number(17, 19)?;
+    let millis = number(20, 23)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+        || millis > 999
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)?;
+    u128::try_from(seconds).ok().and_then(|seconds| {
+        u128::try_from(millis)
+            .ok()
+            .map(|millis| seconds * 1_000 + millis)
+    })
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    let year = year.checked_sub(i64::from(month <= 2))?;
+    let era = if year >= 0 {
+        year / 400
+    } else {
+        (year - 399) / 400
+    };
+    let year_of_era = year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era.checked_mul(146_097)
+        .and_then(|value| value.checked_add(day_of_era))
+        .and_then(|value| value.checked_sub(719_468))
+}
+
+fn ephemeral_status_ttl_elapsed(resource: &StoredResource, process: &DesiredProcess) -> bool {
+    let DesiredProcess::Ephemeral(spec) = process else {
+        return false;
+    };
+    if spec.incident_hold() {
+        return false;
+    }
+    let value = status_value(resource, "cleanupEligibleAt");
+    let Some(CanonicalJsonValue::String(eligible_at)) = value else {
+        return false;
+    };
+    let Some(eligible_at) = timestamp_millis(&eligible_at) else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    eligible_at <= now
+}
+
+fn status_value(resource: &StoredResource, key: &str) -> Option<CanonicalJsonValue> {
+    let value = CanonicalJsonValue::parse(&resource.canonical_json).ok()?;
+    let CanonicalJsonValue::Object(root) = value else {
+        return None;
+    };
+    let CanonicalJsonValue::Object(status) = root.get("status")? else {
+        return None;
+    };
+    status.get(key).cloned()
+}
+
+fn finalizer_candidate(
+    canonical: &[u8],
+    finalizer: &str,
+    add: bool,
+) -> Result<Vec<u8>, ProcessResourceRuntimeError> {
+    let mut value = CanonicalJsonValue::parse(canonical)
+        .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+    let CanonicalJsonValue::Object(root) = &mut value else {
+        return Err(ProcessResourceRuntimeError::InvalidResource);
+    };
+    let Some(CanonicalJsonValue::Object(metadata)) = root.get_mut("metadata") else {
+        return Err(ProcessResourceRuntimeError::InvalidResource);
+    };
+    let Some(CanonicalJsonValue::Array(finalizers)) = metadata.get_mut("finalizers") else {
+        return Err(ProcessResourceRuntimeError::InvalidResource);
+    };
+    if add {
+        if !finalizers
+            .iter()
+            .any(|value| matches!(value, CanonicalJsonValue::String(value) if value == finalizer))
+        {
+            finalizers.push(CanonicalJsonValue::String(finalizer.to_owned()));
+        }
+    } else {
+        finalizers.retain(
+            |value| !matches!(value, CanonicalJsonValue::String(value) if value == finalizer),
+        );
+    }
+    Ok(value.to_canonical_bytes())
+}
+
 fn restart_reset_due(process: &DesiredProcess, started: Instant) -> bool {
     match process {
         DesiredProcess::Process(spec) => {
@@ -1315,6 +2251,10 @@ fn now_timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
+    timestamp_from_millis(millis)
+}
+
+fn timestamp_from_millis(millis: u128) -> String {
     let seconds = millis / 1_000;
     let day = seconds / 86_400;
     let day_seconds = seconds % 86_400;
@@ -1365,7 +2305,7 @@ async fn update_status(
     mutation.target = protobuf::MessageField::some(resource_identity(record));
     mutation.precondition = protobuf::MessageField::some(exact_precondition(record));
     mutation.resource = protobuf::MessageField::some(resource);
-    let operation = process_operation_id(record, "status");
+    let operation = process_mutation_operation_id(record, "status");
     let mut request = wire::UpdateStatusRequest::new();
     request.meta = protobuf::MessageField::some(request_meta(&operation));
     request.mutation = protobuf::MessageField::some(mutation);
@@ -1418,14 +2358,39 @@ fn status_payload(
             CanonicalJsonValue::String(now.clone()),
         );
     }
-    if matches!(
+    let terminal = matches!(
         phase,
         ResourcePhase::Succeeded | ResourcePhase::Failed | ResourcePhase::Deleted
-    ) {
-        status.insert(
-            "completedAt".to_owned(),
-            CanonicalJsonValue::String(now.clone()),
-        );
+    );
+    let completed_at = status
+        .get("completedAt")
+        .filter(|value| !matches!(value, CanonicalJsonValue::Null))
+        .cloned()
+        .unwrap_or_else(|| CanonicalJsonValue::String(now.clone()));
+    if terminal && matches!(phase, ResourcePhase::Succeeded | ResourcePhase::Failed) {
+        status.insert("completedAt".to_owned(), completed_at.clone());
+        if let DesiredProcess::Ephemeral(spec) = &record.process {
+            if spec.incident_hold() {
+                status.insert("cleanupEligibleAt".to_owned(), CanonicalJsonValue::Null);
+            } else if let CanonicalJsonValue::String(completed_at) = completed_at {
+                let eligible = timestamp_millis(&completed_at)
+                    .and_then(|millis| {
+                        millis.checked_add(if phase == ResourcePhase::Failed {
+                            u128::from(spec.failed_ttl().as_millis())
+                        } else {
+                            u128::from(spec.successful_ttl().as_millis())
+                        })
+                    })
+                    .map(|millis| timestamp_from_millis(millis))
+                    .unwrap_or_else(|| now.clone());
+                status.insert(
+                    "cleanupEligibleAt".to_owned(),
+                    CanonicalJsonValue::String(eligible),
+                );
+            }
+        }
+    } else if phase == ResourcePhase::Deleted {
+        status.insert("cleanupEligibleAt".to_owned(), CanonicalJsonValue::Null);
     }
     status.insert(
         "outcome".to_owned(),
@@ -1492,9 +2457,30 @@ fn status_payload(
     Ok(canonical)
 }
 
+fn status_candidate_from_resource(
+    canonical: &[u8],
+) -> Result<Vec<u8>, ProcessResourceRuntimeError> {
+    let value = CanonicalJsonValue::parse(canonical)
+        .map_err(|_| ProcessResourceRuntimeError::InvalidResource)?;
+    let CanonicalJsonValue::Object(root) = value else {
+        return Err(ProcessResourceRuntimeError::InvalidResource);
+    };
+    let status = root
+        .get("status")
+        .cloned()
+        .ok_or(ProcessResourceRuntimeError::InvalidResource)?;
+    match status {
+        CanonicalJsonValue::Object(status) => {
+            Ok(CanonicalJsonValue::Object(status).to_canonical_bytes())
+        }
+        _ => Err(ProcessResourceRuntimeError::InvalidResource),
+    }
+}
+
 async fn update_finalizers(
     client: &dyn ProcessResourceClient,
     record: &DesiredRecord,
+    finalizer: &str,
     add: bool,
 ) -> Result<DesiredRecord, ProcessResourceRuntimeError> {
     let mut mutation = wire::Mutation::new();
@@ -1503,15 +2489,11 @@ async fn update_finalizers(
     mutation.target = protobuf::MessageField::some(resource_identity(record));
     mutation.precondition = protobuf::MessageField::some(exact_precondition(record));
     if add {
-        mutation
-            .add_finalizers
-            .push(PROCESS_RUNTIME_FINALIZER.to_owned());
+        mutation.add_finalizers.push(finalizer.to_owned());
     } else {
-        mutation
-            .remove_finalizers
-            .push(PROCESS_RUNTIME_FINALIZER.to_owned());
+        mutation.remove_finalizers.push(finalizer.to_owned());
     }
-    let operation = process_operation_id(
+    let operation = process_mutation_operation_id(
         record,
         if add {
             "finalizer-add"
@@ -1545,7 +2527,7 @@ async fn delete_resource(
     mutation.kind = protobuf::EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_DELETE);
     mutation.target = protobuf::MessageField::some(resource_identity(record));
     mutation.precondition = protobuf::MessageField::some(exact_precondition(record));
-    let operation = process_operation_id(record, "delete");
+    let operation = process_mutation_operation_id(record, "delete");
     let mut request = wire::DeleteRequest::new();
     request.meta = protobuf::MessageField::some(request_meta(&operation));
     request.mutation = protobuf::MessageField::some(mutation);
@@ -1591,15 +2573,30 @@ fn request_meta(operation: &str) -> wire::RequestMeta {
 }
 
 fn process_operation_id(record: &DesiredRecord, action: &str) -> String {
+    let (template, execution_ref) = match &record.process {
+        DesiredProcess::Process(spec) => (
+            spec.execution().template().as_str().to_owned(),
+            spec.execution().execution_ref().to_canonical_string(),
+        ),
+        DesiredProcess::Ephemeral(spec) => (
+            spec.execution().template().as_str().to_owned(),
+            spec.execution().execution_ref().to_canonical_string(),
+        ),
+    };
     let digest = Sha256::digest(
         format!(
-            "d2bd:process-lifecycle:v2:{action}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "d2bd:process-lifecycle:v4:{action}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             record.resource.zone.as_str(),
             record.key().to_canonical_string(),
             record.resource.uid.as_str(),
             record.resource.generation.get(),
-            record.resource.revision.get(),
             record.provider_ref.to_canonical_string(),
+            record
+                .owner_ref()
+                .map(|owner| owner.to_canonical_string())
+                .unwrap_or_else(|| "unowned".to_owned()),
+            execution_ref,
+            template,
             record
                 .zone_uid
                 .as_ref()
@@ -1613,10 +2610,33 @@ fn process_operation_id(record: &DesiredRecord, action: &str) -> String {
                 .provider_assignment_generation
                 .map(|value| value.get().to_string())
                 .unwrap_or_else(|| "unbound".to_owned()),
+            record
+                .controller_provider_uid
+                .as_ref()
+                .map(ResourceUid::as_str)
+                .unwrap_or("unbound"),
+            record
+                .controller_provider_generation
+                .map(|value| value.get().to_string())
+                .unwrap_or_else(|| "unbound".to_owned()),
         )
         .as_bytes(),
     );
     format!("process-lifecycle-{digest:x}")
+}
+
+fn process_mutation_operation_id(record: &DesiredRecord, action: &str) -> String {
+    let digest = Sha256::digest(
+        format!(
+            "d2bd:process-mutation:v1:{action}:{}:{}:{}:{}",
+            process_operation_id(record, action),
+            record.resource.revision.get(),
+            record.resource.uid.as_str(),
+            record.resource.generation.get(),
+        )
+        .as_bytes(),
+    );
+    format!("process-mutation-{digest:x}")
 }
 
 fn map_provider_error(error: String) -> ProcessResourceRuntimeError {
@@ -1839,29 +2859,6 @@ pub(crate) fn process_list_request(zone: &ZoneId) -> StoreListRequest {
     }
 }
 
-/// Build the generic Process watch request.
-pub(crate) fn process_watch_request(zone: &ZoneId) -> StoreWatchRequest {
-    StoreWatchRequest {
-        operation: StoreOperationContext {
-            operation_id: "process-resource-watch".to_owned(),
-            idempotency_key: None,
-            correlation_id: "process-resource-watch".to_owned(),
-            trace_id: None,
-            deadline_ms: 10_000,
-        },
-        zone: zone.clone(),
-        resource_types: vec![
-            ResourceTypeName::parse(PROCESS_TYPE).expect("static Process type"),
-            ResourceTypeName::parse(EPHEMERAL_PROCESS_TYPE).expect("static EphemeralProcess type"),
-        ],
-        resource_names: Vec::new(),
-        filters: Vec::new(),
-        after_revision: ZoneRevision::new(0),
-        initial_credits: 64,
-        projection: StoreProjection::Full,
-    }
-}
-
 /// Relist all generic Process resources, preserving snapshot pagination.
 pub(crate) async fn list_process_snapshot(
     store: &RedbResourceStore,
@@ -1886,6 +2883,7 @@ pub(crate) async fn list_process_snapshot(
 /// Relist generic Process resources through a session-bound Resource API
 /// backend. This mirrors the concrete Zone-store helper while preserving the
 /// backend's reconnect fence.
+#[allow(dead_code)]
 pub(crate) async fn list_process_snapshot_backend<S: ResourceStoreBackend>(
     store: &S,
     zone: &ZoneId,
@@ -1906,33 +2904,9 @@ pub(crate) async fn list_process_snapshot_backend<S: ResourceStoreBackend>(
     Ok(resources)
 }
 
-/// Run Guest-local Process/EphemeralProcess reconciliation for one
-/// authenticated ComponentSession. The session-bound store is intentionally
-/// relisted instead of opening a second transport or watch implementation;
-/// reconnect fencing makes the loop stop at the first stale-session error.
-pub(crate) async fn run_guest_process_reconciliation<S>(
-    mut runtime: ProcessResourceRuntime,
-    store: Arc<S>,
-    client: Arc<ResourceApiClient<S, UnavailableUpgradeDispatcher>>,
-    zone: ZoneId,
-) where
-    S: ResourceStoreBackend + 'static,
-{
-    runtime.set_status_client(client);
-    loop {
-        let snapshot = match list_process_snapshot_backend(store.as_ref(), &zone).await {
-            Ok(snapshot) => snapshot,
-            Err(_) => return,
-        };
-        if let Err(error) = runtime.reconcile(snapshot).await {
-            tracing::warn!(zone = %zone.as_str(), error = %error, "Guest Process reconciliation degraded");
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
 /// Drain a deleted WaylandSession through its durable Process and Endpoint
 /// children before releasing the session finalizer.
+#[allow(dead_code)]
 pub(crate) async fn reconcile_wayland_session_deletion(
     client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
     store: &RedbResourceStore,
@@ -2053,6 +3027,7 @@ pub(crate) async fn reconcile_wayland_session_deletion(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn list_cleanup_children(
     store: &RedbResourceStore,
     zone: &ZoneId,
@@ -2091,6 +3066,7 @@ async fn list_cleanup_children(
     Ok(resources)
 }
 
+#[allow(dead_code)]
 fn cleanup_operation(
     action: &str,
     resource_ref: &ResourceRef,
@@ -2106,6 +3082,7 @@ fn cleanup_operation(
     }
 }
 
+#[allow(dead_code)]
 fn cleanup_operation_id(action: &str, resource_ref: &ResourceRef, revision: u64) -> String {
     let mut digest = Sha256::new();
     digest.update(action.as_bytes());
@@ -2121,11 +3098,13 @@ fn cleanup_operation_id(action: &str, resource_ref: &ResourceRef, revision: u64)
     format!("{action}-{suffix}")
 }
 
+#[allow(dead_code)]
 fn metadata_deletion_requested(resource: &StoredResource) -> bool {
     metadata_value(resource, "deletionRequestedAt")
         .is_some_and(|value| !matches!(value, CanonicalJsonValue::Null))
 }
 
+#[allow(dead_code)]
 fn metadata_has_finalizer(resource: &StoredResource, expected: &str) -> bool {
     metadata_value(resource, "finalizers").is_some_and(|value| {
         matches!(
@@ -2138,6 +3117,7 @@ fn metadata_has_finalizer(resource: &StoredResource, expected: &str) -> bool {
     })
 }
 
+#[allow(dead_code)]
 fn metadata_owner_ref(resource: &StoredResource) -> Option<ResourceRef> {
     let CanonicalJsonValue::String(value) = metadata_value(resource, "ownerRef")? else {
         return None;
@@ -2145,6 +3125,7 @@ fn metadata_owner_ref(resource: &StoredResource) -> Option<ResourceRef> {
     ResourceRef::parse(&value).ok()
 }
 
+#[allow(dead_code)]
 fn endpoint_producer_ref(resource: &StoredResource) -> Option<ResourceRef> {
     let value = CanonicalJsonValue::parse(&resource.canonical_json).ok()?;
     let CanonicalJsonValue::Object(root) = value else {
@@ -2159,6 +3140,7 @@ fn endpoint_producer_ref(resource: &StoredResource) -> Option<ResourceRef> {
     ResourceRef::parse(&value).ok()
 }
 
+#[allow(dead_code)]
 fn cleanup_wire_identity(resource: &StoredResource) -> wire::ResourceIdentity {
     let mut identity = wire::ResourceIdentity::new();
     identity.zone = resource.zone.as_str().to_owned();
@@ -2170,6 +3152,7 @@ fn cleanup_wire_identity(resource: &StoredResource) -> wire::ResourceIdentity {
     identity
 }
 
+#[allow(dead_code)]
 async fn request_cleanup_delete(
     client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
     resource: &StoredResource,
@@ -2194,6 +3177,7 @@ async fn request_cleanup_delete(
     client.delete(request).await.error.is_none()
 }
 
+#[allow(dead_code)]
 async fn request_cleanup_finalizer(
     client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
     resource: &StoredResource,
@@ -2233,101 +3217,920 @@ async fn request_cleanup_finalizer(
 pub(crate) fn controller_provider_refs(resources: &[StoredResource]) -> BTreeSet<ResourceRef> {
     resources
         .iter()
-        .filter(|resource| resource.resource_ref.resource_type().as_str() == PROCESS_TYPE)
+        .filter(|resource| {
+            matches!(
+                resource.resource_ref.resource_type().as_str(),
+                PROCESS_TYPE | EPHEMERAL_PROCESS_TYPE
+            )
+        })
         .filter_map(|resource| {
             let envelope = ResourceEnvelope::from_json(&resource.canonical_json).ok()?;
-            let process =
-                serde_json::from_slice::<ProcessSpec>(&envelope.spec().base().to_canonical_bytes())
-                    .ok()?;
-            if process.execution().process_class()
-                != d2b_contracts_resource::v3::process::ProcessClass::Controller
-            {
-                return None;
+            let provider = envelope.spec().provider_ref()?.clone();
+            let process = resource.resource_ref.resource_type().as_str() == PROCESS_TYPE;
+            let is_controller = process
+                && serde_json::from_slice::<ProcessSpec>(
+                    &envelope.spec().base().to_canonical_bytes(),
+                )
+                .ok()
+                .is_some_and(|spec| {
+                    spec.execution().process_class()
+                        == d2b_contracts_resource::v3::process::ProcessClass::Controller
+                });
+            if is_controller {
+                let owner = envelope.metadata().owner_ref()?.clone();
+                if owner.resource_type().as_str() == "Provider" {
+                    return Some(owner);
+                }
             }
-            let owner = envelope.metadata().owner_ref()?.clone();
-            (owner.resource_type().as_str() == "Provider").then_some(owner)
+            Some(provider)
         })
         .collect()
 }
 
-/// Run the relist/watch reconciliation loop for one Zone.
-pub(crate) async fn run_process_watch(
-    mut watch: ResourceWatch,
-    store: Arc<RedbResourceStore>,
+struct GuestProcessSource {
     zone: ZoneId,
-    registry: Arc<Mutex<Option<ProcessResourceRuntime>>>,
-    status_client: Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>>,
-    wayland_session_ref: Option<ResourceRef>,
-    provider_identity_hook: Option<ProcessProviderIdentityHook>,
-    controller_fence_hook: Option<ProcessWatchHook>,
-    controller_hook: Option<ProcessWatchHook>,
-    process_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
-) {
-    loop {
-        match tokio::time::timeout(Duration::from_secs(1), watch.recv()).await {
-            Ok(Some(batch)) => {
-                if watch.acknowledge(batch.revision()).await.is_err() {
-                    return;
-                }
+    descriptor: Mutex<Option<ControllerDescriptor>>,
+    store: Arc<d2bd_runtime::guest_resource_runtime::SessionBoundStore>,
+    client: Arc<
+        ResourceApiClient<
+            d2bd_runtime::guest_resource_runtime::SessionBoundStore,
+            UnavailableUpgradeDispatcher,
+        >,
+    >,
+    watch: tokio::sync::Mutex<Option<ResourceWatch>>,
+    pending: tokio::sync::Mutex<VecDeque<(ChangeRecord, OperationContext, ZoneRevision)>>,
+    acknowledge_after: tokio::sync::Mutex<Option<ZoneRevision>>,
+    watch_open: AtomicBool,
+    watch_stop: tokio::sync::Notify,
+}
+
+impl std::fmt::Debug for GuestProcessSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuestProcessSource")
+            .field(
+                "has_descriptor",
+                &self
+                    .descriptor
+                    .lock()
+                    .map(|value| value.is_some())
+                    .unwrap_or(false),
+            )
+            .finish()
+    }
+}
+
+impl GuestProcessSource {
+    fn new(
+        zone: ZoneId,
+        store: Arc<d2bd_runtime::guest_resource_runtime::SessionBoundStore>,
+        client: Arc<
+            ResourceApiClient<
+                d2bd_runtime::guest_resource_runtime::SessionBoundStore,
+                UnavailableUpgradeDispatcher,
+            >,
+        >,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            zone,
+            descriptor: Mutex::new(None),
+            store,
+            client,
+            watch: tokio::sync::Mutex::new(None),
+            pending: tokio::sync::Mutex::new(VecDeque::new()),
+            acknowledge_after: tokio::sync::Mutex::new(None),
+            watch_open: AtomicBool::new(false),
+            watch_stop: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn descriptor(&self) -> Result<ControllerDescriptor, WatchFailure> {
+        self.descriptor
+            .lock()
+            .map_err(|_| WatchFailure::Fatal)?
+            .clone()
+            .ok_or(WatchFailure::Fatal)
+    }
+
+    async fn list_initial_resources(
+        &self,
+        descriptor: &ControllerDescriptor,
+    ) -> Result<InitialList, SourceError> {
+        let mut cursor = None;
+        let mut resources = Vec::new();
+        let mut snapshot_revision = None;
+        loop {
+            let page = self
+                .store
+                .list(StoreListRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "guest-process-initial-list".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "guest-process-initial-list".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: descriptor.identity().zone().clone(),
+                    resource_types: descriptor.resource_types().cloned().collect(),
+                    resource_names: Vec::new(),
+                    filters: Vec::new(),
+                    page_size: 256,
+                    cursor: cursor.take(),
+                    projection: StoreProjection::MetadataOnly,
+                })
+                .await
+                .map_err(|_| SourceError::Unavailable)?;
+            if snapshot_revision.is_some_and(|revision| revision != page.snapshot_revision) {
+                return Err(SourceError::Conflict(page.snapshot_revision));
             }
-            Ok(None) => {
-                if watch.resume().await.is_err() {
-                    return;
-                }
+            snapshot_revision = Some(page.snapshot_revision);
+            resources.extend(page.resources);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
             }
-            Err(_) => {}
         }
-        if let Some(controller_fence_hook) = controller_fence_hook.as_ref() {
-            if controller_fence_hook().await.is_err() {
-                continue;
+        let revision = snapshot_revision.unwrap_or(ZoneRevision::new(1));
+        Ok(InitialList {
+            resources: resources
+                .into_iter()
+                .map(|resource| {
+                    InitialResource::new(
+                        ResourceKey::new(resource.zone, resource.resource_ref, resource.uid),
+                        revision,
+                    )
+                })
+                .collect(),
+            snapshot_revision: revision,
+        })
+    }
+
+    async fn list_dependencies(
+        &self,
+        descriptor: &ControllerDescriptor,
+    ) -> Result<Vec<DependencySnapshot>, SourceError> {
+        let mut resource_types = descriptor
+            .dependency_selectors()
+            .iter()
+            .map(|selector| selector.resource_type().clone())
+            .collect::<Vec<_>>();
+        resource_types.sort();
+        resource_types.dedup();
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut cursor = None;
+        let mut resources = Vec::new();
+        let mut snapshot_revision = None;
+        loop {
+            let page = self
+                .store
+                .list(StoreListRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "guest-process-dependencies".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "guest-process-dependencies".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: descriptor.identity().zone().clone(),
+                    resource_types: resource_types.clone(),
+                    resource_names: Vec::new(),
+                    filters: Vec::new(),
+                    page_size: 256,
+                    cursor: cursor.take(),
+                    projection: StoreProjection::Full,
+                })
+                .await
+                .map_err(|_| SourceError::Unavailable)?;
+            if snapshot_revision.is_some_and(|revision| revision != page.snapshot_revision) {
+                return Err(SourceError::Conflict(page.snapshot_revision));
+            }
+            snapshot_revision = Some(page.snapshot_revision);
+            resources.extend(page.resources);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
             }
         }
-        {
-            let _guard = process_reconcile_lock.lock().await;
-            let Ok(snapshot) = list_process_snapshot(&store, &zone).await else {
-                continue;
-            };
-            let runtime = match registry.lock() {
-                Ok(mut guard) => guard.take(),
-                Err(_) => return,
-            };
-            let Some(mut runtime) = runtime else {
-                continue;
-            };
-            if let Some(provider_identity_hook) = provider_identity_hook.as_ref() {
-                match provider_identity_hook(controller_provider_refs(&snapshot)).await {
-                    Ok(identities) => runtime.set_controller_provider_identities(identities),
-                    Err(()) => runtime.set_controller_provider_identities(BTreeMap::new()),
+        Ok(resources
+            .into_iter()
+            .filter(|resource| {
+                descriptor.dependency_selectors().iter().any(|selector| {
+                    selector.resource_type() == resource.resource_ref.resource_type()
+                })
+            })
+            .map(|resource| {
+                DependencySnapshot::new(ResourceSnapshot::new(
+                    ResourceKey::new(
+                        resource.zone,
+                        resource.resource_ref,
+                        resource.uid,
+                    ),
+                    resource.revision,
+                    resource.generation,
+                    resource.canonical_json.clone(),
+                    resource_deleting(&resource.canonical_json),
+                ))
+            })
+            .collect())
+    }
+
+    fn watch_request(
+        descriptor: &ControllerDescriptor,
+        after_revision: ZoneRevision,
+    ) -> StoreWatchRequest {
+        StoreWatchRequest {
+            operation: StoreOperationContext {
+                operation_id: "guest-process-watch".to_owned(),
+                idempotency_key: None,
+                correlation_id: "guest-process-watch".to_owned(),
+                trace_id: None,
+                deadline_ms: 10_000,
+            },
+            zone: descriptor.identity().zone().clone(),
+            resource_types: descriptor.resource_types().cloned().collect(),
+            resource_names: Vec::new(),
+            filters: Vec::new(),
+            after_revision,
+            initial_credits: descriptor.initial_watch_credits(),
+            projection: StoreProjection::Full,
+        }
+    }
+
+    fn changes_for_batch(
+        &self,
+        descriptor: &ControllerDescriptor,
+        batch: &SharedChangeBatch,
+    ) -> Result<Vec<(ChangeRecord, OperationContext, ZoneRevision)>, WatchFailure> {
+        batch
+            .entries()
+            .filter(|entry| {
+                descriptor
+                    .resource_types()
+                    .any(|resource_type| resource_type == entry.resource_type())
+            })
+            .map(|entry| {
+                let target = ResourceKey::new(
+                    descriptor.identity().zone().clone(),
+                    ResourceRef::new(
+                        entry.resource_type().clone(),
+                        entry.resource_name().clone(),
+                    ),
+                    entry.resource_uid().clone(),
+                );
+                let generation = entry
+                    .new_generation()
+                    .or(entry.old_generation())
+                    .unwrap_or_else(|| ResourceGeneration::new(1).expect("one is valid"));
+                let event = entry.event();
+                let (field, reason) = match event {
+                    ChangeEvent::Created | ChangeEvent::SpecUpdated => (
+                        SelectorField::Spec,
+                        CoreTriggerReason::SpecGenerationChanged,
+                    ),
+                    ChangeEvent::StatusUpdated => (
+                        SelectorField::Status,
+                        CoreTriggerReason::ExecutionStatusChanged,
+                    ),
+                    ChangeEvent::MetadataUpdated => (
+                        SelectorField::Metadata,
+                        CoreTriggerReason::ManualReconcile,
+                    ),
+                    ChangeEvent::FinalizersUpdated => (
+                        SelectorField::Finalizers,
+                        CoreTriggerReason::FinalizerRequired,
+                    ),
+                    ChangeEvent::DeletionRequested | ChangeEvent::Deleted => (
+                        SelectorField::Deletion,
+                        CoreTriggerReason::DeletionRequested,
+                    ),
+                };
+                let operation = OperationContext::new(
+                    entry.operation_id().to_owned(),
+                    entry.operation_id().to_owned(),
+                    entry.correlation_id().to_owned(),
+                    None,
+                )
+                .map_err(|_| WatchFailure::Fatal)?;
+                Ok((
+                    ChangeRecord {
+                        target,
+                        revision: batch.revision(),
+                        generation,
+                        observed_generation: watch_observed_generation(
+                            entry.canonical_resource(),
+                            generation,
+                        ),
+                        fields: BTreeSet::from([field]),
+                        reasons: BTreeSet::from([reason]),
+                        type_is_bound: true,
+                        relevant_field_changed: true,
+                        own_status_only: event == ChangeEvent::StatusUpdated,
+                        owner_consumer_exists: false,
+                        dependency_consumer_exists: false,
+                        controller_generation_current: true,
+                        conditions_require_work: false,
+                        unknown_requires_observation: false,
+                    },
+                    operation,
+                    batch.revision(),
+                ))
+            })
+            .collect()
+    }
+
+    async fn next_change(
+        &self,
+    ) -> Result<Option<(ChangeRecord, OperationContext)>, WatchFailure> {
+        loop {
+            if let Some(revision) = self.acknowledge_after.lock().await.take() {
+                let mut watch = self.watch.lock().await;
+                if let Some(watch) = watch.as_mut() {
+                    let _ = watch.acknowledge(revision).await;
                 }
             }
-            let result = runtime.reconcile(snapshot).await;
-            if let Ok(mut guard) = registry.lock() {
-                *guard = Some(runtime);
+            if let Some((change, operation, revision)) = self.pending.lock().await.pop_front() {
+                let next_is_different = self
+                    .pending
+                    .lock()
+                    .await
+                    .front()
+                    .is_none_or(|next| next.2 != revision);
+                if next_is_different {
+                    *self.acknowledge_after.lock().await = Some(revision);
+                }
+                return Ok(Some((change, operation)));
+            }
+            if self.store.ensure_session_current().is_err() {
+                return Err(WatchFailure::Disconnected);
+            }
+            if !self.watch_open.load(Ordering::Acquire) {
+                let mut watch = self.watch.lock().await;
+                watch.take();
+                return Ok(None);
+            }
+            let mut watch_guard = self.watch.lock().await;
+            let Some(watch) = watch_guard.as_mut() else {
+                return Ok(None);
+            };
+            if !self.watch_open.load(Ordering::Acquire) {
+                watch_guard.take();
+                return Ok(None);
+            }
+            let batch = tokio::select! {
+                batch = watch.recv() => batch,
+                _ = self.watch_stop.notified() => {
+                    watch_guard.take();
+                    return Ok(None);
+                },
+            };
+            let Some(batch) = batch else {
+                if !self.watch_open.load(Ordering::Acquire) {
+                    watch_guard.take();
+                    return Ok(None);
+                }
+                match watch.resume().await {
+                    Ok(()) => continue,
+                    Err(error) if error.kind() == StoreErrorKind::RevisionExpired => {
+                        self.watch_open.store(false, Ordering::Release);
+                        return Err(WatchFailure::RevisionExpired);
+                    }
+                    Err(_) => {
+                        self.watch_open.store(false, Ordering::Release);
+                        return Err(WatchFailure::Disconnected);
+                    }
+                }
+            };
+            let descriptor = self.descriptor()?;
+            let changes = self.changes_for_batch(&descriptor, &batch)?;
+            if changes.is_empty() {
+                let _ = watch.acknowledge(batch.revision()).await;
+                continue;
+            }
+            let mut changes = changes.into_iter();
+            let first = changes.next().expect("nonempty watch changes");
+            let remaining = changes.collect::<Vec<_>>();
+            if remaining.is_empty() {
+                *self.acknowledge_after.lock().await = Some(batch.revision());
             } else {
-                return;
+                self.pending.lock().await.extend(remaining);
             }
-            if let Err(error) = result {
-                tracing::warn!(
-                    zone = %zone.as_str(),
-                    error = ?error,
-                    "generic Process reconciliation degraded",
-                );
+            return Ok(Some((first.0, first.1)));
+        }
+    }
+}
+
+impl RegisteredControllerApi for GuestProcessSource {
+    fn register(
+        &self,
+        descriptor: &ControllerDescriptor,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        let descriptor = descriptor.clone();
+        async move {
+            if descriptor.identity().zone() != &self.zone {
+                return Err(SourceError::Integrity);
             }
-            if let (Some(client), Some(session_ref)) =
-                (status_client.as_ref(), wayland_session_ref.as_ref())
-                && let Err(error) =
-                    reconcile_wayland_session_deletion(client, &store, &zone, session_ref).await
+            *self.descriptor.lock().map_err(|_| SourceError::Integrity)? = Some(descriptor);
+            Ok(())
+        }
+    }
+
+    fn list_initial(
+        &self,
+        descriptor: &ControllerDescriptor,
+    ) -> impl Future<Output = Result<InitialList, SourceError>> + Send {
+        let descriptor = descriptor.clone();
+        async move { self.list_initial_resources(&descriptor).await }
+    }
+
+    fn open_watch(
+        &self,
+        descriptor: &ControllerDescriptor,
+        after_revision: ZoneRevision,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        let descriptor = descriptor.clone();
+        async move {
+            if self.descriptor().map_err(|_| SourceError::Integrity)? != descriptor {
+                return Err(SourceError::Integrity);
+            }
+            let watch = self
+                .store
+                .open_resource_watch(Self::watch_request(&descriptor, after_revision))
+                .await
+                .map_err(|_| SourceError::Unavailable)?;
+            *self.watch.lock().await = Some(watch);
+            self.pending.lock().await.clear();
+            *self.acknowledge_after.lock().await = None;
+            self.watch_open.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    fn stop_watch(&self) {
+        self.watch_open.store(false, Ordering::Release);
+        self.watch_stop.notify_one();
+    }
+
+    fn has_watch_stream(&self) -> bool {
+        self.watch_open.load(Ordering::Acquire)
+    }
+
+    fn receive_watch_change(
+        &self,
+    ) -> impl Future<Output = Result<Option<(ChangeRecord, OperationContext)>, WatchFailure>> + Send
+    {
+        self.next_change()
+    }
+
+    fn read_fresh(
+        &self,
+        key: &ResourceKey,
+    ) -> impl Future<Output = Result<FreshSnapshot, SourceError>> + Send {
+        let key = key.clone();
+        let descriptor = self.descriptor().map_err(|_| SourceError::Integrity);
+        async move {
+            let descriptor = descriptor?;
+            match self
+                .store
+                .get(StoreGetRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "guest-process-fresh-read".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "guest-process-fresh-read".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: key.zone().clone(),
+                    target: key.resource_ref().clone(),
+                    expected_uid: Some(key.uid().clone()),
+                    projection: StoreProjection::Full,
+                })
+                .await
             {
-                tracing::warn!(
-                    zone = %zone.as_str(),
-                    error = %error,
-                    "WaylandSession deletion drain degraded"
-                );
+                Ok(resource) => Ok(FreshSnapshot::Present {
+                    target: ResourceSnapshot::new(
+                        key,
+                        resource.revision,
+                        resource.generation,
+                        resource.canonical_json.clone(),
+                        resource_deleting(&resource.canonical_json),
+                    ),
+                    dependencies: self.list_dependencies(&descriptor).await?,
+                }),
+                Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                    Ok(FreshSnapshot::Deleted {
+                        key,
+                        revision: error.current_revision().unwrap_or(ZoneRevision::new(1)),
+                        generation: ResourceGeneration::new(1).expect("one is valid"),
+                    })
+                }
+                Err(_) => Err(SourceError::Unavailable),
             }
         }
-        if let Some(controller_hook) = controller_hook.as_ref() {
-            let _ = controller_hook().await;
+    }
+
+    fn write_starting(
+        &self,
+        _context: &ReconcileContext,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    fn accept_effect(
+        &self,
+        _context: &ReconcileContext,
+        _plan: &ReconcilePlan,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    fn complete_effect(
+        &self,
+        _context: &ReconcileContext,
+        _result: &ReconcileResult,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    fn commit_result(
+        &self,
+        context: &ReconcileContext,
+        result: &ReconcileResult,
+    ) -> impl Future<Output = Result<CommitOutcome, SourceError>> + Send {
+        let key = context.target().clone();
+        let mutation = result
+            .mutation_batch()
+            .and_then(|batch| batch.mutations().first().cloned());
+        let status = result.status_candidate().map(ToOwned::to_owned);
+        async move {
+            let resource = self.current_resource(&key).await?;
+            if let Some(mutation) = mutation.as_ref() {
+                match mutation.kind() {
+                    MutationIntentKind::Delete => {
+                        let response = self.client.delete(delete_request(&resource)).await;
+                        return response_to_commit(response.error.is_some(), response.revision);
+                    }
+                    MutationIntentKind::UpdateFinalizers => {
+                        let desired = mutation
+                            .canonical_resource()
+                            .ok_or(SourceError::Integrity)?;
+                        let (add, remove) = finalizer_delta(&resource.canonical_json, desired)?;
+                        let response = self
+                            .client
+                            .update_finalizers(finalizer_request(&resource, add, remove))
+                            .await;
+                        return response_to_commit(response.error.is_some(), response.revision);
+                    }
+                    _ => return Err(SourceError::Integrity),
+                }
+            }
+            if let Some(status) = status.as_deref() {
+                let canonical = merge_status_candidate(&resource, status)?;
+                let response = self
+                    .client
+                    .update_status(status_request(&resource, canonical)?)
+                    .await;
+                return response_to_commit(response.error.is_some(), response.revision);
+            }
+            Ok(CommitOutcome::Committed(resource.revision))
         }
+    }
+
+    fn complete_expedited(
+        &self,
+        _context: &ReconcileContext,
+        _projection: &d2b_core_controller::ReconcileProjection,
+        _status_persistence: StatusPersistence,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    fn persist_outcome(
+        &self,
+        projection: &d2b_core_controller::ReconcileProjection,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        let target = projection.target().clone();
+        let phase = projection.phase();
+        async move {
+            let resource = self.current_resource(&target).await?;
+            let canonical = status_phase_candidate(&resource, phase)?;
+            let response = self
+                .client
+                .update_status(status_request(&resource, canonical)?)
+                .await;
+            if response.error.is_some() {
+                Err(SourceError::Unavailable)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn checkpoint(
+        &self,
+        _context: &ReconcileContext,
+        _revision: ZoneRevision,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    fn schedule_requeue(
+        &self,
+        _key: &ResourceKey,
+        _at_tick: u64,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        std::future::ready(Ok(()))
+    }
+}
+
+impl GuestProcessSource {
+    async fn current_resource(&self, key: &ResourceKey) -> Result<StoredResource, SourceError> {
+        self.store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "guest-process-current-resource".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "guest-process-current-resource".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: key.zone().clone(),
+                target: key.resource_ref().clone(),
+                expected_uid: Some(key.uid().clone()),
+                projection: StoreProjection::Full,
+            })
+            .await
+            .map_err(|error| {
+                if error.kind() == StoreErrorKind::ResourceConflict {
+                    SourceError::Conflict(error.current_revision().unwrap_or(key_revision(key)))
+                } else {
+                    SourceError::Unavailable
+                }
+            })
+    }
+}
+
+fn key_revision(_key: &ResourceKey) -> ZoneRevision {
+    ZoneRevision::new(1)
+}
+
+fn watch_observed_generation(
+    canonical_resource: Option<&[u8]>,
+    fallback: ResourceGeneration,
+) -> d2b_contracts_resource::v3::ObservedGeneration {
+    canonical_resource
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .and_then(|value| {
+            value
+                .pointer("/status/observedGeneration")
+                .and_then(serde_json::Value::as_u64)
+                .map(d2b_contracts_resource::v3::ObservedGeneration::new)
+        })
+        .unwrap_or_else(|| {
+            d2b_contracts_resource::v3::ObservedGeneration::new(fallback.get().saturating_sub(1))
+        })
+}
+
+fn resource_deleting(canonical_resource: &[u8]) -> bool {
+        serde_json::from_slice::<serde_json::Value>(canonical_resource)
+            .ok()
+            .and_then(|value| value.pointer("/metadata/deletionRequestedAt").cloned())
+            .is_some_and(|value| !value.is_null())
+}
+
+fn response_to_commit(failed: bool, revision: u64) -> Result<CommitOutcome, SourceError> {
+    if failed {
+        Err(SourceError::Unavailable)
+    } else {
+        Ok(CommitOutcome::Committed(ZoneRevision::new(revision)))
+    }
+}
+
+fn status_phase_candidate(
+    resource: &StoredResource,
+    phase: ResourcePhase,
+) -> Result<Vec<u8>, SourceError> {
+    let mut value =
+        CanonicalJsonValue::parse(&resource.canonical_json).map_err(|_| SourceError::Integrity)?;
+    let CanonicalJsonValue::Object(root) = &mut value else {
+        return Err(SourceError::Integrity);
+    };
+    let Some(CanonicalJsonValue::Object(status)) = root.get_mut("status") else {
+        return Err(SourceError::Integrity);
+    };
+    status.insert("phase".to_owned(), phase_json(phase));
+    status.insert(
+        "observedGeneration".to_owned(),
+        CanonicalJsonValue::Integer(resource.generation.get() as i64),
+    );
+    status.insert(
+        "lastReconciledAt".to_owned(),
+        CanonicalJsonValue::String(now_timestamp()),
+    );
+    Ok(value.to_canonical_bytes())
+}
+
+fn merge_status_candidate(
+    resource: &StoredResource,
+    candidate: &[u8],
+) -> Result<Vec<u8>, SourceError> {
+    let mut value =
+        CanonicalJsonValue::parse(&resource.canonical_json).map_err(|_| SourceError::Integrity)?;
+    let candidate = CanonicalJsonValue::parse(candidate).map_err(|_| SourceError::Integrity)?;
+    let CanonicalJsonValue::Object(root) = &mut value else {
+        return Err(SourceError::Integrity);
+    };
+    let CanonicalJsonValue::Object(candidate) = candidate else {
+        return Err(SourceError::Integrity);
+    };
+    root.insert("status".to_owned(), CanonicalJsonValue::Object(candidate));
+    Ok(value.to_canonical_bytes())
+}
+
+fn finalizer_delta(
+    current: &[u8],
+    desired: &[u8],
+) -> Result<(Vec<String>, Vec<String>), SourceError> {
+    let current = CanonicalJsonValue::parse(current).map_err(|_| SourceError::Integrity)?;
+    let desired = CanonicalJsonValue::parse(desired).map_err(|_| SourceError::Integrity)?;
+    let finalizers = |value: &CanonicalJsonValue| -> Result<BTreeSet<String>, SourceError> {
+        let CanonicalJsonValue::Object(root) = value else {
+            return Err(SourceError::Integrity);
+        };
+        let CanonicalJsonValue::Object(metadata) =
+            root.get("metadata").ok_or(SourceError::Integrity)?
+        else {
+            return Err(SourceError::Integrity);
+        };
+        let CanonicalJsonValue::Array(values) =
+            metadata.get("finalizers").ok_or(SourceError::Integrity)?
+        else {
+            return Err(SourceError::Integrity);
+        };
+        values
+            .iter()
+            .map(|value| match value {
+                CanonicalJsonValue::String(value) => Ok(value.clone()),
+                _ => Err(SourceError::Integrity),
+            })
+            .collect()
+    };
+    let current = finalizers(&current)?;
+    let desired = finalizers(&desired)?;
+    Ok((
+        desired.difference(&current).cloned().collect(),
+        current.difference(&desired).cloned().collect(),
+    ))
+}
+
+fn snapshot_wire_identity(resource: &StoredResource) -> wire::ResourceIdentity {
+    let mut identity = wire::ResourceIdentity::new();
+    identity.zone = resource.zone.as_str().to_owned();
+    identity.resource_type = resource.resource_ref.resource_type().as_str().to_owned();
+    identity.name = resource.resource_ref.name().as_str().to_owned();
+    identity.uid = Some(resource.uid.as_str().to_owned());
+    identity.generation = Some(resource.generation.get());
+    identity.revision = Some(resource.revision.get());
+    identity
+}
+
+fn guest_request_meta(action: &str, resource: &StoredResource) -> wire::RequestMeta {
+    let operation = format!(
+        "guest-process-{action}-{}-{}",
+        resource.resource_ref.to_canonical_string(),
+        resource.revision.get()
+    );
+    let mut meta = wire::RequestMeta::new();
+    meta.operation_id = operation.clone();
+    meta.idempotency_key = operation.clone();
+    meta.correlation_id = operation;
+    meta.deadline_ms = 10_000;
+    meta
+}
+
+fn exact_snapshot_precondition(resource: &StoredResource) -> wire::Precondition {
+    let mut precondition = wire::Precondition::new();
+    precondition.kind =
+        protobuf::EnumOrUnknown::new(wire::PreconditionKind::PRECONDITION_KIND_EXACT_REVISION);
+    precondition.expected_revision = Some(resource.revision.get());
+    precondition.expected_uid = Some(resource.uid.as_str().to_owned());
+    precondition
+}
+
+fn delete_request(resource: &StoredResource) -> wire::DeleteRequest {
+    let mut mutation = wire::Mutation::new();
+    mutation.kind = protobuf::EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_DELETE);
+    mutation.target = protobuf::MessageField::some(snapshot_wire_identity(resource));
+    mutation.precondition = protobuf::MessageField::some(exact_snapshot_precondition(resource));
+    let mut request = wire::DeleteRequest::new();
+    request.meta = protobuf::MessageField::some(guest_request_meta("delete", resource));
+    request.mutation = protobuf::MessageField::some(mutation);
+    request
+}
+
+fn finalizer_request(
+    resource: &StoredResource,
+    add: Vec<String>,
+    remove: Vec<String>,
+) -> wire::UpdateFinalizersRequest {
+    let mut mutation = wire::Mutation::new();
+    mutation.kind =
+        protobuf::EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_FINALIZERS);
+    mutation.target = protobuf::MessageField::some(snapshot_wire_identity(resource));
+    mutation.precondition = protobuf::MessageField::some(exact_snapshot_precondition(resource));
+    mutation.add_finalizers = add;
+    mutation.remove_finalizers = remove;
+    let mut request = wire::UpdateFinalizersRequest::new();
+    request.meta = protobuf::MessageField::some(guest_request_meta("finalizers", resource));
+    request.mutation = protobuf::MessageField::some(mutation);
+    request
+}
+
+fn status_request(
+    resource: &StoredResource,
+    canonical: Vec<u8>,
+) -> Result<wire::UpdateStatusRequest, SourceError> {
+    let envelope = ResourceEnvelope::from_json(&canonical).map_err(|_| SourceError::Integrity)?;
+    let digest = envelope.digest().map_err(|_| SourceError::Integrity)?;
+    let mut body = wire::ResourceEnvelopeBytes::new();
+    body.identity = protobuf::MessageField::some(snapshot_wire_identity(resource));
+    body.canonical_json = canonical;
+    body.payload_digest = digest;
+    let mut mutation = wire::Mutation::new();
+    mutation.kind = protobuf::EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_STATUS);
+    mutation.target = protobuf::MessageField::some(snapshot_wire_identity(resource));
+    mutation.precondition = protobuf::MessageField::some(exact_snapshot_precondition(resource));
+    mutation.resource = protobuf::MessageField::some(body);
+    let mut request = wire::UpdateStatusRequest::new();
+    request.meta = protobuf::MessageField::some(guest_request_meta("status", resource));
+    request.mutation = protobuf::MessageField::some(mutation);
+    Ok(request)
+}
+
+/// Run Guest-local Process/EphemeralProcess reconciliation through the
+/// shared Runner and the session-bound watch.
+pub(crate) async fn run_guest_process_reconciliation(
+    mut runtime: ProcessResourceRuntime,
+    store: Arc<SessionBoundStore>,
+    client: Arc<ResourceApiClient<SessionBoundStore, UnavailableUpgradeDispatcher>>,
+    zone: ZoneId,
+) {
+    runtime.set_status_client(Arc::clone(&client));
+    let controller_ref = match ResourceRef::parse("Process/guest-process-controller") {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let provider_ref = match ResourceRef::parse("Provider/system-core") {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let host_ref = match ResourceRef::parse("Host/host-system") {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let controller_generation = runtime.controller_generation;
+    let provider_generation = runtime
+        .guest_execution
+        .as_ref()
+        .map(GuestExecutionBinding::provider_generation);
+    let Some(provider_generation) = provider_generation else {
+        return;
+    };
+    let identity = match ControllerIdentity::new(
+        zone.clone(),
+        controller_ref.clone(),
+        controller_generation,
+        provider_ref,
+        provider_generation,
+        controller_ref,
+        host_ref,
+        runtime.target.clone(),
+    ) {
+        Ok(identity) => identity,
+        Err(_) => return,
+    };
+    let descriptor = match process_controller_descriptor(identity) {
+        Ok(descriptor) => descriptor,
+        Err(_) => return,
+    };
+    let handler = ProcessResourceReconciler::new(descriptor.clone(), runtime);
+    let api = GuestProcessSource::new(zone, store, client);
+    let source = d2b_core_controller::CoreControllerSource::new(descriptor.clone(), api);
+    let runner = d2b_core_controller::Runner::new(
+        handler,
+        source,
+        d2b_core_controller::RunnerConfig {
+            policy_revision: 1,
+            api_revision: 1,
+            configuration_revision: d2b_contracts_resource::v3::ConfigurationGeneration::new(1)
+                .expect("one is valid"),
+            deadline_tick: 5_000,
+            max_attempts: 3,
+        },
+    );
+    if let Err(error) = runner.run().await {
+        tracing::warn!(error = %error, "Guest Process shared runner stopped");
     }
 }
 
@@ -2626,5 +4429,118 @@ mod tests {
             ResourceRef::parse("Process/acceptance-guest-vmm").expect("VMM ref");
         vmm_record.process = DesiredProcess::Process(vmm);
         assert_eq!(scoped_target_ref(&vmm_record, None, None), Some(vmm_owner));
+    }
+
+    fn identity_record(revision: u64) -> DesiredRecord {
+        let resource_ref = ResourceRef::parse("Process/identity").expect("resource ref");
+        let process = serde_json::from_str::<ProcessSpec>(
+            r#"{"executionRef":"Host/host-system","processClass":"worker","template":"reaction"}"#,
+        )
+        .expect("process spec");
+        DesiredRecord {
+            resource: StoredResource {
+                resource_ref,
+                zone: ZoneId::parse("work").expect("zone"),
+                uid: d2b_contracts_resource::v3::ResourceUid::parse(
+                    "123e4567-e89b-42d3-a456-426614174000",
+                )
+                .expect("uid"),
+                generation: d2b_contracts_resource::v3::ResourceGeneration::new(1)
+                    .expect("generation"),
+                revision: ZoneRevision::new(revision),
+                canonical_json: br#"{"metadata":{"finalizers":[]}}"#.to_vec(),
+                payload_digest: "sha256:".to_owned(),
+            },
+            provider_ref: ResourceRef::parse("Provider/system-minijail").expect("provider ref"),
+            process: DesiredProcess::Process(process),
+            zone_uid: None,
+            policy_revision: Some(1),
+            provider_assignment_generation: Some(
+                d2b_contracts_resource::v3::ResourceGeneration::new(2).expect("generation"),
+            ),
+            controller_provider_uid: None,
+            controller_provider_generation: None,
+        }
+    }
+
+    #[test]
+    fn runtime_effect_identity_does_not_change_when_only_revision_advances() {
+        let first = identity_record(3);
+        let second = identity_record(9);
+        assert_eq!(
+            process_operation_id(&first, "launch"),
+            process_operation_id(&second, "launch")
+        );
+        assert_ne!(
+            process_mutation_operation_id(&first, "status"),
+            process_mutation_operation_id(&second, "status")
+        );
+    }
+
+    #[test]
+    fn provider_finalizer_candidate_keeps_exact_runtime_owner() {
+        let record = identity_record(1);
+        let snapshot = ResourceSnapshot::new(
+            ResourceKey::new(
+                record.resource.zone.clone(),
+                record.resource.resource_ref.clone(),
+                record.resource.uid.clone(),
+            ),
+            record.resource.revision,
+            record.resource.generation,
+            br#"{"metadata":{"finalizers":[]}}"#.to_vec(),
+            false,
+        );
+        let candidate =
+            finalizer_candidate(snapshot.canonical_json(), MINIJAIL_PROCESS_FINALIZER, true)
+                .expect("finalizer candidate");
+        let value: serde_json::Value = serde_json::from_slice(&candidate).expect("candidate JSON");
+        assert_eq!(
+            value["metadata"]["finalizers"],
+            serde_json::json!([MINIJAIL_PROCESS_FINALIZER])
+        );
+    }
+
+    #[test]
+    fn persisted_ephemeral_cleanup_eligibility_is_authoritative() {
+        let mut record = identity_record(1);
+        record.resource.resource_ref =
+            ResourceRef::parse("EphemeralProcess/finished").expect("ephemeral ref");
+        record.resource.canonical_json =
+            br#"{"status":{"cleanupEligibleAt":"1970-01-01T00:00:00.000Z"}}"#.to_vec();
+        record.process = DesiredProcess::Ephemeral(
+            serde_json::from_str(
+                r#"{"executionRef":"Host/host-system","processClass":"worker","template":"reaction","incidentHold":false}"#,
+            )
+            .expect("ephemeral spec"),
+        );
+        assert!(ephemeral_status_ttl_elapsed(
+            &record.resource,
+            &record.process
+        ));
+    }
+
+    #[test]
+    fn process_descriptor_uses_one_shared_runner_for_both_resource_types() {
+        let identity = ControllerIdentity::new(
+            ZoneId::parse("work").expect("zone"),
+            ResourceRef::parse("Process/process-controller").expect("controller"),
+            ControllerGeneration::new(3).expect("controller generation"),
+            ResourceRef::parse("Provider/system-core").expect("provider"),
+            d2b_contracts_resource::v3::ResourceGeneration::new(4).expect("provider generation"),
+            ResourceRef::parse("Process/process-controller").expect("process"),
+            ResourceRef::parse("Host/host-system").expect("host"),
+            None,
+        )
+        .expect("controller identity");
+        let descriptor = process_controller_descriptor(identity).expect("descriptor");
+        assert_eq!(
+            descriptor
+                .resource_types()
+                .map(|resource_type| resource_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![EPHEMERAL_PROCESS_TYPE, PROCESS_TYPE]
+        );
+        assert!(descriptor.finalizers().is_empty());
     }
 }

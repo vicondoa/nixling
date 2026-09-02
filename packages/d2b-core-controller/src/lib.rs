@@ -67,12 +67,12 @@ pub use d2b_controller_toolkit::{
     ControllerHealth, ControllerIdentity, ControllerSelector, ControllerSource, ControllerVerb,
     DependencySnapshot, DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot,
     HandlerFailure, InitialList, InitialResource, MutationIntent, MutationIntentKind,
-    ObservationResult, OperationContext, ProjectionDisposition, ReconcileContext,
+    ObservationResult, OperationContext, PriorityLane, ProjectionDisposition, ReconcileContext,
     ReconcileDisposition, ReconcilePlan, ReconcileProjection, ReconcileReason, ReconcileResult,
     ResourceKey, ResourceMutationBatch, ResourceReconciler, ResourceRegistration, ResourceSnapshot,
     ResyncPolicy, Runner, RunnerConfig, SelectorField, SourceError, StatusPersistence,
-    UpdateAssessment, UpdateAssessmentState, UpgradePlan, UpgradeStage, ValidationResult,
-    WatchEvent, WatchFailure,
+    TriggerReason, TriggerSet, UpdateAssessment, UpdateAssessmentState, UpgradePlan, UpgradeStage,
+    ValidationResult, WatchEvent, WatchFailure, WatchHint,
 };
 pub use dependencies::{
     DependencyError, DependencyEvent, DependencyIndex, DependencyTeardownPlan, DependencyTrigger,
@@ -96,7 +96,7 @@ pub use owner_reconcile::{
     DesiredChild, MAX_OWNER_CHILD_BATCH, MAX_OWNER_CHILD_DEPENDENCIES, ObservedChild,
     OwnedChildIntent, OwnedChildKind, OwnerBatchRecovery, OwnerBatchResult, OwnerChildBatch,
     OwnerChildIdentity, OwnerGraph, OwnerGraphError, OwnerIndex, OwnerLimits, OwnerMutation,
-    OwnerReconcileError, OwnerReconcilePlan, OwnerTrigger, TeardownPlan,
+    OwnerReconcileError, OwnerReconcilePlan, OwnerTrigger, ProcessSchedulingClass, TeardownPlan,
 };
 pub use runtime::{
     CoreAdmissionCounts, CoreControllerDescriptorError, CoreControllerSource, CoreDispatchOutcome,

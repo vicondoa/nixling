@@ -29,6 +29,7 @@ use d2b_resource_api::{
         ResourceVerb, SessionVerb,
     },
     service::UnavailableUpgradeDispatcher,
+    watch::{ResourceWatch, WatchService},
 };
 use d2b_resource_store::{
     ExpectedRevision, MutationSealBody, ResourceMutationKind, SealedMutation, StoreCommitResult,
@@ -618,6 +619,28 @@ impl GuestResourceStore {
             RetryClass::Never,
             "guest-target-resource-not-found",
         )
+    }
+
+    async fn open_resource_watch(
+        &self,
+        request: StoreWatchRequest,
+    ) -> Result<ResourceWatch, StoreError> {
+        if request.zone != self.zone
+            || request
+                .resource_types
+                .iter()
+                .any(|resource_type| !Self::is_target_local_type(resource_type))
+        {
+            return Err(Self::forbidden());
+        }
+        match &self.backend {
+            GuestStoreBackend::Durable(store) => {
+                WatchService::new(Arc::clone(store)).open(request).await
+            }
+            GuestStoreBackend::Memory { .. } => {
+                Err(Self::unavailable("guest-target-watch-unavailable"))
+            }
+        }
     }
 
     fn conflict(revision: u64) -> StoreError {
@@ -1422,6 +1445,20 @@ impl SessionBoundStore {
             ));
         }
         Ok(())
+    }
+
+    /// Open the current session's revision-resumable resource watch.
+    pub async fn open_resource_watch(
+        &self,
+        request: StoreWatchRequest,
+    ) -> Result<ResourceWatch, StoreError> {
+        self.ensure_current()?;
+        self.store.open_resource_watch(request).await
+    }
+
+    /// Verify that this session generation still owns its store.
+    pub fn ensure_session_current(&self) -> Result<(), StoreError> {
+        self.ensure_current()
     }
 }
 

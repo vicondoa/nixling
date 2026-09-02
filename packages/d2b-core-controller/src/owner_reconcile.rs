@@ -14,6 +14,39 @@ pub const MAX_OWNER_CHILD_BATCH: usize = 128;
 const MAX_OWNER_DEPENDENCIES: usize = MAX_OWNER_CHILD_DEPENDENCIES;
 const MAX_OWNER_BATCH_CHILDREN: usize = MAX_OWNER_CHILD_BATCH;
 
+/// Closed Process scheduling class used by Core-owned ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProcessSchedulingClass {
+    /// A deletion or finalizer pass that must drain first.
+    DeletionRequested,
+    /// A normal workload Process or EphemeralProcess.
+    Workload,
+    /// A static Provider-controller Process.
+    ProviderController,
+}
+
+impl ProcessSchedulingClass {
+    /// Classify a Process without inspecting implementation-specific fields.
+    pub const fn classify(deletion_requested: bool, provider_controller: bool) -> Self {
+        if deletion_requested {
+            Self::DeletionRequested
+        } else if provider_controller {
+            Self::ProviderController
+        } else {
+            Self::Workload
+        }
+    }
+
+    /// Return the stable scheduling rank.
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::DeletionRequested => 0,
+            Self::Workload => 1,
+            Self::ProviderController => 2,
+        }
+    }
+}
+
 /// Provider-neutral child kind used for deterministic Core ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OwnedChildKind {
@@ -2145,6 +2178,30 @@ mod tests {
             })
             .unwrap();
         assert_eq!(trigger.revision(), ZoneRevision::new(8));
+    }
+
+    #[test]
+    fn process_scheduling_prioritizes_deletion_then_workload_then_controller() {
+        assert_eq!(
+            ProcessSchedulingClass::classify(true, true),
+            ProcessSchedulingClass::DeletionRequested
+        );
+        assert_eq!(
+            ProcessSchedulingClass::classify(false, false),
+            ProcessSchedulingClass::Workload
+        );
+        assert_eq!(
+            ProcessSchedulingClass::classify(false, true),
+            ProcessSchedulingClass::ProviderController
+        );
+        assert!(
+            ProcessSchedulingClass::DeletionRequested.rank()
+                < ProcessSchedulingClass::Workload.rank()
+        );
+        assert!(
+            ProcessSchedulingClass::Workload.rank()
+                < ProcessSchedulingClass::ProviderController.rank()
+        );
     }
 
     #[test]

@@ -11,6 +11,9 @@ use d2b_process_conformance::{
     ProcessIdentityDigest, ProcessPhaseClass, ProcessProvider, ReadinessExpectation, StopClass,
     WaitReapOwner,
 };
+use d2b_provider_system_minijail::launch::{
+    MinijailReconcileAction, MinijailReconcileResult, reconcile as reconcile_action,
+};
 use d2b_provider_system_minijail::{MinijailProcessProvider, PROVIDER_NAME};
 
 fn required() -> Vec<IdentityBinding> {
@@ -33,6 +36,23 @@ fn launching() -> MinijailProcessProvider<ScriptedEffectPort> {
         required(),
         WaitReapOwner::Local,
     ))
+}
+
+#[test]
+fn typed_handler_dispatches_start_without_waiting_for_terminal_exit() {
+    let provider = launching();
+    let ticket = fixtures::ticket_builder()
+        .selected_provider(PROVIDER_NAME)
+        .expected_identity(required())
+        .build()
+        .expect("conformant ticket");
+    let result = block_on(reconcile_action(
+        &provider,
+        MinijailReconcileAction::Start(&ticket),
+    ))
+    .expect("typed start");
+    assert!(matches!(result, MinijailReconcileResult::Started(_)));
+    assert_eq!(provider.port().calls(), vec![PortCall::Launch]);
 }
 
 #[test]

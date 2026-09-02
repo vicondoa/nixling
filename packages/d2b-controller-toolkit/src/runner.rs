@@ -1730,7 +1730,12 @@ where
         if event_only && result.projection().is_none() {
             result = prepared;
         }
-        if result.mutation_batch().is_some() {
+        if result.mutation_batch().is_some_and(|batch| {
+            batch.mutations().iter().any(|mutation| {
+                mutation.kind() != crate::MutationIntentKind::UpdateFinalizers
+                    || mutation.target() != target.key().resource_ref()
+            })
+        }) {
             return WorkerOutcome::Terminal {
                 projection: failure_projection(
                     target.key().clone(),

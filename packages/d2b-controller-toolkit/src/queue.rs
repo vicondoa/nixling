@@ -9,6 +9,8 @@ use d2b_contracts_resource::v3::ZoneRevision;
 
 use crate::{OperationContext, ResourceKey, TriggerReason, TriggerSet};
 
+const MAX_DELETION_PRIORITY_STREAK: usize = 8;
+
 /// Queue lane. Expedited work shares the same resource single-flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriorityLane {
@@ -179,6 +181,7 @@ impl ResourceEntry {
 struct QueueState {
     resources: BTreeMap<ResourceKey, ResourceEntry>,
     ready: VecDeque<ResourceKey>,
+    deletion_priority_streak: usize,
 }
 
 /// Thread-safe bounded queue. A resource remains present while running.
@@ -263,7 +266,36 @@ impl PendingQueue {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while let Some(key) = state.ready.pop_front() {
+        while !state.ready.is_empty() {
+            let deletion_index = state.ready.iter().position(|key| {
+                state
+                    .resources
+                    .get(key)
+                    .and_then(|entry| entry.ordinary.as_ref())
+                    .is_some_and(|pending| {
+                        pending.reasons.contains(TriggerReason::DeletionRequested)
+                            || pending.reasons.contains(TriggerReason::FinalizerRequired)
+                    })
+            });
+            let ordinary_index = state.ready.iter().position(|key| {
+                state
+                    .resources
+                    .get(key)
+                    .and_then(|entry| entry.ordinary.as_ref())
+                    .is_some_and(|pending| {
+                        !pending.reasons.contains(TriggerReason::DeletionRequested)
+                            && !pending.reasons.contains(TriggerReason::FinalizerRequired)
+                    })
+            });
+            let index = if let Some(deletion_index) = deletion_index
+                && (state.deletion_priority_streak < MAX_DELETION_PRIORITY_STREAK
+                    || ordinary_index.is_none())
+            {
+                deletion_index
+            } else {
+                ordinary_index.unwrap_or(0)
+            };
+            let key = state.ready.remove(index)?;
             let entry = state
                 .resources
                 .get_mut(&key)
@@ -285,9 +317,20 @@ impl PendingQueue {
                 }
                 expedited.or_else(|| entry.ordinary.take())
             };
-            if let Some(pending) = pending {
+            let work = pending.map(|pending| {
+                let is_deletion = pending.reasons.contains(TriggerReason::DeletionRequested)
+                    || pending.reasons.contains(TriggerReason::FinalizerRequired);
                 entry.running = true;
-                return Some(pending.into_running(key));
+                (is_deletion, pending.into_running(key))
+            });
+            if let Some((is_deletion, work)) = work {
+                if is_deletion {
+                    state.deletion_priority_streak =
+                        state.deletion_priority_streak.saturating_add(1);
+                } else {
+                    state.deletion_priority_streak = 0;
+                }
+                return Some(work);
             }
         }
         None
@@ -947,5 +990,50 @@ mod tests {
         assert_eq!(queue.resource_count(), 2);
         queue.finish(&running_key).unwrap();
         assert_eq!(queue.resource_count(), 1);
+    }
+
+    #[test]
+    fn deletion_hints_run_before_workload_hints_without_starving_them() {
+        let queue = PendingQueue::new(16, 1);
+        let workload = key("workload", 0);
+        queue
+            .push(hint(
+                workload.clone(),
+                2,
+                TriggerReason::ManualReconcile,
+                PriorityLane::Ordinary,
+                "workload",
+            ))
+            .unwrap();
+        for index in 0..10 {
+            queue
+                .push(hint(
+                    key(&format!("delete-{index}"), index + 1),
+                    3,
+                    TriggerReason::DeletionRequested,
+                    PriorityLane::Ordinary,
+                    &format!("delete-{index}"),
+                ))
+                .unwrap();
+        }
+
+        let first = queue.pop_ready().unwrap();
+        assert!(first.reasons().contains(TriggerReason::DeletionRequested));
+        let first_key = first.key().clone();
+        queue.finish(&first_key).unwrap();
+
+        let mut saw_workload = false;
+        for _ in 0..10 {
+            let work = queue.pop_ready().unwrap();
+            if work.key() == &workload {
+                saw_workload = true;
+            }
+            let key = work.key().clone();
+            queue.finish(&key).unwrap();
+            if saw_workload {
+                break;
+            }
+        }
+        assert!(saw_workload);
     }
 }
