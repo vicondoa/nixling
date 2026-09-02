@@ -2602,10 +2602,17 @@ fn status_payload(
         "lastReconciledAt".to_owned(),
         CanonicalJsonValue::String(now.clone()),
     );
+    let new_run = outcome.as_ref().is_some_and(|outcome| {
+        matches!(
+            outcome.code,
+            "process-started" | "process-restarted" | "process-ready"
+        )
+    });
     if phase == ResourcePhase::Ready
-        && status
-            .get("startedAt")
-            .is_none_or(|value| matches!(value, CanonicalJsonValue::Null))
+        && (new_run
+            || status
+                .get("startedAt")
+                .is_none_or(|value| matches!(value, CanonicalJsonValue::Null)))
     {
         status.insert(
             "startedAt".to_owned(),
