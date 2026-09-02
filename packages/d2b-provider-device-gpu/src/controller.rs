@@ -331,7 +331,7 @@ impl GpuController {
         &mut self,
         port: &mut P,
     ) -> Result<GpuReconcileOutcome, GpuControllerError> {
-        if self.admission.is_none() {
+        if self.admission.is_none() || self.authority_lease.is_none() {
             return Err(GpuControllerError::Authority(
                 GpuAuthorityError::StartupRehydrationRequired,
             ));
@@ -383,6 +383,11 @@ impl GpuController {
     pub fn finalize<P: GpuEffectPort>(&mut self, port: &mut P) -> Result<(), GpuControllerError> {
         if !self.finalizer {
             return Ok(());
+        }
+        if self.authority_lease.is_none() {
+            return Err(GpuControllerError::Authority(
+                GpuAuthorityError::StartupRehydrationRequired,
+            ));
         }
         self.phase = GpuPhase::Finalizing;
         if self.video_started {

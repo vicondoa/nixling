@@ -176,7 +176,7 @@ fn video_starts_only_after_gpu_worker_is_ready() {
 }
 
 #[test]
-fn resource_reconcile_and_finalize_use_the_typed_effect_port() {
+fn direct_reconcile_is_fenced_until_authority_is_reserved() {
     let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
     let owner = GpuOwnerProof::new(
         ResourceRef::parse("Zone/dev").unwrap(),
@@ -202,14 +202,17 @@ fn resource_reconcile_and_finalize_use_the_typed_effect_port() {
     let mut port = FakePort::default();
 
     assert_eq!(
-        controller.reconcile(&mut port).unwrap(),
-        GpuReconcileOutcome::Converged
+        controller.reconcile(&mut port),
+        Err(d2b_provider_device_gpu::GpuControllerError::Authority(
+            d2b_provider_device_gpu::GpuAuthorityError::StartupRehydrationRequired
+        ))
     );
-    assert_eq!(port.starts, [GpuProcessRole::FullGpu]);
-    controller.finalize(&mut port).unwrap();
+    assert!(port.starts.is_empty());
     assert_eq!(
-        controller.phase(),
-        d2b_provider_device_gpu::GpuPhase::Finalized
+        controller.finalize(&mut port),
+        Err(d2b_provider_device_gpu::GpuControllerError::Authority(
+            d2b_provider_device_gpu::GpuAuthorityError::StartupRehydrationRequired
+        ))
     );
 }
 
