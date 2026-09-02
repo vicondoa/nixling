@@ -38,7 +38,7 @@ use crate::transaction::{
     audit_outbox_pending, authority_operations, authority_prepare, authority_update, backpressure,
     current_meta, decode, mark_audit_outbox_complete, pending_audit_outboxes,
     pending_deferred_activation_operation_ids, resource_key, stored_resource, timeout,
-    validate_deferred_broker_evidence_marker, authority_prepare_batch,
+    validate_deferred_broker_evidence_marker, assignment_fence, authority_prepare_batch,
 };
 use d2b_resource_store::mutation_seal::OpenedMutation;
 
@@ -2014,6 +2014,19 @@ impl ReadPool {
             .await
     }
 
+    pub(crate) async fn assignment_fence(
+        &self,
+        zone: ZoneId,
+        target: ResourceRef,
+    ) -> Result<Option<d2b_resource_store::ResourceAssignmentFence>, StoreError> {
+        self.validate_zone(&zone)?;
+        self.submit("get", |response| ReadCommand::Assignment {
+            target,
+            response,
+        })
+        .await
+    }
+
     pub(crate) async fn inspect_schema(
         &self,
         request: StoreInspectSchemaRequest,
@@ -2124,6 +2137,11 @@ enum ReadCommand {
         request: StoreResolveRequest,
         response: oneshot::Sender<Result<StoreResolvedIdentity, StoreError>>,
     },
+    Assignment {
+        target: ResourceRef,
+        response:
+            oneshot::Sender<Result<Option<d2b_resource_store::ResourceAssignmentFence>, StoreError>>,
+    },
     InspectSchema {
         request: StoreInspectSchemaRequest,
         response: oneshot::Sender<Result<StoredSchema, StoreError>>,
@@ -2193,6 +2211,10 @@ fn read_worker(database: Arc<Database>, receiver: std::sync::mpsc::Receiver<Read
                 });
                 let _ = response.send(result);
             }
+            ReadCommand::Assignment { target, response } => {
+                let result = read_assignment(&database, target, deadline);
+                let _ = response.send(result);
+            }
             ReadCommand::InspectSchema { request, response } => {
                 let _ = response.send(read_schema(&database, request, deadline));
             }
@@ -2249,6 +2271,9 @@ fn send_read_result(command: ReadCommand, result: Result<(), StoreError>) {
         ReadCommand::Resolve { response, .. } => {
             let _ = response.send(Err(result.unwrap_err()));
         }
+        ReadCommand::Assignment { response, .. } => {
+            let _ = response.send(Err(result.unwrap_err()));
+        }
         ReadCommand::InspectSchema { response, .. } => {
             let _ = response.send(Err(result.unwrap_err()));
         }
@@ -2294,6 +2319,34 @@ fn read_get(
     }
     project_resource(&mut resource, request.projection)?;
     Ok(resource)
+}
+
+fn read_assignment(
+    database: &Database,
+    target: ResourceRef,
+    deadline: Instant,
+) -> Result<Option<d2b_resource_store::ResourceAssignmentFence>, StoreError> {
+    check_deadline(deadline)?;
+    let read = database
+        .begin_read()
+        .map_err(crate::transaction::integrity)?;
+    let table = read
+        .open_table(RESOURCES)
+        .map_err(crate::transaction::integrity)?;
+    let key = resource_key(&target)?;
+    let Some(bytes) = table
+        .get(key.as_slice())
+        .map_err(crate::transaction::integrity)?
+    else {
+        return Ok(None);
+    };
+    check_deadline(deadline)?;
+    let record: ResourceRecord = decode(ValueKind::ResourceRecord, bytes.value())?;
+    record
+        .assignment
+        .as_ref()
+        .map(assignment_fence)
+        .transpose()
 }
 
 fn read_list(

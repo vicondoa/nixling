@@ -1,7 +1,7 @@
 //! Persisted store DTOs, recovery validation, and crash-safe write transactions.
 
 use d2b_audit::{AuditHash, OperationIdentity};
-use d2b_contracts_resource::v3::identity::STANDARD_RESOURCE_TYPES;
+use d2b_contracts_resource::v3::identity::{ReconnectGeneration, STANDARD_RESOURCE_TYPES};
 use d2b_contracts_resource::v3::process::PROCESS_RESOURCE_TYPE;
 use d2b_contracts_resource::v3::{
     CanonicalJsonValue, ControllerGeneration, FinalizerId, RESOURCE_ENVELOPE_DOMAIN_TAG,
@@ -4662,6 +4662,31 @@ fn assignment_record(
         session_generation: fence.session_generation.get(),
         epoch: fence.epoch,
         phase: "assigned".to_owned(),
+    })
+}
+
+pub(crate) fn assignment_fence(
+    record: &AssignmentRecord,
+) -> Result<ResourceAssignmentFence, StoreError> {
+    if record.phase != "assigned" {
+        return Err(integrity("stored-assignment-not-active"));
+    }
+    Ok(ResourceAssignmentFence {
+        resource_uid: ResourceUid::parse(record.resource_uid.clone())
+            .map_err(|_| integrity("stored-assignment-invalid"))?,
+        resource_revision: ZoneRevision::new(record.resource_revision),
+        provider_generation: ResourceGeneration::new(record.provider_generation)
+            .map_err(|_| integrity("stored-assignment-invalid"))?,
+        controller_generation: ControllerGeneration::new(record.controller_generation)
+            .map_err(|_| integrity("stored-assignment-invalid"))?,
+        controller_role: ResourceRef::parse(&record.controller_role)
+            .map_err(|_| integrity("stored-assignment-invalid"))?,
+        target: ResourceRef::parse(&record.target)
+            .map_err(|_| integrity("stored-assignment-invalid"))?,
+        session_generation: ReconnectGeneration::new(record.session_generation)
+            .map_err(|_| integrity("stored-assignment-invalid"))?,
+        epoch: record.epoch,
+        scope: ResourceAssignmentScope::Primary,
     })
 }
 

@@ -28,7 +28,7 @@ use d2b_audit::{
 };
 use d2b_contracts_resource::v3::{
     ConfigurationGeneration, ControllerGeneration, ResourceUid, Timestamp, ZoneId, ZoneRevision,
-    canonical_digest, identity::STANDARD_RESOURCE_TYPES,
+    ResourceRef, canonical_digest, identity::STANDARD_RESOURCE_TYPES,
 };
 use d2b_resource_store::MutationSealBody;
 use d2b_resource_store::mutation_seal::{MutationSealAcceptor, SealedMutation};
@@ -36,7 +36,7 @@ use d2b_resource_store::{
     PolicySnapshot, StoreCommitResult, StoreError, StoreGetRequest, StoreInspectSchemaRequest,
     StoreListRequest, StoreListResult, StoreResolveRequest, StoreResolvedIdentity,
     StoreSealIdentity, StoreSlot, StoreWatchReceipt, StoreWatchRequest, StoredResource,
-    StoredSchema,
+    StoredSchema, ResourceAssignmentFence,
 };
 use d2b_telemetry::BoundedEmitter;
 use redb::Database;
@@ -1200,6 +1200,15 @@ fn policy_snapshot_from_meta(meta: &transaction::StoreMeta) -> Result<PolicySnap
 impl RedbResourceStore {
     pub async fn get(&self, request: StoreGetRequest) -> Result<StoredResource, StoreError> {
         self.reads.get(request).await
+    }
+
+    /// Read the durable assignment evidence attached to one resource.
+    pub async fn assignment_fence(
+        &self,
+        zone: ZoneId,
+        target: ResourceRef,
+    ) -> Result<Option<ResourceAssignmentFence>, StoreError> {
+        self.reads.assignment_fence(zone, target).await
     }
 
     pub async fn list(&self, request: StoreListRequest) -> Result<StoreListResult, StoreError> {

@@ -12,7 +12,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 #[cfg(test)]
@@ -80,7 +83,8 @@ use d2b_core_controller::controller_assignment::{
 use d2b_core_controller::controllers::HandlerPhase;
 use d2b_core_controller::{
     ControllerIdentity, CoreControllerSource, CoreResourceReconciler,
-    CORE_RESOURCE_CONTROLLER_REGISTRATIONS, Runner, RunnerConfig, core_controller_descriptors,
+    CORE_RESOURCE_CONTROLLER_REGISTRATIONS, Runner, RunnerConfig, SourceError,
+    core_controller_descriptors,
 };
 use d2b_core_controller::main::{
     CoreProcess, RecoverySnapshot, RuntimeReadiness as CoreRuntimeReadiness, StartupStage,
@@ -117,6 +121,7 @@ use d2b_provider_system_core::{
 use d2b_resource_api::{
     RedbBackend, ResourceApiClient, ResourceBusAdapter, ResourceService, ResourceStoreBackend,
     authz::{AuthorizationState, NativeAuthorizer},
+    registered::AssignmentFenceResolver,
     service::UnavailableUpgradeDispatcher,
 };
 use d2b_resource_store::{
@@ -177,6 +182,16 @@ use sha2::{Digest, Sha256};
 const CORE_CONTROLLER_PROCESS_REF: &str = "Process/d2b-core-controller";
 const CORE_CONTROLLER_PROVIDER_REF: &str = "Provider/system-core";
 const CORE_CONTROLLER_HOST_REF: &str = "Host/host-system";
+
+#[derive(Clone)]
+struct CoreAssignmentAuthority {
+    provider_generation: ResourceGeneration,
+    controller_generation: ControllerGeneration,
+    session_generation: ReconnectGeneration,
+    controller_role: ResourceRef,
+    target: ResourceRef,
+    epoch: u64,
+}
 
 #[derive(Clone)]
 pub(crate) struct CommittedInteractionProviderConfiguration {
@@ -2118,6 +2133,7 @@ pub struct ZoneResourceRuntime {
     controller_endpoint_registered: bool,
     watch_admitted: bool,
     assignments: AssignmentRegistry,
+    core_assignment_epoch: Arc<AtomicU64>,
     authority_index: Arc<tokio::sync::Mutex<HostGlobalAuthorityIndex>>,
     authority_persistence: Arc<RedbAuthorityPersistence>,
     authority_recovery: Arc<AuthorityRecoveryCoordinator>,
@@ -2885,6 +2901,7 @@ impl ZoneResourceRuntime {
             controller_endpoint_registered,
             watch_admitted,
             assignments,
+            core_assignment_epoch: Arc::new(AtomicU64::new(0)),
             authority_index,
             authority_persistence,
             authority_recovery,
@@ -3554,6 +3571,19 @@ impl ZoneResourceRuntime {
             &self.bundle_resource_types,
             &resources,
         )?;
+        let rebind_core = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .is_some();
+        let _runner_guard = if rebind_core {
+            Some(self.core_runner_lock.lock().await)
+        } else {
+            None
+        };
+        if rebind_core {
+            self.stop_core_controller_runners_locked().await?;
+        }
         self.authorizer
             .replace_policy(policy.clone(), &state)
             .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
@@ -3586,13 +3616,8 @@ impl ZoneResourceRuntime {
             .policy_loaded
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)? = true;
-        if self
-            .core_controller_subject
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-            .is_some()
-        {
-            self.restart_core_controller_runners().await?;
+        if rebind_core {
+            self.start_core_controller_runners_locked(true).await?;
         }
         Ok(())
     }
@@ -3924,12 +3949,14 @@ impl ZoneResourceRuntime {
 
     async fn core_assignment_fences(
         &self,
+        rotate_epoch: bool,
     ) -> Result<
         (
             Vec<(ResourceRef, ResourceAssignmentFence)>,
             ResourceGeneration,
             ControllerGeneration,
             ReconnectGeneration,
+            Arc<CoreAssignmentAuthority>,
         ),
         ResourceRuntimeError,
     > {
@@ -3947,7 +3974,7 @@ impl ZoneResourceRuntime {
         let controller_generation = metadata
             .policy_snapshot
             .controller_generation
-            .unwrap_or_else(|| ControllerGeneration::new(1).expect("generation one"));
+            .ok_or(ResourceRuntimeError::HandlerNotReady)?;
         let resource_types = CORE_RESOURCE_CONTROLLER_REGISTRATIONS
             .iter()
             .map(|registration| {
@@ -3990,12 +4017,46 @@ impl ZoneResourceRuntime {
             .iter()
             .find(|resource| resource.resource_ref == provider_ref)
             .map(|resource| resource.generation)
-            .unwrap_or_else(|| ResourceGeneration::new(1).expect("generation one"));
+            .ok_or(ResourceRuntimeError::HandlerNotReady)?;
         let controller_ref = ResourceRef::parse(CORE_CONTROLLER_PROCESS_REF)
             .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
         let target = ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
             .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
         let session_generation = subject.reconnect_generation();
+        let durable_epoch = {
+            let mut maximum = 0;
+            for resource in &resources {
+                if let Some(fence) = self
+                    .store
+                    .assignment_fence(self.zone.clone(), resource.resource_ref.clone())
+                    .await
+                    .map_err(|_| ResourceRuntimeError::StoreReadFailed)?
+                {
+                    maximum = maximum.max(fence.epoch);
+                }
+            }
+            maximum
+        };
+        let current_epoch = self.core_assignment_epoch.load(Ordering::Acquire);
+        let floor = current_epoch.max(durable_epoch);
+        let epoch = if rotate_epoch || current_epoch == 0 || durable_epoch > current_epoch {
+            self.assignments
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .reserve_epoch_after(floor)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?
+        } else {
+            current_epoch
+        };
+        self.core_assignment_epoch.store(epoch, Ordering::Release);
+        let authority = Arc::new(CoreAssignmentAuthority {
+            provider_generation,
+            controller_generation,
+            session_generation,
+            controller_role: controller_ref.clone(),
+            target: target.clone(),
+            epoch,
+        });
         let assignments = resources
             .into_iter()
             .map(|resource| {
@@ -4007,7 +4068,7 @@ impl ZoneResourceRuntime {
                     controller_role: controller_ref.clone(),
                     target: target.clone(),
                     session_generation,
-                    epoch: 1,
+                    epoch,
                     scope: ResourceAssignmentScope::Primary,
                 };
                 (resource.resource_ref, fence)
@@ -4018,10 +4079,11 @@ impl ZoneResourceRuntime {
             provider_generation,
             controller_generation,
             session_generation,
+            authority,
         ))
     }
 
-    async fn stop_core_controller_runners(&self) -> Result<(), ResourceRuntimeError> {
+    async fn stop_core_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
         let tasks = {
             let mut tasks = self
                 .core_runner_tasks
@@ -4036,16 +4098,18 @@ impl ZoneResourceRuntime {
         Ok(())
     }
 
-    async fn restart_core_controller_runners(&self) -> Result<(), ResourceRuntimeError> {
-        self.stop_core_controller_runners().await?;
-        self.start_core_controller_runners().await
+    async fn start_core_controller_runners(&self) -> Result<(), ResourceRuntimeError> {
+        let _runner_guard = self.core_runner_lock.lock().await;
+        self.start_core_controller_runners_locked(false).await
     }
 
-    async fn start_core_controller_runners(&self) -> Result<(), ResourceRuntimeError> {
+    async fn start_core_controller_runners_locked(
+        &self,
+        rotate_epoch: bool,
+    ) -> Result<(), ResourceRuntimeError> {
         if !self.readiness.resource_api_ready {
             return Ok(());
         }
-        let _start = self.core_runner_lock.lock().await;
         let stale = {
             let mut tasks = self
                 .core_runner_tasks
@@ -4071,8 +4135,17 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .clone()
             .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
-        let (assignments, provider_generation, controller_generation, _) =
-            self.core_assignment_fences().await?;
+        let (
+            assignments,
+            provider_generation,
+            controller_generation,
+            _session_generation,
+            assignment_authority,
+        ) = match self.core_assignment_fences(rotate_epoch).await {
+            Ok(value) => value,
+            Err(ResourceRuntimeError::HandlerNotReady) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let controller_ref = ResourceRef::parse(CORE_CONTROLLER_PROCESS_REF)
             .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
         let provider_ref = ResourceRef::parse(CORE_CONTROLLER_PROVIDER_REF)
@@ -4106,10 +4179,46 @@ impl ZoneResourceRuntime {
                 })
                 .cloned()
                 .collect();
+            let resolver_store = Arc::clone(&self.store);
+            let resolver_zone = self.zone.clone();
+            let resolver_authority = Arc::clone(&assignment_authority);
+            let resolver: AssignmentFenceResolver = Arc::new(move |target, uid, revision| {
+                let store = Arc::clone(&resolver_store);
+                let zone = resolver_zone.clone();
+                let authority = Arc::clone(&resolver_authority);
+                Box::pin(async move {
+                    let stored = store
+                        .assignment_fence(zone.clone(), target)
+                        .await
+                        .map_err(|error| match error.kind() {
+                            StoreErrorKind::Backpressure
+                            | StoreErrorKind::StoreBackpressure => {
+                                SourceError::Backpressure
+                            }
+                            StoreErrorKind::Timeout => SourceError::Timeout,
+                            _ => SourceError::Unavailable,
+                        })?;
+                    if stored.is_some_and(|fence| fence.resource_uid != uid) {
+                        return Err(SourceError::Integrity);
+                    }
+                    Ok(ResourceAssignmentFence {
+                        resource_uid: uid,
+                        resource_revision: revision,
+                        provider_generation: authority.provider_generation,
+                        controller_generation: authority.controller_generation,
+                        controller_role: authority.controller_role.clone(),
+                        target: authority.target.clone(),
+                        session_generation: authority.session_generation,
+                        epoch: authority.epoch,
+                        scope: ResourceAssignmentScope::Primary,
+                    })
+                })
+            });
             let api = self
                 .api
                 .registered_controller_api(subject, authorization_state.clone(), resource_assignments)
                 .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
+            let api = api.with_assignment_fence_resolver(resolver);
             let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
             let runner = Runner::new(
                 CoreResourceReconciler::for_handler(descriptor, registration.handler()),

@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -35,6 +36,20 @@ use crate::service::{ResourceService, UpgradeDispatcher};
 use crate::store::{CheckedResourceStore, StoreBindingError};
 use crate::watch::{ResourceWatch, WatchService};
 
+/// Per-reconcile assignment evidence supplied by the Zone-owned authority.
+pub type AssignmentFenceResolver = Arc<
+    dyn Fn(
+            ResourceRef,
+            ResourceUid,
+            ZoneRevision,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<ResourceAssignmentFence, SourceError>> + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 /// A production `RegisteredControllerApi` backed by one owned redb store.
 ///
 /// The mutation issuer is paired with the acceptor installed in the store by
@@ -60,7 +75,8 @@ struct NativeCommitPath {
     subject: Arc<crate::AuthenticatedSubjectContext>,
     state: AuthorizationState,
     zone_uid: Option<ResourceUid>,
-    assignments: BTreeMap<ResourceRef, ResourceAssignmentFence>,
+    assignments: Arc<Mutex<BTreeMap<ResourceRef, ResourceAssignmentFence>>>,
+    assignment_resolver: Option<AssignmentFenceResolver>,
     require_assignment: bool,
 }
 
@@ -116,7 +132,8 @@ impl RedbRegisteredControllerApi {
                 subject: Arc::new(subject),
                 state,
                 zone_uid: service.zone_uid(),
-                assignments: assignments.into_iter().collect(),
+                assignments: Arc::new(Mutex::new(assignments.into_iter().collect())),
+                assignment_resolver: None,
                 require_assignment: true,
             }),
             descriptor: Mutex::new(None),
@@ -166,7 +183,8 @@ impl RedbRegisteredControllerApi {
                 subject: Arc::new(subject),
                 state,
                 zone_uid: service.zone_uid(),
-                assignments: BTreeMap::new(),
+                assignments: Arc::new(Mutex::new(BTreeMap::new())),
+                assignment_resolver: None,
                 require_assignment: false,
             }),
             descriptor: Mutex::new(None),
@@ -183,6 +201,47 @@ impl RedbRegisteredControllerApi {
     /// Borrow the store used by this adapter.
     pub fn store(&self) -> &Arc<RedbResourceStore> {
         &self.store
+    }
+
+    /// Refresh assignment evidence for every fresh target and commit.
+    pub fn with_assignment_fence_resolver(
+        mut self,
+        resolver: AssignmentFenceResolver,
+    ) -> Self {
+        if let Some(commit) = self.commit.as_mut() {
+            commit.assignment_resolver = Some(resolver);
+        }
+        self
+    }
+
+    async fn refresh_assignment(
+        &self,
+        target: &ResourceRef,
+        uid: &ResourceUid,
+        revision: ZoneRevision,
+    ) -> Result<(), SourceError> {
+        let Some(commit) = self.commit.as_ref() else {
+            return Ok(());
+        };
+        let Some(resolver) = commit.assignment_resolver.clone() else {
+            return Ok(());
+        };
+        let fence = resolver(target.clone(), uid.clone(), revision).await?;
+        if fence.resource_uid != *uid
+            || fence.resource_revision != revision
+            || fence.provider_generation.get() == 0
+            || fence.controller_generation.get() == 0
+            || fence.session_generation.get() == 0
+            || fence.epoch == 0
+        {
+            return Err(SourceError::Integrity);
+        }
+        commit
+            .assignments
+            .lock()
+            .map_err(|_| SourceError::Integrity)?
+            .insert(target.clone(), fence);
+        Ok(())
     }
 
     fn descriptor(&self) -> Result<ControllerDescriptor, SourceError> {
@@ -409,12 +468,46 @@ impl RedbRegisteredControllerApi {
             return Err(SourceError::Integrity);
         };
         let mut mutations = mutations;
+        let resolver = commit.assignment_resolver.clone();
         for mutation in &mut mutations {
-            if let Some(fence) = commit.assignments.get(&mutation.target) {
-                if fence.resource_uid != *context_uid {
+            let fence = if let Some(resolver) = resolver.as_ref() {
+                let expected_revision = match mutation.expected {
+                    ExpectedRevision::Exact(revision) => revision,
+                    ExpectedRevision::CreateAbsent => return Err(SourceError::Integrity),
+                };
+                let fence = resolver(
+                    mutation.target.clone(),
+                    mutation
+                        .expected_uid
+                        .clone()
+                        .unwrap_or_else(|| context_uid.clone()),
+                    expected_revision,
+                )
+                .await?;
+                if fence.resource_uid != *context_uid
+                    || fence.resource_revision != expected_revision
+                    || fence.provider_generation.get() == 0
+                    || fence.controller_generation.get() == 0
+                    || fence.session_generation.get() == 0
+                    || fence.epoch == 0
+                {
                     return Err(SourceError::Integrity);
                 }
-                let mut fence = fence.clone();
+                commit
+                    .assignments
+                    .lock()
+                    .map_err(|_| SourceError::Integrity)?
+                    .insert(mutation.target.clone(), fence.clone());
+                Some(fence)
+            } else {
+                commit
+                    .assignments
+                    .lock()
+                    .map_err(|_| SourceError::Integrity)?
+                    .get(&mutation.target)
+                    .cloned()
+            };
+            if let Some(mut fence) = fence {
                 match &mut fence.scope {
                     ResourceAssignmentScope::Primary => {
                         fence.resource_revision = match mutation.expected {
@@ -499,7 +592,11 @@ impl RedbRegisteredControllerApi {
         let Some(commit) = self.commit.as_ref() else {
             return Err(SourceError::Integrity);
         };
-        let assignment = commit.assignments.get(context.target().resource_ref());
+        let assignments = commit
+            .assignments
+            .lock()
+            .map_err(|_| SourceError::Integrity)?;
+        let assignment = assignments.get(context.target().resource_ref());
         if commit.require_assignment && assignment.is_none() {
             return Err(SourceError::Integrity);
         }
@@ -890,10 +987,18 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
         async move {
             let descriptor = self.descriptor()?;
             match self.read_target(&key).await? {
-                Ok(resource) => Ok(FreshSnapshot::Present {
-                    target: snapshot_from_resource(resource),
-                    dependencies: self.dependencies(&descriptor, key.zone()).await?,
-                }),
+                Ok(resource) => {
+                    self.refresh_assignment(
+                        key.resource_ref(),
+                        &resource.uid,
+                        resource.revision,
+                    )
+                    .await?;
+                    Ok(FreshSnapshot::Present {
+                        target: snapshot_from_resource(resource),
+                        dependencies: self.dependencies(&descriptor, key.zone()).await?,
+                    })
+                }
                 Err(revision) => Ok(FreshSnapshot::Deleted {
                     key,
                     revision,
@@ -1737,6 +1842,7 @@ fn source_error(error: StoreError, fallback: ZoneRevision) -> SourceError {
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use crate::authz::{
@@ -2799,6 +2905,66 @@ mod tests {
             .unwrap_err(),
             SourceError::Integrity
         );
+    }
+
+    #[tokio::test]
+    async fn registered_api_refreshes_assignment_for_new_targets_and_each_commit() {
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
+        let target = ResourceRef::parse("Host/owner").unwrap();
+        store
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
+                target.clone(),
+                canonical_host("owner", None),
+                None,
+                "create-owner",
+            ))
+            .await
+            .unwrap();
+        let stored = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let api = RedbRegisteredControllerApi::with_identity(
+            &service,
+            subject,
+            state,
+            Vec::new(),
+        )
+        .unwrap()
+        .with_assignment_fence_resolver(Arc::new(move |target, uid, revision| {
+            let calls = Arc::clone(&resolver_calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::AcqRel);
+                let _ = target;
+                Ok(primary_assignment(uid, revision))
+            })
+        }));
+        let key = ResourceKey::new(
+            stored.zone.clone(),
+            stored.resource_ref.clone(),
+            stored.uid.clone(),
+        );
+        api.register(&descriptor()).await.unwrap();
+        api.read_fresh(&key).await.unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        api.read_fresh(&key).await.unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 2);
     }
 
     #[tokio::test]
