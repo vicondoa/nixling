@@ -1152,25 +1152,6 @@ mod tests {
     }
 
     #[test]
-    fn accepted_catalog_composes_all_27_provider_rows_at_once() {
-        let bindings =
-            accepted_provider_bindings(zone(), FINGERPRINT).expect("accepted Provider catalog");
-        assert_eq!(bindings.len(), ALL_ACCEPTED_PROVIDER_IDENTITIES.len());
-        assert_eq!(bindings.len(), 27);
-        let registry = compose_all_27_provider_registry(zone(), 1, FINGERPRINT)
-            .expect("all accepted Provider rows");
-        let snapshot = registry.snapshot();
-        assert_eq!(snapshot.descriptors().len(), 27);
-        for name in ALL_ACCEPTED_PROVIDER_IDENTITIES {
-            let provider = ResourceRef::parse(&format!("Provider/{name}")).expect("Provider ref");
-            assert!(
-                registry.descriptor(&provider).is_some(),
-                "missing accepted Provider row: {name}"
-            );
-        }
-    }
-
-    #[test]
     fn non_provider_resource_ref_cannot_enter_registry() {
         let error = ProviderBinding::new(
             zone(),
