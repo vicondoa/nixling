@@ -21,10 +21,17 @@ the Provider returns only an opaque carriage connection.
 ## Controllers / services / workers / binaries
 
 `AzureRelayTransportProvider` opens bounded sender or listener connections
-through `RelayCredentialPort` and `RelaySocketConnector`. Binding-aware opens
-fence every lease to one ZoneLink, session, and reconnect generation;
-`AzureRelaySocketConnector` keeps WebSocket/TLS state in the Guest. Reconnect
-and backpressure are explicit typed helpers.
+through the scoped `ScopedCredentialClient` boundary and
+`RelaySocketConnector`. Scoped opens fence every lease to one same-Zone
+Credential, Gateway Guest, ZoneLink, session, and reconnect generation;
+`AzureRelaySocketConnector` keeps WebSocket/TLS state in the Guest. Core owns
+ZoneLink reconnect scheduling; the Provider only performs bounded carriage
+attempt retries and preserves backpressure.
+
+`RelayTransportService` exposes typed opaque open/close/observe handles without
+owning a ResourceType, watch, scheduler, or universal RPC surface. The
+scoped-client adapter remains the narrow U10 seam until the Credential
+ResourceClient is available.
 
 ## Placement and dependencies
 
@@ -53,7 +60,7 @@ sets.
 ## Build and test
 
 ```text
-bazel test //packages/d2b-provider-transport-azure-relay:d2b_provider_transport_azure_relay_doc_test
+bazel test //packages/d2b-provider-transport-azure-relay:all-tests
 ```
 
 Tests use in-process socket objects and do not contact Azure Relay.

@@ -38,6 +38,8 @@ workers or binaries: admission and broker access remain daemon-supervised.
 - Seqpacket routes enable `SO_PASSCRED`; stream routes never carry attachments.
 - ZoneLink routes never carry attachments, even when their caller requests
   them.
+- Local portal requests may bind the accepted socket to an expected kernel
+  uid/gid; peer identity is evidence only and is not derived from payload.
 - Every accepted descriptor and portal monitor duplicate is close-on-exec.
 - The portal retains request-bound peer evidence and an owned monitor duplicate;
   callers receive the validated original descriptor exactly once.
@@ -82,7 +84,7 @@ socket address, descriptor number, opaque handle, path, or payload.
 ## Build and test
 
 ```bash
-bazel test //packages/d2b-provider-transport-unix:all
+bazel test //packages/d2b-provider-transport-unix:all-tests
 ```
 
 The focused tests cover accepted-fd/peer/request binding, socket-kind and

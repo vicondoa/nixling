@@ -14,6 +14,7 @@ use crate::{
     RelayRole, RelayTransportConfig, RelayTransportError, RelayTransportSettings,
 };
 use d2b_contracts_resource::v3::ResourceRef;
+use d2b_contracts_resource::v3::ZoneId;
 
 use crate::guest_credential::{
     CredentialError, CredentialFilePolicy, GatewayGuestCredentialPort, SealingKey,
@@ -185,14 +186,27 @@ impl GatewayGuestZoneLinkRuntime {
     pub async fn open_authenticated_transport<V: RelayEnrollmentVerifier>(
         &self,
         role: RelayRole,
+        zone: ZoneId,
+        credential_ref: ResourceRef,
+        execution_ref: ResourceRef,
         binding: RelayCredentialBinding,
         deadline_ms: u32,
         verifier: &V,
         transcript: &[u8],
     ) -> Result<RelayComponentSessionTransport, GatewayGuestZoneLinkError> {
+        let credential_role = Self::credential_role(role);
+        let request = crate::ScopedCredentialRequest::new(
+            zone,
+            credential_ref,
+            execution_ref,
+            credential_role,
+            binding,
+            deadline_ms,
+        )
+        .map_err(|_| GatewayGuestZoneLinkError::CredentialUnavailable)?;
         let connection = self
             .provider
-            .open_bound(role, binding, deadline_ms)
+            .open_scoped(request)
             .await
             .map_err(GatewayGuestZoneLinkError::from)?;
         let proof = RelayEnrollmentProof::authenticate(

@@ -145,3 +145,19 @@ fn guest_zone_and_signature_mismatches_are_refused() {
         SessionRejectReason::SignatureInvalid
     );
 }
+
+#[test]
+fn zero_reconnect_generation_is_never_admitted() {
+    let expected = identity(42);
+    let key = SessionKey::from_core([9; 32]);
+    let mut authority = SessionAuthority::new(expected.clone(), key.clone(), 0);
+    assert_eq!(
+        authority
+            .authenticate(
+                PeerCid::from_core(42).unwrap(),
+                SessionProof::sign(&key, &expected, nonce_for(8), 0),
+            )
+            .unwrap_err(),
+        SessionRejectReason::StaleSignature
+    );
+}

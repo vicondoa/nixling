@@ -188,6 +188,7 @@ pub enum SessionState {
 /// Single-use authenticated session authority.
 pub struct ReadySession {
     identity: GuestIdentity,
+    generation: u64,
     state: SessionState,
 }
 
@@ -195,6 +196,11 @@ impl ReadySession {
     /// Return the current session state.
     pub const fn state(&self) -> SessionState {
         self.state
+    }
+
+    /// Return the Core-owned reconnect generation for this session.
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Check that a request remains bound to this Guest and Zone.
@@ -261,7 +267,11 @@ impl SessionAuthority {
         if self.expected.zone != proof.identity.zone {
             return Err(SessionRejectReason::ZoneMismatch);
         }
-        if self.expected.boot_id != proof.identity.boot_id || proof.generation != self.generation {
+        if self.generation == 0
+            || proof.generation == 0
+            || self.expected.boot_id != proof.identity.boot_id
+            || proof.generation != self.generation
+        {
             return Err(SessionRejectReason::StaleSignature);
         }
         if self.replayed.contains(&proof.nonce) {
@@ -277,6 +287,7 @@ impl SessionAuthority {
         self.replayed.insert(proof.nonce);
         Ok(ReadySession {
             identity: self.expected.clone(),
+            generation: proof.generation,
             state: SessionState::Ready,
         })
     }

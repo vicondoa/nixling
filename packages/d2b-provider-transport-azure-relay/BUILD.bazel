@@ -78,6 +78,7 @@ rust_test(
     visibility = ["//visibility:public"],
     deps = [
         "//packages/d2b-contracts:d2b_contracts",
+        "//packages/d2b-contracts-resource:d2b_contracts_resource",
         "//packages/d2b-contracts-zone-session:d2b_contracts_zone_session",
         "//packages/d2b-session:d2b_session",
         ":d2b_provider_transport_azure_relay",

@@ -16,7 +16,7 @@ pub mod portal;
 pub mod service;
 
 pub use admission::{OpenTransportRequest, RouteClass, SocketKind, TransportAdmissionError};
-pub use identity::{BrokerRole, TransportRequestBinding};
+pub use identity::{BrokerRole, ExpectedPeer, TransportRequestBinding};
 pub use portal::{
     OpenedTransport, PortalError, TransportDescriptor, TransportHandle, TransportObservation,
     TransportPortal,

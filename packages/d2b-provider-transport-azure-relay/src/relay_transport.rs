@@ -25,8 +25,8 @@ use zeroize::Zeroizing;
 use crate::{
     backpressure::{BackpressureError, CreditWindow, MAX_RELAY_FRAME_BYTES},
     credential_client::{
-        RelayCredentialBinding, RelayCredentialLease, RelayCredentialPort, RelayCredentialRole,
-        RelaySecret,
+        RelayCredentialBinding, RelayCredentialLease, RelayCredentialRole, RelaySecret,
+        ScopedCredentialClient, ScopedCredentialRequest,
     },
     reconnect::{ReconnectBackoff, ReconnectDecision},
     transport_settings::RelayTransportSettings,
@@ -40,6 +40,7 @@ pub const MAX_RELAY_GENERATION_FENCES: usize = 1_024;
 pub const MAX_RELAY_CA_BYTES: usize = 256 * 1024;
 /// Maximum WebSocket write buffer for one Relay connection.
 pub const MAX_RELAY_WS_WRITE_BUFFER_BYTES: usize = 2 * MAX_RELAY_FRAME_BYTES;
+const MAX_COMPLETED_RELAY_TRANSPORTS: usize = MAX_RELAY_GENERATION_FENCES;
 
 /// Relay endpoint role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -512,7 +513,7 @@ impl RelayAuthenticatedPeer {
 
 #[derive(Default)]
 struct RelayGenerationFence {
-    states: StdMutex<HashMap<(String, String), RelayGenerationState>>,
+    states: StdMutex<HashMap<(String, String, String), RelayGenerationState>>,
 }
 
 #[derive(Default)]
@@ -522,18 +523,18 @@ struct RelayGenerationState {
     active: HashMap<u64, usize>,
 }
 
-type RelayGenerationStates = HashMap<(String, String), RelayGenerationState>;
+type RelayGenerationStates = HashMap<(String, String, String), RelayGenerationState>;
 
 struct RelayGenerationAttempt {
     fence: Arc<RelayGenerationFence>,
-    key: (String, String),
+    key: (String, String, String),
     generation: u64,
     live: bool,
 }
 
 struct RelayGenerationLease {
     fence: Arc<RelayGenerationFence>,
-    key: (String, String),
+    key: (String, String, String),
     generation: u64,
     live: bool,
 }
@@ -550,10 +551,7 @@ impl RelayGenerationFence {
         self: &Arc<Self>,
         binding: &RelayCredentialBinding,
     ) -> Result<RelayGenerationAttempt, RelayTransportError> {
-        let key = (
-            binding.zone_link_uid().to_owned(),
-            binding.session_id().to_owned(),
-        );
+        let key = generation_key(binding);
         let generation = binding.reconnect_generation();
         let mut states = self.lock_states();
         let state = match states.get_mut(&key) {
@@ -569,6 +567,17 @@ impl RelayGenerationFence {
         if state.committed.is_some_and(|current| current > generation) {
             return Err(RelayTransportError::StaleGeneration);
         }
+        if state
+            .in_flight
+            .get(&generation)
+            .is_some_and(|count| *count > 0)
+            || state
+                .active
+                .get(&generation)
+                .is_some_and(|count| *count > 0)
+        {
+            return Err(RelayTransportError::DuplicateTransport);
+        }
         *state.in_flight.entry(generation).or_default() += 1;
         Ok(RelayGenerationAttempt {
             fence: Arc::clone(self),
@@ -578,7 +587,11 @@ impl RelayGenerationFence {
         })
     }
 
-    fn commit(&self, key: &(String, String), generation: u64) -> Result<(), RelayTransportError> {
+    fn commit(
+        &self,
+        key: &(String, String, String),
+        generation: u64,
+    ) -> Result<(), RelayTransportError> {
         let mut states = self.lock_states();
         let Some(state) = states.get_mut(key) else {
             return Err(RelayTransportError::StaleGeneration);
@@ -593,7 +606,7 @@ impl RelayGenerationFence {
         Ok(())
     }
 
-    fn abort(&self, key: &(String, String), generation: u64) {
+    fn abort(&self, key: &(String, String, String), generation: u64) {
         let mut states = self.lock_states();
         if let Some(state) = states.get_mut(key) {
             decrement_count(&mut state.in_flight, generation);
@@ -601,7 +614,7 @@ impl RelayGenerationFence {
         remove_empty_state(&mut states, key);
     }
 
-    fn release(&self, key: &(String, String), generation: u64) {
+    fn release(&self, key: &(String, String, String), generation: u64) {
         let mut states = self.lock_states();
         if let Some(state) = states.get_mut(key) {
             decrement_count(&mut state.active, generation);
@@ -610,10 +623,7 @@ impl RelayGenerationFence {
     }
 
     fn is_current(&self, binding: &RelayCredentialBinding) -> bool {
-        let key = (
-            binding.zone_link_uid().to_owned(),
-            binding.session_id().to_owned(),
-        );
+        let key = generation_key(binding);
         let states = self.lock_states();
         let Some(state) = states.get(&key) else {
             return false;
@@ -625,7 +635,7 @@ impl RelayGenerationFence {
                 .is_some_and(|count| *count > 0)
     }
 
-    fn is_attempt_eligible(&self, key: &(String, String), generation: u64) -> bool {
+    fn is_attempt_eligible(&self, key: &(String, String, String), generation: u64) -> bool {
         let states = self.lock_states();
         let Some(state) = states.get(key) else {
             return false;
@@ -689,9 +699,19 @@ fn decrement_count(counts: &mut HashMap<u64, usize>, generation: u64) {
     }
 }
 
+fn generation_key(binding: &RelayCredentialBinding) -> (String, String, String) {
+    (
+        binding
+            .zone()
+            .map_or_else(|| "<unscoped>".to_owned(), |zone| zone.as_str().to_owned()),
+        binding.zone_link_uid().to_owned(),
+        binding.session_id().to_owned(),
+    )
+}
+
 fn remove_empty_state(
-    states: &mut HashMap<(String, String), RelayGenerationState>,
-    key: &(String, String),
+    states: &mut HashMap<(String, String, String), RelayGenerationState>,
+    key: &(String, String, String),
 ) {
     let remove = states
         .get(key)
@@ -913,7 +933,9 @@ fn map_transport_error(error: RelayTransportError) -> TransportError {
         | RelayTransportError::Protocol
         | RelayTransportError::InvalidSessionTransition
         | RelayTransportError::DeadlineExpired
-        | RelayTransportError::StaleGeneration => TransportError::Disconnected,
+        | RelayTransportError::StaleGeneration
+        | RelayTransportError::UnknownTransportHandle
+        | RelayTransportError::DuplicateTransport => TransportError::Disconnected,
         RelayTransportError::InvalidConfiguration => TransportError::Other,
     }
 }
@@ -1038,6 +1060,10 @@ pub enum RelayTransportError {
     DeadlineExpired,
     /// A newer reconnect generation superseded this connection.
     StaleGeneration,
+    /// A transport handle was not owned by this service.
+    UnknownTransportHandle,
+    /// A carriage already exists for the exact binding.
+    DuplicateTransport,
 }
 
 impl fmt::Display for RelayTransportError {
@@ -1057,6 +1083,8 @@ impl fmt::Display for RelayTransportError {
             Self::InvalidSessionTransition => "relay-invalid-session-transition",
             Self::DeadlineExpired => "relay-deadline-expired",
             Self::StaleGeneration => "relay-stale-generation",
+            Self::UnknownTransportHandle => "relay-unknown-transport-handle",
+            Self::DuplicateTransport => "relay-duplicate-transport",
         })
     }
 }
@@ -1071,7 +1099,8 @@ fn map_credential_error(error: crate::RelayCredentialError) -> RelayTransportErr
         crate::RelayCredentialError::InvalidBinding
         | crate::RelayCredentialError::BindingRequired
         | crate::RelayCredentialError::AlreadyBound
-        | crate::RelayCredentialError::BindingMismatch => {
+        | crate::RelayCredentialError::BindingMismatch
+        | crate::RelayCredentialError::InvalidScope => {
             RelayTransportError::CredentialBindingMismatch
         }
         crate::RelayCredentialError::InvalidSecret | crate::RelayCredentialError::UnknownLease => {
@@ -1087,14 +1116,14 @@ enum RetryResult {
 
 const CREDENTIAL_REVOKE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 
-struct CredentialLeaseGuard<C: RelayCredentialPort + 'static> {
+struct CredentialLeaseGuard<C: ScopedCredentialClient + 'static> {
     credentials: Arc<C>,
     lease: Option<RelayCredentialLease>,
 }
 
 impl<C> CredentialLeaseGuard<C>
 where
-    C: RelayCredentialPort + 'static,
+    C: ScopedCredentialClient + 'static,
 {
     fn new(credentials: Arc<C>, lease: RelayCredentialLease) -> Self {
         Self {
@@ -1126,7 +1155,7 @@ where
 
 impl<C> Drop for CredentialLeaseGuard<C>
 where
-    C: RelayCredentialPort + 'static,
+    C: ScopedCredentialClient + 'static,
 {
     fn drop(&mut self) {
         if let Some(lease) = self.lease.take() {
@@ -1140,12 +1169,15 @@ fn spawn_bounded_revoke<C>(
     lease: RelayCredentialLease,
 ) -> Option<tokio::task::JoinHandle<Result<(), crate::RelayCredentialError>>>
 where
-    C: RelayCredentialPort + 'static,
+    C: ScopedCredentialClient + 'static,
 {
     let handle = tokio::runtime::Handle::try_current().ok()?;
     Some(handle.spawn(async move {
-        match tokio::time::timeout(CREDENTIAL_REVOKE_CLEANUP_TIMEOUT, credentials.revoke(lease))
-            .await
+        match tokio::time::timeout(
+            CREDENTIAL_REVOKE_CLEANUP_TIMEOUT,
+            credentials.revoke_credential(lease),
+        )
+        .await
         {
             Ok(result) => result,
             Err(_) => Err(crate::RelayCredentialError::Unavailable),
@@ -1176,13 +1208,6 @@ fn revoke_or(
     revoke.err().unwrap_or(original)
 }
 
-fn legacy_binding() -> RelayCredentialBinding {
-    static NEXT_LEGACY_BINDING: AtomicU64 = AtomicU64::new(1);
-    let id = NEXT_LEGACY_BINDING.fetch_add(1, Ordering::Relaxed);
-    RelayCredentialBinding::new("legacy-zone-link", format!("legacy-session-{id}"), 1)
-        .expect("static legacy credential binding is valid")
-}
-
 /// Canonical Azure Relay Provider.
 pub struct AzureRelayTransportProvider<C, K> {
     config: RelayTransportConfig,
@@ -1195,7 +1220,7 @@ pub struct AzureRelayTransportProvider<C, K> {
 
 impl<C, K> AzureRelayTransportProvider<C, K>
 where
-    C: RelayCredentialPort + 'static,
+    C: ScopedCredentialClient + 'static,
     K: RelaySocketConnector + 'static,
 {
     /// Construct a Provider with gateway-local effect ports.
@@ -1221,64 +1246,41 @@ where
         })
     }
 
-    /// Open a named stream using one short-lived role credential.
+    /// Open a connection through the narrow same-Zone Credential boundary.
     ///
-    /// This convenience entry point creates a unique local binding.
-    /// ZoneLink callers use [`Self::open_bound`] to supply the exact
-    /// ZoneLink/session/generation tuple.
-    pub async fn open(
+    /// The request is the only place where the transport sees a Credential
+    /// reference. U10 can replace the port implementation with its scoped
+    /// ResourceClient without changing transport ownership or scheduling.
+    pub async fn open_scoped(
         &self,
-        role: RelayRole,
-        deadline_ms: u32,
+        request: ScopedCredentialRequest,
     ) -> Result<RelayConnection, RelayTransportError> {
-        self.open_with_backoff(
-            role,
-            deadline_ms,
-            // A single Provider open is one bounded lifecycle operation.
-            // Reconnect supervision belongs to the owning runtime so each
-            // attempt can reacquire fresh role-scoped credentials.
-            ReconnectBackoff::with_limits(0, 0, 0, 0),
-        )
-        .await
-    }
-
-    /// Open a named stream bound to one exact ZoneLink/session/generation.
-    pub async fn open_bound(
-        &self,
-        role: RelayRole,
-        binding: RelayCredentialBinding,
-        deadline_ms: u32,
-    ) -> Result<RelayConnection, RelayTransportError> {
-        self.open_with_backoff_bound(
-            role,
-            binding,
-            deadline_ms,
-            ReconnectBackoff::with_limits(0, 0, 0, 0),
-        )
-        .await
-    }
-
-    /// Open a connection with a finite reconnect policy.
-    pub async fn open_with_backoff(
-        &self,
-        role: RelayRole,
-        deadline_ms: u32,
-        backoff: ReconnectBackoff,
-    ) -> Result<RelayConnection, RelayTransportError> {
-        self.open_with_backoff_bound(role, legacy_binding(), deadline_ms, backoff)
+        self.open_scoped_with_backoff(request, ReconnectBackoff::with_limits(0, 0, 0, 0))
             .await
     }
 
-    /// Open a connection with bounded retries and an exact session binding.
-    pub async fn open_with_backoff_bound(
+    /// Open a scoped connection with bounded carriage-attempt retries.
+    pub async fn open_scoped_with_backoff(
         &self,
-        role: RelayRole,
-        binding: RelayCredentialBinding,
-        deadline_ms: u32,
+        request: ScopedCredentialRequest,
+        backoff: ReconnectBackoff,
+    ) -> Result<RelayConnection, RelayTransportError> {
+        self.open_inner(request, backoff).await
+    }
+
+    async fn open_inner(
+        &self,
+        request: ScopedCredentialRequest,
         mut backoff: ReconnectBackoff,
     ) -> Result<RelayConnection, RelayTransportError> {
+        let role = relay_role(request.role());
+        let binding = request.binding().clone();
+        let deadline_ms = request.deadline_ms();
         if deadline_ms == 0 {
             return Err(RelayTransportError::DeadlineExpired);
+        }
+        if request.execution_ref() != &self.config.execution_ref {
+            return Err(RelayTransportError::CredentialBindingMismatch);
         }
         let generation_attempt = self.generation_fence.begin(&binding)?;
         let deadline = Instant::now() + Duration::from_millis(u64::from(deadline_ms));
@@ -1286,10 +1288,7 @@ where
             .await
             .map_err(|_| RelayTransportError::DeadlineExpired)?
             .map_err(|_| RelayTransportError::Unavailable)?;
-        let credential_role = match role {
-            RelayRole::Listener => RelayCredentialRole::Listen,
-            RelayRole::Sender => RelayCredentialRole::Send,
-        };
+        let credential_role = credential_role(role);
         loop {
             if !generation_attempt.eligible() {
                 return Err(RelayTransportError::StaleGeneration);
@@ -1301,12 +1300,10 @@ where
             if remaining_ms == 0 {
                 return Err(RelayTransportError::DeadlineExpired);
             }
-            let lease = match timeout_at(
-                deadline,
-                self.credentials
-                    .acquire_bound(credential_role, &binding, remaining_ms),
-            )
-            .await
+            let request = request
+                .with_deadline(remaining_ms)
+                .map_err(map_credential_error)?;
+            let lease = match timeout_at(deadline, self.credentials.read_credential(&request)).await
             {
                 Err(_) => return Err(RelayTransportError::DeadlineExpired),
                 Ok(Ok(lease)) => lease,
@@ -1418,6 +1415,193 @@ where
     /// Return the gateway execution boundary.
     pub const fn config(&self) -> &RelayTransportConfig {
         &self.config
+    }
+}
+
+fn credential_role(role: RelayRole) -> RelayCredentialRole {
+    match role {
+        RelayRole::Listener => RelayCredentialRole::Listen,
+        RelayRole::Sender => RelayCredentialRole::Send,
+    }
+}
+
+fn relay_role(role: RelayCredentialRole) -> RelayRole {
+    match role {
+        RelayCredentialRole::Listen => RelayRole::Listener,
+        RelayCredentialRole::Send => RelayRole::Sender,
+    }
+}
+
+/// Opaque handle for one relay carriage owned by a transport service.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RelayTransportHandle(u64);
+
+impl RelayTransportHandle {
+    /// Construct a handle at the trusted Core boundary.
+    pub const fn from_core(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Debug for RelayTransportHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RelayTransportHandle(<redacted>)")
+    }
+}
+
+/// Typed response for one relay carriage open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayOpenTransportResponse {
+    /// Opaque handle used by close and observe.
+    pub transport_handle: RelayTransportHandle,
+    /// Remote carriage descriptor.
+    pub descriptor: TransportDescriptor,
+}
+
+/// Typed observation for one relay carriage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayTransportObservation {
+    /// Current Core-selected session phase.
+    pub phase: RelaySessionPhase,
+    /// Current available send credit.
+    pub available_credits: usize,
+    /// Current in-flight send credit.
+    pub in_flight_credits: usize,
+    /// Core-owned reconnect generation.
+    pub reconnect_generation: u64,
+}
+
+fn relay_transport_descriptor() -> TransportDescriptor {
+    TransportDescriptor {
+        class: d2b_contracts_zone_session::v3::component_session::TransportClass::ProviderStream,
+        locality: d2b_contracts_zone_session::v3::component_session::Locality::Remote,
+        packet_atomic: false,
+        supports_attachments: false,
+    }
+}
+
+impl RelayConnection {
+    /// Return the bounded, identity-free carriage observation.
+    pub async fn observe_transport(&self) -> RelayTransportObservation {
+        let (available_credits, in_flight_credits) = self.credit_state().await;
+        RelayTransportObservation {
+            phase: self.phase().await,
+            available_credits,
+            in_flight_credits,
+            reconnect_generation: self.reconnect_generation(),
+        }
+    }
+}
+
+/// Typed transport-only service façade.
+///
+/// The service owns only high-churn carriage handles. It does not watch or
+/// reconcile ZoneLink resources; Core supplies the scoped request and decides
+/// reconnect timing.
+pub struct RelayTransportService<C, K> {
+    provider: AzureRelayTransportProvider<C, K>,
+    active: Mutex<HashMap<RelayTransportHandle, RelayConnection>>,
+    completed: Mutex<HashMap<RelayTransportHandle, RelayTransportObservation>>,
+    open_lock: Mutex<()>,
+    next_handle: AtomicU64,
+}
+
+impl<C, K> RelayTransportService<C, K>
+where
+    C: ScopedCredentialClient + 'static,
+    K: RelaySocketConnector + 'static,
+{
+    /// Construct one service over one transport Provider instance.
+    pub fn new(provider: AzureRelayTransportProvider<C, K>) -> Self {
+        Self {
+            provider,
+            active: Mutex::new(HashMap::new()),
+            completed: Mutex::new(HashMap::new()),
+            open_lock: Mutex::new(()),
+            next_handle: AtomicU64::new(1),
+        }
+    }
+
+    /// Open one scoped carriage supplied by Core.
+    pub async fn open_transport(
+        &self,
+        request: ScopedCredentialRequest,
+        backoff: ReconnectBackoff,
+    ) -> Result<RelayOpenTransportResponse, RelayTransportError> {
+        let _open_guard = self.open_lock.lock().await;
+        if self
+            .active
+            .lock()
+            .await
+            .values()
+            .any(|connection| connection.binding() == request.binding())
+        {
+            return Err(RelayTransportError::DuplicateTransport);
+        }
+        let connection = self
+            .provider
+            .open_scoped_with_backoff(request, backoff)
+            .await?;
+        let handle =
+            RelayTransportHandle::from_core(self.next_handle.fetch_add(1, Ordering::Relaxed));
+        self.active.lock().await.insert(handle, connection);
+        Ok(RelayOpenTransportResponse {
+            transport_handle: handle,
+            descriptor: relay_transport_descriptor(),
+        })
+    }
+
+    /// Close one carriage. Repeating a successful close is idempotent.
+    pub async fn close_transport(
+        &self,
+        handle: RelayTransportHandle,
+    ) -> Result<(), RelayTransportError> {
+        let connection = self.active.lock().await.remove(&handle);
+        let Some(connection) = connection else {
+            return if self.completed.lock().await.contains_key(&handle) {
+                Ok(())
+            } else {
+                Err(RelayTransportError::UnknownTransportHandle)
+            };
+        };
+        let result = connection.close().await;
+        let observation = connection.observe_transport().await;
+        let mut completed = self.completed.lock().await;
+        if completed.len() >= MAX_COMPLETED_RELAY_TRANSPORTS {
+            if let Some(evicted) = completed.keys().next().copied() {
+                completed.remove(&evicted);
+            }
+        }
+        completed.insert(handle, observation);
+        result
+    }
+
+    /// Observe one active or completed carriage.
+    pub async fn observe_transport(
+        &self,
+        handle: RelayTransportHandle,
+    ) -> Result<RelayTransportObservation, RelayTransportError> {
+        if let Some(connection) = self.active.lock().await.get(&handle) {
+            return Ok(connection.observe_transport().await);
+        }
+        self.completed
+            .lock()
+            .await
+            .get(&handle)
+            .copied()
+            .ok_or(RelayTransportError::UnknownTransportHandle)
+    }
+
+    /// Close every carriage owned by this service.
+    pub async fn finalize(&self) -> Result<(), RelayTransportError> {
+        let handles = self.active.lock().await.keys().copied().collect::<Vec<_>>();
+        let mut first_error = None;
+        for handle in handles {
+            if let Err(error) = self.close_transport(handle).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
