@@ -17,3 +17,5 @@
   fencing.
 - Route Network config through volume-local's typed materialization boundary and
   require its observed digest evidence before Network reports Ready.
+- Parse the typed Volume content projection during normal volume-local
+  reconciliation and retain fail-closed, restart-safe materialization behavior.

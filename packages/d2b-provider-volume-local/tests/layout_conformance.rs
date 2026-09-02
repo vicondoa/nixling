@@ -20,7 +20,14 @@ fn controller(port: &ScriptedPort) -> VolumeLocalController<&ScriptedPort, &Scri
 fn an_absent_entry_is_provisioned_and_reported_ready() {
     let port = ScriptedPort::empty();
     let report =
-        block_on(controller(&port).reconcile(&fixtures::volume_uid(), &fixtures::state_volume()))
+        block_on(
+            controller(&port).reconcile(
+                &fixtures::volume_uid(),
+                &fixtures::state_volume(),
+                None,
+                None,
+            ),
+        )
             .expect("reconcile succeeds");
     assert_eq!(report.layout_phase, LayoutPhase::Ready);
     assert!(report.layout_conditions.is_empty());
@@ -35,7 +42,14 @@ fn an_absent_entry_is_provisioned_and_reported_ready() {
 fn a_converged_entry_requests_no_effect() {
     let port = ScriptedPort::converged();
     let report =
-        block_on(controller(&port).reconcile(&fixtures::volume_uid(), &fixtures::state_volume()))
+        block_on(
+            controller(&port).reconcile(
+                &fixtures::volume_uid(),
+                &fixtures::state_volume(),
+                None,
+                None,
+            ),
+        )
             .expect("reconcile succeeds");
     assert_eq!(report.layout_phase, LayoutPhase::Ready);
     assert!(
@@ -52,7 +66,14 @@ fn owner_drift_is_repaired_under_the_exact_owner_policy() {
     drifted.drift = BTreeSet::from([DriftClass::Owner]);
     let port = ScriptedPort::converged().with_observation("", drifted);
     let report =
-        block_on(controller(&port).reconcile(&fixtures::volume_uid(), &fixtures::state_volume()))
+        block_on(
+            controller(&port).reconcile(
+                &fixtures::volume_uid(),
+                &fixtures::state_volume(),
+                None,
+                None,
+            ),
+        )
             .expect("reconcile succeeds");
     assert_eq!(report.layout_phase, LayoutPhase::Ready);
     assert!(
@@ -70,7 +91,12 @@ fn unrepairable_drift_degrades_instead_of_silently_converging() {
     let mut rendered = serde_json::to_value(fixtures::state_volume()).expect("fixture serializes");
     rendered["layout"][0]["repairPolicy"] = serde_json::json!("none");
     let spec = serde_json::from_value(rendered).expect("fixture remains valid");
-    let report = block_on(controller(&port).reconcile(&fixtures::volume_uid(), &spec))
+    let report = block_on(controller(&port).reconcile(
+        &fixtures::volume_uid(),
+        &spec,
+        None,
+        None,
+    ))
         .expect("reconcile succeeds");
     assert_eq!(report.layout_phase, LayoutPhase::Degraded);
     assert_eq!(
@@ -85,7 +111,14 @@ fn a_symlink_on_a_no_follow_walk_fails_closed_and_mutates_nothing() {
     observed.symlink_encountered = true;
     let port = ScriptedPort::converged().with_observation("", observed);
     let report =
-        block_on(controller(&port).reconcile(&fixtures::volume_uid(), &fixtures::state_volume()))
+        block_on(
+            controller(&port).reconcile(
+                &fixtures::volume_uid(),
+                &fixtures::state_volume(),
+                None,
+                None,
+            ),
+        )
             .expect("reconcile reports");
     assert_eq!(report.layout_phase, LayoutPhase::Failed);
     assert_eq!(
@@ -109,7 +142,12 @@ fn a_wrong_entry_class_or_split_filesystem_is_a_fail_closed_invariant() {
         observed.drift = BTreeSet::from([drift]);
         let port = ScriptedPort::converged().with_observation("", observed);
         let report = block_on(
-            controller(&port).reconcile(&fixtures::volume_uid(), &fixtures::state_volume()),
+            controller(&port).reconcile(
+                &fixtures::volume_uid(),
+                &fixtures::state_volume(),
+                None,
+                None,
+            ),
         )
         .expect("reconcile reports");
         assert_eq!(report.layout_phase, LayoutPhase::Failed);
@@ -125,7 +163,14 @@ fn ambiguous_ownership_quarantines_rather_than_deleting_or_reusing() {
     let port = ScriptedPort::converged()
         .with_observation("", ObservedEntry::conformant(OwnerProof::Unknown));
     let report =
-        block_on(controller(&port).reconcile(&fixtures::volume_uid(), &fixtures::state_volume()))
+        block_on(
+            controller(&port).reconcile(
+                &fixtures::volume_uid(),
+                &fixtures::state_volume(),
+                None,
+                None,
+            ),
+        )
             .expect("reconcile reports");
     assert_eq!(report.layout_phase, LayoutPhase::Degraded);
     assert_eq!(
@@ -144,7 +189,12 @@ fn ambiguous_ownership_quarantines_rather_than_deleting_or_reusing() {
 fn declared_acls_are_re_applied_on_every_repair_cycle() {
     let port = ScriptedPort::converged();
     let report = block_on(
-        controller(&port).reconcile(&fixtures::volume_uid(), &fixtures::acl_volume("preserve")),
+        controller(&port).reconcile(
+            &fixtures::volume_uid(),
+            &fixtures::acl_volume("preserve"),
+            None,
+            None,
+        ),
     )
     .expect("reconcile succeeds");
     assert_eq!(report.layout_phase, LayoutPhase::Ready);
@@ -162,7 +212,12 @@ fn a_foreign_child_acl_is_preserved_or_reported_per_policy() {
         observed.foreign_children = true;
         let port = ScriptedPort::converged().with_observation("", observed);
         block_on(
-            controller(&port).reconcile(&fixtures::volume_uid(), &fixtures::acl_volume(policy)),
+            controller(&port).reconcile(
+                &fixtures::volume_uid(),
+                &fixtures::acl_volume(policy),
+                None,
+                None,
+            ),
         )
         .expect("reconcile reports")
     };
@@ -179,7 +234,14 @@ fn a_foreign_child_acl_is_preserved_or_reported_per_policy() {
 fn a_provisioned_marker_with_missing_state_never_re_provisions() {
     let port = ScriptedPort::empty().with_marker(MarkerState::Provisioned);
     let report =
-        block_on(controller(&port).reconcile(&fixtures::volume_uid(), &fixtures::swtpm_volume()))
+        block_on(
+            controller(&port).reconcile(
+                &fixtures::volume_uid(),
+                &fixtures::swtpm_volume(),
+                None,
+                None,
+            ),
+        )
             .expect("reconcile reports");
     assert_eq!(report.layout_phase, LayoutPhase::Failed);
     assert_eq!(
@@ -280,7 +342,13 @@ fn hard_quota_on_a_filesystem_that_cannot_enforce_it_fails_the_volume() {
         .expect("conformant fixture");
     let port = ScriptedPort::empty().with_quota(QuotaCapability::Unenforceable);
     assert_eq!(
-        block_on(controller(&port).reconcile(&fixtures::volume_uid(), &spec)).unwrap_err(),
+        block_on(controller(&port).reconcile(
+            &fixtures::volume_uid(),
+            &spec,
+            None,
+            None,
+        ))
+        .unwrap_err(),
         VolumeLocalError::QuotaUnenforceable
     );
 }
@@ -294,7 +362,13 @@ fn fail_closed_repair_never_mutates_drifted_state() {
     drifted.drift = BTreeSet::from([DriftClass::Mode]);
     let port = ScriptedPort::converged().with_observation("", drifted);
     let report =
-        block_on(controller(&port).reconcile(&fixtures::volume_uid(), &spec)).expect("report");
+        block_on(controller(&port).reconcile(
+            &fixtures::volume_uid(),
+            &spec,
+            None,
+            None,
+        ))
+        .expect("report");
     assert_eq!(report.layout_phase, LayoutPhase::Failed);
     assert_eq!(
         report.layout_conditions[0].reason,

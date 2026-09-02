@@ -774,7 +774,6 @@ fn format_digest(digest: &[u8; 32]) -> String {
     }
     rendered
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -242,6 +242,17 @@ impl VolumeLayoutEffectPort for &FilesystemVolume {
             Ok(MarkerState::NeverProvisioned)
         }
     }
+
+    async fn materialize_network_config(
+        &self,
+        _root: &VolumeRootHandle,
+        _projection: &d2b_provider_volume_local::NetworkConfigContentProjection,
+    ) -> Result<
+        d2b_provider_volume_local::NetworkConfigMaterializationEvidence,
+        d2b_provider_volume_local::VolumeLocalError,
+    > {
+        Err(d2b_provider_volume_local::VolumeLocalError::EffectFailed)
+    }
 }
 
 pub fn volume_spec() -> VolumeSpec {
@@ -290,7 +301,8 @@ fn volume_zone_activation_ready_restart_and_cleanup_use_real_files() {
     let spec = volume_spec();
     let controller = VolumeLocalController::new(VolumeLocalProfile::shipped(), &volume, &volume);
 
-    let first = block_on(controller.reconcile(&uid, &spec)).expect("initial Volume reconcile");
+    let first = block_on(controller.reconcile(&uid, &spec, None, None))
+        .expect("initial Volume reconcile");
     assert_eq!(
         first.layout_phase,
         d2b_provider_volume_local::LayoutPhase::Ready
@@ -298,7 +310,8 @@ fn volume_zone_activation_ready_restart_and_cleanup_use_real_files() {
     assert!(directory.path().join("state.db").is_file());
 
     let restarted = VolumeLocalController::new(VolumeLocalProfile::shipped(), &volume, &volume);
-    let adopted = block_on(restarted.reconcile(&uid, &spec)).expect("restart Volume reconcile");
+    let adopted = block_on(restarted.reconcile(&uid, &spec, None, None))
+        .expect("restart Volume reconcile");
     assert_eq!(
         adopted.layout_phase,
         d2b_provider_volume_local::LayoutPhase::Ready
@@ -1424,7 +1437,7 @@ impl Wave6ProviderBoundary for Wave6RealBoundary {
         let controller =
             VolumeLocalController::new(VolumeLocalProfile::shipped(), &self.volume, &self.volume);
         controller
-            .reconcile(&resource.uid, &volume_spec())
+            .reconcile(&resource.uid, &volume_spec(), None, None)
             .await
             .map_err(|_| Wave6BoundaryError::Effect)?;
         Ok(Wave6ReconcileResult::Ready)
@@ -1521,7 +1534,7 @@ impl Wave6ProviderBoundary for Wave6RealBoundary {
         let volume =
             VolumeLocalController::new(VolumeLocalProfile::shipped(), &self.volume, &self.volume);
         volume
-            .reconcile(&resources.volume.uid, &volume_spec())
+            .reconcile(&resources.volume.uid, &volume_spec(), None, None)
             .await
             .map_err(|_| Wave6BoundaryError::Effect)?;
 

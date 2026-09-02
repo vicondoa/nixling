@@ -212,6 +212,14 @@ impl VolumeLayoutEffectPort for &ScriptedPort {
         self.record(PortCall::Marker);
         Ok(self.marker)
     }
+
+    async fn materialize_network_config(
+        &self,
+        _root: &VolumeRootHandle,
+        _projection: &crate::NetworkConfigContentProjection,
+    ) -> Result<crate::NetworkConfigMaterializationEvidence, VolumeLocalError> {
+        Err(VolumeLocalError::EffectFailed)
+    }
 }
 
 /// Canonical Volume fixtures.

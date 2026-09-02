@@ -164,7 +164,12 @@ fn public_status_carries_no_path_policy_id_or_numeric_identity() {
     let port = ScriptedPort::empty();
     let controller = VolumeLocalController::new(VolumeLocalProfile::shipped(), &port, &port);
     let report =
-        block_on(controller.reconcile(&fixtures::volume_uid(), &fixtures::store_view_volume()))
+        block_on(controller.reconcile(
+            &fixtures::volume_uid(),
+            &fixtures::store_view_volume(),
+            None,
+            None,
+        ))
             .expect("reconcile succeeds");
     let rendered = serde_json::to_string(&report)
         .expect("status serializes")

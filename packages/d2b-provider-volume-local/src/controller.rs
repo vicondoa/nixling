@@ -19,7 +19,6 @@ use crate::content::{
 use crate::error::VolumeLocalError;
 use crate::content::{
     NetworkConfigContentProjection, NetworkConfigMaterializationEvidence,
-    VolumeContentEffectPort,
 };
 use crate::finalization::{
     FinalizationAction, FinalizationObservation, FinalizationResult, finalization_plan,
@@ -155,6 +154,52 @@ impl<S: VolumeSourceEffectPort, L: VolumeLayoutEffectPort> VolumeLocalController
         &self,
         volume_uid: &ResourceUid,
         spec: &VolumeSpec,
+        provider: Option<&serde_json::Value>,
+        owner_ref: Option<&d2b_contracts_resource::v3::ResourceRef>,
+    ) -> Result<VolumeStatusReport, VolumeLocalError> {
+        let mut status = self.reconcile_layout(volume_uid, spec).await?;
+        if status.layout_phase != LayoutPhase::Ready {
+            return Ok(status);
+        }
+        if let Some(provider) = provider {
+            if provider.get("schemaId").and_then(serde_json::Value::as_str)
+                != Some(crate::VOLUME_CONTENT_SCHEMA_ID)
+                || provider.get("schemaVersion").and_then(serde_json::Value::as_str)
+                    != Some(crate::VOLUME_CONTENT_SCHEMA_VERSION)
+            {
+                return Err(VolumeLocalError::InvalidSpec);
+            }
+            let settings = provider
+                .get("settings")
+                .ok_or(VolumeLocalError::InvalidSpec)?;
+            if settings.get("kind").and_then(serde_json::Value::as_str)
+                != Some(crate::NETWORK_CONFIG_CONTENT_KIND)
+            {
+                return Err(VolumeLocalError::InvalidSpec);
+            }
+            let owner_ref = owner_ref.ok_or(VolumeLocalError::InvalidSpec)?;
+            let projection = NetworkConfigContentProjection::from_settings(
+                settings
+                    .get("content")
+                    .ok_or(VolumeLocalError::InvalidSpec)?,
+            )?;
+            status.content = Some(
+                self.reconcile_network_config_content(
+                    volume_uid,
+                    spec,
+                    &projection,
+                    owner_ref,
+                )
+                .await?,
+            );
+        }
+        Ok(status)
+    }
+
+    async fn reconcile_layout(
+        &self,
+        volume_uid: &ResourceUid,
+        spec: &VolumeSpec,
     ) -> Result<VolumeStatusReport, VolumeLocalError> {
         let kind = self.validate_spec(spec)?;
         let attachments = admit_attachments(spec, self.profile.supports_shared_write())?;
@@ -237,13 +282,12 @@ impl<S: VolumeSourceEffectPort, L: VolumeLayoutEffectPort> VolumeLocalController
 
     /// Materialize a typed Network configuration projection through the
     /// Volume-owned content effect port.
-    pub async fn reconcile_network_config_content<C: VolumeContentEffectPort>(
+    async fn reconcile_network_config_content(
         &self,
         volume_uid: &ResourceUid,
         spec: &VolumeSpec,
         projection: &NetworkConfigContentProjection,
         owner_ref: &d2b_contracts_resource::v3::ResourceRef,
-        content: &C,
     ) -> Result<NetworkConfigMaterializationEvidence, VolumeLocalError> {
         let kind = self.validate_spec(spec)?;
         if projection.volume_uid() != volume_uid || projection.network_ref() != owner_ref {
@@ -261,7 +305,8 @@ impl<S: VolumeSourceEffectPort, L: VolumeLayoutEffectPort> VolumeLocalController
         if self.layout.marker_state(&root).await? != MarkerState::Provisioned {
             return Err(VolumeLocalError::InvariantViolated);
         }
-        let evidence = content
+        let evidence = self
+            .layout
             .materialize_network_config(&root, projection)
             .await?;
         if !evidence.matches(projection) {
@@ -272,22 +317,6 @@ impl<S: VolumeSourceEffectPort, L: VolumeLayoutEffectPort> VolumeLocalController
 
     /// Reconcile the Volume layout and materialize a typed Network
     /// configuration projection, returning the evidence for status.
-    pub async fn reconcile_with_network_config_content<C: VolumeContentEffectPort>(
-        &self,
-        volume_uid: &ResourceUid,
-        spec: &VolumeSpec,
-        projection: &NetworkConfigContentProjection,
-        owner_ref: &d2b_contracts_resource::v3::ResourceRef,
-        content: &C,
-    ) -> Result<VolumeStatusReport, VolumeLocalError> {
-        let mut status = self.reconcile(volume_uid, spec).await?;
-        status.content = Some(
-            self.reconcile_network_config_content(volume_uid, spec, projection, owner_ref, content)
-                .await?,
-        );
-        Ok(status)
-    }
-
     /// Remove every declared entry whose cleanup policy admits removal.
     ///
     /// Returns the digests of the entries that were removed. An entry
