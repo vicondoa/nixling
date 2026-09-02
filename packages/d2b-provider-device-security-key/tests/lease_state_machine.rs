@@ -1,8 +1,9 @@
-use d2b_contracts_resource::v3::ResourceUid;
+use d2b_contracts_resource::v3::{ResourceRef, ResourceUid};
 use d2b_provider_device_security_key::{
     GuestCid, LeaseState, PhysicalAuthorityLease, PhysicalUsbBackingClaim, PhysicalUsbBackingToken,
-    RelayLaunchTicket, SecurityKeyCidTranslator, SecurityKeyEffectError, SecurityKeyEffectPort,
-    SecurityKeyLease, SecurityKeyOpenIntent, SecurityKeySessionId,
+    RelayLaunchTicket, SecurityKeyBindingAdmission, SecurityKeyCidTranslator,
+    SecurityKeyController, SecurityKeyEffectError, SecurityKeyEffectPort, SecurityKeyLease,
+    SecurityKeyOpenIntent, SecurityKeySessionId, DEFAULT_SESSION_RING_SIZE,
 };
 
 struct FakePort {
@@ -108,4 +109,65 @@ fn cid_translation_round_trips_without_exposing_session_material() {
     let translator = SecurityKeyCidTranslator::from_core(0x1020_3040).unwrap();
     let relay = translator.to_relay(guest);
     assert_eq!(translator.to_guest(relay).unwrap(), guest);
+}
+
+#[test]
+fn stale_binding_assignment_quarantines_completion_before_release() {
+    let device = uid("123e4567-e89b-42d3-a456-426614174000");
+    let binding = SecurityKeyBindingAdmission::new(
+        uid("223e4567-e89b-42d3-a456-426614174001"),
+        device.clone(),
+        uid("323e4567-e89b-42d3-a456-426614174002"),
+        uid("423e4567-e89b-42d3-a456-426614174003"),
+        uid("523e4567-e89b-42d3-a456-426614174004"),
+        uid("623e4567-e89b-42d3-a456-426614174005"),
+        4,
+    )
+    .unwrap();
+    let physical = PhysicalUsbBackingToken::from_core([7; 32]);
+    let admission = d2b_provider_device_security_key::SecurityKeyAdmission::from_core(
+        ResourceRef::parse("Zone/work").unwrap(),
+        device.clone(),
+        ResourceRef::parse("Guest/guest-a").unwrap(),
+        physical,
+    );
+    let mut controller =
+        SecurityKeyController::new_authorized(device, admission, DEFAULT_SESSION_RING_SIZE)
+            .unwrap();
+    controller.bind_resource_admission(binding.clone()).unwrap();
+    let mut port = FakePort {
+        opens: 0,
+        releases: 0,
+        conflict: false,
+        release_error: None,
+    };
+    let session = SecurityKeySessionId::from_core([3; 16]);
+    controller
+        .acquire_authorized(
+            session,
+            uid("123e4567-e89b-42d3-a456-426614174000"),
+            &ResourceRef::parse("Guest/guest-a").unwrap(),
+            &mut port,
+        )
+        .unwrap();
+
+    let stale = SecurityKeyBindingAdmission::new(
+        uid("223e4567-e89b-42d3-a456-426614174001"),
+        uid("123e4567-e89b-42d3-a456-426614174000"),
+        uid("323e4567-e89b-42d3-a456-426614174002"),
+        uid("423e4567-e89b-42d3-a456-426614174003"),
+        uid("523e4567-e89b-42d3-a456-426614174004"),
+        uid("623e4567-e89b-42d3-a456-426614174005"),
+        5,
+    )
+    .unwrap();
+    assert_eq!(
+        controller.complete_authorized(session, &stale, &mut port),
+        Err(d2b_provider_device_security_key::SecurityKeyControllerError::Admission)
+    );
+    assert_eq!(
+        controller.phase(),
+        d2b_provider_device_security_key::SecurityKeyPhase::Quarantined
+    );
+    assert_eq!(port.releases, 0);
 }
