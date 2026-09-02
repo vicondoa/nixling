@@ -1762,6 +1762,7 @@ dependencies = [
  "d2b-provider-audio-pipewire",
  "d2b-provider-clipboard-wayland",
  "d2b-provider-config-nixos",
+ "d2b-provider-device-gpu",
  "d2b-provider-device-security-key",
  "d2b-provider-device-tpm",
  "d2b-provider-device-usbip",
