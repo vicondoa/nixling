@@ -187,3 +187,57 @@ fn security_key_runner_contract_disables_legacy_scheduling() {
     assert!(contract.watched_configuration_is_dependency());
     assert!((30..=60).contains(&contract.repair_interval_secs()));
 }
+
+#[test]
+fn binding_children_are_resource_backed_without_volume_ownership() {
+    let device = uid("123e4567-e89b-42d3-a456-426614174000");
+    let binding_admission = SecurityKeyBindingAdmission::new(
+        uid("223e4567-e89b-42d3-a456-426614174001"),
+        device.clone(),
+        uid("323e4567-e89b-42d3-a456-426614174002"),
+        uid("423e4567-e89b-42d3-a456-426614174003"),
+        uid("523e4567-e89b-42d3-a456-426614174004"),
+        uid("623e4567-e89b-42d3-a456-426614174005"),
+        4,
+    )
+    .unwrap();
+    let admission = d2b_provider_device_security_key::SecurityKeyAdmission::from_core(
+        ResourceRef::parse("Zone/work").unwrap(),
+        device.clone(),
+        ResourceRef::parse("Guest/guest-a").unwrap(),
+        PhysicalUsbBackingToken::from_core([7; 32]),
+    );
+    let mut controller =
+        SecurityKeyController::new_authorized(device, admission, DEFAULT_SESSION_RING_SIZE)
+            .unwrap();
+    controller.bind_resource_admission(binding_admission).unwrap();
+    let binding = ResourceRef::parse(
+        "security-key.d2bus.org.SecurityKeyBinding/key",
+    )
+    .unwrap();
+    let service = ResourceRef::parse(
+        "security-key.d2bus.org.SecurityKeyService/key",
+    )
+    .unwrap();
+    let guest = ResourceRef::parse("Guest/guest-a").unwrap();
+    let user = ResourceRef::parse("User/alice").unwrap();
+    let admission = controller.binding_admission().unwrap().clone();
+    assert!(!SecurityKeyController::owns_child(
+        &binding,
+        &service,
+        &guest,
+        &ResourceRef::parse("Volume/foreign").unwrap(),
+    )
+    .unwrap());
+    let result = controller
+        .reconcile_binding_with_admission(
+            &admission,
+            &binding,
+            &service,
+            &guest,
+            &user,
+            d2b_provider_device_security_key::SecurityKeyReconcileOutcome::Active,
+        )
+        .unwrap();
+    assert_eq!(result.children.iter().count(), 2);
+}

@@ -410,6 +410,55 @@ impl SecurityKeyController {
         Ok(SecurityKeyReconcileResultWithChildren { outcome, children })
     }
 
+    /// Reconcile a resource-backed Binding only with its current Core
+    /// admission and explicit Guest/User target.
+    pub fn reconcile_binding_with_admission(
+        &mut self,
+        admission: &SecurityKeyBindingAdmission,
+        binding_ref: &ResourceRef,
+        service_ref: &ResourceRef,
+        target_ref: &ResourceRef,
+        user_ref: &ResourceRef,
+        outcome: SecurityKeyReconcileOutcome,
+    ) -> Result<SecurityKeyReconcileResultWithChildren, SecurityKeyControllerError> {
+        if self.binding_admission.as_ref() != Some(admission)
+            || binding_ref.resource_type().as_str() != SECURITY_KEY_BINDING_RESOURCE_TYPE
+            || service_ref.resource_type().as_str() != SECURITY_KEY_SERVICE_RESOURCE_TYPE
+            || target_ref.resource_type().as_str() != "Guest"
+            || user_ref.resource_type().as_str() != "User"
+        {
+            self.phase = SecurityKeyPhase::Quarantined;
+            return Err(SecurityKeyControllerError::Admission);
+        }
+        self.reconcile_with_children_for_user(
+            binding_ref,
+            service_ref,
+            target_ref,
+            user_ref,
+            outcome,
+        )
+    }
+
+    /// Whether a child belongs to this Binding's Process/Endpoint set.
+    pub fn owns_child(
+        binding_ref: &ResourceRef,
+        service_ref: &ResourceRef,
+        target_ref: &ResourceRef,
+        child_ref: &ResourceRef,
+    ) -> Result<bool, SecurityKeyControllerError> {
+        if binding_ref.resource_type().as_str() != SECURITY_KEY_BINDING_RESOURCE_TYPE
+            || service_ref.resource_type().as_str() != SECURITY_KEY_SERVICE_RESOURCE_TYPE
+            || target_ref.resource_type().as_str() != "Guest"
+        {
+            return Err(SecurityKeyControllerError::Admission);
+        }
+        let children = Self::child_resources(binding_ref, service_ref, target_ref)?;
+        Ok(matches!(
+            child_ref.resource_type().as_str(),
+            "Process" | "Endpoint"
+        ) && children.resource_refs().any(|current| current == child_ref))
+    }
+
     /// Observe the exact physical Device through Core's injected port.
     pub async fn observe_inventory<P: SecurityKeyInventoryEffectPort>(
         &self,
