@@ -21,11 +21,12 @@ use std::thread::{self, Thread};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use d2b_contracts_provider::v3::credential::{
-    CredentialAuthorization, CredentialLeaseHandle, CredentialLeaseState, CredentialMetadata,
-    CredentialOutcomeCode, CredentialServiceError, CredentialServiceErrorCode,
+    CREDENTIAL_SERVICE_NAME, CredentialAuthorization, CredentialLeaseHandle, CredentialLeaseState,
+    CredentialMetadata, CredentialOutcomeCode, CredentialServiceError, CredentialServiceErrorCode,
     CredentialSourceVersion, PlacementBinding,
 };
 use d2b_contracts_resource::v3::{ResourceGeneration, ResourceRef, ZoneId};
+use d2b_provider_toolkit::{ProviderEntrypoint, ProviderLifecycle};
 
 pub use controller::{
     PROVIDER_KIND, PROVIDER_REVOKE_FINALIZER, SecretServiceController,
@@ -54,6 +55,28 @@ pub fn reject_process_environment_credential_chain(
     reject_ambient_credential_chain(
         std::env::vars_os().filter_map(|(key, _value)| key.into_string().ok()),
     )
+}
+
+/// Return the fail-closed status used when the controller is not registered by
+/// `d2bd`.
+pub fn controller_binary_entrypoint() -> i32 {
+    if reject_process_environment_credential_chain().is_err() {
+        return 1;
+    }
+    let Ok(provider_ref) = ResourceRef::parse(PROVIDER_REF) else {
+        return 1;
+    };
+    let Ok(entrypoint) = ProviderEntrypoint::with_provider(
+        "d2b-provider-credential-secret-service",
+        provider_ref,
+        CREDENTIAL_SERVICE_NAME,
+    ) else {
+        return 1;
+    };
+    if entrypoint.lifecycle() != ProviderLifecycle::Starting || entrypoint.admit().is_err() {
+        return 1;
+    }
+    1
 }
 
 /// A boxed asynchronous result returned by the injected port.

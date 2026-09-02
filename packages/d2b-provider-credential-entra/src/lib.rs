@@ -20,11 +20,12 @@ use std::thread::{self, Thread};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use d2b_contracts_provider::v3::credential::{
-    CredentialLeaseHandle, CredentialLeaseState, CredentialMetadata, CredentialOutcomeCode,
-    CredentialServiceError, CredentialServiceErrorCode, CredentialSourceVersion, OpaqueAzureRef,
-    PlacementBinding,
+    CREDENTIAL_SERVICE_NAME, CredentialLeaseHandle, CredentialLeaseState, CredentialMetadata,
+    CredentialOutcomeCode, CredentialServiceError, CredentialServiceErrorCode,
+    CredentialSourceVersion, OpaqueAzureRef, PlacementBinding,
 };
 use d2b_contracts_resource::v3::ResourceRef;
+use d2b_provider_toolkit::{ProviderEntrypoint, ProviderLifecycle};
 
 pub use controller::{
     EntraController, EntraEndpointPolicy, EntraStatusProjection, PROVIDER_KIND,
@@ -57,6 +58,28 @@ pub fn reject_process_environment_credential_chain(
     reject_ambient_credential_chain(
         std::env::vars_os().filter_map(|(key, _value)| key.into_string().ok()),
     )
+}
+
+/// Return the fail-closed status used when the controller is not registered by
+/// `d2bd`.
+pub fn controller_binary_entrypoint() -> i32 {
+    if reject_process_environment_credential_chain().is_err() {
+        return 1;
+    }
+    let Ok(provider_ref) = ResourceRef::parse(PROVIDER_REF) else {
+        return 1;
+    };
+    let Ok(entrypoint) = ProviderEntrypoint::with_provider(
+        "d2b-provider-credential-entra",
+        provider_ref,
+        CREDENTIAL_SERVICE_NAME,
+    ) else {
+        return 1;
+    };
+    if entrypoint.lifecycle() != ProviderLifecycle::Starting || entrypoint.admit().is_err() {
+        return 1;
+    }
+    1
 }
 
 /// Boxed asynchronous result returned by the injected identity-Guest client.

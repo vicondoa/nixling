@@ -30,6 +30,7 @@ use d2b_contracts_provider::v3::credential::{
 };
 use d2b_contracts_resource::v3::ResourceRef;
 use d2b_contracts_resource::v3::identity::{AuthenticatedSubjectContext, Locality};
+use d2b_provider_toolkit::{ProviderEntrypoint, ProviderLifecycle};
 
 pub use agent::ManagedIdentityAgent;
 pub use audit::{
@@ -76,14 +77,36 @@ pub fn reject_process_environment_credential_chain(
     )
 }
 
-/// Return the clean status used by the daemon-composed controller role.
-pub const fn controller_binary_entrypoint() -> i32 {
-    0
+/// Return the fail-closed status used when the controller is not registered by
+/// `d2bd`.
+pub fn controller_binary_entrypoint() -> i32 {
+    standalone_entrypoint(CONTROLLER_BINARY)
 }
 
-/// Return the clean status used by the daemon-composed agent role.
-pub const fn agent_binary_entrypoint() -> i32 {
-    0
+/// Return the fail-closed status used when the agent is not registered by
+/// `d2bd`.
+pub fn agent_binary_entrypoint() -> i32 {
+    standalone_entrypoint(AGENT_BINARY)
+}
+
+fn standalone_entrypoint(name: &'static str) -> i32 {
+    if reject_process_environment_credential_chain().is_err() {
+        return 1;
+    }
+    let Ok(provider_ref) = ResourceRef::parse(PROVIDER_REF) else {
+        return 1;
+    };
+    let Ok(entrypoint) =
+        ProviderEntrypoint::with_provider(name, provider_ref, CREDENTIAL_SERVICE_NAME)
+    else {
+        return 1;
+    };
+    if entrypoint.lifecycle() != ProviderLifecycle::Starting || entrypoint.admit().is_err() {
+        return 1;
+    }
+    // A standalone Provider has no allocator-issued authenticated session.
+    // Refuse readiness instead of serving an unauthenticated or ambient path.
+    1
 }
 
 /// Boxed asynchronous result returned by the injected IMDS client.
