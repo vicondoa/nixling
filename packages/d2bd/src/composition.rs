@@ -3696,16 +3696,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), TypedError> {
             let provider_ready = match provider_root.as_ref() {
                 Some(root) => {
                     let legacy_registry_ready = if resolver.bundle.schema_version == "v3" {
-                        match state.provider_runtime.configure_all_27(root.clone(), 1) {
-                            Ok(()) => true,
-                            Err(error) => {
-                                tracing::error!(
-                                    error = %error,
-                                    "v3 Provider catalog composition refused; Provider lifecycle effects are disabled",
-                                );
-                                false
-                            }
-                        }
+                        true
                     } else {
                         match state
                             .provider_runtime

@@ -51,37 +51,6 @@ pub const PROVIDER_BUNDLE_VERSION: u32 = 3;
 /// Schema identity of the v3 Provider bundle artifact.
 pub const PROVIDER_BUNDLE_SCHEMA_VERSION: &str = "v3";
 
-/// The closed v3 Provider catalog accepted by the daemon.
-pub const ALL_ACCEPTED_PROVIDER_IDENTITIES: [&str; 27] = [
-    "system-core",
-    "system-systemd",
-    "system-minijail",
-    "runtime-cloud-hypervisor",
-    "runtime-qemu-media",
-    "runtime-azure-container-apps",
-    "runtime-azure-virtual-machine",
-    "volume-local",
-    "volume-virtiofs",
-    "network-local",
-    "device-tpm",
-    "device-usbip",
-    "device-security-key",
-    "device-gpu",
-    "display-wayland",
-    "audio-pipewire",
-    "clipboard-wayland",
-    "notification-desktop",
-    "shell-terminal",
-    "credential-secret-service",
-    "credential-entra",
-    "credential-managed-identity",
-    "transport-unix",
-    "transport-vsock",
-    "transport-azure-relay",
-    "observability-otel",
-    "activation-nixos",
-];
-
 /// Registry limits and snapshots are owned by the shared Provider crate.
 pub use d2b_provider::{MAX_PROVIDER_REGISTRY_ENTRIES, ProviderRegistrySnapshot};
 
@@ -204,7 +173,6 @@ pub struct ProviderBinding {
     resource: ResourceRef,
     artifact_id: ResourceName,
     schema_fingerprint: SchemaFingerprint,
-    class: ProviderClass,
     capability_methods: Option<Vec<String>>,
 }
 
@@ -226,15 +194,8 @@ impl ProviderBinding {
             resource,
             artifact_id,
             schema_fingerprint,
-            class: ProviderClass::Runtime,
             capability_methods: None,
         })
-    }
-
-    /// Bind the Provider family declared by the trusted catalog.
-    pub fn with_class(mut self, class: ProviderClass) -> Self {
-        self.class = class;
-        self
     }
 
     /// Narrow the methods exposed by this trusted Provider descriptor.
@@ -297,7 +258,7 @@ impl ProviderBinding {
         ProviderDescriptor::new(
             zone.clone(),
             self.resource.clone(),
-            self.class,
+            ProviderClass::Runtime,
             implementation_id,
             registry_generation,
             provider_generation,
@@ -348,81 +309,6 @@ pub fn compose_provider_registry(
             .map_err(ProviderCompositionError::from)?;
     }
     builder.finish().map_err(ProviderCompositionError::from)
-}
-
-/// Build the complete accepted Provider row set for one Zone.
-///
-/// This is catalog composition only: it does not select a Guest route,
-/// launch a component, or cut over any Provider-family handler.
-pub fn accepted_provider_bindings(
-    zone: ZoneId,
-    schema_fingerprint: impl Into<String>,
-) -> Result<Vec<ProviderBinding>, ProviderCompositionError> {
-    let schema_fingerprint = schema_fingerprint.into();
-    ALL_ACCEPTED_PROVIDER_IDENTITIES
-        .into_iter()
-        .map(|name| {
-            let resource = ResourceRef::parse(&format!("Provider/{name}"))
-                .map_err(|_| ProviderCompositionError::ProviderRefInvalid)?;
-            let artifact_id =
-                ResourceName::parse(name).map_err(|_| ProviderCompositionError::ProviderRefInvalid)?;
-            let class = accepted_provider_class(name);
-            let mut binding =
-                ProviderBinding::new(zone.clone(), resource, artifact_id, schema_fingerprint.clone())?
-                    .with_class(class);
-            if class == ProviderClass::Transport {
-                binding = binding.with_capability_methods([
-                    "open-transport",
-                    "close-transport",
-                    "observe-transport",
-                ]);
-            }
-            Ok(binding)
-        })
-        .collect()
-}
-
-/// Compose all accepted Provider identities into the shared registry.
-pub fn compose_all_27_provider_registry(
-    zone: ZoneId,
-    generation: u64,
-    schema_fingerprint: impl Into<String>,
-) -> Result<ProviderRegistry<ProviderInstance>, ProviderCompositionError> {
-    compose_provider_registry(
-        zone.clone(),
-        generation,
-        accepted_provider_bindings(zone, schema_fingerprint)?,
-    )
-}
-
-fn accepted_provider_class(name: &str) -> ProviderClass {
-    match name {
-        "system-core"
-        | "system-systemd"
-        | "system-minijail"
-        | "runtime-cloud-hypervisor"
-        | "runtime-qemu-media"
-        | "runtime-azure-container-apps"
-        | "runtime-azure-virtual-machine" => ProviderClass::Runtime,
-        "volume-local" | "volume-virtiofs" => ProviderClass::Storage,
-        "network-local" => ProviderClass::Network,
-        "device-tpm" | "device-usbip" | "device-security-key" | "device-gpu" => {
-            ProviderClass::Device
-        }
-        "display-wayland" => ProviderClass::Display,
-        "audio-pipewire" => ProviderClass::Audio,
-        "credential-secret-service"
-        | "credential-entra"
-        | "credential-managed-identity" => ProviderClass::Credential,
-        "transport-unix" | "transport-vsock" | "transport-azure-relay" => {
-            ProviderClass::Transport
-        }
-        "observability-otel" => ProviderClass::Observability,
-        "activation-nixos" | "clipboard-wayland" | "notification-desktop" | "shell-terminal" => {
-            ProviderClass::Infrastructure
-        }
-        _ => ProviderClass::Infrastructure,
-    }
 }
 
 /// Validate the v3 bundle version and schema before composition.
@@ -764,40 +650,6 @@ impl ProviderRuntime {
             .map_err(|_| ProviderCompositionError::StateUnavailable)?;
         *state = next;
         Ok(())
-    }
-
-    /// Compose the closed v3 Provider catalog without consulting legacy
-    /// HostJson routes.
-    pub fn configure_all_27(
-        &self,
-        zone: ZoneId,
-        generation: u64,
-    ) -> Result<(), ProviderCompositionError> {
-        let registry = compose_all_27_provider_registry(
-            zone.clone(),
-            generation,
-            "sha256:0000000000000000000000000000000000000000000000000000000000000001",
-        )?;
-        let lifecycle = match &self.lifecycle_state_path {
-            Some(path) => ProviderLifecycleDispatch::new_persistent(
-                zone.clone(),
-                path.with_file_name("provider-lifecycle.json"),
-            )
-            .map_err(|_| ProviderCompositionError::StateUnavailable)?,
-            None => ProviderLifecycleDispatch::new(zone.clone()),
-        };
-        let active = ActiveProviderRuntime {
-            zone,
-            registry: ProviderRegistryManager::new(registry),
-            routes: BTreeMap::new(),
-            lifecycle,
-        };
-        self.state
-            .write()
-            .map_err(|_| ProviderCompositionError::StateUnavailable)
-            .map(|mut state| {
-                *state = ProviderRuntimeState::Active(active);
-            })
     }
 
     /// Construct an active runtime from exact bindings and Guest routes.
