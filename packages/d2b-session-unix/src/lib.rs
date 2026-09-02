@@ -116,6 +116,44 @@ pub fn controller_resource_endpoint_policy()
     inherited_resource_v3_endpoint_policy(EndpointRole::Provider, EndpointRole::ZoneController)
 }
 
+/// Exact local ComponentSession policy used by a typed Credential Provider
+/// service. Sensitive token delivery remains a separate Noise_KK session
+/// owned by the Provider; this control session carries only bounded metadata.
+#[cfg(feature = "host-socket")]
+pub fn credential_provider_endpoint_policy()
+-> d2b_contracts_zone_session::v3::component_session::EndpointPolicy {
+    use d2b_contracts_zone_session::v3::component_session::{
+        AttachmentPolicy, AttachmentPolicyKind, EndpointPolicy, EndpointPurpose, EndpointRole,
+        IdentityEvidenceRequirement, LimitProfile, Locality, NoiseProfile, PurposeClass,
+        ServicePackage, TransportBinding, TransportClass,
+    };
+    EndpointPolicy {
+        purpose: EndpointPurpose::ProviderControl,
+        purpose_class: PurposeClass::Local,
+        initiator_role: EndpointRole::Provider,
+        responder_role: EndpointRole::ZoneController,
+        service: ServicePackage::CredentialV3,
+        schema_fingerprint: [0x33; 32],
+        noise_profile: NoiseProfile::Nn25519ChaChaPolySha256,
+        limits: LimitProfile::local_default(),
+        transport_binding: TransportBinding {
+            transport: TransportClass::InheritedSocketpair,
+            locality: Locality::HostLocal,
+            channel_binding: [0x34; 32],
+            identity_evidence: IdentityEvidenceRequirement::DirectionalUnix,
+        },
+        reconnect_generation: 1,
+        attachment_policy: AttachmentPolicy {
+            kind: AttachmentPolicyKind::PacketAtomic,
+            max_per_packet: 1,
+            max_per_request: 1,
+            max_per_operation: 1,
+            max_per_session: 1,
+            credentials_allowed: false,
+        },
+    }
+}
+
 #[cfg(feature = "host-socket")]
 pub use adapter::{
     DescriptorPolicyResolver, NoopUnixTransportObserver, OwnedUnixAttachment, PathnamePeerVerifier,

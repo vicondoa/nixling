@@ -37,7 +37,8 @@ use crate::binding_child_resource_runtime::{
 };
 use crate::binding_child_resource_runtime::reconcile_binding_children;
 use crate::credential_resource_runtime::{
-    CredentialResourceReconciler, credential_controller_descriptor,
+    CredentialResourceReconciler, CredentialSessionRegistry, ComponentCredentialSession,
+    CredentialSession, credential_controller_descriptor, is_credential_provider_ref,
 };
 use crate::process_resource_runtime::{
     ProcessResourceReconciler, ProcessResourceRuntime, ProcessResourceRuntimeError,
@@ -162,7 +163,7 @@ use d2b_session::{
 use d2b_session_unix::{
     AncillaryCapacity, CONTROLLER_BOOTSTRAP_TIMEOUT, PeerCredentials, SeqpacketSocket,
     VerifiedUnixPeer, controller_bootstrap_attachment_policy, controller_credit_scopes,
-    controller_resource_endpoint_policy,
+    controller_resource_endpoint_policy, credential_provider_endpoint_policy,
 };
 use d2bd_runtime::authority_persistence::RedbAuthorityPersistence;
 pub use d2bd_runtime::resource_api::ResourceRuntimeError;
@@ -8780,7 +8781,7 @@ struct ControllerSession {
     binding: ControllerSessionBinding,
     ingress: BusIngress,
     driver: SessionDriverHandle,
-    resource_client: Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+    resource_client: Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>>,
     service_task: tokio::task::JoinHandle<Result<(), SessionServerError>>,
     assignments: BTreeMap<ResourceUid, ResourceClientLease>,
     assignment_stream_open: bool,
@@ -8814,6 +8815,7 @@ struct ControllerSessionCoordinator {
     registrar: Arc<Mutex<Option<ZoneRegistrar>>>,
     assignments: AssignmentRegistry,
     controller_sessions: Arc<Mutex<BTreeMap<ResourceRef, ControllerSession>>>,
+    credential_sessions: CredentialSessionRegistry,
     controller_session_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -10252,6 +10254,7 @@ pub struct ZoneResourceRuntime {
     u10_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     u10_runner_lock: Arc<tokio::sync::Mutex<()>>,
     u10_required: AtomicBool,
+    credential_sessions: CredentialSessionRegistry,
     #[cfg(test)]
     core_runner_events: Arc<Mutex<Vec<&'static str>>>,
     core: Mutex<CoreProcess>,
@@ -11047,6 +11050,7 @@ impl ZoneResourceRuntime {
             u10_runner_tasks: Mutex::new(Vec::new()),
             u10_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
             u10_required: AtomicBool::new(false),
+            credential_sessions: CredentialSessionRegistry::default(),
             #[cfg(test)]
             core_runner_events: Arc::new(Mutex::new(Vec::new())),
             core: Mutex::new(core),
@@ -12492,7 +12496,7 @@ impl ZoneResourceRuntime {
             self.zone.clone(),
             controller_ref,
             controller_generation,
-            provider_ref,
+            provider_ref.clone(),
             provider_generation,
             ResourceRef::parse(CORE_CONTROLLER_PROCESS_REF)
                 .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
@@ -12920,7 +12924,7 @@ impl ZoneResourceRuntime {
                 provider_name,
                 controller_ref,
                 provider_kind,
-                provider_ref,
+                provider_ref.clone(),
                 provider.generation,
             ));
         }
@@ -13030,8 +13034,10 @@ impl ZoneResourceRuntime {
                         Arc::clone(&self.store),
                         Arc::clone(&status_client),
                         identity,
-                        provider_ref,
+                        provider_ref.clone(),
                         session_generation,
+                        self.credential_sessions
+                            .for_provider(provider_ref.clone()),
                     )
                     .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
                 );
@@ -14922,7 +14928,9 @@ impl ZoneResourceRuntime {
                 ) && !session.service_task.is_finished()
             })
         {
-            return Ok(Arc::clone(&session.resource_client));
+            if let Some(client) = session.resource_client.as_ref() {
+                return Ok(Arc::clone(client));
+            }
         }
         self.status_client()
     }
@@ -15462,6 +15470,7 @@ impl ZoneResourceRuntime {
             registrar: Arc::clone(&self.registrar),
             assignments: Arc::clone(&self.assignments),
             controller_sessions: Arc::clone(&self.controller_sessions),
+            credential_sessions: self.credential_sessions.clone(),
             controller_session_lock: Arc::clone(&self.controller_session_lock),
         }
     }
@@ -15825,6 +15834,7 @@ impl ControllerSessionCoordinator {
                     _resource_client,
                     service_task,
                     _session_generation,
+                    _route,
                 ))) = setup.take()
                 {
                     let _ = driver
@@ -15841,7 +15851,7 @@ impl ControllerSessionCoordinator {
                 return Err(ResourceRuntimeError::AuthenticationUnavailable);
             }
             match setup.expect("controller setup result present") {
-                Ok((ingress, driver, resource_client, service_task, session_generation)) => {
+                Ok((ingress, driver, resource_client, service_task, session_generation, route)) => {
                     let current = self
                         .controller_context_is_current(&providers, &context)
                         .await
@@ -15860,9 +15870,26 @@ impl ControllerSessionCoordinator {
                         continue;
                     }
                     let context_for_cleanup = context.clone();
+                    let binding = controller_session_binding(&context, session_generation)?;
+                    let credential_session = if is_credential_provider_ref(context.provider_owner_ref()) {
+                        Some(Arc::new(
+                            ComponentCredentialSession::new(route.clone(), Arc::new(driver.clone()))
+                                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?,
+                        ) as Arc<dyn CredentialSession>)
+                    } else {
+                        None
+                    };
+                    if let Some(session) = credential_session.as_ref() {
+                        self.credential_sessions.register(
+                            context.provider_owner_ref().clone(),
+                            session_generation,
+                            Arc::clone(session),
+                        )
+                        .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
+                    }
                     let mut session = Some(ControllerSession {
                         context: context.clone(),
-                        binding: controller_session_binding(&context, session_generation)?,
+                        binding,
                         ingress,
                         driver: driver.clone(),
                         resource_client,
@@ -15885,6 +15912,12 @@ impl ControllerSessionCoordinator {
                         Err(_) => false,
                     };
                     if !inserted {
+                        if credential_session.is_some() {
+                            self.credential_sessions.remove(
+                                context.provider_owner_ref(),
+                                session_generation,
+                            );
+                        }
                         providers.fail_controller_bootstrap(&context_for_cleanup);
                         if let Some(session) = session {
                             let _ = session
@@ -16466,6 +16499,8 @@ impl ControllerSessionCoordinator {
             matches.then(|| sessions.remove(process_ref)).flatten()
         };
         if let Some(session) = session {
+            self.credential_sessions
+                .remove(session.binding.provider_ref(), session.binding.session_generation());
             self.revoke_controller_assignments(&session.binding);
             send_controller_assignment_revocations(&session.driver, &session.assignments).await;
             let _ = session
@@ -16517,9 +16552,10 @@ impl ControllerSessionCoordinator {
         (
             BusIngress,
             SessionDriverHandle,
-            Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+            Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>>,
             tokio::task::JoinHandle<Result<(), SessionServerError>>,
             ReconnectGeneration,
+            d2b_session::AuthenticatedSessionRouteBinding,
         ),
         ResourceRuntimeError,
     > {
@@ -16592,7 +16628,12 @@ impl ControllerSessionCoordinator {
             )
             .map_err(|_| authentication_error("controller-subject-install"))?;
 
-        let policy = controller_resource_endpoint_policy();
+        let credential_session = is_credential_provider_ref(context.provider_owner_ref());
+        let policy = if credential_session {
+            credential_provider_endpoint_policy()
+        } else {
+            controller_resource_endpoint_policy()
+        };
         let acceptor = registrar
             .component_session_acceptor(policy.clone(), verified_peer)
             .map_err(|_| authentication_error("session-acceptor"))?;
@@ -16625,24 +16666,34 @@ impl ControllerSessionCoordinator {
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .clone()
             .ok_or_else(|| authentication_error("authorization-state"))?;
-        let subject = self
-            .authorizer
-            .issue_authenticated_subject(route.context().clone(), authorization_state)
-            .map_err(|_| authentication_error("authenticated-subject"))?;
-        let service = Arc::new(
-            ResourceBusAdapter::bind_component_session(Arc::clone(&self.api), subject)
-                .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?,
-        );
-        let resource_client = Arc::new(service.client());
-        let services = Arc::clone(&service).ttrpc_services();
         let (ingress, driver) = registrar
             .register_component_service_session(candidate)
             .await
             .map_err(|_| authentication_error("service-registration"))?;
-        let service_task = tokio::spawn(d2b_session::serve_ttrpc_services(
-            Arc::new(driver.clone()),
-            services,
-        ));
+        let (resource_client, service_task) = if credential_session {
+            (
+                None,
+                tokio::spawn(async {
+                    std::future::pending::<Result<(), SessionServerError>>().await
+                }),
+            )
+        } else {
+            let subject = self
+                .authorizer
+                .issue_authenticated_subject(route.context().clone(), authorization_state)
+                .map_err(|_| authentication_error("authenticated-subject"))?;
+            let service = Arc::new(
+                ResourceBusAdapter::bind_component_session(Arc::clone(&self.api), subject)
+                    .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?,
+            );
+            let resource_client = Some(Arc::new(service.client()));
+            let services = Arc::clone(&service).ttrpc_services();
+            let service_task = tokio::spawn(d2b_session::serve_ttrpc_services(
+                Arc::new(driver.clone()),
+                services,
+            ));
+            (resource_client, service_task)
+        };
         tokio::task::yield_now().await;
         if service_task.is_finished() {
             service_task.abort();
@@ -16656,6 +16707,7 @@ impl ControllerSessionCoordinator {
             resource_client,
             service_task,
             session_generation,
+            route,
         ))
     }
 

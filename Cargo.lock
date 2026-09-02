@@ -1481,6 +1481,7 @@ dependencies = [
 name = "d2b-provider-toolkit"
 version = "0.0.0-bootstrap"
 dependencies = [
+ "async-trait",
  "d2b-contracts-provider",
  "d2b-contracts-resource",
  "d2b-contracts-zone-session",
@@ -1490,6 +1491,7 @@ dependencies = [
  "schemars",
  "serde_json",
  "sha2",
+ "ttrpc",
  "tokio",
 ]
 

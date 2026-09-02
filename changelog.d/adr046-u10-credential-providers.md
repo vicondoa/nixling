@@ -29,3 +29,7 @@
 - Provider-filtered runners are now attached for all three providers before
   any Credential row exists, while standalone provider binaries refuse
   unauthenticated or ambient-chain startup instead of reporting readiness.
+- U10 runners now receive a reconnect-aware typed ComponentSession Credential
+  adapter from daemon composition; confirmed and uncertain revocation evidence
+  remains durable and provider service entrypoints expose the supervised typed
+  Credential session lifecycle.

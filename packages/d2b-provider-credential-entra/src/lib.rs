@@ -25,7 +25,12 @@ use d2b_contracts_provider::v3::credential::{
     CredentialSourceVersion, OpaqueAzureRef, PlacementBinding,
 };
 use d2b_contracts_resource::v3::ResourceRef;
-use d2b_provider_toolkit::{ProviderEntrypoint, ProviderLifecycle};
+use d2b_provider_toolkit::{
+    AllocatorSessionBinding, AuthenticatedComponentSession, Cancellation,
+    CredentialAuthorizationSource, ProviderAdmission, ProviderAgentBootstrap, ProviderEntrypoint,
+    ProviderLifecycle, ProviderRuntimeError,
+    run_authenticated_credential_provider,
+};
 
 pub use controller::{
     EntraController, EntraEndpointPolicy, EntraStatusProjection, PROVIDER_KIND,
@@ -80,6 +85,37 @@ pub fn controller_binary_entrypoint() -> i32 {
         return 1;
     }
     1
+}
+
+/// Serve the typed Credential service after the daemon has admitted the
+/// allocator-issued ComponentSession.
+pub async fn run_authenticated_credential_service<A>(
+    bootstrap: ProviderAgentBootstrap,
+    binding: AllocatorSessionBinding,
+    entrypoint: ProviderEntrypoint,
+    registration: ProviderAdmission,
+    session: AuthenticatedComponentSession<()>,
+    provider: Arc<EntraCredentialProvider>,
+    authorizer: Arc<A>,
+    cancellation: Cancellation,
+) -> Result<(), ProviderRuntimeError>
+where
+    A: CredentialAuthorizationSource,
+{
+    bootstrap
+        .admit(binding)
+        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let session_admission = entrypoint.admit_authenticated(&session)?;
+    run_authenticated_credential_provider(
+        entrypoint,
+        registration,
+        session_admission,
+        session,
+        provider,
+        authorizer,
+        cancellation,
+    )
+    .await
 }
 
 /// Boxed asynchronous result returned by the injected identity-Guest client.

@@ -6,7 +6,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use d2b_contracts_provider::v3::{
     credential::{
-        CREDENTIAL_SERVICE_NAME, CredentialMethod, CredentialSpec, PlacementBinding,
+        CREDENTIAL_SERVICE_NAME, CredentialMethod, CredentialOutcomeCode, CredentialRequest,
+        CredentialSpec, MetadataResponse, PlacementBinding,
+        decode_outer, encode_outer,
     },
     credential_controller::{
         CREDENTIAL_PROVIDER_REVOKE_FINALIZER, CredentialIdempotencyKey, CredentialProviderKind,
@@ -43,6 +45,7 @@ use d2b_resource_store::{
     StoreProjection, StoredResource,
 };
 use d2b_resource_store_redb::RedbResourceStore;
+use d2b_session::{ComponentSessionDriver, SessionTtrpcClient};
 
 const CREDENTIAL_RESOURCE_TYPE: &str = "Credential";
 const PROCESS_RESOURCE_TYPE: &str = "Process";
@@ -112,6 +115,7 @@ impl CredentialResourceClient for ResourceApiClient<RedbBackend, UnavailableUpgr
 /// Exact non-secret input for one provider-side RevokeToken call.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct CredentialRevocationRequest {
+    zone: ZoneId,
     credential_ref: ResourceRef,
     credential_uid: d2b_contracts_resource::v3::ResourceUid,
     credential_generation: d2b_contracts_resource::v3::ResourceGeneration,
@@ -170,6 +174,7 @@ impl CredentialRevocationRequest {
         .map_err(|_| CredentialResourceRuntimeError::Revocation)?
         .request_value();
         Ok(Self {
+            zone: resource.key().zone().clone(),
             credential_ref: resource.key().resource_ref().clone(),
             credential_uid: resource.key().uid().clone(),
             credential_generation: resource.generation(),
@@ -191,6 +196,7 @@ impl CredentialRevocationRequest {
 pub(crate) enum CredentialRevocationOutcome {
     Revoked,
     AlreadyRevoked,
+    Uncertain,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -216,6 +222,7 @@ impl CredentialRevocationEvidence {
         match self.outcome {
             CredentialRevocationOutcome::Revoked => "revoked",
             CredentialRevocationOutcome::AlreadyRevoked => "already-revoked",
+            CredentialRevocationOutcome::Uncertain => "uncertain",
         }
     }
 }
@@ -240,15 +247,200 @@ pub(crate) trait CredentialSession: Send + Sync {
     ) -> Result<CredentialRevocationOutcome, CredentialResourceRuntimeError>;
 }
 
-struct UnavailableCredentialSession;
+/// One authenticated Provider ComponentSession used for typed Credential calls.
+///
+/// The session driver is supplied by the daemon's ProviderSupervisor handoff.
+/// This adapter owns only the generated ttrpc client and a single-flight gate;
+/// Resource status remains the durable evidence owner.
+pub(crate) struct ComponentCredentialSession {
+    route: d2b_session::AuthenticatedSessionRouteBinding,
+    driver: Arc<dyn ComponentSessionDriver>,
+    client: Arc<SessionTtrpcClient>,
+    gate: tokio::sync::Mutex<()>,
+}
+
+impl ComponentCredentialSession {
+    pub(crate) fn new(
+        route: d2b_session::AuthenticatedSessionRouteBinding,
+        driver: Arc<dyn ComponentSessionDriver>,
+    ) -> Result<Self, CredentialResourceRuntimeError> {
+        if route.provider_ref().is_none()
+            || route.reconnect_generation().get() == 0
+            || driver.generation() != route.reconnect_generation().get()
+            || !route.liveness().is_live()
+            || route.service().as_str() != CREDENTIAL_SERVICE_NAME
+        {
+            return Err(CredentialResourceRuntimeError::InvalidResource);
+        }
+        let client_driver = Arc::clone(&driver);
+        Ok(Self {
+            route,
+            driver: client_driver,
+            client: Arc::new(SessionTtrpcClient::new(driver)),
+            gate: tokio::sync::Mutex::new(()),
+        })
+    }
+}
 
 #[async_trait]
-impl CredentialSession for UnavailableCredentialSession {
+impl CredentialSession for ComponentCredentialSession {
     async fn revoke_credential(
         &self,
-        _request: &CredentialRevocationRequest,
+        request: &CredentialRevocationRequest,
     ) -> Result<CredentialRevocationOutcome, CredentialResourceRuntimeError> {
-        Err(CredentialResourceRuntimeError::Revocation)
+        let Some(provider_ref) = self.route.provider_ref() else {
+            return Err(CredentialResourceRuntimeError::InvalidResource);
+        };
+        if request.credential_ref.resource_type().as_str() != CREDENTIAL_RESOURCE_TYPE
+            || &request.zone != self.route.zone()
+            || &request.provider_ref != provider_ref
+            || request.session_generation != self.route.reconnect_generation()
+        {
+            return Err(CredentialResourceRuntimeError::InvalidResource);
+        }
+        let _gate = self.gate.lock().await;
+        if !self.route.liveness().is_live()
+            || self.driver.generation() != self.route.reconnect_generation().get()
+        {
+            return Ok(CredentialRevocationOutcome::Uncertain);
+        }
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| CredentialResourceRuntimeError::Revocation)?
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let expiry = now_unix_ms.saturating_add(request.deadline_ms);
+        if expiry <= now_unix_ms {
+            return Ok(CredentialRevocationOutcome::Uncertain);
+        }
+        let typed = CredentialRequest::new(
+            request.credential_ref.clone(),
+            request.operation_id.clone(),
+            request.idempotency_key.clone(),
+            expiry,
+            expiry,
+        )
+        .map_err(|_| CredentialResourceRuntimeError::Revocation)?;
+        let mut rpc = ttrpc::proto::Request::new();
+        rpc.set_service("d2b.credential.v3.CredentialService".to_owned());
+        rpc.set_method("RevokeToken".to_owned());
+        rpc.timeout_nano = i64::try_from(request.deadline_ms.saturating_mul(1_000_000))
+            .unwrap_or(i64::MAX);
+        rpc.payload = encode_outer(&typed)
+            .map_err(|_| CredentialResourceRuntimeError::Revocation)?;
+        let response = match self.client.client().request(rpc).await {
+            Ok(response) => response,
+            Err(_) => return Ok(CredentialRevocationOutcome::Uncertain),
+        };
+        let metadata: MetadataResponse = decode_outer(&response.payload)
+            .map_err(|_| CredentialResourceRuntimeError::Revocation)?;
+        if metadata.metadata.state != d2b_contracts_provider::v3::credential::CredentialLeaseState::Revoked {
+            return Ok(CredentialRevocationOutcome::Uncertain);
+        }
+        match metadata.metadata.outcome {
+            CredentialOutcomeCode::Revoked => Ok(CredentialRevocationOutcome::Revoked),
+            CredentialOutcomeCode::AlreadyRevoked => {
+                Ok(CredentialRevocationOutcome::AlreadyRevoked)
+            }
+            CredentialOutcomeCode::Success => Ok(CredentialRevocationOutcome::Uncertain),
+        }
+    }
+}
+
+/// Registry populated by authenticated ProviderSupervisor session handoffs.
+#[derive(Clone, Default)]
+pub(crate) struct CredentialSessionRegistry {
+    sessions: Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<
+                ResourceRef,
+                (ReconnectGeneration, Arc<dyn CredentialSession>),
+            >,
+        >,
+    >,
+}
+
+impl CredentialSessionRegistry {
+    pub(crate) fn register(
+        &self,
+        provider_ref: ResourceRef,
+        session_generation: ReconnectGeneration,
+        session: Arc<dyn CredentialSession>,
+    ) -> Result<(), CredentialResourceRuntimeError> {
+        if provider_ref.resource_type().as_str() != "Provider" || session_generation.get() == 0 {
+            return Err(CredentialResourceRuntimeError::InvalidResource);
+        }
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| CredentialResourceRuntimeError::Revocation)?;
+        if sessions
+            .get(&provider_ref)
+            .is_some_and(|(generation, _)| *generation > session_generation)
+        {
+            return Err(CredentialResourceRuntimeError::InvalidResource);
+        }
+        sessions.insert(provider_ref, (session_generation, session));
+        Ok(())
+    }
+
+    pub(crate) fn remove(
+        &self,
+        provider_ref: &ResourceRef,
+        session_generation: ReconnectGeneration,
+    ) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            if sessions
+                .get(provider_ref)
+                .is_some_and(|(generation, _)| *generation == session_generation)
+            {
+                sessions.remove(provider_ref);
+            }
+        }
+    }
+
+    pub(crate) fn for_provider(
+        &self,
+        provider_ref: ResourceRef,
+    ) -> Arc<dyn CredentialSession> {
+        Arc::new(RegistryCredentialSession {
+            provider_ref,
+            sessions: Arc::clone(&self.sessions),
+        })
+    }
+}
+
+struct RegistryCredentialSession {
+    provider_ref: ResourceRef,
+    sessions: Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<
+                ResourceRef,
+                (ReconnectGeneration, Arc<dyn CredentialSession>),
+            >,
+        >,
+    >,
+}
+
+#[async_trait]
+impl CredentialSession for RegistryCredentialSession {
+    async fn revoke_credential(
+        &self,
+        request: &CredentialRevocationRequest,
+    ) -> Result<CredentialRevocationOutcome, CredentialResourceRuntimeError> {
+        if request.provider_ref != self.provider_ref {
+            return Err(CredentialResourceRuntimeError::InvalidResource);
+        }
+        let session = self
+            .sessions
+            .lock()
+            .map_err(|_| CredentialResourceRuntimeError::Revocation)?
+            .get(&self.provider_ref)
+            .map(|(_, session)| Arc::clone(session));
+        match session {
+            Some(session) => session.revoke_credential(request).await,
+            None => Ok(CredentialRevocationOutcome::Uncertain),
+        }
     }
 }
 
@@ -350,24 +542,19 @@ where
         identity: ControllerIdentity,
         provider_ref: ResourceRef,
         session_generation: ReconnectGeneration,
+        credential_session: Arc<dyn CredentialSession>,
     ) -> Result<Self, CredentialResourceRuntimeError> {
         let provider_kind =
             provider_kind(&provider_ref).ok_or(CredentialResourceRuntimeError::InvalidResource)?;
-        let reconciler = Self {
+        Ok(Self {
             store,
             client,
             identity,
             provider_ref,
             provider_kind,
             session_generation,
-            credential_session: Arc::new(UnavailableCredentialSession),
-        };
-        Ok(reconciler.with_credential_session(Arc::new(UnavailableCredentialSession)))
-    }
-
-    fn with_credential_session(mut self, session: Arc<dyn CredentialSession>) -> Self {
-        self.credential_session = session;
-        self
+            credential_session,
+        })
     }
 
     fn owns(&self, resource: &ResourceSnapshot) -> Result<bool, CredentialResourceRuntimeError> {
@@ -841,11 +1028,24 @@ where
                 )?;
                 let outcome = self.credential_session.revoke_credential(&request).await?;
                 let evidence = CredentialRevocationEvidence::confirmed(&request, outcome);
+                let (phase, outcome_code, lease_revoked) = match outcome {
+                    CredentialRevocationOutcome::Revoked
+                    | CredentialRevocationOutcome::AlreadyRevoked => (
+                        ResourcePhase::Pending,
+                        "credential-lease-revoked",
+                        true,
+                    ),
+                    CredentialRevocationOutcome::Uncertain => (
+                        ResourcePhase::Degraded,
+                        "credential-revocation-uncertain",
+                        false,
+                    ),
+                };
                 let status = credential_status_candidate(
                     resource,
-                    ResourcePhase::Pending,
-                    "credential-lease-revoked",
-                    true,
+                    phase,
+                    outcome_code,
+                    lease_revoked,
                     Some(&evidence),
                 )?;
                 return ReconcileResult::new(
@@ -947,6 +1147,10 @@ fn provider_kind(provider_ref: &ResourceRef) -> Option<CredentialProviderKind> {
         "Provider/credential-managed-identity" => Some(CredentialProviderKind::ManagedIdentity),
         _ => None,
     }
+}
+
+pub(crate) fn is_credential_provider_ref(provider_ref: &ResourceRef) -> bool {
+    provider_kind(provider_ref).is_some()
 }
 
 fn credential_spec(
@@ -1403,7 +1607,8 @@ fn credential_revoke_operation_id(
     controller_generation: d2b_contracts_resource::v3::ControllerGeneration,
 ) -> String {
     let preimage = format!(
-        "{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}",
+        resource.key().zone().as_str(),
         resource.key().uid().as_str(),
         resource.generation().get(),
         provider_ref.to_canonical_string(),
@@ -1450,27 +1655,27 @@ fn credential_status_candidate(
             "retryable": phase == ResourcePhase::Degraded,
         }),
     );
-    if lease_revoked {
-        if let Some(credential) = status
-            .get_mut("resource")
-            .and_then(serde_json::Value::as_object_mut)
-            .and_then(|resource| resource.get_mut("credential"))
-            .and_then(serde_json::Value::as_object_mut)
-        {
+    if let Some(credential) = status
+        .get_mut("resource")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|resource| resource.get_mut("credential"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        if lease_revoked {
             credential.insert(
                 "leaseState".to_owned(),
                 serde_json::Value::String("Revoked".to_owned()),
             );
-            if let Some(revocation) = revocation {
-                credential.insert(
-                    "revocation".to_owned(),
-                    serde_json::json!({
-                        "operationId": revocation.operation_id,
-                        "outcome": revocation.outcome_code(),
-                        "sessionGeneration": revocation.session_generation.get(),
-                    }),
-                );
-            }
+        }
+        if let Some(revocation) = revocation {
+            credential.insert(
+                "revocation".to_owned(),
+                serde_json::json!({
+                    "operationId": revocation.operation_id,
+                    "outcome": revocation.outcome_code(),
+                    "sessionGeneration": revocation.session_generation.get(),
+                }),
+            );
         }
     }
     let status = value
@@ -1770,6 +1975,7 @@ fn scoped_identity(request: &ScopedCredentialRequest) -> wire::ResourceIdentity 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use d2b_contracts_provider::v3::credential::CredentialWire;
     use d2b_contracts_resource::v3::{
         ControllerGeneration, ResourceGeneration, ResourcePhase, ResourceRef, ResourceUid, ZoneId,
         ZoneRevision,
@@ -1782,6 +1988,7 @@ mod tests {
     };
     use d2b_provider_transport_azure_relay::{RelayCredentialBinding, RelayCredentialRole};
     use serde_json::json;
+    use ttrpc::proto::Codec;
 
     fn identity() -> ControllerIdentity {
         ControllerIdentity::new(
@@ -1971,6 +2178,18 @@ mod tests {
             } else {
                 Ok(CredentialRevocationOutcome::Revoked)
             }
+        }
+    }
+
+    struct UncertainCredentialSession;
+
+    #[async_trait]
+    impl CredentialSession for UncertainCredentialSession {
+        async fn revoke_credential(
+            &self,
+            _request: &CredentialRevocationRequest,
+        ) -> Result<CredentialRevocationOutcome, CredentialResourceRuntimeError> {
+            Ok(CredentialRevocationOutcome::Uncertain)
         }
     }
 
@@ -2171,6 +2390,231 @@ mod tests {
 
         fn commits(&self) -> Vec<TestCommit> {
             self.commits.lock().unwrap().clone()
+        }
+    }
+
+    struct FakeCredentialDriver {
+        generation: u64,
+        responses: std::sync::Arc<(
+            tokio::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
+            tokio::sync::Notify,
+        )>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl FakeCredentialDriver {
+        fn new(generation: u64) -> Self {
+            Self {
+                generation,
+                responses: std::sync::Arc::new((
+                    tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+                    tokio::sync::Notify::new(),
+                )),
+                requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl d2b_session::ComponentSessionDriver for FakeCredentialDriver {
+        fn generation(&self) -> u64 {
+            self.generation
+        }
+
+        async fn start_ttrpc(
+            &self,
+            _request_id: d2b_contracts_zone_session::v3::component_session::RequestId,
+            frame: Vec<u8>,
+        ) -> d2b_session::Result<()> {
+            let header = ttrpc::proto::MessageHeader::from(&frame);
+            let request = ttrpc::Request::decode(&frame[ttrpc::proto::MESSAGE_HEADER_LENGTH..])
+                .map_err(|_| d2b_session::SessionError::new(
+                    d2b_contracts_zone_session::v3::component_session::SessionErrorCode::RecordMalformed,
+                ))?;
+            let typed = CredentialRequest::decode_wire(&request.payload).map_err(|_| {
+                d2b_session::SessionError::new(
+                    d2b_contracts_zone_session::v3::component_session::SessionErrorCode::RecordMalformed,
+                )
+            })?;
+            self.requests.lock().unwrap().push((
+                typed.operation_id().to_owned(),
+                typed.idempotency_key().to_owned(),
+            ));
+            let metadata = MetadataResponse {
+                metadata: d2b_contracts_provider::v3::credential::CredentialMetadata {
+                    lease_handle: d2b_contracts_provider::v3::credential::CredentialLeaseHandle::parse(
+                        "provider-lease",
+                    )
+                    .unwrap(),
+                    rotation_generation: 1,
+                    source_version:
+                        d2b_contracts_provider::v3::credential::CredentialSourceVersion::parse(
+                            "provider-source",
+                        )
+                        .unwrap(),
+                    expires_at_unix_ms: u64::MAX,
+                    state: d2b_contracts_provider::v3::credential::CredentialLeaseState::Revoked,
+                    outcome: CredentialOutcomeCode::Revoked,
+                },
+            };
+            let response_payload = encode_outer(&metadata).map_err(|_| {
+                d2b_session::SessionError::new(
+                    d2b_contracts_zone_session::v3::component_session::SessionErrorCode::RecordMalformed,
+                )
+            })?;
+            let mut response = ttrpc::Response::new();
+            response.set_status(ttrpc::get_status(ttrpc::Code::OK, ""));
+            response.payload = response_payload;
+            let encoded = response.encode().map_err(|_| {
+                d2b_session::SessionError::new(
+                    d2b_contracts_zone_session::v3::component_session::SessionErrorCode::RecordMalformed,
+                )
+            })?;
+            let mut response_frame =
+                Vec::from(ttrpc::proto::MessageHeader::new_response(
+                    header.stream_id,
+                    encoded.len() as u32,
+                ));
+            response_frame.extend(encoded);
+            let (queue, notify) = &*self.responses;
+            queue.lock().await.push_back(response_frame);
+            notify.notify_one();
+            Ok(())
+        }
+
+        async fn complete_ttrpc(
+            &self,
+            _request_id: d2b_contracts_zone_session::v3::component_session::RequestId,
+        ) -> d2b_session::Result<bool> {
+            Ok(true)
+        }
+
+        async fn cancel(
+            &self,
+            _generation: u64,
+            _request_id: d2b_contracts_zone_session::v3::component_session::RequestId,
+        ) -> d2b_session::Result<()> {
+            Ok(())
+        }
+
+        async fn send_ttrpc(&self, _frame: Vec<u8>) -> d2b_session::Result<()> {
+            Ok(())
+        }
+
+        async fn receive_ttrpc(&self) -> d2b_session::Result<Vec<u8>> {
+            loop {
+                let (queue, notify) = &*self.responses;
+                if let Some(frame) = queue.lock().await.pop_front() {
+                    return Ok(frame);
+                }
+                notify.notified().await;
+            }
+        }
+
+        async fn register_inbound_call(
+            &self,
+            _request_id: d2b_contracts_zone_session::v3::component_session::RequestId,
+        ) -> d2b_session::Result<d2b_session::Cancellation> {
+            Err(d2b_session::SessionError::new(
+                d2b_contracts_zone_session::v3::component_session::SessionErrorCode::Cancelled,
+            ))
+        }
+
+        async fn mark_inbound_dispatched(
+            &self,
+            _request_id: d2b_contracts_zone_session::v3::component_session::RequestId,
+        ) -> d2b_session::Result<()> {
+            Ok(())
+        }
+
+        async fn complete_inbound_call(
+            &self,
+            _request_id: d2b_contracts_zone_session::v3::component_session::RequestId,
+        ) -> d2b_session::Result<bool> {
+            Ok(true)
+        }
+
+        async fn remove_inbound_call(
+            &self,
+            _request_id: d2b_contracts_zone_session::v3::component_session::RequestId,
+        ) -> d2b_session::Result<bool> {
+            Ok(true)
+        }
+
+        async fn send_attachments(
+            &self,
+            _attachments: Vec<d2b_session::OwnedAttachment>,
+        ) -> d2b_session::Result<()> {
+            Ok(())
+        }
+
+        async fn receive_attachments(
+            &self,
+        ) -> d2b_session::Result<Vec<d2b_session::OwnedAttachment>> {
+            Ok(Vec::new())
+        }
+
+        async fn open_named_stream(
+            &self,
+            _stream: d2b_session::StreamId,
+            _send_credit: u32,
+            _receive_credit: u32,
+        ) -> d2b_session::Result<()> {
+            Ok(())
+        }
+
+        async fn send_named_stream(
+            &self,
+            _stream: d2b_session::StreamId,
+            _bytes: Vec<u8>,
+        ) -> d2b_session::Result<()> {
+            Ok(())
+        }
+
+        async fn receive_named_stream(&self) -> d2b_session::Result<d2b_session::StreamEvent> {
+            Err(d2b_session::SessionError::new(
+                d2b_contracts_zone_session::v3::component_session::SessionErrorCode::Cancelled,
+            ))
+        }
+
+        async fn grant_named_stream_credit(
+            &self,
+            _stream: d2b_session::StreamId,
+            _bytes: u32,
+        ) -> d2b_session::Result<()> {
+            Ok(())
+        }
+
+        async fn close_named_stream(
+            &self,
+            _stream: d2b_session::StreamId,
+        ) -> d2b_session::Result<()> {
+            Ok(())
+        }
+
+        async fn reset_named_stream(
+            &self,
+            _stream: d2b_session::StreamId,
+        ) -> d2b_session::Result<()> {
+            Ok(())
+        }
+
+        async fn drive_keepalive(&self, _now: std::time::Instant) -> d2b_session::Result<()> {
+            Ok(())
+        }
+
+        async fn receive_control(&self) -> d2b_session::Result<d2b_session::SessionEvent> {
+            Err(d2b_session::SessionError::new(
+                d2b_contracts_zone_session::v3::component_session::SessionErrorCode::Cancelled,
+            ))
+        }
+
+        async fn close(
+            &self,
+            _reason: d2b_contracts_zone_session::v3::component_session::CloseReason,
+            _remediation: d2b_contracts_zone_session::v3::component_session::Remediation,
+        ) -> d2b_session::Result<()> {
+            Ok(())
         }
     }
 
@@ -2437,9 +2881,9 @@ mod tests {
             identity_for_provider(provider),
             provider_ref,
             ReconnectGeneration::new(7).unwrap(),
+            session,
         )
         .unwrap()
-        .with_credential_session(session)
     }
 
     fn credential_reconciler(
@@ -2518,6 +2962,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uncertain_revoke_evidence_retains_the_finalizer_and_lease() {
+        let source = Arc::new(TestRunnerSource::new(
+            Some(deleting_resource("Active")),
+            Vec::new(),
+        ));
+        let provider_ref =
+            ResourceRef::parse("Provider/credential-managed-identity").unwrap();
+        let client = Arc::new(TestCredentialClient::default());
+        let reconciler = Arc::new(
+            CredentialResourceReconciler::new(
+                Arc::new(TestCredentialStore::default()),
+                Arc::clone(&client),
+                identity_for_provider("Provider/credential-managed-identity"),
+                provider_ref,
+                ReconnectGeneration::new(7).unwrap(),
+                Arc::new(UncertainCredentialSession),
+            )
+            .unwrap(),
+        );
+        Runner::new(reconciler, source.clone(), runner_config())
+            .run()
+            .await
+            .expect("uncertain revoke runner");
+        let status = String::from_utf8(source.commits()[0].status_candidate.clone().unwrap())
+            .unwrap();
+        assert!(status.contains("\"outcome\":\"uncertain\""));
+        assert!(status.contains("\"leaseState\":\"Active\""));
+        assert!(client.finalizer_updates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn runner_keeps_finalizer_until_revocation_and_process_child_cleanup_complete() {
         let deleting = deleting_resource("Revoked");
         let child = process_child(&deleting, false);
@@ -2571,6 +3046,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn composed_runner_revokes_then_cleans_the_managed_identity_child() {
+        let provider_ref =
+            ResourceRef::parse("Provider/credential-managed-identity").unwrap();
+        let driver = Arc::new(FakeCredentialDriver::new(7));
+        let route = d2b_session::AuthenticatedSessionRouteBinding::for_test(
+            Some(provider_ref.clone()),
+            CREDENTIAL_SERVICE_NAME,
+            7,
+            Some(1),
+            Some(1),
+        );
+        let session = Arc::new(
+            ComponentCredentialSession::new(route, driver.clone()).unwrap(),
+        );
+        let registry = CredentialSessionRegistry::default();
+        registry
+            .register(
+                provider_ref.clone(),
+                ReconnectGeneration::new(7).unwrap(),
+                session,
+            )
+            .unwrap();
+        let client = Arc::new(TestCredentialClient::default());
+
+        let active = deleting_resource("Active");
+        let expected_revoke = CredentialRevocationRequest::new(
+            &active,
+            &provider_ref,
+            &identity_for_provider("Provider/credential-managed-identity"),
+            ReconnectGeneration::new(7).unwrap(),
+        )
+        .unwrap();
+        let revoke_source = Arc::new(TestRunnerSource::new(Some(active.clone()), Vec::new()));
+        let revoke = Arc::new(CredentialResourceReconciler::new(
+            Arc::new(TestCredentialStore::default()),
+            Arc::clone(&client),
+            identity_for_provider("Provider/credential-managed-identity"),
+            provider_ref.clone(),
+            ReconnectGeneration::new(7).unwrap(),
+            registry.for_provider(provider_ref.clone()),
+        )
+        .unwrap());
+        Runner::new(revoke, revoke_source.clone(), runner_config())
+            .run()
+            .await
+            .expect("composed revoke runner");
+        let commits = revoke_source.commits();
+        assert_eq!(commits.len(), 1);
+        assert!(String::from_utf8(commits[0].status_candidate.clone().unwrap())
+            .unwrap()
+            .contains("\"outcome\":\"revoked\""));
+        assert_eq!(driver.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            driver.requests.lock().unwrap()[0],
+            (
+                expected_revoke.operation_id.clone(),
+                expected_revoke.idempotency_key.clone()
+            )
+        );
+
+        let revoked = deleting_resource("Revoked");
+        let delete_source = Arc::new(TestRunnerSource::new(Some(revoked.clone()), Vec::new()));
+        let delete = Arc::new(CredentialResourceReconciler::new(
+            Arc::new(TestCredentialStore::with_children(vec![(
+                process_child(&revoked, false),
+                revoked.key().uid().clone(),
+            )])),
+            Arc::clone(&client),
+            identity_for_provider("Provider/credential-managed-identity"),
+            provider_ref.clone(),
+            ReconnectGeneration::new(7).unwrap(),
+            registry.for_provider(provider_ref.clone()),
+        )
+        .unwrap());
+        Runner::new(delete, delete_source, runner_config())
+            .run()
+            .await
+            .expect("composed child-delete runner");
+        assert_eq!(client.deletes.lock().unwrap().len(), 1);
+        assert!(client.finalizer_updates.lock().unwrap().is_empty());
+
+        let retained_source = Arc::new(TestRunnerSource::new(Some(revoked.clone()), Vec::new()));
+        let retained = Arc::new(CredentialResourceReconciler::new(
+            Arc::new(TestCredentialStore::with_children(vec![(
+                process_child(&revoked, true),
+                revoked.key().uid().clone(),
+            )])),
+            Arc::clone(&client),
+            identity_for_provider("Provider/credential-managed-identity"),
+            provider_ref.clone(),
+            ReconnectGeneration::new(7).unwrap(),
+            registry.for_provider(provider_ref.clone()),
+        )
+        .unwrap());
+        Runner::new(retained, retained_source, runner_config())
+            .run()
+            .await
+            .expect("composed retained-finalizer runner");
+        assert!(client.finalizer_updates.lock().unwrap().is_empty());
+
+        let clear_source = Arc::new(TestRunnerSource::new(Some(revoked.clone()), Vec::new()));
+        let clear = Arc::new(CredentialResourceReconciler::new(
+            Arc::new(TestCredentialStore::default()),
+            Arc::clone(&client),
+            identity_for_provider("Provider/credential-managed-identity"),
+            provider_ref,
+            ReconnectGeneration::new(7).unwrap(),
+            registry.for_provider(
+                ResourceRef::parse("Provider/credential-managed-identity").unwrap(),
+            ),
+        )
+        .unwrap());
+        Runner::new(clear, clear_source, runner_config())
+            .run()
+            .await
+            .expect("composed clear-finalizer runner");
+        assert_eq!(client.finalizer_updates.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn empty_provider_watches_register_before_any_credential_exists() {
         for provider in [
             "Provider/credential-secret-service",
@@ -2586,6 +3181,7 @@ mod tests {
                     identity_for_provider(provider),
                     provider_ref,
                     ReconnectGeneration::new(7).unwrap(),
+                    Arc::new(RecordingCredentialSession::default()),
                 )
                 .unwrap(),
             );

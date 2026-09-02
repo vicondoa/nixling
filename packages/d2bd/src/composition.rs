@@ -17209,6 +17209,22 @@ mod zone_publication_order_tests {
         assert!(!method.contains("self.status_client()?"));
         assert!(!method.contains("SameZoneScopedCredentialClient::new"));
     }
+
+    #[test]
+    fn credential_runners_receive_the_production_session_router() {
+        let source = include_str!("resource_runtime.rs");
+        assert!(source.contains("CredentialSessionRegistry"));
+        assert!(source.contains("for_provider(provider_ref.clone())"));
+        assert!(!source.contains("UnavailableCredentialSession"));
+    }
+
+    #[test]
+    fn credential_process_sessions_use_the_typed_credential_endpoint() {
+        let source = include_str!("resource_runtime.rs");
+        assert!(source.contains("credential_provider_endpoint_policy()"));
+        assert!(source.contains("if credential_session"));
+        assert!(source.contains("ComponentCredentialSession::new(route.clone()"));
+    }
 }
 
 const BROKER_AUDIT_EVIDENCE_PAGE_LIMIT: u32 = 16;

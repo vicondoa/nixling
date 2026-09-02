@@ -30,7 +30,12 @@ use d2b_contracts_provider::v3::credential::{
 };
 use d2b_contracts_resource::v3::ResourceRef;
 use d2b_contracts_resource::v3::identity::{AuthenticatedSubjectContext, Locality};
-use d2b_provider_toolkit::{ProviderEntrypoint, ProviderLifecycle};
+use d2b_provider_toolkit::{
+    AllocatorSessionBinding, AuthenticatedComponentSession, Cancellation,
+    CredentialAuthorizationSource, ProviderAdmission, ProviderAgentBootstrap, ProviderEntrypoint,
+    ProviderLifecycle, ProviderRuntimeError,
+    run_authenticated_credential_provider,
+};
 
 pub use agent::ManagedIdentityAgent;
 pub use audit::{
@@ -107,6 +112,37 @@ fn standalone_entrypoint(name: &'static str) -> i32 {
     // A standalone Provider has no allocator-issued authenticated session.
     // Refuse readiness instead of serving an unauthenticated or ambient path.
     1
+}
+
+/// Serve the managed-identity Agent after the daemon has admitted the
+/// allocator-issued ComponentSession.
+pub async fn run_authenticated_agent<A>(
+    bootstrap: ProviderAgentBootstrap,
+    binding: AllocatorSessionBinding,
+    entrypoint: ProviderEntrypoint,
+    registration: ProviderAdmission,
+    session: AuthenticatedComponentSession<()>,
+    agent: Arc<ManagedIdentityAgent>,
+    authorizer: Arc<A>,
+    cancellation: Cancellation,
+) -> Result<(), ProviderRuntimeError>
+where
+    A: CredentialAuthorizationSource,
+{
+    bootstrap
+        .admit(binding)
+        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let session_admission = entrypoint.admit_authenticated(&session)?;
+    run_authenticated_credential_provider(
+        entrypoint,
+        registration,
+        session_admission,
+        session,
+        agent,
+        authorizer,
+        cancellation,
+    )
+    .await
 }
 
 /// Boxed asynchronous result returned by the injected IMDS client.

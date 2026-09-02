@@ -45,6 +45,7 @@
 mod agent;
 mod audit;
 mod bootstrap;
+mod credential;
 mod dispatch;
 mod error;
 mod fixture;
@@ -73,9 +74,13 @@ pub use audit::{
 pub use bootstrap::{
     AllocatorSessionBinding, PROVIDER_RESOURCE_TYPE, ProviderAgentBootstrap, ProviderAgentIdentity,
 };
+pub use credential::{
+    CredentialAuthorizationSource, RouteCredentialAuthorization, credential_service,
+    run_authenticated_credential_provider,
+};
 pub use d2b_session::{
-    AuthenticatedComponentSession, AuthenticatedSessionRouteBinding, ComponentSessionDriver,
-    StreamEvent, StreamId,
+    AuthenticatedComponentSession, AuthenticatedSessionRouteBinding, Cancellation,
+    ComponentSessionDriver, StreamEvent, StreamId,
 };
 pub use dispatch::{DispatchLimiter, DispatchPermit, MAX_DISPATCH_IN_FLIGHT};
 pub use error::ProviderToolkitError;
