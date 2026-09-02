@@ -600,6 +600,11 @@ enum FrameworkAzureOperation {
     Update,
 }
 
+/// Framework-only QEMU effect evidence for non-Cloud-Hypervisor Guest owners.
+///
+/// The real Process/ComponentSession path remains owned by the selected
+/// child Providers; this adapter exercises the typed lifecycle state machine
+/// without claiming Cloud Hypervisor host liveness.
 struct FrameworkQemuEffect {
     guest_ref: ResourceRef,
     identity: Option<qemu_media_runtime::ProcessIdentity>,
