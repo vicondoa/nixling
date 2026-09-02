@@ -97,9 +97,22 @@ pub struct ProductionStore {
     _directory: tempfile::TempDir,
     store: Arc<RedbResourceStore>,
     claims: SessionClaims,
+    provider_claims: std::collections::BTreeMap<String, SessionClaims>,
+    authorizer: Arc<NativeAuthorizer>,
+    service: Arc<ResourceService<RedbBackend>>,
+    state: AuthorizationState,
     client: Arc<ResourceApiClient<RedbBackend, d2b_resource_api::service::UnavailableUpgradeDispatcher>>,
-    core_assignment_epoch: u64,
-    core_api: Mutex<Option<d2b_resource_api::registered::RedbRegisteredControllerApi>>,
+    core_authority: Arc<Mutex<CoreAssignmentAuthority>>,
+}
+
+#[derive(Clone)]
+struct CoreAssignmentAuthority {
+    provider_generation: ResourceGeneration,
+    controller_generation: d2b_contracts_resource::v3::ControllerGeneration,
+    session_generation: ReconnectGeneration,
+    controller_role: ResourceRef,
+    target: ResourceRef,
+    epoch: u64,
 }
 
 impl ProductionStore {
@@ -119,12 +132,25 @@ impl ProductionStore {
             .expect("create hermetic store marker");
         let identity = store_identity();
         let state = core_state();
-        let subject_context = core_subject_context();
+        let provider_claims = PROVIDER_IDS
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| {
+                (
+                    (*provider).to_owned(),
+                    provider_subject_context(provider, index),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let claims = provider_claims
+            .get("system-core")
+            .cloned()
+            .expect("system-core subject is present");
         let mut assignment_registry = ControllerAssignmentRegistry::default();
         let core_assignment_epoch = assignment_registry
             .reserve_epoch_after(0)
             .expect("reserve Core assignment epoch");
-        let policy = core_policy(&subject_context);
+        let policy = core_policy(provider_claims.values());
         let authorizer = Arc::new(
             NativeAuthorizer::new(ApiCatalog::standard(), Some(policy))
                 .expect("construct production Core authorizer"),
@@ -143,26 +169,41 @@ impl ProductionStore {
                 .expect("bind production Core ResourceService"),
         );
         let client_subject = authorizer
-            .issue_authenticated_subject(subject_context.clone(), state.clone())
+            .issue_authenticated_subject(claims.clone(), state.clone())
             .expect("issue authenticated Core subject");
         let client = Arc::new(
             ResourceBusAdapter::bind_component_session(Arc::clone(&service), client_subject)
                 .expect("bind authenticated Core Resource API client")
                 .client(),
         );
-        let subject = authorizer
-            .issue_authenticated_subject(subject_context, state.clone())
-            .expect("issue authenticated Core source subject");
-        let core_api = service
-            .registered_controller_api(subject, state.clone(), Vec::new())
-            .expect("bind production Core source API");
+        let authority = CoreAssignmentAuthority {
+            provider_generation: claims
+                .provider_generation()
+                .expect("Core Provider generation is authoritative"),
+            controller_generation: claims
+                .controller_generation()
+                .expect("Core controller generation is authoritative"),
+            session_generation: claims.reconnect_generation(),
+            controller_role: claims
+                .process_ref()
+                .cloned()
+                .expect("Core controller role is authoritative"),
+            target: claims
+                .execution_ref()
+                .cloned()
+                .expect("Core execution target is authoritative"),
+            epoch: core_assignment_epoch,
+        };
         Arc::new(Self {
             _directory: directory,
             store,
-            claims: core_subject_context(),
+            claims,
+            provider_claims,
+            authorizer,
+            service,
+            state,
             client,
-            core_assignment_epoch,
-            core_api: Mutex::new(Some(core_api)),
+            core_authority: Arc::new(Mutex::new(authority)),
         })
     }
 
@@ -171,51 +212,125 @@ impl ProductionStore {
     }
 
     pub fn core_registered_api(&self) -> d2b_resource_api::registered::RedbRegisteredControllerApi {
-        self.core_api
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-            .expect("take production Core source API once")
+        self.core_registered_api_with_assignments(Vec::new())
     }
 
-    pub fn core_assignment_resolver(
+    pub fn core_registered_api_with_assignments(
+        &self,
+        assignments: Vec<(ResourceRef, ResourceAssignmentFence)>,
+    ) -> d2b_resource_api::registered::RedbRegisteredControllerApi {
+        self.provider_registered_api("system-core", assignments)
+    }
+
+    pub fn provider_registered_api(
+        &self,
+        provider: &str,
+        assignments: Vec<(ResourceRef, ResourceAssignmentFence)>,
+    ) -> d2b_resource_api::registered::RedbRegisteredControllerApi {
+        let claims = self
+            .provider_claims
+            .get(provider)
+            .cloned()
+            .expect("requested Provider subject is in the closed catalog");
+        let subject = self
+            .authorizer
+            .issue_authenticated_subject(claims, self.state.clone())
+            .expect("issue authenticated Core source subject");
+        self.service
+            .registered_controller_api(subject, self.state.clone(), assignments)
+            .expect("bind production Core source API")
+    }
+
+    pub fn authoritative_assignment(
+        &self,
+        resource: &StoredResource,
+    ) -> ResourceAssignmentFence {
+        let authority = self
+            .core_authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        ResourceAssignmentFence {
+            resource_uid: resource.uid.clone(),
+            resource_revision: resource.revision,
+            provider_generation: authority.provider_generation,
+            controller_generation: authority.controller_generation,
+            controller_role: authority.controller_role,
+            target: authority.target,
+            session_generation: authority.session_generation,
+            epoch: authority.epoch,
+            scope: ResourceAssignmentScope::Primary,
+        }
+    }
+
+    pub fn set_core_authority_epoch(&self, epoch: u64) {
+        self.core_authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .epoch = epoch;
+    }
+
+    pub fn durable_core_assignment_resolver(
         &self,
     ) -> d2b_resource_api::registered::AssignmentFenceResolver {
-        let epoch = self.core_assignment_epoch;
-        let provider_generation = self
-            .claims
-            .provider_generation()
-            .expect("fixed Core Provider generation");
-        let controller_generation = self
-            .claims
-            .controller_generation()
-            .expect("fixed Core controller generation");
-        let session_generation = self.claims.reconnect_generation();
-        let controller_role =
-            ResourceRef::parse("Process/controller").expect("fixed controller role");
-        let execution_target =
-            ResourceRef::parse("Host/host-system").expect("fixed execution target");
+        let store = self.store();
+        let authority = Arc::clone(&self.core_authority);
         Arc::new(move |target, uid, revision| {
-            let provider_generation = provider_generation;
-            let controller_generation = controller_generation;
-            let session_generation = session_generation;
-            let controller_role = controller_role.clone();
-            let execution_target = execution_target.clone();
+            let store = Arc::clone(&store);
+            let authority = Arc::clone(&authority);
             Box::pin(async move {
                 if target.resource_type().as_str() != "Process" {
                     return Err(SourceError::Integrity);
                 }
-                Ok(ResourceAssignmentFence {
-                    resource_uid: uid,
-                    resource_revision: revision,
-                    provider_generation,
-                    controller_generation,
-                    controller_role,
-                    target: execution_target,
-                    session_generation,
-                    epoch,
-                    scope: ResourceAssignmentScope::Primary,
-                })
+                let stored = 'read: {
+                    for _ in 0..4 {
+                        match store
+                            .assignment_fence(
+                                ZoneId::parse("dev").expect("fixed Zone"),
+                                target.clone(),
+                            )
+                            .await
+                        {
+                            Ok(stored) => break 'read stored,
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    d2b_resource_store::StoreErrorKind::Backpressure
+                                        | d2b_resource_store::StoreErrorKind::StoreBackpressure
+                                ) =>
+                            {
+                                tokio::task::yield_now().await;
+                            }
+                            Err(error)
+                                if error.kind()
+                                    == d2b_resource_store::StoreErrorKind::Timeout =>
+                            {
+                                return Err(SourceError::Timeout);
+                            }
+                            Err(_) => return Err(SourceError::Unavailable),
+                        }
+                    }
+                    return Err(SourceError::Backpressure);
+                };
+                let Some(stored) = stored else {
+                    return Err(SourceError::Integrity);
+                };
+                let current = authority
+                    .lock()
+                    .map_err(|_| SourceError::Integrity)?
+                    .clone();
+                if stored.resource_uid != uid
+                    || stored.resource_revision != revision
+                    || stored.provider_generation != current.provider_generation
+                    || stored.controller_generation != current.controller_generation
+                    || stored.controller_role != current.controller_role
+                    || stored.target != current.target
+                    || stored.session_generation != current.session_generation
+                    || stored.epoch != current.epoch
+                {
+                    return Err(SourceError::Integrity);
+                }
+                Ok(stored)
             })
         })
     }
@@ -265,6 +380,61 @@ impl ProductionStore {
         }
     }
 
+    pub async fn commit_provider_catalog_update(&self) {
+        let mut resources = Vec::with_capacity(PROVIDER_IDS.len());
+        for provider in PROVIDER_IDS {
+            resources.push(
+                self.get_resource(
+                    &ResourceRef::parse(&format!("Provider/{provider}"))
+                        .expect("fixed Provider reference"),
+                )
+                .await
+                .expect("read committed Provider resource"),
+            );
+        }
+        let mut request = wire::CommitBatchRequest::new();
+        let catalog_digest = canonical_digest(
+            "d2b:reaction-provider-catalog-update/v1",
+            PROVIDER_IDS.join("\0").as_bytes(),
+        );
+        let operation_id = format!(
+            "{}{}",
+            d2b_contracts_resource::v3::RESOURCE_BUNDLE_MATERIALIZATION_OPERATION_PREFIX,
+            catalog_digest
+        );
+        request.meta = d2b_resource_api::protobuf::MessageField::some(request_meta(&operation_id));
+        for resource in &resources {
+            request.mutations.push(wire_mutation(
+                wire::MutationKind::MUTATION_KIND_UPDATE_SPEC,
+                wire::PreconditionKind::PRECONDITION_KIND_EXACT_REVISION,
+                &resource.resource_ref,
+                Some((resource.uid.clone(), resource.revision.get())),
+                provider_spec_update_body(&resource.canonical_json),
+            ));
+        }
+        let response = loop {
+            let response = self.client.commit_batch(request.clone()).await;
+            let retryable = response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.reason.as_str() == "redb-store-backpressure");
+            if retryable {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            break response;
+        };
+        if let Some(error) = response.error.as_ref() {
+            panic!(
+                "production Provider catalog update failed: kind={:?} reason={} retry={:?}",
+                error.kind,
+                error.reason.as_str(),
+                error.retry_class
+            );
+        }
+        assert_eq!(response.resources.len(), PROVIDER_IDS.len());
+    }
+
     pub async fn commit_process_batch(
         &self,
         profile: usize,
@@ -306,47 +476,54 @@ impl ProductionStore {
             );
         }
         let committed_at = std::time::Instant::now();
-        let resources = response
-            .resources
-            .iter()
-            .map(|envelope| {
-                let identity = envelope
-                    .identity
-                    .as_ref()
-                    .expect("production commit response carries resource identity");
-                StoredResource {
-                    resource_ref: ResourceRef::parse(&format!(
-                        "{}/{}",
-                        identity.resource_type, identity.name
-                    ))
-                    .expect("production commit response carries valid resource reference"),
-                    zone: ZoneId::parse(identity.zone.clone())
-                        .expect("production commit response carries valid Zone"),
-                    uid: ResourceUid::parse(
-                        identity
-                            .uid
-                            .clone()
-                            .expect("production commit response carries resource UID"),
-                    )
-                    .expect("production commit response carries valid resource UID"),
-                    generation: ResourceGeneration::new(
-                        identity
-                            .generation
-                            .expect("production commit response carries generation"),
-                    )
-                    .expect("production commit response carries valid generation"),
-                    revision: ZoneRevision::new(
-                        identity
-                            .revision
-                            .expect("production commit response carries revision"),
-                    ),
-                    canonical_json: envelope.canonical_json.clone(),
-                    payload_digest: envelope.payload_digest.clone(),
-                }
-            })
-            .collect::<Vec<_>>();
+        let resources = stored_resources_from_response(&response);
         assert_eq!(resources.len(), end - start);
         Ok((resources, committed_at))
+    }
+
+    pub async fn commit_process_spec_update(
+        &self,
+        resources: &[StoredResource],
+        operation_id: &str,
+    ) -> Result<(Vec<StoredResource>, std::time::Instant), StoreError> {
+        let mut request = wire::CommitBatchRequest::new();
+        request.meta =
+            d2b_resource_api::protobuf::MessageField::some(request_meta(operation_id));
+        for resource in resources {
+            request.mutations.push(wire_mutation(
+                wire::MutationKind::MUTATION_KIND_UPDATE_SPEC,
+                wire::PreconditionKind::PRECONDITION_KIND_EXACT_REVISION,
+                &resource.resource_ref,
+                Some((resource.uid.clone(), resource.revision.get())),
+                process_spec_update_body(&resource.canonical_json),
+            ));
+        }
+        let response = loop {
+            let response = self.client.commit_batch(request.clone()).await;
+            let retryable = response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.reason.as_str() == "redb-store-backpressure");
+            if retryable {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            break response;
+        };
+        if let Some(error) = response.error.as_ref() {
+            panic!(
+                "production ResourceService Process update failed: kind={:?} reason={} retry={:?}",
+                error.kind,
+                error.reason.as_str(),
+                error.retry_class
+            );
+        }
+        let resources = stored_resources_from_response(&response);
+        let committed_at = std::time::Instant::now();
+        Ok((
+            resources,
+            committed_at,
+        ))
     }
 
     pub async fn commit_status(
@@ -378,6 +555,52 @@ impl ProductionStore {
         Ok(self.store.get(get_request(target)).await?.revision)
     }
 
+    pub async fn get_resource(&self, target: &ResourceRef) -> Result<StoredResource, StoreError> {
+        loop {
+            match self.store.get(get_request(target)).await {
+                Ok(resource) => return Ok(resource),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        d2b_resource_store::StoreErrorKind::Backpressure
+                            | d2b_resource_store::StoreErrorKind::StoreBackpressure
+                            | d2b_resource_store::StoreErrorKind::Timeout
+                    ) =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub async fn assignment_fence(
+        &self,
+        target: &ResourceRef,
+    ) -> Result<Option<ResourceAssignmentFence>, StoreError> {
+        loop {
+            match self.store.assignment_fence(
+                ZoneId::parse("dev").expect("fixed Zone"),
+                target.clone(),
+            )
+            .await
+            {
+                Ok(fence) => return Ok(fence),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        d2b_resource_store::StoreErrorKind::Backpressure
+                            | d2b_resource_store::StoreErrorKind::StoreBackpressure
+                            | d2b_resource_store::StoreErrorKind::Timeout
+                    ) =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub async fn wait_for_newer_revision(
         &self,
         target: &ResourceRef,
@@ -402,63 +625,20 @@ impl ProductionStore {
         }
     }
 
-    pub async fn delete_process(&self, resource: &StoredResource) {
-        let mut identity = wire::ResourceIdentity::new();
-        identity.zone = resource.zone.to_canonical_string();
-        identity.resource_type = resource.resource_ref.resource_type().as_str().to_owned();
-        identity.name = resource.resource_ref.name().as_str().to_owned();
-        identity.uid = Some(resource.uid.as_str().to_owned());
-        identity.revision = Some(resource.revision.get());
-        let mut precondition = wire::Precondition::new();
-        precondition.kind = d2b_resource_api::protobuf::EnumOrUnknown::new(
-            wire::PreconditionKind::PRECONDITION_KIND_EXACT_REVISION,
-        );
-        precondition.expected_uid = Some(resource.uid.as_str().to_owned());
-        precondition.expected_revision = Some(resource.revision.get());
-        let mut mutation = wire::Mutation::new();
-        mutation.kind = d2b_resource_api::protobuf::EnumOrUnknown::new(
-            wire::MutationKind::MUTATION_KIND_DELETE,
-        );
-        mutation.target = d2b_resource_api::protobuf::MessageField::some(identity);
-        mutation.precondition = d2b_resource_api::protobuf::MessageField::some(precondition);
-        let mut request = wire::CommitBatchRequest::new();
-        request.meta = d2b_resource_api::protobuf::MessageField::some(request_meta(
-            &format!("reaction-warmup-delete-{}", resource.resource_ref.name().as_str()),
-        ));
-        request.mutations.push(mutation);
-        let response = loop {
-            let response = self.client.commit_batch(request.clone()).await;
-            let retryable = response
-                .error
-                .as_ref()
-                .is_some_and(|error| error.reason.as_str() == "redb-store-backpressure");
-            if retryable {
-                tokio::task::yield_now().await;
-                continue;
-            }
-            break response;
-        };
-        if let Some(error) = response.error.as_ref() {
-            panic!(
-                "production warmup Process delete failed: kind={:?} reason={} retry={:?}",
-                error.kind,
-                error.reason.as_str(),
-                error.retry_class
-            );
-        }
-    }
-
     pub async fn shutdown(self) -> Result<(), StoreError> {
         let Self {
             _directory,
             store,
             claims: _claims,
+            provider_claims: _provider_claims,
+            authorizer: _authorizer,
+            service,
+            state: _state,
             client,
-            core_assignment_epoch: _core_assignment_epoch,
-            core_api,
+            core_authority: _core_authority,
         } = self;
         drop(client);
-        drop(core_api);
+        drop(service);
         for _ in 0..1_000 {
             if Arc::strong_count(&store) == 1 {
                 break;
@@ -494,11 +674,15 @@ fn core_state() -> AuthorizationState {
     }
 }
 
-fn core_subject_context() -> SessionClaims {
+fn provider_subject_context(provider: &str, index: usize) -> SessionClaims {
+    let subject_uid = if provider == "system-core" {
+        "33333333-3333-4333-8333-333333333333".to_owned()
+    } else {
+        format!("44444444-4444-4444-8444-{index:012}")
+    };
     SessionClaims::new(
-        ResourceRef::parse("Provider/system-core").expect("fixed Core subject"),
-        ResourceUid::parse("33333333-3333-4333-8333-333333333333")
-            .expect("fixed Core subject UID"),
+        ResourceRef::parse(&format!("Provider/{provider}")).expect("fixed Provider subject"),
+        ResourceUid::parse(subject_uid).expect("fixed Provider subject UID"),
         ResourceRef::parse("Zone/dev").expect("fixed Zone"),
         EvidenceClass::UnixPeer,
         SessionPurpose::parse("resource-api").expect("fixed session purpose"),
@@ -518,7 +702,11 @@ fn core_subject_context() -> SessionClaims {
             TranscriptHash::from_bytes([3; 32]),
         ),
     )
-    .with_provider_ref(ResourceRef::parse("Provider/system-core").expect("fixed Provider"))
+    .with_execution_ref(ResourceRef::parse("Host/host-system").expect("fixed execution target"))
+    .with_process_ref(ResourceRef::parse("Process/controller").expect("fixed controller role"))
+    .with_provider_ref(
+        ResourceRef::parse(&format!("Provider/{provider}")).expect("fixed Provider"),
+    )
     .with_provider_generation(
         d2b_contracts_resource::v3::ResourceGeneration::new(1)
             .expect("fixed Provider generation"),
@@ -529,7 +717,7 @@ fn core_subject_context() -> SessionClaims {
     )
 }
 
-fn core_policy(subject: &SessionClaims) -> PolicySet {
+fn core_policy<'a>(subjects: impl IntoIterator<Item = &'a SessionClaims>) -> PolicySet {
     let catalog = ApiCatalog::standard();
     let process = ResourceTypeName::parse("Process").expect("fixed Process ResourceType");
     let provider = ResourceTypeName::parse("Provider").expect("fixed Provider ResourceType");
@@ -543,6 +731,7 @@ fn core_policy(subject: &SessionClaims) -> PolicySet {
                 ResourceVerb::List,
                 ResourceVerb::Watch,
                 ResourceVerb::Create,
+                ResourceVerb::UpdateSpec,
                 ResourceVerb::Delete,
             ],
             [SessionVerb::Connect],
@@ -571,6 +760,7 @@ fn core_policy(subject: &SessionClaims) -> PolicySet {
                 ResourceVerb::List,
                 ResourceVerb::Watch,
                 ResourceVerb::Create,
+                ResourceVerb::UpdateSpec,
             ],
             [SessionVerb::Connect],
             [],
@@ -598,10 +788,10 @@ fn core_policy(subject: &SessionClaims) -> PolicySet {
     .expect("fixed Core role");
     let binding = CompiledRoleBinding::new(
         role.role_ref.clone(),
-        [BoundSubject {
+        subjects.into_iter().map(|subject| BoundSubject {
             subject_ref: subject.subject_ref().clone(),
             subject_uid: subject.subject_uid().clone(),
-        }],
+        }),
         BindingScope::default(),
         RelayGrantAuthority::None,
     )
@@ -648,6 +838,50 @@ fn wire_mutation(
     mutation.precondition = d2b_resource_api::protobuf::MessageField::some(precondition);
     mutation.resource = d2b_resource_api::protobuf::MessageField::some(body);
     mutation
+}
+
+fn stored_resources_from_response(
+    response: &wire::CommitBatchResponse,
+) -> Vec<StoredResource> {
+    response
+        .resources
+        .iter()
+        .map(|envelope| {
+            let identity = envelope
+                .identity
+                .as_ref()
+                .expect("production commit response carries resource identity");
+            StoredResource {
+                resource_ref: ResourceRef::parse(&format!(
+                    "{}/{}",
+                    identity.resource_type, identity.name
+                ))
+                .expect("production commit response carries valid resource reference"),
+                zone: ZoneId::parse(identity.zone.clone())
+                    .expect("production commit response carries valid Zone"),
+                uid: ResourceUid::parse(
+                    identity
+                        .uid
+                        .clone()
+                        .expect("production commit response carries resource UID"),
+                )
+                .expect("production commit response carries valid resource UID"),
+                generation: ResourceGeneration::new(
+                    identity
+                        .generation
+                        .expect("production commit response carries generation"),
+                )
+                .expect("production commit response carries valid generation"),
+                revision: ZoneRevision::new(
+                    identity
+                        .revision
+                        .expect("production commit response carries revision"),
+                ),
+                canonical_json: envelope.canonical_json.clone(),
+                payload_digest: envelope.payload_digest.clone(),
+            }
+        })
+        .collect()
 }
 
 pub async fn open_named_watch(
@@ -785,6 +1019,25 @@ fn provider_body(index: usize, provider: &str) -> Vec<u8> {
     value.to_canonical_bytes()
 }
 
+fn provider_spec_update_body(canonical: &[u8]) -> Vec<u8> {
+    let mut value = CanonicalJsonValue::parse(canonical).expect("stored Provider is canonical");
+    let CanonicalJsonValue::Object(root) = &mut value else {
+        panic!("stored Provider envelope is an object");
+    };
+    let CanonicalJsonValue::Object(spec) = root
+        .get_mut("spec")
+        .expect("stored Provider spec is present")
+    else {
+        panic!("stored Provider spec is an object");
+    };
+    spec.insert(
+        "config".to_owned(),
+        CanonicalJsonValue::parse(br#"{"watch":"updated"}"#)
+            .expect("Provider update config is canonical"),
+    );
+    value.to_canonical_bytes()
+}
+
 fn process_body(index: usize) -> Vec<u8> {
     let raw = format!(
         r#"{{
@@ -849,6 +1102,24 @@ fn process_body(index: usize) -> Vec<u8> {
         panic!("Process metadata is an object");
     };
     metadata.remove("uid");
+    value.to_canonical_bytes()
+}
+
+fn process_spec_update_body(canonical: &[u8]) -> Vec<u8> {
+    let mut value = CanonicalJsonValue::parse(canonical).expect("stored Process is canonical");
+    let CanonicalJsonValue::Object(root) = &mut value else {
+        panic!("stored Process envelope is an object");
+    };
+    let CanonicalJsonValue::Object(spec) = root
+        .get_mut("spec")
+        .expect("stored Process spec is present")
+    else {
+        panic!("stored Process spec is an object");
+    };
+    spec.insert(
+        "template".to_owned(),
+        CanonicalJsonValue::String("reaction-updated".to_owned()),
+    );
     value.to_canonical_bytes()
 }
 
