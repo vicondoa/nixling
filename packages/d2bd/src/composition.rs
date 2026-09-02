@@ -7873,11 +7873,13 @@ fn dispatch_wave6_resource_reconcile(
         .and_then(Value::as_str)
         .ok_or(resource_runtime::ResourceRuntimeError::RequestInvalid)?;
     if resource_type == "Guest"
-        && provider_ref != d2b_provider_runtime_cloud_hypervisor::PROVIDER_REF
+        && !resource_runtime::U6_SHARED_PROVIDER_RUNNERS
+            .iter()
+            .any(|registration| registration.provider_ref == provider_ref)
     {
         tracing::warn!(
             operation = "guest-provider-binding",
-            "Guest reconcile refused a non-Cloud-Hypervisor Provider",
+            "Guest reconcile refused an unregistered runtime Provider",
         );
         return Err(resource_runtime::ResourceRuntimeError::CapabilityUnavailable);
     }
@@ -7982,20 +7984,22 @@ fn dispatch_wave6_resource_reconcile(
             "device-tpm-reconciled"
         }
         "Guest" => {
-            block_on_future(runtime.reconcile_cloud_hypervisor_guests(Arc::new(state.clone())))?;
-            ready = resource
-                .get("status")
-                .and_then(|status| status.get("phase"))
-                .and_then(Value::as_str)
-                == Some("Ready")
-                && resource
+            if provider_ref == d2b_provider_runtime_cloud_hypervisor::PROVIDER_REF {
+                block_on_future(runtime.reconcile_cloud_hypervisor_guests(Arc::new(state.clone())))?;
+                ready = resource
                     .get("status")
-                    .and_then(|status| status.get("observedGeneration"))
-                    .and_then(Value::as_u64)
-                    == resource
-                        .get("metadata")
-                        .and_then(|metadata| metadata.get("generation"))
-                        .and_then(Value::as_u64);
+                    .and_then(|status| status.get("phase"))
+                    .and_then(Value::as_str)
+                    == Some("Ready")
+                    && resource
+                        .get("status")
+                        .and_then(|status| status.get("observedGeneration"))
+                        .and_then(Value::as_u64)
+                        == resource
+                            .get("metadata")
+                            .and_then(|metadata| metadata.get("generation"))
+                            .and_then(Value::as_u64);
+            }
             "controller-managed"
         }
         _ => unreachable!(),

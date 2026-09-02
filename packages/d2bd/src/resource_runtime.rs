@@ -1563,6 +1563,17 @@ impl DaemonSharedProviderEffects {
         if gateway.resource_type().as_str() != "Guest" {
             return Err(SharedProviderEffectError::InvalidResource);
         }
+        let gateway_resource = runtime
+            .committed_resource_value(&gateway, &context.operation_id)
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if gateway_resource.pointer("/metadata/zone").and_then(Value::as_str)
+            != Some(self.zone.as_str())
+            || gateway_resource.pointer("/status/phase").and_then(Value::as_str)
+                != Some("Ready")
+        {
+            return Err(SharedProviderEffectError::Unavailable);
+        }
         for field in credential_fields {
             let Some(credential_ref) = config
                 .get(*field)
