@@ -11,8 +11,7 @@ use std::{
 };
 
 use d2b_contracts_resource::v3::{
-    ControllerGeneration, ResourceGeneration, ResourceRef, ZoneId,
-    identity::ReconnectGeneration,
+    ControllerGeneration, ResourceGeneration, ResourceRef, ZoneId, identity::ReconnectGeneration,
 };
 use d2b_core_controller::{
     ControllerDescriptor, CoreControllerSource, Runner, RunnerConfig, SourceError,
@@ -25,7 +24,7 @@ use d2b_resource_store::{
 
 use super::{
     DaemonSharedProviderEffects, ResourceRuntimeError, SharedProviderEffectExecutor,
-    SharedProviderResourceKind, SharedProviderRunnerRegistration, SharedProviderResourceReconciler,
+    SharedProviderResourceKind, SharedProviderResourceReconciler, SharedProviderRunnerRegistration,
 };
 
 /// The shared-Runner registration shape used by Guest runtime Providers.
@@ -41,15 +40,14 @@ pub const U6_SHARED_PROVIDER_RUNNERS: [SharedGuestRunnerRegistration; 4] = [
         provider_ref: "Provider/runtime-cloud-hypervisor",
         resource_type: "Guest",
         finalizer: d2b_provider_runtime_cloud_hypervisor::GUEST_CONTROLLER_FINALIZER,
-        repair_interval_ticks: d2b_provider_runtime_cloud_hypervisor::
-            CLOUD_HYPERVISOR_REPAIR_INTERVAL_SECS
-            * 1_000,
-        legacy_scheduler_disabled: d2b_provider_runtime_cloud_hypervisor::
-            cloud_hypervisor_runner_contract()
-            .legacy_scheduler_disabled(),
-        watched_configuration_is_dependency: d2b_provider_runtime_cloud_hypervisor::
-            cloud_hypervisor_runner_contract()
-            .watched_configuration_is_dependency(),
+        repair_interval_ticks:
+            d2b_provider_runtime_cloud_hypervisor::CLOUD_HYPERVISOR_REPAIR_INTERVAL_SECS * 1_000,
+        legacy_scheduler_disabled:
+            d2b_provider_runtime_cloud_hypervisor::cloud_hypervisor_runner_contract()
+                .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency:
+            d2b_provider_runtime_cloud_hypervisor::cloud_hypervisor_runner_contract()
+                .watched_configuration_is_dependency(),
     },
     SharedProviderRunnerRegistration {
         controller_ref: "Process/runtime-qemu-media-controller",
@@ -101,10 +99,7 @@ pub fn compose_shared_guest_runner_descriptors(
     controller_generation: ControllerGeneration,
     provider_generations: &BTreeMap<ResourceRef, ResourceGeneration>,
     session_generation: ReconnectGeneration,
-) -> Result<
-    Vec<(SharedGuestRunnerRegistration, ControllerDescriptor)>,
-    ResourceRuntimeError,
-> {
+) -> Result<Vec<(SharedGuestRunnerRegistration, ControllerDescriptor)>, ResourceRuntimeError> {
     super::compose_shared_provider_runner_descriptors(
         registrations,
         zone,
@@ -151,8 +146,9 @@ pub(crate) async fn start(
         &provider_generations,
         session_generation,
     )?;
-    let effects: Arc<dyn SharedProviderEffectExecutor> =
-        Arc::new(DaemonSharedProviderEffects::new(state, runtime.zone.clone()));
+    let effects: Arc<dyn SharedProviderEffectExecutor> = Arc::new(
+        DaemonSharedProviderEffects::new(state, runtime.zone.clone()),
+    );
     let mut tasks = Vec::new();
     for (registration, descriptor) in descriptors {
         let kind = SharedProviderResourceKind::from_registration(registration)?;
@@ -195,17 +191,15 @@ pub(crate) async fn start(
                 if !allowed_types.contains(target.resource_type()) {
                     return Err(SourceError::Integrity);
                 }
-                if let Some(stored) = store
-                    .assignment_fence(zone, target.clone())
-                    .await
-                    .map_err(|error| match error.kind() {
+                if let Some(stored) = store.assignment_fence(zone, target.clone()).await.map_err(
+                    |error| match error.kind() {
                         StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure => {
                             SourceError::Backpressure
                         }
                         StoreErrorKind::Timeout => SourceError::Timeout,
                         _ => SourceError::Unavailable,
-                    })?
-                {
+                    },
+                )? {
                     if stored.resource_uid != uid
                         || stored.epoch > authority.epoch
                         || (stored.epoch == authority.epoch
@@ -326,15 +320,21 @@ mod tests {
             .map(|registration| registration.provider_ref)
             .collect::<BTreeSet<_>>();
         assert_eq!(refs.len(), 4);
-        assert!(U6_SHARED_PROVIDER_RUNNERS
-            .iter()
-            .all(|registration| registration.resource_type == "Guest"));
-        assert!(U6_SHARED_PROVIDER_RUNNERS
-            .iter()
-            .all(|registration| registration.legacy_scheduler_disabled));
-        assert!(U6_SHARED_PROVIDER_RUNNERS
-            .iter()
-            .all(|registration| registration.watched_configuration_is_dependency));
+        assert!(
+            U6_SHARED_PROVIDER_RUNNERS
+                .iter()
+                .all(|registration| registration.resource_type == "Guest")
+        );
+        assert!(
+            U6_SHARED_PROVIDER_RUNNERS
+                .iter()
+                .all(|registration| registration.legacy_scheduler_disabled)
+        );
+        assert!(
+            U6_SHARED_PROVIDER_RUNNERS
+                .iter()
+                .all(|registration| registration.watched_configuration_is_dependency)
+        );
     }
 
     #[test]
