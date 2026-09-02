@@ -717,6 +717,15 @@ impl DaemonSharedProviderEffects {
         }
     }
 
+    fn project_network_volume_spec(
+        spec: Value,
+        content: &d2b_provider_network_local::controller::NetworkConfigContent,
+        fence: &SharedRunnerNetworkContentFence,
+        owner_ref: &ResourceRef,
+    ) -> Result<Value, NetworkEffectError> {
+        network_config_spec_with_content(spec, content, fence, owner_ref)
+    }
+
     #[cfg(test)]
     pub(crate) async fn test_reconcile_registration(
         &self,
@@ -1626,7 +1635,12 @@ impl NetworkResourcePort for SharedRunnerNetworkResources {
         if !network_assignment_matches(&assignment, fence) {
             return Err(NetworkEffectError::NetworkAdmissionMismatch);
         }
-        spec = network_config_spec_with_content(spec, content, fence, &self.owner_ref)?;
+        spec = DaemonSharedProviderEffects::project_network_volume_spec(
+            spec,
+            content,
+            fence,
+            &self.owner_ref,
+        )?;
         self.upsert(
             &self.volume_ref,
             spec,
@@ -17064,8 +17078,13 @@ mod tests {
         spec.as_object_mut()
             .unwrap()
             .insert("providerRef".to_owned(), Value::String("Provider/volume-local".to_owned()));
-        let projected =
-            network_config_spec_with_content(spec, &content, &fence, &owner_ref).unwrap();
+        let projected = DaemonSharedProviderEffects::project_network_volume_spec(
+            spec,
+            &content,
+            &fence,
+            &owner_ref,
+        )
+        .unwrap();
         let envelope = json!({ "spec": projected });
         assert!(network_config_content_projection_ready(&envelope));
         for (path, bytes) in [
@@ -17095,7 +17114,12 @@ mod tests {
             &marker
         ));
         assert_eq!(
-            network_config_spec_with_content(foreign.clone(), &content, &fence, &owner_ref),
+            DaemonSharedProviderEffects::project_network_volume_spec(
+                foreign.clone(),
+                &content,
+                &fence,
+                &owner_ref,
+            ),
             Err(NetworkEffectError::NetworkAdmissionMismatch)
         );
         assert_eq!(serde_json::to_vec(&foreign).unwrap(), before);
