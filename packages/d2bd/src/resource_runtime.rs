@@ -4484,6 +4484,21 @@ impl SharedProviderResourceReconciler {
             .map_err(|_| SharedProviderReconcileError::InvalidResource)
     }
 
+    fn status_candidate_for_phase(
+        &self,
+        resource: &ResourceSnapshot,
+        phase: SharedProviderEffectPhase,
+    ) -> Result<Option<Vec<u8>>, SharedProviderReconcileError> {
+        if self.kind == SharedProviderResourceKind::CloudHypervisorGuest {
+            // The live CH controller owns its layered Guest status. Do not
+            // replace its freshly committed conditions with this Runner's
+            // bounded generic projection.
+            Ok(None)
+        } else {
+            Self::status_candidate(resource, Some(phase)).map(Some)
+        }
+    }
+
     #[cfg(test)]
     fn first_pass_for_test(
         &self,
@@ -4817,11 +4832,12 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             )
             .await
             .map_err(SharedProviderReconcileError::Effect)?;
+        let status = self.status_candidate_for_phase(resource, phase)?;
         Ok(ReconcileResult::new(
             resource.revision(),
             resource.generation(),
             None,
-            Some(Self::status_candidate(resource, Some(phase))?),
+            status,
             ReconcileDisposition::Pending,
             None,
             None,
@@ -4867,12 +4883,13 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             )
             .await
             .map_err(SharedProviderReconcileError::Effect)?;
+        let status = self.status_candidate_for_phase(resource, phase)?;
         Ok(ObservationResult::new(
             ReconcileResult::new(
                 resource.revision(),
                 resource.generation(),
                 None,
-                Some(Self::status_candidate(resource, Some(phase))?),
+                status,
                 ReconcileDisposition::Pending,
                 None,
                 None,
@@ -5051,12 +5068,13 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             )
             .await
             .map_err(SharedProviderReconcileError::Effect)?;
+        let status = self.status_candidate_for_phase(resource, phase)?;
         Ok(
             ReconcileResult::new(
                 resource.revision(),
                 resource.generation(),
                 None,
-                Some(Self::status_candidate(resource, Some(phase))?),
+                status,
                 ReconcileDisposition::Pending,
                 None,
                 None,
