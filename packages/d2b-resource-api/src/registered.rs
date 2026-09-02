@@ -8,6 +8,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use d2b_contracts_resource::v3::{
@@ -36,6 +37,9 @@ use crate::service::{ResourceService, UpgradeDispatcher};
 use crate::store::{CheckedResourceStore, StoreBindingError};
 use crate::watch::{ResourceWatch, WatchService};
 
+const TRANSIENT_RETRY_ATTEMPTS: usize = 4;
+const TRANSIENT_RETRY_BUDGET: Duration = Duration::from_secs(1);
+
 /// Per-reconcile assignment evidence supplied by the Zone-owned authority.
 pub type AssignmentFenceResolver = Arc<
     dyn Fn(
@@ -52,6 +56,38 @@ pub type AssignmentFenceResolver = Arc<
 
 /// Optional production-path observer for durable effect acceptance timing.
 pub type EffectAcceptanceObserver = Arc<dyn Fn(&ResourceUid) + Send + Sync>;
+
+/// Optional production-path observer for completed controller passes.
+pub type CheckpointObserver = Arc<dyn Fn(&ResourceUid) + Send + Sync>;
+
+async fn retry_source_backpressure<T, F, Fut>(
+    mut operation: F,
+) -> Result<T, SourceError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, SourceError>>,
+{
+    match tokio::time::timeout(TRANSIENT_RETRY_BUDGET, async {
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            match operation().await {
+                Ok(value) => return Ok(value),
+                Err(SourceError::Backpressure) => {
+                    if attempt + 1 == TRANSIENT_RETRY_ATTEMPTS {
+                        return Err(SourceError::Backpressure);
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(SourceError::Backpressure)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(SourceError::Timeout),
+    }
+}
 
 /// A production `RegisteredControllerApi` backed by one owned redb store.
 ///
@@ -82,6 +118,7 @@ struct NativeCommitPath {
     assignments: Arc<Mutex<BTreeMap<ResourceRef, ResourceAssignmentFence>>>,
     assignment_resolver: Option<AssignmentFenceResolver>,
     effect_acceptance_observer: Option<EffectAcceptanceObserver>,
+    checkpoint_observer: Option<CheckpointObserver>,
     require_assignment: bool,
 }
 
@@ -140,6 +177,7 @@ impl RedbRegisteredControllerApi {
                 assignments: Arc::new(Mutex::new(assignments.into_iter().collect())),
                 assignment_resolver: None,
                 effect_acceptance_observer: None,
+                checkpoint_observer: None,
                 require_assignment: true,
             }),
             descriptor: Mutex::new(None),
@@ -194,6 +232,7 @@ impl RedbRegisteredControllerApi {
                 assignments: Arc::new(Mutex::new(BTreeMap::new())),
                 assignment_resolver: None,
                 effect_acceptance_observer: None,
+                checkpoint_observer: None,
                 require_assignment: false,
             }),
             descriptor: Mutex::new(None),
@@ -232,6 +271,14 @@ impl RedbRegisteredControllerApi {
     ) -> Self {
         if let Some(commit) = self.commit.as_mut() {
             commit.effect_acceptance_observer = Some(observer);
+        }
+        self
+    }
+
+    /// Attach a non-authorizing observer to the completed-pass boundary.
+    pub fn with_checkpoint_observer(mut self, observer: CheckpointObserver) -> Self {
+        if let Some(commit) = self.commit.as_mut() {
+            commit.checkpoint_observer = Some(observer);
         }
         self
     }
@@ -347,7 +394,8 @@ impl RedbRegisteredControllerApi {
         &self,
         key: &ResourceKey,
     ) -> Result<Result<StoredResource, ZoneRevision>, SourceError> {
-        for _ in 0..4096 {
+        let retry_deadline = tokio::time::Instant::now() + TRANSIENT_RETRY_BUDGET;
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             match self
                 .store
                 .get(StoreGetRequest {
@@ -380,12 +428,23 @@ impl RedbRegisteredControllerApi {
                 Err(error)
                     if matches!(
                         error.kind(),
-                        StoreErrorKind::Backpressure
-                            | StoreErrorKind::StoreBackpressure
-                            | StoreErrorKind::Timeout
-                    ) =>
+                        StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure
+                    )
+                        && attempt + 1 < TRANSIENT_RETRY_ATTEMPTS
+                        && tokio::time::Instant::now() < retry_deadline =>
                 {
                     tokio::task::yield_now().await;
+                }
+                Err(error) if error.kind() == StoreErrorKind::Timeout => {
+                    return Err(SourceError::Timeout);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure
+                    ) =>
+                {
+                    return Err(SourceError::Backpressure);
                 }
                 Err(error) => return Err(source_error(error, ZoneRevision::new(1))),
             }
@@ -519,7 +578,11 @@ impl RedbRegisteredControllerApi {
                     expected_revision,
                 )
                 .await?;
-                if fence.resource_uid != *context_uid
+                let expected_uid = mutation
+                    .expected_uid
+                    .as_ref()
+                    .unwrap_or(context_uid);
+                if fence.resource_uid != *expected_uid
                     || fence.resource_revision != expected_revision
                     || fence.provider_generation.get() == 0
                     || fence.controller_generation.get() == 0
@@ -583,7 +646,7 @@ impl RedbRegisteredControllerApi {
                 });
             }
         }
-        for _ in 0..4096 {
+        let result = retry_source_backpressure(|| async {
             let grant = commit
                 .authorizer
                 .authorize(
@@ -602,36 +665,32 @@ impl RedbRegisteredControllerApi {
                 grant.admit(mutations.clone(), operation.clone())
             }
             .map_err(|_| SourceError::Integrity)?;
-            match commit.checked.commit(admitted).await {
-                Ok(StoreCommitResult { revision, .. }) => {
-                    return Ok(CommitOutcome::Committed(revision));
+            commit.checked.commit(admitted).await.map_err(|error| {
+                if is_conflict(&error) {
+                    SourceError::Conflict(error.current_revision().unwrap_or(fallback_revision))
+                } else {
+                    source_error(error, fallback_revision)
                 }
-                Err(error) if is_conflict(&error) => {
-                    return Ok(CommitOutcome::Conflict(
-                        error.current_revision().unwrap_or(fallback_revision),
-                    ));
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        StoreErrorKind::Backpressure
-                            | StoreErrorKind::StoreBackpressure
-                            | StoreErrorKind::Timeout
-                    ) =>
-                {
-                    tokio::task::yield_now().await;
-                }
-                Err(error) => return Err(source_error(error, fallback_revision)),
-            }
+            })
+        })
+        .await;
+        match result {
+            Ok(StoreCommitResult { revision, .. }) => Ok(CommitOutcome::Committed(revision)),
+            Err(SourceError::Conflict(revision)) => Ok(CommitOutcome::Conflict(revision)),
+            Err(error) => Err(error),
         }
-        Err(SourceError::Backpressure)
     }
 
     fn resource_operation_id(context: &ReconcileContext) -> String {
-        format!(
-            "resource:{}:{}",
-            context.operation().operation_id(),
-            context.attempt()
+        canonical_digest(
+            "d2b:controller-resource-operation/v1",
+            format!(
+                "{}:{}:{}",
+                context.operation().operation_id(),
+                context.attempt(),
+                context.revision().get(),
+            )
+            .as_bytes(),
         )
     }
 
@@ -987,16 +1046,20 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
                 }
                 let descriptor = self.descriptor().map_err(|_| WatchFailure::Fatal)?;
                 let batch = {
-                    let mut watch = self.watch.lock().await;
-                    let Some(watch) = watch.as_mut() else {
+                    let mut watch_guard = self.watch.lock().await;
+                    let Some(watch) = watch_guard.as_mut() else {
                         return Ok(None);
                     };
                     if self.watch_stopped.load(Ordering::Acquire) {
+                        watch_guard.take();
                         return Ok(None);
                     }
                     tokio::select! {
                         batch = watch.recv() => batch,
-                        _ = self.watch_stop.notified() => return Ok(None),
+                        _ = self.watch_stop.notified() => {
+                            watch_guard.take();
+                            return Ok(None);
+                        },
                     }
                 };
                 let Some(batch) = batch else {
@@ -1039,12 +1102,6 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
             let descriptor = self.descriptor()?;
             match self.read_target(&key).await? {
                 Ok(resource) => {
-                    self.refresh_assignment(
-                        key.resource_ref(),
-                        &resource.uid,
-                        resource.revision,
-                    )
-                    .await?;
                     Ok(FreshSnapshot::Present {
                         target: snapshot_from_resource(resource),
                         dependencies: self.dependencies(&descriptor, key.zone()).await?,
@@ -1079,16 +1136,20 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
         context: &ReconcileContext,
         plan: &ReconcilePlan,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
-        let effect_identity = self.effect_identity(context, plan);
+        let target = context.target().resource_ref().clone();
+        let uid = context.target().uid().clone();
+        let revision = context.revision();
         let store = Arc::clone(&self.store);
         let accepted = self.accepted.clone();
-        let accepting = effect_identity.is_ok();
+        let accepting = self.commit.is_some();
         if accepting {
             self.effect_acceptances_in_flight
                 .fetch_add(1, Ordering::AcqRel);
         }
         async move {
             let result = async {
+                self.refresh_assignment(&target, &uid, revision).await?;
+                let effect_identity = self.effect_identity(context, plan);
                 let (authority_operation_id, claim_digest, operation_class, effect_ids) =
                     effect_identity?;
                 let payload = serde_json::to_vec(&serde_json::json!({
@@ -1247,9 +1308,16 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
 
     fn checkpoint(
         &self,
-        _context: &ReconcileContext,
+        context: &ReconcileContext,
         _revision: ZoneRevision,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        if let Some(observer) = self
+            .commit
+            .as_ref()
+            .and_then(|commit| commit.checkpoint_observer.clone())
+        {
+            observer(context.target().uid());
+        }
         std::future::ready(Ok(()))
     }
 
@@ -2514,6 +2582,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_backpressure_retry_is_bounded_and_timeout_is_not_retried() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let retry_attempts = Arc::clone(&attempts);
+        let started = Instant::now();
+        let result = retry_source_backpressure(|| {
+            let attempts = Arc::clone(&retry_attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                Err::<(), SourceError>(SourceError::Backpressure)
+            }
+        })
+        .await;
+        assert!(matches!(result, Err(SourceError::Backpressure)));
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            TRANSIENT_RETRY_ATTEMPTS
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let timeout_attempts = Arc::clone(&attempts);
+        let result = retry_source_backpressure(|| {
+            let attempts = Arc::clone(&timeout_attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                Err::<(), SourceError>(SourceError::Timeout)
+            }
+        })
+        .await;
+        assert!(matches!(result, Err(SourceError::Timeout)));
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_backpressure_retry_returns_after_a_bounded_success() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let retry_attempts = Arc::clone(&attempts);
+        let result = retry_source_backpressure(|| {
+            let attempts = Arc::clone(&retry_attempts);
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::AcqRel);
+                if attempt < 2 {
+                    Err(SourceError::Backpressure)
+                } else {
+                    Ok::<_, SourceError>(42)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 42);
+        assert_eq!(attempts.load(Ordering::Acquire), 3);
+    }
+
+    #[tokio::test]
     async fn registered_api_lists_and_delivers_store_changes_through_core_shape() {
         let (_directory, store, issuer) = test_store().await;
         for (name, owner, operation) in [
@@ -2993,7 +3116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_api_refreshes_assignment_for_new_targets_and_each_commit() {
+    async fn registered_api_refreshes_assignment_at_each_effect_boundary() {
         let (_directory, store, service, subject, state, issuer_slot) =
             authorized_test_setup().await;
         let target = ResourceRef::parse("Host/owner").unwrap();
@@ -3047,8 +3170,14 @@ mod tests {
         );
         api.register(&descriptor()).await.unwrap();
         api.read_fresh(&key).await.unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        api.refresh_assignment(&target, &stored.uid, stored.revision)
+            .await
+            .unwrap();
         assert_eq!(calls.load(Ordering::Acquire), 1);
-        api.read_fresh(&key).await.unwrap();
+        api.refresh_assignment(&target, &stored.uid, stored.revision)
+            .await
+            .unwrap();
         assert_eq!(calls.load(Ordering::Acquire), 2);
     }
 
