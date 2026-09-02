@@ -2630,46 +2630,46 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         let generation = resource.generation();
         let admission = self
             .network_admission(
-            &runtime,
-            resource,
-            &value,
-            &spec,
-            &resolver,
-            &context.operation_id,
-        )
-        .await?;
+                &runtime,
+                resource,
+                &value,
+                &spec,
+                &resolver,
+                &context.operation_id,
+            )
+            .await?;
         let provenance = NetworkProvenance::new(
-        admission.key().zone_uid().clone(),
-        admission.key().network_uid().clone(),
-        admission.key().network_generation(),
-        admission.key().attachment_generation(),
-        admission.key().bundle_generation().clone(),
+            admission.key().zone_uid().clone(),
+            admission.key().network_uid().clone(),
+            admission.key().network_generation(),
+            admission.key().attachment_generation(),
+            admission.key().bundle_generation().clone(),
         );
         let assignment = self.network_assignment(&runtime, context, resource).await?;
         let children = SharedRunnerNetworkResources::new(
-        Arc::clone(&runtime),
-        resource.key().resource_ref().clone(),
-        resource.key().uid(),
+            Arc::clone(&runtime),
+            resource.key().resource_ref().clone(),
+            resource.key().uid(),
         )
         .with_content_fence(SharedRunnerNetworkContentFence {
-        owner_ref: resource.key().resource_ref().clone(),
-        provenance,
-        assignment,
-        controller_ref: context.identity.controller_ref().clone(),
-        controller_generation: context.identity.controller_generation(),
-        provider_generation: context.identity.provider_generation(),
-        session_generation: runtime
-            .core_controller_subject
-            .lock()
-            .map_err(|_| SharedProviderEffectError::Unavailable)?
-            .as_ref()
-            .map(|subject| subject.reconnect_generation())
-            .ok_or(SharedProviderEffectError::Unavailable)?,
+            owner_ref: resource.key().resource_ref().clone(),
+            provenance,
+            assignment,
+            controller_ref: context.identity.controller_ref().clone(),
+            controller_generation: context.identity.controller_generation(),
+            provider_generation: context.identity.provider_generation(),
+            session_generation: runtime
+                .core_controller_subject
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .as_ref()
+                .map(|subject| subject.reconnect_generation())
+                .ok_or(SharedProviderEffectError::Unavailable)?,
         });
         let readiness = children
-        .readiness()
-        .await
-        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            .readiness()
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
         let broker_context = crate::resolve_network_effect_context(
             &value,
             &resolver,
