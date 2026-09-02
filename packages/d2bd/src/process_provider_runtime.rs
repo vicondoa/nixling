@@ -1284,14 +1284,19 @@ impl ProductionProcessProviders {
         context: ProcessResourceContext<'_>,
         spec: &ProcessSpec,
     ) -> Result<ProviderLiveness, String> {
-        self.probe_resource_with_execution(
+        let liveness = self
+            .probe_resource_with_execution(
             &context,
             spec.execution(),
             None,
             &serde_json::to_vec(spec).map_err(|_| "provider-ticket:serialization".to_owned())?,
             Some(spec.readiness().class()),
         )
-        .await
+        .await?;
+        if liveness == ProviderLiveness::Exited {
+            self.forget_resource_for_context(&context, spec.execution().execution_ref());
+        }
+        Ok(liveness)
     }
 
     /// Probe one ephemeral Process resource with the controller generation
@@ -1301,14 +1306,19 @@ impl ProductionProcessProviders {
         context: ProcessResourceContext<'_>,
         spec: &EphemeralProcessSpec,
     ) -> Result<ProviderLiveness, String> {
-        self.probe_resource_with_execution(
+        let liveness = self
+            .probe_resource_with_execution(
             &context,
             spec.execution(),
             spec.activation_input(),
             &serde_json::to_vec(spec).map_err(|_| "provider-ticket:serialization".to_owned())?,
             None,
         )
-        .await
+        .await?;
+        if liveness == ProviderLiveness::Exited {
+            self.forget_resource_for_context(&context, spec.execution().execution_ref());
+        }
+        Ok(liveness)
     }
 
     /// Stop one exact generic Process identity with the controller
@@ -1795,7 +1805,10 @@ impl ProductionProcessProviders {
         };
         let controller_bootstrap = ticket.inherited_fd_table().count() == 1;
         match outcome {
-            AdoptionOutcome::Absent => Ok(ProviderAdoption::Absent),
+            AdoptionOutcome::Absent => {
+                self.forget_resource_for_context(&context, execution.execution_ref());
+                Ok(ProviderAdoption::Absent)
+            }
             AdoptionOutcome::Adopted(report) => {
                 self.remember_resource(
                     context.zone.clone(),
@@ -2131,6 +2144,36 @@ impl ProductionProcessProviders {
             Ok(ProviderLiveness::Unknown)
         } else {
             Ok(ProviderLiveness::Alive)
+        }
+    }
+
+    /// Observe a Provider-owned OneShot until it exits, then release its
+    /// exact pidfd or service-manager identity.
+    pub async fn wait_node(
+        &self,
+        vm: &str,
+        node: &ProcessNode,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        if !Self::supports_node(node) {
+            return Err("provider-node-unsupported".to_owned());
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.probe_node(vm, node).await? {
+                ProviderLiveness::Exited => {
+                    self.finalize_node(vm, node).await?;
+                    return Ok(());
+                }
+                ProviderLiveness::Alive => {}
+                ProviderLiveness::Unknown => {
+                    return Err("provider-process-identity-ambiguous".to_owned());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("provider-process-exit-timeout".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 

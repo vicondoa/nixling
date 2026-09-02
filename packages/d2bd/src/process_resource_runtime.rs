@@ -19,6 +19,7 @@ use d2b_contracts_resource::resource_proto as wire;
 use d2b_contracts_resource::v3::{
     CanonicalJsonValue, ControllerGeneration, ResourceEnvelope, ResourceGeneration, ResourcePhase,
     ResourceRef, ResourceTypeName, ResourceUid, SchemaFingerprint, ZoneId, ZoneRevision,
+    canonical_digest,
     process::{EphemeralProcessSpec, ProcessSpec, RestartClass},
 };
 use d2b_core_controller::{
@@ -40,10 +41,13 @@ use d2b_resource_api::{
     watch::ResourceWatch,
 };
 use d2b_resource_store::{
-    StoreErrorKind, StoreGetRequest, StoreListRequest, StoreOperationContext, StoreProjection,
-    StoreWatchRequest, StoredResource,
+    StoreError, StoreErrorKind, StoreGetRequest, StoreListRequest, StoreOperationContext,
+    StoreProjection, StoreWatchRequest, StoredResource,
 };
-use d2b_resource_store_redb::{ChangeEvent, RedbResourceStore, SharedChangeBatch};
+use d2b_resource_store_redb::{
+    AuthorityOperationState, ChangeEvent, RedbResourceStore, SharedChangeBatch,
+    AuthorityOperationCapability,
+};
 use sha2::{Digest, Sha256};
 
 use crate::process_provider_runtime::{
@@ -499,6 +503,9 @@ impl ProcessResourceRuntime {
             record.zone_uid = self.zone_uid.clone();
             record.policy_revision = self.policy_revision;
             record.provider_assignment_generation = provider_assignment_generation;
+            self.restart_counts
+                .entry(record.resource.resource_ref.clone())
+                .or_insert_with(|| status_restart_count(&record.resource));
         }
         let desired_keys = desired.keys().cloned().collect::<BTreeSet<_>>();
         let removed = self
@@ -993,6 +1000,49 @@ impl ProcessResourceRuntime {
         }
     }
 
+    async fn observe_existing_record(
+        &mut self,
+        record: &DesiredRecord,
+    ) -> Result<ExistingProcessState, ProcessResourceRuntimeError> {
+        let adoption = match &record.process {
+            DesiredProcess::Process(spec) => self
+                .providers
+                .adopt_resource(self.context(record), spec)
+                .await
+                .map_err(map_provider_error)?,
+            DesiredProcess::Ephemeral(spec) => self
+                .providers
+                .adopt_ephemeral_resource(self.context(record), spec)
+                .await
+                .map_err(map_provider_error)?,
+        };
+        match adoption {
+            ProviderAdoption::Adopted(_) => {
+                self.last_adopted = Some(true);
+                Ok(ExistingProcessState::Alive)
+            }
+            ProviderAdoption::Absent => Ok(ExistingProcessState::Exited),
+            ProviderAdoption::Stale { candidate } => {
+                self.providers
+                    .stop_stale_resource(&record.provider_ref, &candidate)
+                    .await
+                    .map_err(map_provider_error)?;
+                Ok(ExistingProcessState::Exited)
+            }
+            ProviderAdoption::ControllerBootstrapMissing => {
+                if matches!(&record.process, DesiredProcess::Process(_)) {
+                    self.stop_record(record).await?;
+                    self.providers
+                        .finalize_resource(self.context(record))
+                        .await
+                        .map_err(map_provider_error)?;
+                }
+                Ok(ExistingProcessState::Exited)
+            }
+            ProviderAdoption::Quarantined(_) => Ok(ExistingProcessState::Ambiguous),
+        }
+    }
+
     async fn launch_record(
         &self,
         record: &DesiredRecord,
@@ -1476,6 +1526,15 @@ impl ProcessResourceReconciler {
             self.runtime.zone_uid.as_ref(),
             key,
         );
+        if matches!(
+            phase,
+            Some(ResourcePhase::Succeeded | ResourcePhase::Failed)
+        ) {
+            return false;
+        }
+        if phase == Some(ResourcePhase::Degraded) && !status_retry_due(stored) {
+            return false;
+        }
         if matches!(process, DesiredProcess::Ephemeral(_))
             && matches!(
                 phase,
@@ -1484,6 +1543,11 @@ impl ProcessResourceReconciler {
             && !ephemeral_status_ttl_elapsed(stored, process)
         {
             return false;
+        }
+        if phase == Some(ResourcePhase::Ready)
+            && observed_generation == Some(stored.generation)
+        {
+            return true;
         }
         !active
             || observed_generation != Some(stored.generation)
@@ -1651,40 +1715,122 @@ impl ResourceReconciler for ProcessResourceReconciler {
             };
             let mut runtime = self.runtime.for_pass();
             runtime.without_status_client();
-            runtime.reconcile(vec![record.resource.clone()]).await?;
-            let adopted = runtime.last_adopted().unwrap_or(false);
-            let active = runtime.providers.has_active_resource_in_zone(
-                &runtime.zone,
-                runtime.zone_uid.as_ref(),
-                &record.resource.resource_ref,
-            );
-            let (phase, outcome) = match &record.process {
-                DesiredProcess::Process(spec)
-                    if spec.desired_lifecycle()
-                        == d2b_contracts_resource::v3::process::DesiredLifecycle::Stopped =>
-                {
-                    (
-                        ResourcePhase::Succeeded,
-                        OutcomeState::success("process-stopped", "process lifecycle is stopped"),
-                    )
+            let observe_only = status_phase(&record.resource) == Some(ResourcePhase::Ready)
+                && status_observed_generation(&record.resource) == Some(record.resource.generation);
+            let (phase, outcome, restart_count) = if observe_only {
+                match runtime.observe_existing_record(&record).await? {
+                    ExistingProcessState::Alive => {
+                        return Ok(ReconcileResult::converged(
+                            resource.revision(),
+                            resource.generation(),
+                        ));
+                    }
+                    ExistingProcessState::Ambiguous => (
+                        ResourcePhase::Failed,
+                        OutcomeState::failure(
+                            "identity-ambiguous",
+                            "provider identity could not be verified safely",
+                        ),
+                        status_restart_count(&record.resource),
+                    ),
+                    ExistingProcessState::Exited => {
+                        let restart_count = status_restart_count(&record.resource);
+                        match &record.process {
+                            DesiredProcess::Ephemeral(_) => (
+                                ResourcePhase::Succeeded,
+                                OutcomeState::success(
+                                    "process-exited",
+                                    "ephemeral process reached a terminal exit",
+                                ),
+                                restart_count,
+                            ),
+                            DesiredProcess::Process(_)
+                                if process_restart_allowed(&record.process, restart_count) =>
+                            {
+                                let next_restart_count = restart_count.saturating_add(1);
+                                runtime
+                                    .restart_counts
+                                    .insert(record.resource.resource_ref.clone(), next_restart_count);
+                                let delay =
+                                    restart_delay(&record.process, next_restart_count);
+                                if delay.is_zero() {
+                                    runtime.launch_record(&record).await?;
+                                    (
+                                        ResourcePhase::Ready,
+                                        OutcomeState::success(
+                                            "process-restarted",
+                                            "process exited and was restarted",
+                                        ),
+                                        next_restart_count,
+                                    )
+                                } else {
+                                    (
+                                        ResourcePhase::Degraded,
+                                        OutcomeState::retry(
+                                            "process-exited",
+                                            "process exited and is awaiting restart",
+                                            delay,
+                                        ),
+                                        next_restart_count,
+                                    )
+                                }
+                            }
+                            DesiredProcess::Process(_) => (
+                                ResourcePhase::Succeeded,
+                                OutcomeState::success(
+                                    "process-exited",
+                                    "process reached a terminal exit",
+                                ),
+                                restart_count,
+                            ),
+                        }
+                    }
                 }
-                DesiredProcess::Ephemeral(_) if !active => (
-                    ResourcePhase::Succeeded,
-                    OutcomeState::success(
-                        "process-exited",
-                        "ephemeral process reached a terminal exit",
+            } else {
+                runtime.reconcile(vec![record.resource.clone()]).await?;
+                let adopted = runtime.last_adopted().unwrap_or(false);
+                let active = runtime.providers.has_active_resource_in_zone(
+                    &runtime.zone,
+                    runtime.zone_uid.as_ref(),
+                    &record.resource.resource_ref,
+                );
+                let restart_count = runtime
+                    .restart_counts
+                    .get(&record.resource.resource_ref)
+                    .copied()
+                    .unwrap_or_else(|| status_restart_count(&record.resource));
+                let (phase, outcome) = match &record.process {
+                    DesiredProcess::Process(spec)
+                        if spec.desired_lifecycle()
+                            == d2b_contracts_resource::v3::process::DesiredLifecycle::Stopped =>
+                    {
+                        (
+                            ResourcePhase::Succeeded,
+                            OutcomeState::success(
+                                "process-stopped",
+                                "process lifecycle is stopped",
+                            ),
+                        )
+                    }
+                    DesiredProcess::Ephemeral(_) if !active => (
+                        ResourcePhase::Succeeded,
+                        OutcomeState::success(
+                            "process-exited",
+                            "ephemeral process reached a terminal exit",
+                        ),
                     ),
-                ),
-                _ if active => (ResourcePhase::Ready, OutcomeState::ready(adopted)),
-                _ => (
-                    ResourcePhase::Failed,
-                    OutcomeState::failure(
-                        "provider-start-failed",
-                        "the Provider did not retain a verified process identity",
+                    _ if active => (ResourcePhase::Ready, OutcomeState::ready(adopted)),
+                    _ => (
+                        ResourcePhase::Failed,
+                        OutcomeState::failure(
+                            "provider-start-failed",
+                            "the Provider did not retain a verified process identity",
+                        ),
                     ),
-                ),
+                };
+                (phase, outcome, restart_count)
             };
-            let canonical = status_payload(&record, phase, 0, Some(outcome))?;
+            let canonical = status_payload(&record, phase, restart_count, Some(outcome))?;
             let status = status_candidate_from_resource(&canonical)?;
             ReconcileResult::new(
                 resource.revision(),
@@ -2020,6 +2166,60 @@ fn status_observed_generation(resource: &StoredResource) -> Option<ResourceGener
         .and_then(|generation| ResourceGeneration::new(generation).ok())
 }
 
+fn status_restart_count(resource: &StoredResource) -> u32 {
+    let Some(CanonicalJsonValue::Object(value)) = status_value(resource, "resource") else {
+        return 0;
+    };
+    match value.get("restartCount") {
+        Some(CanonicalJsonValue::Integer(count)) => u32::try_from(*count).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn status_retry_due(resource: &StoredResource) -> bool {
+    let Some(CanonicalJsonValue::Object(outcome)) = status_value(resource, "outcome") else {
+        return true;
+    };
+    let retryable = matches!(
+        outcome.get("retryable"),
+        Some(CanonicalJsonValue::Bool(true))
+    );
+    if !retryable {
+        return true;
+    }
+    let Some(CanonicalJsonValue::Integer(delay)) = outcome.get("retryAfterMs") else {
+        return true;
+    };
+    let Some(CanonicalJsonValue::String(occurred_at)) = outcome.get("occurredAt") else {
+        return true;
+    };
+    let Some(occurred_at) = timestamp_millis(occurred_at) else {
+        return true;
+    };
+    let Ok(delay) = u128::try_from(*delay) else {
+        return true;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    occurred_at
+        .checked_add(delay)
+        .is_none_or(|due_at| due_at <= now)
+}
+
+fn process_restart_allowed(process: &DesiredProcess, restart_count: u32) -> bool {
+    matches!(
+        process,
+        DesiredProcess::Process(spec)
+            if spec.restart_policy().class() != RestartClass::Never
+                && spec
+                    .restart_policy()
+                    .max_restarts()
+                    .is_none_or(|max| restart_count < max)
+    )
+}
+
 fn active_process_finalizer_for_values(
     resource: &StoredResource,
     provider_ref: &ResourceRef,
@@ -2103,11 +2303,25 @@ fn ephemeral_status_ttl_elapsed(resource: &StoredResource, process: &DesiredProc
     if spec.incident_hold() {
         return false;
     }
-    let value = status_value(resource, "cleanupEligibleAt");
-    let Some(CanonicalJsonValue::String(eligible_at)) = value else {
-        return false;
+    let eligible_at = match status_value(resource, "cleanupEligibleAt") {
+        Some(CanonicalJsonValue::String(eligible_at)) => timestamp_millis(&eligible_at),
+        _ => {
+            let phase = status_phase(resource);
+            let ttl = match phase {
+                Some(ResourcePhase::Succeeded) => spec.successful_ttl(),
+                Some(ResourcePhase::Failed) => spec.failed_ttl(),
+                _ => return false,
+            };
+            match status_value(resource, "completedAt") {
+                Some(CanonicalJsonValue::String(completed_at)) => timestamp_millis(&completed_at)
+                    .and_then(|completed_at| {
+                        completed_at.checked_add(u128::from(ttl.as_millis()))
+                    }),
+                _ => None,
+            }
+        }
     };
-    let Some(eligible_at) = timestamp_millis(&eligible_at) else {
+    let Some(eligible_at) = eligible_at else {
         return false;
     };
     let now = SystemTime::now()
@@ -2682,6 +2896,13 @@ enum StartRecordEffect {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingProcessState {
+    Alive,
+    Exited,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StartRecordPlan {
     adopted: bool,
     effects: &'static [StartRecordEffect],
@@ -3249,6 +3470,8 @@ pub(crate) fn controller_provider_refs(resources: &[StoredResource]) -> BTreeSet
 
 struct GuestProcessSource {
     zone: ZoneId,
+    target_ref: Option<ResourceRef>,
+    guest_execution: GuestExecutionBinding,
     descriptor: Mutex<Option<ControllerDescriptor>>,
     store: Arc<d2bd_runtime::guest_resource_runtime::SessionBoundStore>,
     client: Arc<
@@ -3262,6 +3485,156 @@ struct GuestProcessSource {
     acknowledge_after: tokio::sync::Mutex<Option<ZoneRevision>>,
     watch_open: AtomicBool,
     watch_stop: tokio::sync::Notify,
+    accepted: tokio::sync::Mutex<BTreeMap<String, GuestAcceptedEffect>>,
+}
+
+struct GuestAcceptedEffect {
+    capability: AuthorityOperationCapability,
+    target: ResourceKey,
+}
+
+fn guest_operation_class(context: &ReconcileContext) -> &'static str {
+    if context
+        .reasons()
+        .contains(d2b_core_controller::CoreTriggerReason::UpgradeRequested)
+    {
+        "upgrade"
+    } else if context
+        .reasons()
+        .contains(d2b_core_controller::CoreTriggerReason::DeletionRequested)
+        || context
+            .reasons()
+            .contains(d2b_core_controller::CoreTriggerReason::FinalizerRequired)
+    {
+        "finalize"
+    } else {
+        "reconcile"
+    }
+}
+
+fn append_guest_claim_text(material: &mut Vec<u8>, value: &str) {
+    material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    material.extend_from_slice(value.as_bytes());
+}
+
+fn guest_effect_claim_digest(
+    source: &GuestProcessSource,
+    context: &ReconcileContext,
+    plan: &ReconcilePlan,
+) -> String {
+    let mut material = Vec::new();
+    append_guest_claim_text(&mut material, guest_operation_class(context));
+    append_guest_claim_text(&mut material, context.target().uid().as_str());
+    material.extend_from_slice(&context.generation().get().to_be_bytes());
+    for effect_id in plan.effect_ids() {
+        append_guest_claim_text(&mut material, effect_id);
+    }
+    append_guest_claim_text(
+        &mut material,
+        source.guest_execution.target_uid().as_str(),
+    );
+    append_guest_claim_text(
+        &mut material,
+        &source.guest_execution.boot_identity_digest().to_hex(),
+    );
+    material.extend_from_slice(
+        &source
+            .guest_execution
+            .session_generation()
+            .get()
+            .to_be_bytes(),
+    );
+    material.extend_from_slice(
+        &source
+            .guest_execution
+            .assignment_epoch()
+            .to_be_bytes(),
+    );
+    material.extend_from_slice(
+        &source
+            .guest_execution
+            .provider_generation()
+            .get()
+            .to_be_bytes(),
+    );
+    material.extend_from_slice(
+        &source
+            .guest_execution
+            .controller_generation()
+            .get()
+            .to_be_bytes(),
+    );
+    append_guest_claim_text(
+        &mut material,
+        &context.identity().controller_ref().to_canonical_string(),
+    );
+    if let Some(target_ref) = source.target_ref.as_ref() {
+        append_guest_claim_text(&mut material, &target_ref.to_canonical_string());
+    } else {
+        append_guest_claim_text(&mut material, "unbound");
+    }
+    canonical_digest("d2b:guest-controller-effect-claim/v1", &material)
+}
+
+fn guest_result_state(
+    disposition: ReconcileDisposition,
+) -> AuthorityOperationState {
+    match disposition {
+        ReconcileDisposition::Converged | ReconcileDisposition::Finalized => {
+            AuthorityOperationState::EffectConfirmed
+        }
+        ReconcileDisposition::Pending
+        | ReconcileDisposition::Degraded
+        | ReconcileDisposition::RequeueAt => AuthorityOperationState::Pending,
+        ReconcileDisposition::FailedRetryable => AuthorityOperationState::EffectRetryable,
+        ReconcileDisposition::FailedTerminal => AuthorityOperationState::EffectTerminal,
+    }
+}
+
+fn guest_projection_state(
+    projection: &d2b_core_controller::ReconcileProjection,
+) -> AuthorityOperationState {
+    match projection.disposition() {
+        d2b_core_controller::ProjectionDisposition::Converged => {
+            AuthorityOperationState::EffectConfirmed
+        }
+        d2b_core_controller::ProjectionDisposition::Failed
+            if matches!(
+                projection.reason(),
+                d2b_core_controller::ReconcileReason::HandlerTerminal
+                    | d2b_core_controller::ReconcileReason::HandlerExhausted
+                    | d2b_core_controller::ReconcileReason::InvalidSpec
+            ) =>
+        {
+            AuthorityOperationState::EffectTerminal
+        }
+        d2b_core_controller::ProjectionDisposition::Failed => {
+            AuthorityOperationState::EffectRetryable
+        }
+        d2b_core_controller::ProjectionDisposition::Progressing
+        | d2b_core_controller::ProjectionDisposition::Blocked
+        | d2b_core_controller::ProjectionDisposition::UpgradeRequired => {
+            AuthorityOperationState::Pending
+        }
+    }
+}
+
+fn guest_store_error(error: &StoreError, fallback: ZoneRevision) -> SourceError {
+    match error.kind() {
+        StoreErrorKind::ResourceConflict
+        | StoreErrorKind::ResourceAlreadyExists
+        | StoreErrorKind::ResourceNotFound
+        | StoreErrorKind::ResourceFinalizerDenied => {
+            SourceError::Conflict(error.current_revision().unwrap_or(fallback))
+        }
+        StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure => {
+            SourceError::Backpressure
+        }
+        StoreErrorKind::Timeout => SourceError::Timeout,
+        StoreErrorKind::Cancelled => SourceError::Cancelled,
+        StoreErrorKind::ResourcePlaneUnavailable => SourceError::Unavailable,
+        _ => SourceError::Integrity,
+    }
 }
 
 impl std::fmt::Debug for GuestProcessSource {
@@ -3283,6 +3656,8 @@ impl std::fmt::Debug for GuestProcessSource {
 impl GuestProcessSource {
     fn new(
         zone: ZoneId,
+        target_ref: Option<ResourceRef>,
+        guest_execution: GuestExecutionBinding,
         store: Arc<d2bd_runtime::guest_resource_runtime::SessionBoundStore>,
         client: Arc<
             ResourceApiClient<
@@ -3293,6 +3668,8 @@ impl GuestProcessSource {
     ) -> Arc<Self> {
         Arc::new(Self {
             zone,
+            target_ref,
+            guest_execution,
             descriptor: Mutex::new(None),
             store,
             client,
@@ -3301,6 +3678,7 @@ impl GuestProcessSource {
             acknowledge_after: tokio::sync::Mutex::new(None),
             watch_open: AtomicBool::new(false),
             watch_stop: tokio::sync::Notify::new(),
+            accepted: tokio::sync::Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -3456,6 +3834,93 @@ impl GuestProcessSource {
             initial_credits: descriptor.initial_watch_credits(),
             projection: StoreProjection::Full,
         }
+    }
+
+    async fn supersede_pending_effects(
+        &self,
+        target: &ResourceKey,
+        generation: ResourceGeneration,
+        current_operation_id: &str,
+        revision: ZoneRevision,
+    ) -> Result<(), SourceError> {
+        let operations = self
+            .store
+            .authority_operations()
+            .await
+            .map_err(|error| guest_store_error(&error, revision))?;
+        for operation in operations {
+            if operation.operation_id == current_operation_id
+                || operation.state != AuthorityOperationState::Pending
+            {
+                continue;
+            }
+            let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&operation.payload) else {
+                continue;
+            };
+            if payload.get("resourceUid").and_then(serde_json::Value::as_str)
+                != Some(target.uid().as_str())
+                || payload.get("generation").and_then(serde_json::Value::as_u64)
+                    != Some(generation.get())
+            {
+                continue;
+            }
+            let Some(binding_digest) = payload
+                .get("storeBindingDigest")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Ok(capability) = self
+                .store
+                .resume_authority_operation(operation.operation_id, binding_digest)
+                .await
+            else {
+                continue;
+            };
+            capability
+                .record_effect(AuthorityOperationState::EffectRetryable)
+                .await
+                .map_err(|error| guest_store_error(&error, revision))?;
+        }
+        Ok(())
+    }
+
+    async fn record_effect_for_operation(
+        &self,
+        operation_id: &str,
+        state: AuthorityOperationState,
+        revision: ZoneRevision,
+    ) -> Result<(), SourceError> {
+        let accepted = self.accepted.lock().await.remove(operation_id);
+        if let Some(accepted) = accepted {
+            accepted
+                .capability
+                .record_effect(state)
+                .await
+                .map_err(|error| guest_store_error(&error, revision))?;
+        }
+        Ok(())
+    }
+
+    async fn record_effect_for_target(
+        &self,
+        target: &ResourceKey,
+        state: AuthorityOperationState,
+        revision: ZoneRevision,
+    ) -> Result<(), SourceError> {
+        let operation_id = {
+            self.accepted
+                .lock()
+                .await
+                .iter()
+                .find(|(_, accepted)| accepted.target == *target)
+                .map(|(operation_id, _)| operation_id.clone())
+        };
+        if let Some(operation_id) = operation_id {
+            self.record_effect_for_operation(&operation_id, state, revision)
+                .await?;
+        }
+        Ok(())
     }
 
     fn changes_for_batch(
@@ -3732,25 +4197,112 @@ impl RegisteredControllerApi for GuestProcessSource {
 
     fn write_starting(
         &self,
-        _context: &ReconcileContext,
+        context: &ReconcileContext,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
-        std::future::ready(Ok(()))
+        let operation_id = context.operation().operation_id().to_owned();
+        async move {
+            self.accepted.lock().await.remove(&operation_id);
+            Ok(())
+        }
     }
 
     fn accept_effect(
         &self,
-        _context: &ReconcileContext,
-        _plan: &ReconcilePlan,
+        context: &ReconcileContext,
+        plan: &ReconcilePlan,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
-        std::future::ready(Ok(()))
+        let target = context.target().clone();
+        let generation = context.generation();
+        let revision = context.revision();
+        let operation_id = format!(
+            "effect:{}",
+            guest_effect_claim_digest(self, context, plan)
+        );
+        let claim_digest = operation_id
+            .strip_prefix("effect:")
+            .unwrap_or_default()
+            .to_owned();
+        let effect_ids = plan.effect_ids().to_vec();
+        let operation_class = guest_operation_class(context);
+        let controller_ref = context.identity().controller_ref().to_canonical_string();
+        let target_ref = self
+            .target_ref
+            .as_ref()
+            .map(ResourceRef::to_canonical_string)
+            .unwrap_or_else(|| "unbound".to_owned());
+        let guest_execution = self.guest_execution.clone();
+        async move {
+            let store_binding_digest = self
+                .store
+                .authority_binding_digest(&claim_digest)
+                .map_err(|error| guest_store_error(&error, revision))?;
+            self.supersede_pending_effects(
+                &target,
+                generation,
+                &operation_id,
+                revision,
+            )
+            .await?;
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "kind": "controller-effect",
+                "state": "pending",
+                "operationClass": operation_class,
+                "effectIds": effect_ids,
+                "resourceUid": target.uid().as_str(),
+                "generation": generation.get(),
+                "operationId": operation_id,
+                "claimDigest": claim_digest,
+                "storeBindingDigest": store_binding_digest,
+                "assignment": {
+                    "resourceUid": target.uid().as_str(),
+                    "resourceRevision": revision.get(),
+                    "providerGeneration": guest_execution.provider_generation().get(),
+                    "controllerGeneration": guest_execution.controller_generation().get(),
+                    "controllerRole": controller_ref,
+                    "target": target_ref,
+                    "sessionGeneration": guest_execution.session_generation().get(),
+                    "epoch": guest_execution.assignment_epoch(),
+                    "scope": "primary",
+                },
+                "guestExecution": {
+                    "targetUid": guest_execution.target_uid().as_str(),
+                    "bootIdentityDigest": guest_execution.boot_identity_digest().to_hex(),
+                    "sessionGeneration": guest_execution.session_generation().get(),
+                    "assignmentEpoch": guest_execution.assignment_epoch(),
+                    "providerGeneration": guest_execution.provider_generation().get(),
+                    "controllerGeneration": guest_execution.controller_generation().get(),
+                },
+            }))
+            .map_err(|_| SourceError::Integrity)?;
+            let capability = self
+                .store
+                .prepare_authority_operation(operation_id, payload, &claim_digest)
+                .await
+                .map_err(|error| guest_store_error(&error, revision))?;
+            self.accepted.lock().await.insert(
+                context.operation().operation_id().to_owned(),
+                GuestAcceptedEffect {
+                    capability,
+                    target,
+                },
+            );
+            Ok(())
+        }
     }
 
     fn complete_effect(
         &self,
-        _context: &ReconcileContext,
-        _result: &ReconcileResult,
+        context: &ReconcileContext,
+        result: &ReconcileResult,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
-        std::future::ready(Ok(()))
+        let operation_id = context.operation().operation_id().to_owned();
+        let state = guest_result_state(result.disposition());
+        let revision = context.revision();
+        async move {
+            self.record_effect_for_operation(&operation_id, state, revision)
+                .await
+        }
     }
 
     fn commit_result(
@@ -3799,11 +4351,17 @@ impl RegisteredControllerApi for GuestProcessSource {
 
     fn complete_expedited(
         &self,
-        _context: &ReconcileContext,
-        _projection: &d2b_core_controller::ReconcileProjection,
+        context: &ReconcileContext,
+        projection: &d2b_core_controller::ReconcileProjection,
         _status_persistence: StatusPersistence,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
-        std::future::ready(Ok(()))
+        let operation_id = context.operation().operation_id().to_owned();
+        let state = guest_projection_state(projection);
+        let revision = context.revision();
+        async move {
+            self.record_effect_for_operation(&operation_id, state, revision)
+                .await
+        }
     }
 
     fn persist_outcome(
@@ -3822,7 +4380,12 @@ impl RegisteredControllerApi for GuestProcessSource {
             if response.error.is_some() {
                 Err(SourceError::Unavailable)
             } else {
-                Ok(())
+                self.record_effect_for_target(
+                    &target,
+                    guest_projection_state(projection),
+                    resource.revision,
+                )
+                .await
             }
         }
     }
@@ -4090,13 +4653,14 @@ pub(crate) async fn run_guest_process_reconciliation(
         Err(_) => return,
     };
     let controller_generation = runtime.controller_generation;
-    let provider_generation = runtime
+    let guest_execution = runtime
         .guest_execution
         .as_ref()
-        .map(GuestExecutionBinding::provider_generation);
-    let Some(provider_generation) = provider_generation else {
+        .cloned();
+    let Some(guest_execution) = guest_execution else {
         return;
     };
+    let provider_generation = guest_execution.provider_generation();
     let identity = match ControllerIdentity::new(
         zone.clone(),
         controller_ref.clone(),
@@ -4115,7 +4679,13 @@ pub(crate) async fn run_guest_process_reconciliation(
         Err(_) => return,
     };
     let handler = ProcessResourceReconciler::new(descriptor.clone(), runtime);
-    let api = GuestProcessSource::new(zone, store, client);
+    let api = GuestProcessSource::new(
+        zone,
+        handler.runtime.target.clone(),
+        guest_execution,
+        store,
+        client,
+    );
     let source = d2b_core_controller::CoreControllerSource::new(descriptor.clone(), api);
     let runner = d2b_core_controller::Runner::new(
         handler,

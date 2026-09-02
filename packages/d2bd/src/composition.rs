@@ -17965,12 +17965,12 @@ impl d2bd_runtime::supervisor::dag::NodeRunner for VmStartRunner<'_> {
                         budget.readiness,
                     ),
                     VmRunnerLaunch::Provider => {
-                        tracing::debug!(
-                            vm = %vm,
-                            role = %process_provider_runtime::ProductionProcessProviders::tracked_role_id(node),
-                            "Provider one-shot launch accepted for asynchronous observation",
-                        );
-                        Ok(())
+                        let providers = self
+                            .state
+                            .provider_runtime
+                            .process_providers()
+                            .ok_or_else(|| "provider-runtime-unavailable".to_owned())?;
+                        block_on_future(providers.wait_node(vm, node, budget.readiness))
                     }
                     VmRunnerLaunch::ControllerOwned => {
                         Err("controller-owned-one-shot-process-invalid".to_owned())

@@ -37,7 +37,10 @@ use d2b_resource_store::{
     StoreListResult, StoreResolveRequest, StoreResolvedIdentity, StoreWatchReceipt,
     StoreWatchRequest, StoredResource, StoredSchema, mutation_seal::MutationSealAcceptor,
 };
-use d2b_resource_store_redb::{RedbResourceStore, StoreIdentity, write_provisioning_marker};
+use d2b_resource_store_redb::{
+    AuthorityOperation, AuthorityOperationCapability, RedbResourceStore, StoreIdentity,
+    write_provisioning_marker,
+};
 use protobuf::Message;
 use ttrpc::{
     r#async::{MethodHandler, TtrpcContext},
@@ -1460,6 +1463,68 @@ impl SessionBoundStore {
     pub fn ensure_session_current(&self) -> Result<(), StoreError> {
         self.ensure_current()
     }
+
+    /// Derive the current target-local store binding for one authority claim.
+    pub fn authority_binding_digest(&self, claim_digest: &str) -> Result<String, StoreError> {
+        self.ensure_current()?;
+        match &self.store.backend {
+            GuestStoreBackend::Durable(store) => Ok(store.authority_binding_digest(claim_digest)),
+            GuestStoreBackend::Memory { .. } => Err(GuestResourceStore::unavailable(
+                "guest-target-authority-unavailable",
+            )),
+        }
+    }
+
+    /// Prepare one durable target-local authority operation.
+    pub async fn prepare_authority_operation(
+        &self,
+        operation_id: String,
+        payload: Vec<u8>,
+        claim_digest: &str,
+    ) -> Result<AuthorityOperationCapability, StoreError> {
+        self.ensure_current()?;
+        match &self.store.backend {
+            GuestStoreBackend::Durable(store) => {
+                store
+                    .prepare_authority_operation(operation_id, payload, claim_digest)
+                    .await
+            }
+            GuestStoreBackend::Memory { .. } => Err(GuestResourceStore::unavailable(
+                "guest-target-authority-unavailable",
+            )),
+        }
+    }
+
+    /// Resume one non-terminal target-local authority operation after rejoin.
+    pub async fn resume_authority_operation(
+        &self,
+        operation_id: String,
+        binding_digest: &str,
+    ) -> Result<AuthorityOperationCapability, StoreError> {
+        self.ensure_current()?;
+        match &self.store.backend {
+            GuestStoreBackend::Durable(store) => {
+                store
+                    .resume_authority_operation(operation_id, binding_digest)
+                    .await
+            }
+            GuestStoreBackend::Memory { .. } => Err(GuestResourceStore::unavailable(
+                "guest-target-authority-unavailable",
+            )),
+        }
+    }
+
+    /// Read target-local authority operations for crash/session rejoin.
+    pub async fn authority_operations(&self) -> Result<Vec<AuthorityOperation>, StoreError> {
+        self.ensure_current()?;
+        match &self.store.backend {
+            GuestStoreBackend::Durable(store) => store.authority_operations().await,
+            GuestStoreBackend::Memory { .. } => Err(GuestResourceStore::unavailable(
+                "guest-target-authority-unavailable",
+            )),
+        }
+    }
+
 }
 
 impl ResourceStoreBackend for SessionBoundStore {
