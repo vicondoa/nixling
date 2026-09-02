@@ -176,8 +176,6 @@ pub(crate) use d2bd_runtime::readiness::{
 #[cfg(test)]
 use d2bd_runtime::readiness::wait_for_tcp_port;
 pub(crate) use d2bd_runtime::resource_api::resource_runtime_error_frame;
-#[cfg(test)]
-use d2bd_runtime::resource_api::projection_digest_bytes;
 use d2bd_runtime::supervisor::pidfd_table::{
     BrokerReapLog, PidfdEntry, PidfdRegistration, PidfdTable, PidfdTableError, WaitTermination,
 };
@@ -236,9 +234,7 @@ pub use d2bd_runtime::runtime_process::{
     sd_notify_payload, sd_notify_ready, sd_notify_status, validate_lock_parent,
     write_daemon_version_file,
 };
-use d2bd_runtime::runtime_util::{
-    block_on_future, duplicate_received_fd, hex_bytes,
-};
+use d2bd_runtime::runtime_util::{block_on_future, duplicate_received_fd, hex_bytes};
 #[cfg(test)]
 use d2bd_runtime::runtime_util::projection_digest_bytes;
 #[cfg(test)]
@@ -7465,6 +7461,7 @@ fn dispatch_device_usb_resource_request(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn resolve_volume_storage_ref(
     resource: &Value,
     resolver: &BundleResolver,
@@ -7505,6 +7502,7 @@ fn resolve_volume_storage_ref(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn resolve_network_effect_context(
     resource: &Value,
     resolver: &BundleResolver,
@@ -7647,6 +7645,7 @@ fn resolve_network_effect_context(
 // it invokes. It is not the readiness authority: each pass commits a typed
 // projection and the next pass reads that projection back from Resource API.
 #[cfg(test)]
+#[allow(dead_code)]
 struct PublicNetworkResourceBoundary {
     state: Arc<Mutex<PublicNetworkResourceState>>,
 }
@@ -7667,10 +7666,12 @@ struct PublicNetworkResourceState {
     volume_written: bool,
     guest_upserted: bool,
     volume_attached: bool,
+    #[allow(dead_code)]
     agent_upserted: bool,
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 const MAX_NETWORK_CHILD_READINESS_PASSES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7682,6 +7683,7 @@ struct PublicNetworkChildReadiness {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl PublicNetworkChildReadiness {
     const fn pending() -> Self {
         Self {
@@ -7714,6 +7716,7 @@ impl PublicNetworkChildReadiness {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl PublicNetworkResourceBoundary {
     fn completed_child_readiness(&self) -> Result<PublicNetworkChildReadiness, NetworkEffectError> {
         let state = self
@@ -7780,6 +7783,7 @@ fn network_child_readiness_from_resource(resource: &Value) -> PublicNetworkChild
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn fetch_public_resource(
     runtime: &resource_runtime::ZoneResourceRuntime,
     peer: &PeerIdentity,
@@ -7971,6 +7975,7 @@ impl NetworkResourcePort for PublicNetworkResourceBoundary {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn dispatch_wave6_resource_reconcile(
     state: &ServerState,
     peer: &PeerIdentity,
@@ -8143,6 +8148,7 @@ fn dispatch_wave6_resource_reconcile(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn public_resource_get_error(resource: &Value) -> Option<resource_runtime::ResourceRuntimeError> {
     let kind = resource
         .get("error")
@@ -8158,6 +8164,7 @@ fn public_resource_get_error(resource: &Value) -> Option<resource_runtime::Resou
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 struct Wave6NetworkEffectRequest<'a> {
     state: &'a ServerState,
     peer: &'a PeerIdentity,
@@ -8171,6 +8178,7 @@ struct Wave6NetworkEffectRequest<'a> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn parse_committed_network_spec(
     resource: &Value,
 ) -> Result<NetworkSpec, resource_runtime::ResourceRuntimeError> {
@@ -8312,6 +8320,7 @@ fn network_deletion_completed(resource: &Value) -> bool {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn release_completed_network_admission(
     state: &ServerState,
     runtime: &resource_runtime::ZoneResourceRuntime,
@@ -8340,6 +8349,7 @@ fn release_completed_network_admission(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn resolve_network_admission(
     state: &ServerState,
     runtime: &resource_runtime::ZoneResourceRuntime,
@@ -8463,6 +8473,7 @@ fn resolve_network_admission(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn reconcile_wave6_network_effect(
     request: Wave6NetworkEffectRequest<'_>,
 ) -> Result<bool, resource_runtime::ResourceRuntimeError> {
@@ -8688,6 +8699,7 @@ fn reconcile_wave6_network_effect(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn is_device_tpm_reconcile_request(request: &Value) -> bool {
     request.get("method").and_then(Value::as_str) == Some("Reconcile")
         && request.get("resourceType").and_then(Value::as_str) == Some("Device")
@@ -8696,6 +8708,7 @@ fn is_device_tpm_reconcile_request(request: &Value) -> bool {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn dispatch_device_tpm_reconcile(
     state: &ServerState,
     peer: &PeerIdentity,
@@ -8705,6 +8718,7 @@ fn dispatch_device_tpm_reconcile(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn dispatch_device_tpm_reconcile_inner(
     state: &ServerState,
     peer: &PeerIdentity,
@@ -8813,9 +8827,7 @@ fn dispatch_device_tpm_reconcile_inner(
         lifecycle_admission.provider_assignment_generation,
     )
     .map_err(|_| resource_runtime::ResourceRuntimeError::AuthenticationUnavailable)?;
-    let outcome = runtime
-        .device_tpm_controller()
-        .reconcile(
+    let outcome = tpm_effect_port::reconcile_device_tpm(
             state,
             &resolver,
             VmId::new(vm_id),
@@ -8863,6 +8875,7 @@ fn trusted_tpm_migration_anchor(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn tpm_opaque_bytes(domain: &str, value: &str) -> [u8; 32] {
     let digest = Sha256::digest(format!("{domain}:{value}").as_bytes());
     let mut bytes = [0; 32];
@@ -8871,6 +8884,7 @@ fn tpm_opaque_bytes(domain: &str, value: &str) -> [u8; 32] {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn tpm_state_intent(
     device_uid: &ResourceUid,
     vm_id: &str,
@@ -10829,6 +10843,7 @@ fn validate_usbip_bus_id_for_daemon(verb: &str, bus_id: &str) -> Result<(), Valu
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn usbip_lifecycle_claim_for_intent(
     resolver: &BundleResolver,
     vm: &str,
@@ -10852,6 +10867,7 @@ fn usbip_lifecycle_claim_for_intent(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn read_usbip_claim_lock_owner_path(lock_path: &Path) -> io::Result<String> {
     let file = File::open(lock_path)?;
     let mut owner = String::new();
@@ -10860,6 +10876,7 @@ fn read_usbip_claim_lock_owner_path(lock_path: &Path) -> io::Result<String> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn bounded_usbip_owner_label(owner: &str) -> &str {
     if owner.len() <= 63
         && owner
@@ -10875,6 +10892,7 @@ fn bounded_usbip_owner_label(owner: &str) -> &str {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn same_vm_declared_usbip_start_claims_with_reader(
     resolver: &BundleResolver,
     vm: &str,
@@ -10914,6 +10932,7 @@ fn same_vm_declared_usbip_start_claims_with_reader(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn same_vm_declared_usbip_start_claims(
     resolver: &BundleResolver,
     vm: &str,
@@ -10922,6 +10941,7 @@ fn same_vm_declared_usbip_start_claims(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn same_vm_persisted_usbip_stop_claims_with_reader(
     resolver: &BundleResolver,
     vm: &str,
@@ -10939,6 +10959,7 @@ fn same_vm_persisted_usbip_stop_claims_with_reader(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn same_vm_persisted_usbip_stop_claims(
     resolver: &BundleResolver,
     vm: &str,
@@ -10947,6 +10968,7 @@ fn same_vm_persisted_usbip_stop_claims(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn lifecycle_broker_error_kind(
     error: &BrokerErrorResponse,
 ) -> d2b_provider_device_usbip::reconcile_state::UsbipLifecycleFailureKind {
@@ -11004,6 +11026,7 @@ fn lifecycle_broker_error_kind(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn lifecycle_broker_ack(
     state: &ServerState,
     op_name: &str,
@@ -11037,6 +11060,7 @@ fn lifecycle_broker_ack(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 struct DaemonUsbipStartReconcileExecutor<'a> {
     state: &'a ServerState,
     resolver: &'a BundleResolver,
@@ -11044,6 +11068,7 @@ struct DaemonUsbipStartReconcileExecutor<'a> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl d2b_provider_device_usbip::reconcile_state::UsbipVmStartReconcileExecutor
     for DaemonUsbipStartReconcileExecutor<'_>
 {
@@ -11135,12 +11160,14 @@ impl d2b_provider_device_usbip::reconcile_state::UsbipVmStartReconcileExecutor
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 struct DaemonUsbipStopCleanupExecutor<'a> {
     state: &'a ServerState,
     caller_role: BrokerCallerRole,
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl d2b_provider_device_usbip::reconcile_state::UsbipVmStopCarrierCleanup
     for DaemonUsbipStopCleanupExecutor<'_>
 {
@@ -11202,6 +11229,7 @@ impl d2b_provider_device_usbip::reconcile_state::UsbipVmStopCarrierCleanup
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn emit_usbip_lifecycle_observations(
     phase: &str,
     report: &d2b_provider_device_usbip::reconcile_state::UsbipLifecycleReconcileReport,
@@ -11225,6 +11253,7 @@ fn emit_usbip_lifecycle_observations(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn usbip_lifecycle_report_summary(
     phase: &str,
     report: &d2b_provider_device_usbip::reconcile_state::UsbipLifecycleReconcileReport,
@@ -11274,6 +11303,7 @@ fn usbip_lifecycle_report_summary(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn new_usbip_reconcile_attempt(
     phase: &str,
 ) -> d2b_provider_device_usbip::reconcile_state::UsbipReconcileAttemptContext {
@@ -11298,6 +11328,7 @@ fn new_usbip_reconcile_attempt(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn tracing_span_id_for_usbip_attempt(
     attempt: &d2b_provider_device_usbip::reconcile_state::UsbipReconcileAttemptContext,
 ) -> TracingSpanId {
@@ -11305,6 +11336,7 @@ fn tracing_span_id_for_usbip_attempt(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn reconcile_usbip_after_vm_start(
     state: &ServerState,
     resolver: &BundleResolver,
@@ -11331,11 +11363,14 @@ fn reconcile_usbip_after_vm_start(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 const USBIP_STRICT_RECONCILE_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(test)]
+#[allow(dead_code)]
 const USBIP_STRICT_RECONCILE_BACKOFF: Duration = Duration::from_secs(2);
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn reconcile_usbip_after_vm_start_until_converged(
     state: &ServerState,
     resolver: &BundleResolver,
@@ -11355,17 +11390,21 @@ fn reconcile_usbip_after_vm_start_until_converged(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn usbip_start_reconciles_synchronously(request: &public_wire::VmLifecycleRequest) -> bool {
     !request.no_wait_api
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 const USBIP_BACKGROUND_RECONCILE_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(test)]
+#[allow(dead_code)]
 const USBIP_BACKGROUND_RECONCILE_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(test)]
+#[allow(dead_code)]
 enum UsbipBackgroundReconcileSpawn {
     NoClaims,
     AlreadyRunning,
@@ -11373,12 +11412,14 @@ enum UsbipBackgroundReconcileSpawn {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 struct UsbipBackgroundReconcileGuard {
     coordinator: Arc<Mutex<ZoneCoordinator>>,
     zone: ZoneId,
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl UsbipBackgroundReconcileGuard {
     fn try_acquire(state: &ServerState, vm: &str) -> Option<Self> {
         let zone =
@@ -11391,6 +11432,7 @@ impl UsbipBackgroundReconcileGuard {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl Drop for UsbipBackgroundReconcileGuard {
     fn drop(&mut self) {
         if let Ok(mut coordinator) = self.coordinator.lock() {
@@ -11400,6 +11442,7 @@ impl Drop for UsbipBackgroundReconcileGuard {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn spawn_usbip_reconcile_after_vm_start(
     state: &ServerState,
     resolver: &BundleResolver,
@@ -11484,6 +11527,7 @@ fn spawn_usbip_reconcile_after_vm_start(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn cleanup_usbip_before_vm_stop(
     state: &ServerState,
     resolver: &BundleResolver,
@@ -11507,6 +11551,7 @@ fn cleanup_usbip_before_vm_stop(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(test)]
+#[allow(dead_code)]
 enum UsbipClaimLockProbe {
     None,
     Present,
@@ -11514,6 +11559,7 @@ enum UsbipClaimLockProbe {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn probe_usbip_claim_locks_for_vm_without_bundle(
     state: &ServerState,
     vm: &str,
@@ -11559,6 +11605,7 @@ fn probe_usbip_claim_locks_for_vm_without_bundle(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn ensure_usbipd_env_ready_for_attach(
     state: &ServerState,
     resolver: &BundleResolver,
@@ -29837,7 +29884,7 @@ mod broker_dispatch_tests {
     }
 
     #[test]
-    fn vm_stop_reports_usbip_degradation_when_bundle_missing_and_claim_lock_matches() {
+    fn vm_stop_does_not_run_legacy_usbip_cleanup_when_claim_lock_matches() {
         let mut state =
             test_state_with_broker_socket(unreachable_broker_socket_path("vm-stop-usbip-lock"));
         state.config.artifacts.bundle_path = state.daemon_state_dir.join("missing-bundle.json");
@@ -29867,8 +29914,8 @@ mod broker_dispatch_tests {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         assert!(
-            summary.contains("USBIP cleanup degraded: could not load trusted bundle"),
-            "missing USBIP degradation in summary: {summary}"
+            !summary.contains("USBIP cleanup degraded"),
+            "legacy USBIP cleanup still ran: {summary}"
         );
         let status = child.wait();
         assert!(!status.success());
