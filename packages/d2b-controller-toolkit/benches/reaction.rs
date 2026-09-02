@@ -270,8 +270,10 @@ impl ProcessEffectBackend for RecordingEffectBackend {
 struct ExitProcessState {
     alive: Mutex<BTreeMap<ResourceUid, bool>>,
     launches: Mutex<BTreeMap<ResourceUid, usize>>,
+    identities: Mutex<BTreeMap<ProcessIdentityDigest, ResourceUid>>,
     next_identity: AtomicUsize,
     observes: AtomicUsize,
+    wakes: AtomicUsize,
 }
 
 impl ExitProcessState {
@@ -279,8 +281,10 @@ impl ExitProcessState {
         Self {
             alive: Mutex::new(BTreeMap::new()),
             launches: Mutex::new(BTreeMap::new()),
+            identities: Mutex::new(BTreeMap::new()),
             next_identity: AtomicUsize::new(1),
             observes: AtomicUsize::new(0),
+            wakes: AtomicUsize::new(0),
         }
     }
 
@@ -311,14 +315,23 @@ impl ExitProcessState {
     fn observe_count(&self) -> usize {
         self.observes.load(Ordering::Acquire)
     }
+
+    fn wake_count(&self) -> usize {
+        self.wakes.load(Ordering::Acquire)
+    }
 }
 
 struct ExitEffectBackend {
     state: Arc<ExitProcessState>,
 }
 
+#[derive(Clone)]
+struct ExitHandle {
+    uid: ResourceUid,
+}
+
 impl ProcessEffectBackend for ExitEffectBackend {
-    type Handle = ();
+    type Handle = ExitHandle;
 
     fn launch(
         &self,
@@ -335,13 +348,18 @@ impl ProcessEffectBackend for ExitEffectBackend {
             .launches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(uid)
+            .entry(uid.clone())
             .or_default() += 1;
         let identity_number = self.state.next_identity.fetch_add(1, Ordering::Relaxed);
         let mut identity_bytes = [0_u8; 32];
         identity_bytes[..std::mem::size_of::<usize>()]
             .copy_from_slice(&identity_number.to_le_bytes());
         let identity = ProcessIdentityDigest::from_bytes(identity_bytes);
+        self.state
+            .identities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(identity, uid.clone());
         let observed = ObservedIdentity::from_verified([
             IdentityBinding::Pid,
             IdentityBinding::ProcessStartTime,
@@ -352,7 +370,7 @@ impl ProcessEffectBackend for ExitEffectBackend {
         ]);
         Ok(BackendLaunch::new(
             BackendObservation::new(identity, observed, WaitReapOwner::Local),
-            (),
+            ExitHandle { uid: uid.clone() },
         ))
     }
 
@@ -400,9 +418,42 @@ impl ProcessEffectBackend for ExitEffectBackend {
 
     fn open_pidfd(
         &self,
-        _observation: BackendObservation,
+        observation: BackendObservation,
     ) -> Result<Self::Handle, ProcessEffectError> {
-        Ok(())
+        let uid = self
+            .state
+            .identities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&observation.identity())
+            .cloned()
+            .ok_or(ProcessEffectError::PidfdUnavailable)?;
+        Ok(ExitHandle { uid })
+    }
+
+    fn wait(
+        &self,
+        handle: &Self::Handle,
+        timeout: Duration,
+    ) -> Result<(), ProcessEffectError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self
+                .state
+                .alive
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&handle.uid)
+                .copied()
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(ProcessEffectError::StopFailed);
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn stop(
@@ -419,9 +470,45 @@ struct ExitProcessReconciler {
     provider: Arc<MinijailProcessProvider<ProviderSupervisor<ExitEffectBackend>>>,
     state: Arc<ExitProcessState>,
     restart_on_exit: bool,
+    waker: Mutex<Option<Arc<dyn Fn(ResourceKey, ZoneRevision) + Send + Sync>>>,
 }
 
 impl ExitProcessReconciler {
+    fn set_waker(&self, waker: Arc<dyn Fn(ResourceKey, ZoneRevision) + Send + Sync>) {
+        *self.waker.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(waker);
+    }
+
+    fn spawn_waiter(&self, resource: &ResourceSnapshot, identity: ProcessIdentityDigest) {
+        let Some(waker) = self
+            .waker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let provider = self.provider.port().clone();
+        let key = resource.key().clone();
+        let revision = resource.revision();
+        let wakes = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            loop {
+                match provider
+                    .wait_identity(&identity, Duration::from_millis(10))
+                    .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => continue,
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+            wakes.wakes.fetch_add(1, Ordering::AcqRel);
+            waker(key, revision);
+        });
+    }
+
     fn phase(resource: &ResourceSnapshot) -> Option<String> {
         serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
             .ok()
@@ -478,6 +565,25 @@ impl ExitProcessReconciler {
         )
         .map_err(|_| HandlerError)
     }
+
+    fn retry_result(
+        resource: &ResourceSnapshot,
+        phase: &str,
+        code: &str,
+        next_tick: u64,
+    ) -> Result<ReconcileResult, HandlerError> {
+        ReconcileResult::new(
+            resource.revision(),
+            resource.generation(),
+            None,
+            Some(Self::status_candidate(resource, phase, code)?),
+            d2b_controller_toolkit::ReconcileDisposition::RequeueAt,
+            Some(next_tick),
+            None,
+            StatusPersistence::Pending,
+        )
+        .map_err(|_| HandlerError)
+    }
 }
 
 impl ResourceReconciler for ExitProcessReconciler {
@@ -503,12 +609,19 @@ impl ResourceReconciler for ExitProcessReconciler {
         resource: &ResourceSnapshot,
         _dependencies: &[DependencySnapshot],
     ) -> impl Future<Output = Result<ReconcilePlan, Self::Error>> + Send {
-        let effect = !context.reasons().contains(TriggerReason::StartupRelist)
-            && matches!(Self::phase(resource).as_deref(), Some("Pending" | "Ready"));
+        let phase = Self::phase(resource);
+        let effect = phase.as_deref() == Some("Pending")
+            || (phase.as_deref() == Some("Ready")
+                && self.state.launch_count(resource.key().uid()) == 0)
+            || (phase.as_deref() == Some("Degraded")
+                && context.reasons().contains(TriggerReason::RetryDue));
         std::future::ready(
             ReconcilePlan::new(
                 effect
-                    .then_some(vec!["process-liveness".to_owned()])
+                    .then_some(vec![format!(
+                        "process-lifecycle-restart-{}",
+                        self.state.launch_count(resource.key().uid())
+                    )])
                     .unwrap_or_default(),
                 !effect,
             )
@@ -518,15 +631,40 @@ impl ResourceReconciler for ExitProcessReconciler {
 
     fn reconcile(
         &self,
-        _context: &ReconcileContext,
+        context: &ReconcileContext,
         resource: &ResourceSnapshot,
         _dependencies: &[DependencySnapshot],
         _plan: &ReconcilePlan,
     ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
-        std::future::ready(Ok(ReconcileResult::converged(
-            resource.revision(),
-            resource.generation(),
-        )))
+        let result = match Self::phase(resource).as_deref() {
+            Some("Ready")
+                if self.state.launch_count(resource.key().uid()) > 0
+                    && !self
+                    .state
+                    .alive
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(resource.key().uid())
+                    .copied()
+                    .unwrap_or(false) =>
+            {
+                if self.restart_on_exit {
+                    Self::retry_result(
+                        resource,
+                        "Degraded",
+                        "process-exited",
+                        context.now_tick().saturating_add(50),
+                    )
+                } else {
+                    Self::result(resource, "Succeeded", "process-exited")
+                }
+            }
+            _ => Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            )),
+        };
+        std::future::ready(result)
     }
 
     fn execute_effect(
@@ -542,20 +680,23 @@ impl ResourceReconciler for ExitProcessReconciler {
         );
         let phase = Self::phase(resource).unwrap_or_else(|| "Unknown".to_owned());
         let provider = Arc::clone(&self.provider);
+        let reconciler = self;
         let initial = self.state.launch_count(resource.key().uid()) == 0;
         let restart_on_exit = self.restart_on_exit;
         async move {
             context.authorize_effect().map_err(|_| HandlerError)?;
             if phase == "Ready" && !initial {
                 match provider.adopt(&ticket).await.map_err(|_| HandlerError)? {
-                    AdoptionOutcome::Adopted(_) => {
+                    AdoptionOutcome::Adopted(report) => {
+                        reconciler.spawn_waiter(resource, report.identity);
                         return Ok(ReconcileResult::converged(
                             resource.revision(),
                             resource.generation(),
                         ));
                     }
                     AdoptionOutcome::Absent if restart_on_exit => {
-                        provider.launch(&ticket).await.map_err(|_| HandlerError)?;
+                        let report = provider.launch(&ticket).await.map_err(|_| HandlerError)?;
+                        reconciler.spawn_waiter(resource, report.identity);
                         return Self::result(resource, "Ready", "process-restarted");
                     }
                     AdoptionOutcome::Absent => {
@@ -564,20 +705,46 @@ impl ResourceReconciler for ExitProcessReconciler {
                     _ => return Err(HandlerError),
                 }
             }
-            provider.launch(&ticket).await.map_err(|_| HandlerError)?;
+            let report = provider.launch(&ticket).await.map_err(|_| HandlerError)?;
+            reconciler.spawn_waiter(resource, report.identity);
             Self::result(resource, "Ready", "process-started")
         }
     }
 
     fn observe(
         &self,
-        _context: &ReconcileContext,
+        context: &ReconcileContext,
         resource: &ResourceSnapshot,
     ) -> impl Future<Output = Result<ObservationResult, Self::Error>> + Send {
-        std::future::ready(Ok(ObservationResult::new(ReconcileResult::converged(
-            resource.revision(),
-            resource.generation(),
-        ))))
+        let result = match Self::phase(resource).as_deref() {
+            Some("Ready")
+                if self.state.launch_count(resource.key().uid()) > 0
+                    && !self
+                    .state
+                    .alive
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(resource.key().uid())
+                    .copied()
+                    .unwrap_or(false) =>
+            {
+                if self.restart_on_exit {
+                    Self::retry_result(
+                        resource,
+                        "Degraded",
+                        "process-exited",
+                        context.now_tick().saturating_add(50),
+                    )
+                } else {
+                    Self::result(resource, "Succeeded", "process-exited")
+                }
+            }
+            _ => Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            )),
+        };
+        std::future::ready(result.map(ObservationResult::new))
     }
 
     fn finalize(
@@ -2104,11 +2271,18 @@ async fn run_process_exit_profile(restart_on_exit: bool) {
         provider: Arc::clone(&provider),
         state: Arc::clone(&state),
         restart_on_exit,
+        waker: Mutex::new(None),
     });
     let api = fixture
         .core_registered_api()
         .with_assignment_fence_resolver(fixture.durable_core_assignment_resolver());
     let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+    let wake_source = Arc::downgrade(&source);
+    reconciler.set_waker(Arc::new(move |key, revision| {
+        if let Some(source) = wake_source.upgrade() {
+            let _ = source.dispatch_observation(key, revision);
+        }
+    }));
     let runner = Runner::new(
         Arc::clone(&reconciler),
         Arc::clone(&source),
@@ -2124,26 +2298,11 @@ async fn run_process_exit_profile(restart_on_exit: bool) {
     let runner_task = tokio::spawn(runner.run());
     drop(runner);
     let mut current_resources = Vec::with_capacity(resources.len());
-    for (index, resource) in resources.iter().enumerate() {
-        let current = fixture
-            .get_resource(&resource.resource_ref)
-            .await
-            .expect("refresh Process before start trigger");
-        let (updated, _) = fixture
-            .commit_process_spec_update(
-                std::slice::from_ref(&current),
-                &format!("process-start-{index}"),
-            )
-            .await
-            .expect("commit production Process start trigger");
-        let updated = updated
-            .into_iter()
-            .next()
-            .expect("updated Process is present");
+    for resource in &resources {
         let current = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let resource = fixture
-                    .get_resource(&updated.resource_ref)
+                    .get_resource(&resource.resource_ref)
                     .await
                     .expect("read Process status");
                 let value = serde_json::from_slice::<serde_json::Value>(&resource.canonical_json)
@@ -2152,7 +2311,7 @@ async fn run_process_exit_profile(restart_on_exit: bool) {
                 let observed_generation = value["status"]["observedGeneration"]
                     .as_u64()
                     .unwrap_or_default();
-                if phase == "Ready" && observed_generation == updated.generation.get() {
+                if phase == "Ready" && observed_generation == resource.generation.get() {
                     return resource;
                 }
                 tokio::task::yield_now().await;
@@ -2170,17 +2329,29 @@ async fn run_process_exit_profile(restart_on_exit: bool) {
         .get(1)
         .expect("sibling Process resource")
         .clone();
+    let initial_generation = first.generation;
+    let initial_spec = serde_json::from_slice::<serde_json::Value>(&first.canonical_json)
+        .expect("initial Process JSON")["spec"]
+        .clone();
+    let lifecycle_operations_before = fixture
+        .store()
+        .authority_operations()
+        .await
+        .expect("read initial Process effect ledger")
+        .into_iter()
+        .filter_map(|operation| {
+            let payload = serde_json::from_slice::<serde_json::Value>(&operation.payload).ok()?;
+            (payload["effectIds"]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|id| {
+                    id.as_str()
+                        .is_some_and(|id| id.starts_with("process-lifecycle-restart-"))
+                }))
+                && payload["resourceUid"].as_str() == Some(first.uid.as_str()))
+            .then_some(operation.operation_id)
+        })
+        .collect::<BTreeSet<_>>();
     state.mark_exited(&first.uid);
-    let first = fixture
-        .get_resource(&first.resource_ref)
-        .await
-        .expect("refresh first Process before exit trigger");
-    let (updated, _) = fixture
-        .commit_process_spec_update(std::slice::from_ref(&first), "process-exit-observe")
-        .await
-        .expect("commit production liveness trigger");
-    assert_eq!(updated.len(), 1);
-    let updated_generation = updated[0].generation;
     let terminal_wait = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let resource = fixture
@@ -2196,7 +2367,7 @@ async fn run_process_exit_profile(restart_on_exit: bool) {
             let expected_phase = if restart_on_exit { "Ready" } else { "Succeeded" };
             let expected_launches = if restart_on_exit { 2 } else { 1 };
             if phase == expected_phase
-                && observed_generation == updated_generation.get()
+                && observed_generation == initial_generation.get()
                 && state.launch_count(&first.uid) == expected_launches
             {
                 break;
@@ -2242,6 +2413,47 @@ async fn run_process_exit_profile(restart_on_exit: bool) {
         terminal_phase,
         if restart_on_exit { "Ready" } else { "Succeeded" }
     );
+    let lifecycle_operations_after = fixture
+        .store()
+        .authority_operations()
+        .await
+        .expect("read final Process effect ledger")
+        .into_iter()
+        .filter_map(|operation| {
+            let payload = serde_json::from_slice::<serde_json::Value>(&operation.payload).ok()?;
+            (payload["effectIds"]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|id| {
+                    id.as_str()
+                        .is_some_and(|id| id.starts_with("process-lifecycle-restart-"))
+                }))
+                && payload["resourceUid"].as_str() == Some(first.uid.as_str()))
+            .then_some(operation.operation_id)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        lifecycle_operations_after.len(),
+        lifecycle_operations_before.len() + usize::from(restart_on_exit),
+        "restart launch gets a fresh durable effect identity"
+    );
+    assert_eq!(
+        terminal.generation, initial_generation,
+        "natural exit observation must not mutate Process spec generation"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&terminal.canonical_json)
+            .expect("terminal Process JSON")["spec"],
+        initial_spec,
+        "natural exit observation must not mutate Process spec"
+    );
+    let final_launches = state.launch_count(&first.uid);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        state.launch_count(&first.uid),
+        final_launches,
+        "terminal or restarted Process does not relaunch without a new exit"
+    );
+    assert!(state.wake_count() >= 1, "exact child exit wakes its owner");
     assert!(
         state
             .alive
@@ -2266,7 +2478,7 @@ async fn run_process_exit_profile(restart_on_exit: bool) {
                     .as_deref()
                     == Some(first.uid.as_str())
         }),
-        "exit observation must complete its durable effect acceptance"
+        "Process launch must complete its durable effect acceptance"
     );
     drop(reconciler);
     drop(provider);
