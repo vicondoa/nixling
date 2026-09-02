@@ -2033,9 +2033,11 @@ impl ReadPool {
     pub(crate) async fn authority_operations(
         &self,
     ) -> Result<Vec<crate::AuthorityOperation>, StoreError> {
-        self.submit("scan", |response| ReadCommand::AuthorityOperations {
-            response,
-        })
+        self.submit_with_lifetime(
+            "scan",
+            |response| ReadCommand::AuthorityOperations { response },
+            LIST_READ_LIFETIME,
+        )
         .await
     }
 
