@@ -24,7 +24,7 @@ use d2b_resource_store::{
 
 use super::{
     DaemonSharedProviderEffects, ResourceRuntimeError, SharedProviderEffectExecutor,
-    SharedProviderResourceKind, SharedProviderResourceReconciler, SharedProviderRunnerRegistration,
+    GuestRuntimeReconciler, SharedProviderResourceKind, SharedProviderRunnerRegistration,
 };
 
 /// The shared-Runner registration shape used by Guest runtime Providers.
@@ -230,8 +230,7 @@ pub(crate) async fn start(
         });
         let api = api.with_assignment_fence_resolver(resolver);
         let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
-        let reconciler =
-            SharedProviderResourceReconciler::new(descriptor, kind, Arc::clone(&effects));
+        let reconciler = GuestRuntimeReconciler::new(descriptor, kind, Arc::clone(&effects));
         let runner = Runner::new(
             reconciler,
             source,
