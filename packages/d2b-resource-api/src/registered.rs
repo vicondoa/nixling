@@ -60,6 +60,10 @@ pub type EffectAcceptanceObserver = Arc<dyn Fn(&ResourceUid) + Send + Sync>;
 /// Optional production-path observer for completed controller passes.
 pub type CheckpointObserver = Arc<dyn Fn(&ResourceUid) + Send + Sync>;
 
+/// Optional production-path observer for a durable watch change handed to
+/// Core before queue admission.
+pub type WatchChangeObserver = Arc<dyn Fn(&ChangeRecord) + Send + Sync>;
+
 async fn retry_source_backpressure<T, F, Fut>(
     mut operation: F,
 ) -> Result<T, SourceError>
@@ -107,6 +111,7 @@ pub struct RedbRegisteredControllerApi {
     watch_stop: tokio::sync::Notify,
     accepted:
         Arc<Mutex<BTreeMap<String, Arc<d2b_resource_store_redb::AuthorityOperationCapability>>>>,
+    watch_change_observer: Option<WatchChangeObserver>,
 }
 
 struct NativeCommitPath {
@@ -189,6 +194,7 @@ impl RedbRegisteredControllerApi {
             effect_acceptances_in_flight: AtomicUsize::new(0),
             watch_stop: tokio::sync::Notify::new(),
             accepted: Arc::new(Mutex::new(BTreeMap::new())),
+            watch_change_observer: None,
         })
     }
 
@@ -206,6 +212,7 @@ impl RedbRegisteredControllerApi {
             effect_acceptances_in_flight: AtomicUsize::new(0),
             watch_stop: tokio::sync::Notify::new(),
             accepted: Arc::new(Mutex::new(BTreeMap::new())),
+            watch_change_observer: None,
         }
     }
 
@@ -244,6 +251,7 @@ impl RedbRegisteredControllerApi {
             effect_acceptances_in_flight: AtomicUsize::new(0),
             watch_stop: tokio::sync::Notify::new(),
             accepted: Arc::new(Mutex::new(BTreeMap::new())),
+            watch_change_observer: None,
         })
     }
 
@@ -280,6 +288,12 @@ impl RedbRegisteredControllerApi {
         if let Some(commit) = self.commit.as_mut() {
             commit.checkpoint_observer = Some(observer);
         }
+        self
+    }
+
+    /// Attach a non-authorizing observer to the Core watch handoff boundary.
+    pub fn with_watch_change_observer(mut self, observer: WatchChangeObserver) -> Self {
+        self.watch_change_observer = Some(observer);
         self
     }
 
@@ -1081,6 +1095,11 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
                     }
                 };
                 let changes = self.changes_for_batch(&descriptor, &batch)?;
+                if let Some(observer) = self.watch_change_observer.as_ref() {
+                    for (change, _, _) in &changes {
+                        observer(change);
+                    }
+                }
                 if changes.is_empty() {
                     let mut watch = self.watch.lock().await;
                     if let Some(watch) = watch.as_mut() {
