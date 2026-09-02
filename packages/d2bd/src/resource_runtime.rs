@@ -7926,6 +7926,12 @@ impl ZoneResourceRuntime {
             } else {
                 runtime.set_target_scope(None, None);
             }
+            let wake_source = Arc::downgrade(&source);
+            runtime.set_liveness_waker(Arc::new(move |key, revision| {
+                if let Some(source) = wake_source.upgrade() {
+                    let _ = source.dispatch_observation(key, revision);
+                }
+            }));
             runtime.set_status_client(self.status_client()?);
             let handler = ProcessResourceReconciler::new(descriptor, runtime);
             let runner = Runner::new(

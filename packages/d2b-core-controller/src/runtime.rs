@@ -1,7 +1,7 @@
 //! Core-to-toolkit source and reconciler adapters.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     sync::{
         Arc, Mutex,
@@ -255,6 +255,57 @@ where
         let revision = change.revision;
         let hint = ControllerHint::new(controller, change.target, change.revision, change.reasons)
             .map_err(CoreSourceError::Hint)?;
+        self.admit_hint(hint, target, revision, operation)
+    }
+
+    /// Wake one exact resource for a declared liveness observation.
+    ///
+    /// This path is not a store mutation and therefore bypasses convergence
+    /// suppression while still using the same bounded Core admission queue.
+    pub fn dispatch_observation(
+        &self,
+        target: ResourceKey,
+        revision: ZoneRevision,
+    ) -> Result<CoreDispatchOutcome, CoreSourceError> {
+        if revision.get() == 0
+            || target.zone() != self.controller.zone()
+            || !self
+                .descriptor
+                .resource_types()
+                .any(|resource_type| resource_type == target.resource_ref().resource_type())
+        {
+            return Err(CoreSourceError::Hint(HintAdmissionError::InvalidHint));
+        }
+        let operation_suffix = format!(
+            "{}:{}:{}",
+            target.zone().as_str(),
+            target.resource_ref().to_canonical_string(),
+            target.uid().as_str(),
+        );
+        let operation = OperationContext::new(
+            format!("process-observe:{operation_suffix}"),
+            format!("process-observe:{operation_suffix}"),
+            format!("process-observe:{operation_suffix}"),
+            None,
+        )
+        .map_err(|_| CoreSourceError::Hint(HintAdmissionError::InvalidHint))?;
+        let hint = ControllerHint::new(
+            self.controller.clone(),
+            target.clone(),
+            revision,
+            BTreeSet::from([d2b_controller_toolkit::TriggerReason::ScheduledObserve]),
+        )
+        .map_err(CoreSourceError::Hint)?;
+        self.admit_hint(hint, target, revision, operation)
+    }
+
+    fn admit_hint(
+        &self,
+        hint: ControllerHint,
+        target: ResourceKey,
+        revision: ZoneRevision,
+        operation: OperationContext,
+    ) -> Result<CoreDispatchOutcome, CoreSourceError> {
         let key = (self.controller.clone(), target);
         let outcome = {
             let mut watch = self
@@ -1270,6 +1321,24 @@ mod tests {
                 backpressure: 0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn declared_observation_wakeup_bypasses_convergence_suppression() {
+        let target = key("observed", 9);
+        let descriptor = descriptor(2);
+        let (_api, source) = source_with_snapshot(&descriptor, &target, 2);
+
+        assert_eq!(
+            source
+                .dispatch_observation(target, ZoneRevision::new(2))
+                .unwrap(),
+            CoreDispatchOutcome::Admitted
+        );
+        let WatchEvent::Hint(hint) = source.receive_watch().await.unwrap() else {
+            panic!("observation wakeup returned an unexpected event");
+        };
+        assert!(hint.reasons().contains(TriggerReason::ScheduledObserve));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

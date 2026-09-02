@@ -970,6 +970,14 @@ impl<R: BrokerLaunchResolver> ProcessEffectBackend for BrokerProcessBackend<R> {
         })
     }
 
+    fn wait(
+        &self,
+        handle: &Self::Handle,
+        timeout: Duration,
+    ) -> Result<(), ProcessEffectError> {
+        wait_pidfd_exit(&handle.pidfd, timeout)
+    }
+
     fn take_controller_bootstrap(
         &self,
         handle: &Self::Handle,
@@ -1082,7 +1090,10 @@ impl<R: BrokerLaunchResolver> ProcessEffectBackend for BrokerProcessBackend<R> {
     }
 }
 
-fn wait_pidfd_exit(pidfd: &OwnedFd, timeout: Duration) -> Result<(), ProcessEffectError> {
+pub(crate) fn wait_pidfd_exit(
+    pidfd: &OwnedFd,
+    timeout: Duration,
+) -> Result<(), ProcessEffectError> {
     let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
     let mut fds = [PollFd::new(
         pidfd,

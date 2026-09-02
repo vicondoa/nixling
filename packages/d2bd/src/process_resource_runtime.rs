@@ -286,6 +286,7 @@ pub(crate) struct ProcessResourceRuntime {
     guest_descriptor_digests: BTreeMap<ResourceRef, SchemaFingerprint>,
     owner_uids: BTreeMap<ResourceRef, ResourceUid>,
     status_client: Option<Arc<dyn ProcessResourceClient>>,
+    liveness_waker: Option<Arc<dyn Fn(ResourceKey, ZoneRevision) + Send + Sync>>,
     last_adopted: Option<bool>,
 }
 
@@ -356,6 +357,7 @@ impl ProcessResourceRuntime {
             guest_descriptor_digests: BTreeMap::new(),
             owner_uids: BTreeMap::new(),
             status_client: None,
+            liveness_waker: None,
             last_adopted: None,
         }
     }
@@ -407,6 +409,13 @@ impl ProcessResourceRuntime {
         self.status_client = Some(status_client);
     }
 
+    pub(crate) fn set_liveness_waker(
+        &mut self,
+        liveness_waker: Arc<dyn Fn(ResourceKey, ZoneRevision) + Send + Sync>,
+    ) {
+        self.liveness_waker = Some(liveness_waker);
+    }
+
     fn without_status_client(&mut self) {
         self.status_client = None;
     }
@@ -433,6 +442,7 @@ impl ProcessResourceRuntime {
             guest_descriptor_digests: self.guest_descriptor_digests.clone(),
             owner_uids: self.owner_uids.clone(),
             status_client: self.status_client.clone(),
+            liveness_waker: self.liveness_waker.clone(),
             last_adopted: None,
         }
     }
@@ -952,6 +962,9 @@ impl ProcessResourceRuntime {
         };
         if let Some(plan) = start_record_plan(&adoption, &record.process)? {
             if plan.adopted {
+                if let ProviderAdoption::Adopted(report) = &adoption {
+                    self.register_liveness_waiter(record, report.identity)?;
+                }
                 return Ok(true);
             }
             let DesiredProcess::Process(spec) = &record.process else {
@@ -1000,60 +1013,17 @@ impl ProcessResourceRuntime {
         }
     }
 
-    async fn observe_existing_record(
-        &mut self,
-        record: &DesiredRecord,
-    ) -> Result<ExistingProcessState, ProcessResourceRuntimeError> {
-        let adoption = match &record.process {
-            DesiredProcess::Process(spec) => self
-                .providers
-                .adopt_resource(self.context(record), spec)
-                .await
-                .map_err(map_provider_error)?,
-            DesiredProcess::Ephemeral(spec) => self
-                .providers
-                .adopt_ephemeral_resource(self.context(record), spec)
-                .await
-                .map_err(map_provider_error)?,
-        };
-        match adoption {
-            ProviderAdoption::Adopted(_) => {
-                self.last_adopted = Some(true);
-                Ok(ExistingProcessState::Alive)
-            }
-            ProviderAdoption::Absent => Ok(ExistingProcessState::Exited),
-            ProviderAdoption::Stale { candidate } => {
-                self.providers
-                    .stop_stale_resource(&record.provider_ref, &candidate)
-                    .await
-                    .map_err(map_provider_error)?;
-                Ok(ExistingProcessState::Exited)
-            }
-            ProviderAdoption::ControllerBootstrapMissing => {
-                if matches!(&record.process, DesiredProcess::Process(_)) {
-                    self.stop_record(record).await?;
-                    self.providers
-                        .finalize_resource(self.context(record))
-                        .await
-                        .map_err(map_provider_error)?;
-                }
-                Ok(ExistingProcessState::Exited)
-            }
-            ProviderAdoption::Quarantined(_) => Ok(ExistingProcessState::Ambiguous),
-        }
-    }
-
     async fn launch_record(
         &self,
         record: &DesiredRecord,
-    ) -> Result<(), ProcessResourceRuntimeError> {
+    ) -> Result<d2b_process_conformance::ProcessIdentityDigest, ProcessResourceRuntimeError> {
         if is_static_controller(record)
             && (record.controller_provider_uid.is_none()
                 || record.controller_provider_generation.is_none())
         {
             return Err(ProcessResourceRuntimeError::ProviderIdentityUnavailable);
         }
-        match &record.process {
+        let launch = match &record.process {
             DesiredProcess::Process(spec) => self
                 .providers
                 .launch_resource(self.context(record), spec, launch_timeout(&record.process))
@@ -1077,7 +1047,21 @@ impl ProcessResourceRuntime {
                 .await
                 .map_err(map_provider_error)?,
         };
-        Ok(())
+        self.register_liveness_waiter(record, launch.identity)?;
+        Ok(launch.identity)
+    }
+
+    fn register_liveness_waiter(
+        &self,
+        record: &DesiredRecord,
+        identity: d2b_process_conformance::ProcessIdentityDigest,
+    ) -> Result<(), ProcessResourceRuntimeError> {
+        let Some(waker) = self.liveness_waker.clone() else {
+            return Ok(());
+        };
+        self.providers
+            .spawn_resource_waiter(&self.context(record), identity, waker)
+            .map_err(|_| ProcessResourceRuntimeError::ProviderEffect)
     }
 
     async fn handle_start_failure(
@@ -1222,6 +1206,50 @@ impl ProcessResourceRuntime {
             return Ok(());
         };
         delete_resource(client.as_ref(), record).await
+    }
+
+    async fn observe_existing_record(
+        &mut self,
+        record: &DesiredRecord,
+    ) -> Result<ProviderLiveness, ProcessResourceRuntimeError> {
+        let adoption = match &record.process {
+            DesiredProcess::Process(spec) => self
+                .providers
+                .adopt_resource(self.context(record), spec)
+                .await
+                .map_err(map_provider_error)?,
+            DesiredProcess::Ephemeral(spec) => self
+                .providers
+                .adopt_ephemeral_resource(self.context(record), spec)
+                .await
+                .map_err(map_provider_error)?,
+        };
+        match adoption {
+            ProviderAdoption::Adopted(report) => {
+                self.last_adopted = Some(true);
+                self.register_liveness_waiter(record, report.identity)?;
+                Ok(ProviderLiveness::Alive)
+            }
+            ProviderAdoption::Absent => Ok(ProviderLiveness::Exited),
+            ProviderAdoption::Stale { candidate } => {
+                self.providers
+                    .stop_stale_resource(&record.provider_ref, &candidate)
+                    .await
+                    .map_err(map_provider_error)?;
+                Ok(ProviderLiveness::Exited)
+            }
+            ProviderAdoption::ControllerBootstrapMissing => {
+                if matches!(&record.process, DesiredProcess::Process(_)) {
+                    self.stop_record(record).await?;
+                    self.providers
+                        .finalize_resource(self.context(record))
+                        .await
+                        .map_err(map_provider_error)?;
+                }
+                Ok(ProviderLiveness::Exited)
+            }
+            ProviderAdoption::Quarantined(_) => Ok(ProviderLiveness::Unknown),
+        }
     }
 
     async fn probe_record(
@@ -1493,9 +1521,23 @@ impl ProcessResourceReconciler {
         ReconcilePlan::new(Vec::new(), true).expect("empty Process plan is bounded")
     }
 
-    fn effect_plan(&self) -> ReconcilePlan {
-        ReconcilePlan::new(vec!["process-lifecycle".to_owned()], false)
+    fn effect_plan(&self, stored: &StoredResource) -> ReconcilePlan {
+        ReconcilePlan::new(vec![lifecycle_effect_id(stored)], false)
             .expect("Process effect plan is bounded")
+    }
+
+    fn observation_plan(&self) -> ReconcilePlan {
+        ReconcilePlan::new(Vec::new(), false)
+            .expect("Process observation plan is bounded")
+    }
+
+    fn observation_required(
+        &self,
+        stored: &StoredResource,
+    ) -> bool {
+        status_phase(stored) == Some(ResourcePhase::Ready)
+            && status_observed_generation(stored) == Some(stored.generation)
+            && status_has_started_at(stored)
     }
 
     fn needs_effect(
@@ -1503,6 +1545,7 @@ impl ProcessResourceReconciler {
         stored: &StoredResource,
         provider_ref: &ResourceRef,
         process: &DesiredProcess,
+        retry_due: bool,
     ) -> bool {
         let key = &stored.resource_ref;
         let running = match process {
@@ -1532,7 +1575,7 @@ impl ProcessResourceReconciler {
         ) {
             return false;
         }
-        if phase == Some(ResourcePhase::Degraded) && !status_retry_due(stored) {
+        if phase == Some(ResourcePhase::Degraded) && !retry_due && !status_retry_due(stored) {
             return false;
         }
         if matches!(process, DesiredProcess::Ephemeral(_))
@@ -1544,15 +1587,117 @@ impl ProcessResourceReconciler {
         {
             return false;
         }
-        if phase == Some(ResourcePhase::Ready)
-            && observed_generation == Some(stored.generation)
-        {
-            return true;
-        }
         !active
             || observed_generation != Some(stored.generation)
             || !matches!(phase, Some(ResourcePhase::Ready))
             || active_process_finalizer_for_values(stored, provider_ref).is_none()
+    }
+
+    async fn observe_liveness(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<ReconcileResult, ProcessResourceRuntimeError> {
+        let Some(record) = self.desired_record(resource)? else {
+            return Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ));
+        };
+        let mut runtime = self.runtime.for_pass();
+        runtime.without_status_client();
+        match runtime.observe_existing_record(&record).await? {
+            ProviderLiveness::Alive => Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            )),
+            ProviderLiveness::Unknown => {
+                let canonical = status_payload(
+                    &record,
+                    ResourcePhase::Failed,
+                    persisted_restart_count(&record.resource, &record.process),
+                    Some(OutcomeState::failure(
+                        "identity-ambiguous",
+                        "provider identity could not be verified safely",
+                    )),
+                )?;
+                let status = status_candidate_from_resource(&canonical)?;
+                ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    None,
+                    Some(status),
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    StatusPersistence::Pending,
+                )
+                .map_err(|_| ProcessResourceRuntimeError::InvalidResource)
+            }
+            ProviderLiveness::Exited => {
+                let restart_count =
+                    persisted_restart_count(&record.resource, &record.process);
+                let (phase, outcome, next_tick) = match &record.process {
+                    DesiredProcess::Ephemeral(_) => (
+                        ResourcePhase::Succeeded,
+                        OutcomeState::success(
+                            "process-exited",
+                            "ephemeral process reached a terminal exit",
+                        ),
+                        None,
+                    ),
+                    DesiredProcess::Process(_) if process_restart_allowed(
+                        &record.process,
+                        restart_count,
+                    ) =>
+                    {
+                        let next_restart_count = restart_count.saturating_add(1);
+                        let delay = restart_delay(&record.process, next_restart_count);
+                        let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                        (
+                            ResourcePhase::Degraded,
+                            OutcomeState::retry(
+                                "process-exited",
+                                "process exited and is awaiting restart",
+                                delay,
+                            ),
+                            Some(context.now_tick().saturating_add(delay_ms)),
+                        )
+                    }
+                    DesiredProcess::Process(_) => (
+                        ResourcePhase::Succeeded,
+                        OutcomeState::success(
+                            "process-exited",
+                            "process reached a terminal exit",
+                        ),
+                        None,
+                    ),
+                };
+                let restart_count = if phase == ResourcePhase::Degraded {
+                    restart_count.saturating_add(1)
+                } else {
+                    restart_count
+                };
+                let canonical =
+                    status_payload(&record, phase, restart_count, Some(outcome))?;
+                let status = status_candidate_from_resource(&canonical)?;
+                ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    None,
+                    Some(status),
+                    if next_tick.is_some() {
+                        ReconcileDisposition::RequeueAt
+                    } else {
+                        ReconcileDisposition::Pending
+                    },
+                    next_tick,
+                    None,
+                    StatusPersistence::Pending,
+                )
+                .map_err(|_| ProcessResourceRuntimeError::InvalidResource)
+            }
+        }
     }
 }
 
@@ -1591,7 +1736,7 @@ impl ResourceReconciler for ProcessResourceReconciler {
 
     async fn plan(
         &self,
-        _context: &ReconcileContext,
+        context: &ReconcileContext,
         resource: &ResourceSnapshot,
         dependencies: &[DependencySnapshot],
     ) -> Result<ReconcilePlan, Self::Error> {
@@ -1616,20 +1761,28 @@ impl ResourceReconciler for ProcessResourceReconciler {
                 ReconcilePlan::new(Vec::new(), false).expect("ephemeral cleanup plan is bounded")
             );
         }
-        if !self.needs_effect(&stored, &provider_ref, &process) {
+        if self.observation_required(&stored) {
+            return Ok(self.observation_plan());
+        }
+        if !self.needs_effect(
+            &stored,
+            &provider_ref,
+            &process,
+            context.reasons().contains(CoreTriggerReason::RetryDue),
+        ) {
             return Ok(self.no_op());
         }
-        Ok(self.effect_plan())
+        Ok(self.effect_plan(&stored))
     }
 
     fn reconcile(
         &self,
-        _context: &ReconcileContext,
+        context: &ReconcileContext,
         resource: &ResourceSnapshot,
         _dependencies: &[DependencySnapshot],
         _plan: &ReconcilePlan,
     ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
-        let result = (|| {
+        let result = async {
             let Some((stored, provider_ref, process)) = self.desired(resource)? else {
                 return Ok(ReconcileResult::converged(
                     resource.revision(),
@@ -1691,12 +1844,15 @@ impl ResourceReconciler for ProcessResourceReconciler {
                 )
                 .map_err(|_| ProcessResourceRuntimeError::InvalidResource);
             }
+            if self.observation_required(&stored) {
+                return self.observe_liveness(context, resource).await;
+            }
             Ok(ReconcileResult::converged(
                 resource.revision(),
                 resource.generation(),
             ))
-        })();
-        std::future::ready(result)
+        };
+        result
     }
 
     fn execute_effect(
@@ -1715,126 +1871,43 @@ impl ResourceReconciler for ProcessResourceReconciler {
             };
             let mut runtime = self.runtime.for_pass();
             runtime.without_status_client();
-            // A persisted Ready identity is checked by the declared
-            // adoption-backed repair probe before any replacement launch.
-            let observe_only = status_phase(&record.resource) == Some(ResourcePhase::Ready)
-                && status_observed_generation(&record.resource) == Some(record.resource.generation)
-                && status_has_started_at(&record.resource);
-            let (phase, outcome, restart_count) = if observe_only {
-                match runtime.observe_existing_record(&record).await? {
-                    ExistingProcessState::Alive => {
-                        return Ok(ReconcileResult::converged(
-                            resource.revision(),
-                            resource.generation(),
-                        ));
-                    }
-                    ExistingProcessState::Ambiguous => (
-                        ResourcePhase::Failed,
-                        OutcomeState::failure(
-                            "identity-ambiguous",
-                            "provider identity could not be verified safely",
-                        ),
-                        persisted_restart_count(&record.resource, &record.process),
-                    ),
-                    ExistingProcessState::Exited => {
-                        let restart_count =
-                            persisted_restart_count(&record.resource, &record.process);
-                        match &record.process {
-                            DesiredProcess::Ephemeral(_) => (
-                                ResourcePhase::Succeeded,
-                                OutcomeState::success(
-                                    "process-exited",
-                                    "ephemeral process reached a terminal exit",
-                                ),
-                                restart_count,
-                            ),
-                            DesiredProcess::Process(_)
-                                if process_restart_allowed(&record.process, restart_count) =>
-                            {
-                                let next_restart_count = restart_count.saturating_add(1);
-                                runtime
-                                    .restart_counts
-                                    .insert(record.resource.resource_ref.clone(), next_restart_count);
-                                let delay =
-                                    restart_delay(&record.process, next_restart_count);
-                                if delay.is_zero() {
-                                    runtime.launch_record(&record).await?;
-                                    (
-                                        ResourcePhase::Ready,
-                                        OutcomeState::success(
-                                            "process-restarted",
-                                            "process exited and was restarted",
-                                        ),
-                                        next_restart_count,
-                                    )
-                                } else {
-                                    (
-                                        ResourcePhase::Degraded,
-                                        OutcomeState::retry(
-                                            "process-exited",
-                                            "process exited and is awaiting restart",
-                                            delay,
-                                        ),
-                                        next_restart_count,
-                                    )
-                                }
-                            }
-                            DesiredProcess::Process(_) => (
-                                ResourcePhase::Succeeded,
-                                OutcomeState::success(
-                                    "process-exited",
-                                    "process reached a terminal exit",
-                                ),
-                                restart_count,
-                            ),
-                        }
-                    }
-                }
-            } else {
-                runtime.reconcile(vec![record.resource.clone()]).await?;
-                let adopted = runtime.last_adopted().unwrap_or(false);
-                let active = runtime.providers.has_active_resource_in_zone(
-                    &runtime.zone,
-                    runtime.zone_uid.as_ref(),
-                    &record.resource.resource_ref,
-                );
-                let restart_count = runtime
-                    .restart_counts
-                    .get(&record.resource.resource_ref)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        persisted_restart_count(&record.resource, &record.process)
-                    });
-                let (phase, outcome) = match &record.process {
-                    DesiredProcess::Process(spec)
-                        if spec.desired_lifecycle()
-                            == d2b_contracts_resource::v3::process::DesiredLifecycle::Stopped =>
-                    {
-                        (
-                            ResourcePhase::Succeeded,
-                            OutcomeState::success(
-                                "process-stopped",
-                                "process lifecycle is stopped",
-                            ),
-                        )
-                    }
-                    DesiredProcess::Ephemeral(_) if !active => (
+            runtime.reconcile(vec![record.resource.clone()]).await?;
+            let adopted = runtime.last_adopted().unwrap_or(false);
+            let active = runtime.providers.has_active_resource_in_zone(
+                &runtime.zone,
+                runtime.zone_uid.as_ref(),
+                &record.resource.resource_ref,
+            );
+            let restart_count = runtime
+                .restart_counts
+                .get(&record.resource.resource_ref)
+                .copied()
+                .unwrap_or_else(|| persisted_restart_count(&record.resource, &record.process));
+            let (phase, outcome) = match &record.process {
+                DesiredProcess::Process(spec)
+                    if spec.desired_lifecycle()
+                        == d2b_contracts_resource::v3::process::DesiredLifecycle::Stopped =>
+                {
+                    (
                         ResourcePhase::Succeeded,
-                        OutcomeState::success(
-                            "process-exited",
-                            "ephemeral process reached a terminal exit",
-                        ),
+                        OutcomeState::success("process-stopped", "process lifecycle is stopped"),
+                    )
+                }
+                DesiredProcess::Ephemeral(_) if !active => (
+                    ResourcePhase::Succeeded,
+                    OutcomeState::success(
+                        "process-exited",
+                        "ephemeral process reached a terminal exit",
                     ),
-                    _ if active => (ResourcePhase::Ready, OutcomeState::ready(adopted)),
-                    _ => (
-                        ResourcePhase::Failed,
-                        OutcomeState::failure(
-                            "provider-start-failed",
-                            "the Provider did not retain a verified process identity",
-                        ),
+                ),
+                _ if active => (ResourcePhase::Ready, OutcomeState::ready(adopted)),
+                _ => (
+                    ResourcePhase::Failed,
+                    OutcomeState::failure(
+                        "provider-start-failed",
+                        "the Provider did not retain a verified process identity",
                     ),
-                };
-                (phase, outcome, restart_count)
+                ),
             };
             let canonical = status_payload(&record, phase, restart_count, Some(outcome))?;
             let status = status_candidate_from_resource(&canonical)?;
@@ -1855,13 +1928,15 @@ impl ResourceReconciler for ProcessResourceReconciler {
 
     fn observe(
         &self,
-        _context: &ReconcileContext,
+        context: &ReconcileContext,
         resource: &ResourceSnapshot,
     ) -> impl Future<Output = Result<ObservationResult, Self::Error>> + Send {
-        std::future::ready(Ok(ObservationResult::new(ReconcileResult::converged(
-            resource.revision(),
-            resource.generation(),
-        ))))
+        let result = async {
+            Ok(ObservationResult::new(
+                self.observe_liveness(context, resource).await?,
+            ))
+        };
+        result
     }
 
     fn finalize(
@@ -2187,6 +2262,10 @@ fn status_restart_count(resource: &StoredResource) -> u32 {
         Some(CanonicalJsonValue::Integer(count)) => u32::try_from(*count).unwrap_or(0),
         _ => 0,
     }
+}
+
+fn lifecycle_effect_id(resource: &StoredResource) -> String {
+    format!("process-lifecycle-restart-{}", status_restart_count(resource))
 }
 
 fn restart_count_reset_due(resource: &StoredResource, process: &DesiredProcess) -> bool {
@@ -2846,7 +2925,7 @@ fn process_operation_id(record: &DesiredRecord, action: &str) -> String {
     };
     let digest = Sha256::digest(
         format!(
-            "d2bd:process-lifecycle:v4:{action}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "d2bd:process-lifecycle:v5:{action}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             record.resource.zone.as_str(),
             record.key().to_canonical_string(),
             record.resource.uid.as_str(),
@@ -2880,6 +2959,7 @@ fn process_operation_id(record: &DesiredRecord, action: &str) -> String {
                 .controller_provider_generation
                 .map(|value| value.get().to_string())
                 .unwrap_or_else(|| "unbound".to_owned()),
+            status_restart_count(&record.resource),
         )
         .as_bytes(),
     );
@@ -2940,13 +3020,6 @@ fn controller_requires_stop(record: &DesiredRecord, bootstrap_present: bool) -> 
 enum StartRecordEffect {
     StopAndFinalize,
     Launch,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExistingProcessState {
-    Alive,
-    Exited,
-    Ambiguous,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4725,15 +4798,22 @@ pub(crate) async fn run_guest_process_reconciliation(
         Ok(descriptor) => descriptor,
         Err(_) => return,
     };
-    let handler = ProcessResourceReconciler::new(descriptor.clone(), runtime);
+    let target = runtime.target.clone();
     let api = GuestProcessSource::new(
         zone,
-        handler.runtime.target.clone(),
+        target,
         guest_execution,
         store,
         client,
     );
     let source = d2b_core_controller::CoreControllerSource::new(descriptor.clone(), api);
+    let wake_source = Arc::downgrade(&source);
+    runtime.set_liveness_waker(Arc::new(move |key, revision| {
+        if let Some(source) = wake_source.upgrade() {
+            let _ = source.dispatch_observation(key, revision);
+        }
+    }));
+    let handler = ProcessResourceReconciler::new(descriptor.clone(), runtime);
     let runner = d2b_core_controller::Runner::new(
         handler,
         source,
@@ -5091,6 +5171,21 @@ mod tests {
         assert_ne!(
             process_mutation_operation_id(&first, "status"),
             process_mutation_operation_id(&second, "status")
+        );
+    }
+
+    #[test]
+    fn restart_launch_effect_identity_changes_after_persisted_exit() {
+        let mut first = identity_record(3);
+        first.resource.canonical_json =
+            br#"{"status":{"resource":{"restartCount":0}}}"#.to_vec();
+        let mut restarted = identity_record(9);
+        restarted.resource.canonical_json =
+            br#"{"status":{"resource":{"restartCount":1}}}"#.to_vec();
+        assert_eq!(lifecycle_effect_id(&first.resource), "process-lifecycle-restart-0");
+        assert_eq!(
+            lifecycle_effect_id(&restarted.resource),
+            "process-lifecycle-restart-1"
         );
     }
 

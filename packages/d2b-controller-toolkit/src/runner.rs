@@ -1,6 +1,7 @@
 //! Store-watch driven async controller loop.
 
 use std::{
+    collections::HashSet,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -862,6 +863,8 @@ where
             shutdown.clone(),
         );
         let mut watch_closed = false;
+        let mut requeues = JoinSet::<(ResourceKey, ZoneRevision, OperationContext)>::new();
+        let mut scheduled_keys = HashSet::new();
 
         loop {
             while let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() {
@@ -904,8 +907,9 @@ where
                 );
             }
 
-            if watch_closed && workers.is_empty() && queue.is_empty() {
+            if watch_closed && workers.is_empty() && queue.is_empty() && requeues.is_empty() {
                 watchers.shutdown().await;
+                requeues.shutdown().await;
                 return Ok(());
             }
 
@@ -914,14 +918,26 @@ where
                 _ = shutdown.cancelled() => {
                     workers.shutdown().await;
                     watchers.shutdown().await;
+                    requeues.shutdown().await;
                     return Err(RunnerError::Cancelled);
                 }
                 completion = workers.join_next(), if !workers.is_empty() => {
                     let completion = completion.ok_or(RunnerError::TaskFailed)??;
                     let key = completion.work.key().clone();
                     match completion.outcome {
-                        WorkerOutcome::Done { checkpointed, status_pending } => {
+                        WorkerOutcome::Done { checkpointed, status_pending, requeue_at } => {
                             queue.finish(&key)?;
+                            if let Some(at_tick) = requeue_at {
+                                if scheduled_keys.insert(key.clone()) {
+                                    let clock = Arc::clone(&self.clock);
+                                    let operation = completion.work.operation().clone();
+                                    let revision = completion.work.high_water_revision();
+                                    requeues.spawn(async move {
+                                        clock.sleep_until(at_tick).await;
+                                        (key, revision, operation)
+                                    });
+                                }
+                            }
                             report.checkpointed += usize::from(checkpointed);
                             report.committed_status_pending += usize::from(status_pending);
                         }
@@ -1009,6 +1025,37 @@ where
                             queue.finish(&key)?;
                             return Err(RunnerError::Source(error));
                         }
+                    }
+                    observe_gauge(
+                        self.observer.as_ref(),
+                        queue.resource_count(),
+                        workers.len(),
+                    );
+                }
+                scheduled = requeues.join_next(), if !requeues.is_empty() => {
+                    let (key, revision, operation) = scheduled
+                        .ok_or(RunnerError::TaskFailed)?
+                        .map_err(|_| RunnerError::TaskFailed)?;
+                    let hint = QueueHint::new(
+                        key.clone(),
+                        revision,
+                        TriggerSet::new([TriggerReason::RetryDue]),
+                        PriorityLane::Ordinary,
+                        operation.clone(),
+                    )?;
+                    match queue.push(hint) {
+                        Ok(_) => {
+                            scheduled_keys.remove(&key);
+                        }
+                        Err(QueueError::Backpressure) => {
+                            let clock = Arc::clone(&self.clock);
+                            requeues.spawn(async move {
+                                let retry_at = clock.now_tick().saturating_add(1);
+                                clock.sleep_until(retry_at).await;
+                                (key, revision, operation)
+                            });
+                        }
+                        Err(error) => return Err(error.into()),
                     }
                     observe_gauge(
                         self.observer.as_ref(),
@@ -1232,6 +1279,7 @@ enum WorkerOutcome {
     Done {
         checkpointed: bool,
         status_pending: bool,
+        requeue_at: Option<u64>,
     },
     Retry {
         revision: ZoneRevision,
@@ -1263,6 +1311,7 @@ impl OwnedWorkers {
         self.cancellations.push(cancellation.clone());
         self.tasks.spawn(async move {
             let _permit = permit;
+            let now_tick = runtime.clock.now_tick();
             let deadline_tick =
                 phase_deadline(runtime.clock.as_ref(), runtime.config.deadline_tick);
             let work_config = RunnerConfig {
@@ -1280,6 +1329,7 @@ impl OwnedWorkers {
                     work_config,
                     &work,
                     cancellation.clone(),
+                    now_tick,
                 ),
             )
             .await
@@ -1525,6 +1575,7 @@ async fn execute_work_inner<R, S>(
     config: RunnerConfig,
     work: &QueuedWork,
     cancellation: Cancellation,
+    now_tick: u64,
 ) -> WorkerOutcome
 where
     R: ResourceReconciler,
@@ -1575,6 +1626,7 @@ where
             work.high_water_revision().max(target.revision()),
             work.operation().clone(),
             work.attempt(),
+            now_tick,
             config.deadline_tick,
             cancellation.clone(),
             config.policy_revision,
@@ -1590,6 +1642,7 @@ where
             work.high_water_revision().max(target.revision()),
             work.operation().clone(),
             work.attempt(),
+            now_tick,
             config.deadline_tick,
             cancellation,
             config.policy_revision,
@@ -1667,6 +1720,7 @@ where
                 return WorkerOutcome::Done {
                     checkpointed: false,
                     status_pending: false,
+                    requeue_at: None,
                 };
             }
             Err(error) => return WorkerOutcome::SourceFailed(error),
@@ -2009,6 +2063,7 @@ where
         }
     }
 
+    let requeue_at = result.next_tick();
     if result.requires_commit() {
         match source.commit_result(context, &result).await {
             Ok(CommitOutcome::Committed(revision)) => {
@@ -2032,6 +2087,7 @@ where
                 return WorkerOutcome::Done {
                     checkpointed: true,
                     status_pending: false,
+                    requeue_at,
                 };
             }
             Ok(CommitOutcome::CommittedStatusPending(revision)) => {
@@ -2061,6 +2117,7 @@ where
                 return WorkerOutcome::Done {
                     checkpointed: true,
                     status_pending: true,
+                    requeue_at,
                 };
             }
             Ok(CommitOutcome::Conflict(revision)) | Err(SourceError::Conflict(revision)) => {
@@ -2081,11 +2138,6 @@ where
             return WorkerOutcome::SourceFailed(error);
         }
     }
-    if let Some(next_tick) = result.next_tick()
-        && let Err(error) = source.schedule_requeue(context.target(), next_tick).await
-    {
-        return WorkerOutcome::SourceFailed(error);
-    }
     if result.disposition().is_terminal()
         || result.next_tick().is_some()
         || result.disposition() == ReconcileDisposition::Pending
@@ -2099,6 +2151,7 @@ where
         return WorkerOutcome::Done {
             checkpointed: true,
             status_pending: false,
+            requeue_at,
         };
     }
     if result.disposition() == ReconcileDisposition::FailedRetryable {
@@ -2110,6 +2163,7 @@ where
     WorkerOutcome::Done {
         checkpointed: false,
         status_pending: false,
+        requeue_at: None,
     }
 }
 
@@ -2598,10 +2652,11 @@ mod tests {
                 )
                 .map_err(|_| FakeError);
             }
-            let requeue_at = *self
+            let requeue_at = self
                 .requeue_at
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
             if let Some(next_tick) = requeue_at {
                 return ReconcileResult::new(
                     resource.revision(),
@@ -3594,6 +3649,7 @@ mod tests {
             target_snapshot.revision(),
             OperationContext::new("mutation", "mutation", "mutation", None).unwrap(),
             1,
+            0,
             30_000,
             Cancellation::default(),
             1,
@@ -3634,7 +3690,8 @@ mod tests {
             outcome,
             WorkerOutcome::Done {
                 checkpointed: true,
-                status_pending: true
+                status_pending: true,
+                requeue_at: None,
             }
         ));
         assert_eq!(source.commits.load(Ordering::SeqCst), 1);
@@ -3801,7 +3858,7 @@ mod tests {
     }
 
     #[test]
-    fn requeue_at_uses_source_scheduler_and_terminal_checkpoint() {
+    fn requeue_at_uses_runner_scheduler_and_terminal_checkpoint() {
         let target = key("app", 1);
         let (reconciler, _entered, source, watch_tx) = harness(vec![target], 1);
         reconciler.block_handlers.store(false, Ordering::SeqCst);
@@ -3813,9 +3870,10 @@ mod tests {
         watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
 
         let report = runner.join().unwrap().unwrap();
-        assert_eq!(source.requeues.load(Ordering::SeqCst), 1);
-        assert_eq!(source.checkpoints.load(Ordering::SeqCst), 1);
-        assert_eq!(report.checkpointed, 1);
+        assert_eq!(source.requeues.load(Ordering::SeqCst), 0);
+        assert_eq!(source.checkpoints.load(Ordering::SeqCst), 2);
+        assert_eq!(report.checkpointed, 2);
+        assert_eq!(report.dispatched, 2);
     }
 
     #[test]

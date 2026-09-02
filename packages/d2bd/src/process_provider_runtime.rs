@@ -25,6 +25,7 @@ use d2b_core::{
     bundle_resolver::BundleResolver,
     processes::{ProcessNode, ProcessRole},
 };
+use d2b_core_controller::ResourceKey;
 use d2b_process_conformance::{
     AdoptionCandidate, AdoptionOutcome, CompiledDigests, ConfigurationDigest,
     GuestExecutionBinding, IdentityBinding, LaunchTicket, OperationBinding,
@@ -53,6 +54,7 @@ pub(crate) const GUEST_EXECUTION_UNAVAILABLE: &str = "provider-ticket:guest-exec
 
 type BrokerProcessSupervisor = ProviderSupervisor<BrokerProcessBackend<BundleBackedLaunchResolver>>;
 type BrokerSystemdSupervisor = ProviderSupervisor<SystemdProcessBackend<BrokerSystemdEffectOwner>>;
+const RESOURCE_WAITER_POLL: Duration = Duration::from_millis(250);
 
 /// Probe the host posture needed by the daemon-owned minijail Provider.
 ///
@@ -113,6 +115,33 @@ enum ManagedProvider {
     Systemd,
 }
 
+enum Waiter {
+    Minijail(BrokerProcessSupervisor),
+    Systemd(BrokerSystemdSupervisor),
+}
+
+impl Waiter {
+    async fn wait(
+        self,
+        identity: ProcessIdentityDigest,
+    ) -> Result<(), ProcessConformanceError> {
+        loop {
+            let done = match &self {
+                Self::Minijail(supervisor) => {
+                    supervisor.wait_identity(&identity, RESOURCE_WAITER_POLL).await?
+                }
+                Self::Systemd(supervisor) => {
+                    supervisor.wait_identity(&identity, RESOURCE_WAITER_POLL).await?
+                }
+            };
+            if done {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ManagedProcess {
     provider: ManagedProvider,
@@ -147,6 +176,7 @@ impl core::fmt::Debug for ManagedResource {
 }
 
 type ManagedResourceKey = (ZoneId, Option<ResourceUid>, ResourceRef);
+type ResourceWaiterKey = (ManagedResourceKey, ProcessIdentityDigest);
 
 fn resource_identity_matches(
     managed: &ManagedResource,
@@ -608,6 +638,7 @@ pub struct ProductionProcessProviders {
     fixed_effect: FixedEffectAdapter,
     managed: Mutex<BTreeMap<(String, String), ManagedProcess>>,
     managed_resources: Mutex<BTreeMap<ManagedResourceKey, ManagedResource>>,
+    resource_waiters: Arc<Mutex<BTreeSet<ResourceWaiterKey>>>,
     controller_bootstrap: Mutex<BTreeMap<(ZoneId, ResourceRef), ControllerBootstrapMarker>>,
 }
 
@@ -677,6 +708,7 @@ impl ProductionProcessProviders {
             fixed_effect,
             managed: Mutex::new(BTreeMap::new()),
             managed_resources: Mutex::new(BTreeMap::new()),
+            resource_waiters: Arc::new(Mutex::new(BTreeSet::new())),
             controller_bootstrap: Mutex::new(BTreeMap::new()),
         }
     }
@@ -1422,6 +1454,72 @@ impl ProductionProcessProviders {
             Err(error) if error == "pidfd-unavailable" => Err(error),
             Err(error) => Err(error),
         }
+    }
+
+    pub(crate) fn spawn_resource_waiter(
+        &self,
+        context: &ProcessResourceContext<'_>,
+        identity: ProcessIdentityDigest,
+        waker: Arc<dyn Fn(ResourceKey, ZoneRevision) + Send + Sync>,
+    ) -> Result<(), String> {
+        let managed = self
+            .managed_resources
+            .lock()
+            .map_err(|_| "provider-managed-state-poisoned".to_owned())?
+            .get(&(
+                context.zone.clone(),
+                context.zone_uid.clone(),
+                context.resource_ref.clone(),
+            ))
+            .cloned()
+            .ok_or_else(|| "provider-process-not-found".to_owned())?;
+        let mismatches = resource_identity_mismatches(&managed, context);
+        if !mismatches.is_empty() {
+            return Err(identity_changed_error(mismatches));
+        }
+        if managed.identity != identity {
+            return Err(identity_changed_error(vec![
+                "process_identity".to_owned(),
+            ]));
+        }
+        let waiter_key = (
+            (
+                context.zone.clone(),
+                context.zone_uid.clone(),
+                context.resource_ref.clone(),
+            ),
+            identity,
+        );
+        {
+            let mut waiters = self
+                .resource_waiters
+                .lock()
+                .map_err(|_| "provider-managed-state-poisoned".to_owned())?;
+            if !waiters.insert(waiter_key.clone()) {
+                return Ok(());
+            }
+        }
+        let waiter = match managed.provider {
+            ManagedProvider::Minijail => Waiter::Minijail(self.minijail.port().clone()),
+            ManagedProvider::Systemd => Waiter::Systemd(self.systemd.port().clone()),
+        };
+        let resource_waiters = Arc::clone(&self.resource_waiters);
+        let key = ResourceKey::new(
+            context.zone.clone(),
+            context.resource_ref.clone(),
+            context.resource_uid.clone(),
+        );
+        let revision = context.resource_revision;
+        tokio::spawn(async move {
+            if let Err(error) = waiter.wait(identity).await {
+                tracing::debug!(error = %error, "Process identity waiter ended before exit wake");
+            }
+            if let Ok(mut waiters) = resource_waiters.lock() {
+                waiters.remove(&waiter_key);
+            }
+            waker(key, revision);
+        });
+        Ok(())
     }
 
     /// Return whether a generic resource retains a verified identity.

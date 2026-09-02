@@ -380,6 +380,29 @@ impl<B: ProcessEffectBackend> ProviderSupervisor<B> {
         }
     }
 
+    /// Wait for one retained exact identity to exit without exposing its
+    /// local authority to the Provider. `Ok(false)` means the bounded wait
+    /// elapsed without a terminal signal.
+    pub async fn wait_identity(
+        &self,
+        identity: &ProcessIdentityDigest,
+        timeout: Duration,
+    ) -> Result<bool, ProcessConformanceError> {
+        let handle = self.handle(identity).map_err(map_error)?;
+        match self
+            .blocking(timeout, move |backend| backend.wait(handle.as_ref(), timeout))
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(
+                ProcessEffectError::StopFailed
+                | ProcessEffectError::DeadlineExceeded
+                | ProcessEffectError::Busy,
+            ) => Ok(false),
+            Err(error) => Err(map_error(error)),
+        }
+    }
+
     /// Take the Provider-controller bootstrap endpoint retained with one handle.
     pub async fn take_controller_bootstrap(
         &self,

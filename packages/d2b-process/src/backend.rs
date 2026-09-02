@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::os::fd::OwnedFd;
+use std::time::Duration;
 
 use d2b_process_conformance::{
     LaunchTicket, MAX_INHERITED_FDS, ObservedIdentity, ProcessConformanceError,
@@ -296,6 +297,19 @@ pub trait ProcessEffectBackend: Send + Sync + 'static {
         &self,
         observation: BackendObservation,
     ) -> Result<Self::Handle, ProcessEffectError>;
+
+    /// Wait for the exact local authority to become readable.
+    ///
+    /// This observes process termination without exposing the descriptor to
+    /// Provider code. Service-manager owners may use the same readiness
+    /// signal without taking ownership of reap.
+    fn wait(
+        &self,
+        _handle: &Self::Handle,
+        _timeout: Duration,
+    ) -> Result<(), ProcessEffectError> {
+        Err(ProcessEffectError::PidfdUnavailable)
+    }
 
     /// Take a broker-retained Provider-controller bootstrap endpoint.
     fn take_controller_bootstrap(

@@ -326,6 +326,7 @@ pub struct ReconcileContext {
     high_water_revision: ZoneRevision,
     operation: OperationContext,
     attempt: u32,
+    now_tick: u64,
     deadline_tick: u64,
     cancellation: Cancellation,
     policy_revision: u64,
@@ -344,6 +345,7 @@ impl ReconcileContext {
         high_water_revision: ZoneRevision,
         operation: OperationContext,
         attempt: u32,
+        now_tick: u64,
         deadline_tick: u64,
         cancellation: Cancellation,
         policy_revision: u64,
@@ -358,6 +360,7 @@ impl ReconcileContext {
             high_water_revision,
             operation,
             attempt,
+            now_tick,
             deadline_tick,
             cancellation,
             policy_revision,
@@ -376,6 +379,7 @@ impl ReconcileContext {
         high_water_revision: ZoneRevision,
         operation: OperationContext,
         attempt: u32,
+        now_tick: u64,
         deadline_tick: u64,
         cancellation: Cancellation,
         policy_revision: u64,
@@ -390,6 +394,7 @@ impl ReconcileContext {
             high_water_revision,
             operation,
             attempt,
+            now_tick,
             deadline_tick,
             cancellation,
             policy_revision,
@@ -408,6 +413,7 @@ impl ReconcileContext {
         high_water_revision: ZoneRevision,
         operation: OperationContext,
         attempt: u32,
+        now_tick: u64,
         deadline_tick: u64,
         cancellation: Cancellation,
         policy_revision: u64,
@@ -434,6 +440,7 @@ impl ReconcileContext {
             high_water_revision,
             operation,
             attempt,
+            now_tick,
             deadline_tick,
             cancellation,
             policy_revision,
@@ -504,6 +511,11 @@ impl ReconcileContext {
         self.attempt
     }
 
+    /// Return the monotonic tick at which this worker began.
+    pub const fn now_tick(&self) -> u64 {
+        self.now_tick
+    }
+
     /// Return the monotonic deadline tick.
     pub const fn deadline_tick(&self) -> u64 {
         self.deadline_tick
@@ -553,6 +565,7 @@ impl core::fmt::Debug for ReconcileContext {
             .field("high_water_revision", &self.high_water_revision)
             .field("operation", &self.operation)
             .field("attempt", &self.attempt)
+            .field("now_tick", &self.now_tick)
             .field("deadline_tick", &self.deadline_tick)
             .field("cancellation", &self.cancellation)
             .field("policy_revision", &self.policy_revision)
@@ -645,6 +658,7 @@ mod tests {
             ZoneRevision::new(4),
             operation(),
             1,
+            0,
             20,
             Cancellation::default(),
             5,
@@ -710,6 +724,7 @@ mod tests {
             ZoneRevision::new(4),
             operation(),
             1,
+            0,
             20,
             Cancellation::default(),
             5,
@@ -787,6 +802,7 @@ mod tests {
             OperationContext::new(OPERATION, OPERATION, OPERATION, Some(OPERATION.to_owned()))
                 .unwrap(),
             1,
+            0,
             20,
             Cancellation::default(),
             5,
