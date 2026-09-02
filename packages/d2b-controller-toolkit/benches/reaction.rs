@@ -1435,7 +1435,6 @@ async fn run_core_profile(profile: usize) {
     let metrics = Arc::new(ReactionMetrics::new());
     let observer_metrics = Arc::clone(&metrics);
     let checkpoint_metrics = Arc::clone(&metrics);
-    let handoff_metrics = Arc::clone(&metrics);
     let api = fixture
         .core_registered_api()
         .with_assignment_fence_resolver(fixture.durable_core_assignment_resolver())
@@ -1444,16 +1443,6 @@ async fn run_core_profile(profile: usize) {
         }))
         .with_checkpoint_observer(Arc::new(move |_| {
             checkpoint_metrics.record_checkpoint();
-        }))
-        .with_watch_change_observer(Arc::new(move |change| {
-            // The Core handler-start boundary is the durable change handoff;
-            // fresh reads and effects remain on the measured production path.
-            if change
-                .reasons
-                .contains(&d2b_core_controller::CoreTriggerReason::SpecGenerationChanged)
-            {
-                handoff_metrics.record_handler_key_at(&change.target, Instant::now());
-            }
         }));
     let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
     source
@@ -1484,7 +1473,7 @@ async fn run_core_profile(profile: usize) {
         descriptor: descriptor.clone(),
         provider,
         metrics: Arc::clone(&metrics),
-        measure_handler_start: false,
+        measure_handler_start: true,
         effect_id: "process-launch",
         status_only: false,
         seed_batches: None,
