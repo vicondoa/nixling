@@ -80,6 +80,35 @@ where
                 CredentialServiceErrorCode::OperationDenied,
             )));
         }
+        let expected_provider = self
+            .route
+            .provider_ref()
+            .map(d2b_contracts_resource::v3::ResourceRef::to_canonical_string);
+        if metadata_value(&request, "d2b.credential.zone") != Some(self.route.zone().as_str())
+            || metadata_value(&request, "d2b.credential.provider")
+                != expected_provider.as_deref()
+            || metadata_value(&request, "d2b.credential.session-generation")
+                .and_then(|value| value.parse::<u64>().ok())
+                != Some(self.route.reconnect_generation().get())
+            || metadata_value(&request, "d2b.credential.uid")
+                .and_then(|value| {
+                    d2b_contracts_resource::v3::ResourceUid::parse(value.to_owned()).ok()
+                })
+                .is_none()
+            || metadata_value(&request, "d2b.credential.generation")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_none_or(|value| value == 0)
+            || metadata_value(&request, "d2b.credential.provider-generation")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_none_or(|value| value == 0)
+            || metadata_value(&request, "d2b.credential.controller-generation")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_none_or(|value| value == 0)
+        {
+            return Err(rpc_error(CredentialServiceError::new(
+                CredentialServiceErrorCode::OperationDenied,
+            )));
+        }
         let request = decode_outer::<CredentialRequest>(&request.payload).map_err(rpc_error)?;
         let authorization = self
             .authorizer
@@ -108,6 +137,14 @@ where
         response.payload = payload;
         Ok(response)
     }
+}
+
+fn metadata_value<'a>(request: &'a ttrpc::Request, key: &str) -> Option<&'a str> {
+    request
+        .metadata
+        .iter()
+        .find(|value| value.key == key)
+        .map(|value| value.value.as_str())
 }
 
 /// Build the typed Credential service map for an authenticated route.
@@ -162,6 +199,9 @@ where
     P: CredentialProvider + 'static,
     A: CredentialAuthorizationSource,
 {
+    if session.route_binding().service().as_str() != "d2b.credential.v3" {
+        return Err(ProviderRuntimeError::SessionUnauthenticated);
+    }
     entrypoint
         .publish_authenticated_ready(&registration, session_admission, &session)
         .map_err(|_| ProviderRuntimeError::NotAccepting)?;
@@ -260,6 +300,43 @@ mod tests {
         ttrpc::Request {
             service: CREDENTIAL_SERVICE.to_owned(),
             method: "RevokeToken".to_owned(),
+            metadata: vec![
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.zone".to_owned(),
+                    value: "dev".to_owned(),
+                    ..Default::default()
+                },
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.provider".to_owned(),
+                    value: "Provider/credential-managed-identity".to_owned(),
+                    ..Default::default()
+                },
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.uid".to_owned(),
+                    value: "123e4567-e89b-42d3-a456-426614174000".to_owned(),
+                    ..Default::default()
+                },
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.generation".to_owned(),
+                    value: "1".to_owned(),
+                    ..Default::default()
+                },
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.provider-generation".to_owned(),
+                    value: "1".to_owned(),
+                    ..Default::default()
+                },
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.controller-generation".to_owned(),
+                    value: "1".to_owned(),
+                    ..Default::default()
+                },
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.session-generation".to_owned(),
+                    value: "7".to_owned(),
+                    ..Default::default()
+                },
+            ],
             payload: encode_outer(&typed).unwrap(),
             ..Default::default()
         }

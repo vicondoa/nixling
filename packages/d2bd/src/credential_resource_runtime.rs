@@ -294,6 +294,8 @@ impl CredentialSession for ComponentCredentialSession {
         if request.credential_ref.resource_type().as_str() != CREDENTIAL_RESOURCE_TYPE
             || &request.zone != self.route.zone()
             || &request.provider_ref != provider_ref
+            || self.route.provider_generation() != Some(request.provider_generation)
+            || self.route.controller_generation() != Some(request.controller_generation)
             || request.session_generation != self.route.reconnect_generation()
         {
             return Err(CredentialResourceRuntimeError::InvalidResource);
@@ -326,6 +328,43 @@ impl CredentialSession for ComponentCredentialSession {
         rpc.set_method("RevokeToken".to_owned());
         rpc.timeout_nano = i64::try_from(request.deadline_ms.saturating_mul(1_000_000))
             .unwrap_or(i64::MAX);
+        rpc.metadata = vec![
+            ttrpc::proto::KeyValue {
+                key: "d2b.credential.zone".to_owned(),
+                value: request.zone.as_str().to_owned(),
+                ..Default::default()
+            },
+            ttrpc::proto::KeyValue {
+                key: "d2b.credential.provider".to_owned(),
+                value: request.provider_ref.to_canonical_string(),
+                ..Default::default()
+            },
+            ttrpc::proto::KeyValue {
+                key: "d2b.credential.uid".to_owned(),
+                value: request.credential_uid.as_str().to_owned(),
+                ..Default::default()
+            },
+            ttrpc::proto::KeyValue {
+                key: "d2b.credential.generation".to_owned(),
+                value: request.credential_generation.get().to_string(),
+                ..Default::default()
+            },
+            ttrpc::proto::KeyValue {
+                key: "d2b.credential.provider-generation".to_owned(),
+                value: request.provider_generation.get().to_string(),
+                ..Default::default()
+            },
+            ttrpc::proto::KeyValue {
+                key: "d2b.credential.controller-generation".to_owned(),
+                value: request.controller_generation.get().to_string(),
+                ..Default::default()
+            },
+            ttrpc::proto::KeyValue {
+                key: "d2b.credential.session-generation".to_owned(),
+                value: request.session_generation.get().to_string(),
+                ..Default::default()
+            },
+        ];
         rpc.payload = encode_outer(&typed)
             .map_err(|_| CredentialResourceRuntimeError::Revocation)?;
         let response = match self.client.client().request(rpc).await {
