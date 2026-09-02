@@ -171,3 +171,19 @@ fn stale_binding_assignment_quarantines_completion_before_release() {
     );
     assert_eq!(port.releases, 0);
 }
+
+#[test]
+fn security_key_runner_contract_disables_legacy_scheduling() {
+    let contract = d2b_provider_device_security_key::security_key_runner_contract();
+    assert_eq!(
+        contract.service_resource_type(),
+        d2b_provider_device_security_key::SECURITY_KEY_SERVICE_RESOURCE_TYPE
+    );
+    assert_eq!(
+        contract.binding_resource_type(),
+        d2b_provider_device_security_key::SECURITY_KEY_BINDING_RESOURCE_TYPE
+    );
+    assert!(contract.legacy_scheduler_disabled());
+    assert!(contract.watched_configuration_is_dependency());
+    assert!((30..=60).contains(&contract.repair_interval_secs()));
+}

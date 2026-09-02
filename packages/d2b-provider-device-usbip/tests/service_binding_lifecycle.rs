@@ -518,3 +518,19 @@ fn binding_admission_fences_stale_assignment_and_rejects_volume_ownership() {
         Err(d2b_provider_device_usbip::UsbipBindingControllerError::StaleAssignment)
     );
 }
+
+#[test]
+fn usbip_runner_contract_keeps_service_and_binding_on_one_runner() {
+    let contract = d2b_provider_device_usbip::usbip_runner_contract();
+    assert_eq!(
+        contract.service_resource_type(),
+        d2b_provider_device_usbip::USB_SERVICE_RESOURCE_TYPE
+    );
+    assert_eq!(
+        contract.binding_resource_type(),
+        d2b_provider_device_usbip::USB_BINDING_RESOURCE_TYPE
+    );
+    assert!(contract.legacy_scheduler_disabled());
+    assert!(contract.watched_configuration_is_dependency());
+    assert!((30..=60).contains(&contract.repair_interval_secs()));
+}

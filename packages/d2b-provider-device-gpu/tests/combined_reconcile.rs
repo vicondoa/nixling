@@ -462,3 +462,16 @@ fn gpu_upgrade_requires_dependents_to_drain_before_replacement() {
         Err(d2b_provider_device_gpu::GpuControllerError::DependenciesNotDrained)
     );
 }
+
+#[test]
+fn gpu_runner_contract_disables_legacy_scheduling() {
+    let contract = d2b_provider_device_gpu::gpu_runner_contract();
+    assert_eq!(contract.resource_type(), "Device");
+    assert_eq!(
+        contract.finalizer(),
+        d2b_provider_device_gpu::DEVICE_GPU_FINALIZER
+    );
+    assert!(contract.legacy_scheduler_disabled());
+    assert!(contract.watched_configuration_is_dependency());
+    assert!((30..=60).contains(&contract.repair_interval_secs()));
+}

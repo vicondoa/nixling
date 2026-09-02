@@ -61,6 +61,16 @@ fn repeated_reconcile_reuses_children_and_keeps_persistent_evidence() {
 }
 
 #[test]
+fn tpm_runner_contract_disables_legacy_scheduling() {
+    let contract = d2b_provider_device_tpm::tpm_runner_contract();
+    assert_eq!(contract.resource_type(), "Device");
+    assert_eq!(contract.finalizer(), d2b_provider_device_tpm::DEVICE_TPM_FINALIZER);
+    assert!(contract.legacy_scheduler_disabled());
+    assert!(contract.watched_configuration_is_dependency());
+    assert!((30..=60).contains(&contract.repair_interval_secs()));
+}
+
+#[test]
 fn controller_rejects_non_host_execution_refs() {
     let device = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
     let device_ref = ResourceRef::parse("Device/work-tpm").unwrap();
