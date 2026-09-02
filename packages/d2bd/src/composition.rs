@@ -16784,6 +16784,22 @@ async fn open_resource_plane(
             }
             return Err(error);
         }
+        if let Err(error) = runtime
+            .start_u7_controller_runners(Arc::new(state.clone()))
+            .await
+        {
+            tracing::error!(
+                zone = %runtime.zone().as_str(),
+                error = ?error,
+                "storage Provider runners refused during startup",
+            );
+            let _ = runtime.shutdown().await;
+            let _ = plane.shutdown().await;
+            while let Some((_, runtime, _)) = remaining.next() {
+                let _ = runtime.shutdown().await;
+            }
+            return Err(error);
+        }
         let _ = runtime.audio_binding_statuses();
         if let Err(error) = runtime.require_ready() {
             let _ = runtime.shutdown().await;

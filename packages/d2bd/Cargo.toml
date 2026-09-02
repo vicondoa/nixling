@@ -34,6 +34,7 @@ d2b-provider-supervisor = { path = "../d2b-provider-supervisor", version = "0.0.
 d2b-provider-activation-nixos = { path = "../d2b-provider-activation-nixos", version = "0.0.0-bootstrap" }
 d2b-provider-config-nixos = { path = "../d2b-provider-config-nixos", version = "0.0.0-bootstrap" }
 d2b-provider-volume-local = { path = "../d2b-provider-volume-local", version = "0.0.0-bootstrap" }
+d2b-provider-volume-virtiofs = { path = "../d2b-provider-volume-virtiofs", version = "0.0.0-bootstrap" }
 d2b-process = { path = "../d2b-process", version = "0.0.0-bootstrap" }
 d2b-process-conformance = { path = "../d2b-process-conformance", version = "0.0.0-bootstrap" }
 d2b-bus = { path = "../d2b-bus", version = "0.0.0-bootstrap" }

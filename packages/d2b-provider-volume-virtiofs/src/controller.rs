@@ -8,9 +8,35 @@ use d2b_contracts_resource::v3::execution_policy::BoundedToken;
 use d2b_contracts_resource::v3::volume::{ViewSpec, VolumeSpec};
 
 use crate::error::VirtiofsExportError;
-use crate::export::{EXPORT_FINALIZER, ExportSpec};
+use crate::export::{EXPORT_FINALIZER, EXPORT_RESOURCE_TYPE, ExportSpec};
 use crate::port::{ExportPhase, ExportStatusReport, LaunchedWorker, VirtiofsExportEffectPort};
 use crate::worker::{VirtiofsdWorkerPlan, WorkerSandbox};
+
+/// The exact shared-Runner contract for `volume-virtiofs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtiofsRunnerContract {
+    /// The qualified Export ResourceType owned by this Provider.
+    pub resource_type: &'static str,
+    /// The finalizer installed on Export resources.
+    pub finalizer: &'static str,
+    /// Bounded repair interval in seconds.
+    pub repair_interval_secs: u64,
+    /// Whether legacy scheduling is disabled.
+    pub legacy_scheduler_disabled: bool,
+    /// Whether configuration is dependency-only.
+    pub watched_configuration_is_dependency: bool,
+}
+
+/// Return the production volume-virtiofs Runner contract.
+pub const fn virtiofs_runner_contract() -> VirtiofsRunnerContract {
+    VirtiofsRunnerContract {
+        resource_type: EXPORT_RESOURCE_TYPE,
+        finalizer: EXPORT_FINALIZER,
+        repair_interval_secs: 30,
+        legacy_scheduler_disabled: true,
+        watched_configuration_is_dependency: true,
+    }
+}
 
 /// Resolve the named view an Export selects, read-only.
 pub fn resolve_view<'spec>(

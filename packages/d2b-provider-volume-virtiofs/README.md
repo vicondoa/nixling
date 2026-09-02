@@ -21,6 +21,11 @@ uniform crate layout, schema links, configuration, and test lanes.
 | Worker template | `virtiofsd-worker` |
 | Finalizer | `volume-virtiofs/export`, on an Export and nothing else |
 
+The production controller is attached to the shared Core Runner with an
+event-driven Export watch and a bounded 30-second repair interval. Its only
+owned children are the Export's virtiofsd Process and private Endpoint;
+volume-local remains the sole Volume owner.
+
 ## Config schema
 
 | Field | Description | Default |

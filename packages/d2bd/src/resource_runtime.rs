@@ -181,6 +181,16 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+mod volume_effect_adapter;
+mod volume_provider_runtime;
+pub use volume_provider_runtime::{
+    compose_shared_volume_runner_descriptors, SharedVolumeRunnerRegistration,
+    U7_SHARED_PROVIDER_RUNNERS,
+};
+pub use volume_effect_adapter::{
+    AnchoredVolumeEffectAdapter, FdRootResolver, ResolvedVolumeRoot, VolumeRootResolver,
+};
+
 const CORE_CONTROLLER_PROCESS_REF: &str = "Process/d2b-core-controller";
 const CORE_CONTROLLER_PROVIDER_REF: &str = "Provider/system-core";
 const CORE_CONTROLLER_HOST_REF: &str = "Host/host-system";
@@ -2161,6 +2171,10 @@ pub struct ZoneResourceRuntime {
     u12_runner_lock: Arc<tokio::sync::Mutex<()>>,
     u12_state: Mutex<Option<Arc<crate::ServerState>>>,
     u12_required: AtomicBool,
+    u7_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    u7_runner_lock: Arc<tokio::sync::Mutex<()>>,
+    u7_state: Mutex<Option<Arc<crate::ServerState>>>,
+    u7_required: AtomicBool,
     #[cfg(test)]
     core_runner_events: Arc<Mutex<Vec<&'static str>>>,
     core: Mutex<CoreProcess>,
@@ -2929,6 +2943,10 @@ impl ZoneResourceRuntime {
             u12_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
             u12_state: Mutex::new(None),
             u12_required: AtomicBool::new(false),
+            u7_runner_tasks: Mutex::new(Vec::new()),
+            u7_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
+            u7_state: Mutex::new(None),
+            u7_required: AtomicBool::new(false),
             #[cfg(test)]
             core_runner_events: Arc::new(Mutex::new(Vec::new())),
             core: Mutex::new(core),
@@ -3626,9 +3644,15 @@ impl ZoneResourceRuntime {
         } else {
             None
         };
+        let _u7_runner_guard = if rebind_core {
+            Some(self.u7_runner_lock.lock().await)
+        } else {
+            None
+        };
         if rebind_core {
             self.stop_core_controller_runners_locked().await?;
             self.stop_u12_controller_runners_locked().await?;
+            self.stop_u7_controller_runners_locked().await?;
         }
         self.authorizer
             .replace_policy(policy.clone(), &state)
@@ -3671,6 +3695,14 @@ impl ZoneResourceRuntime {
                 .clone();
             if let Some(state) = state {
                 self.start_u12_controller_runners_locked(state).await?;
+            }
+            let state = self
+                .u7_state
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .clone();
+            if let Some(state) = state {
+                self.start_u7_controller_runners_locked(state).await?;
             }
         }
         Ok(())
@@ -4428,6 +4460,74 @@ impl ZoneResourceRuntime {
             task.abort();
             let _ = task.await;
         }
+        Ok(())
+    }
+
+    async fn stop_u7_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        let tasks = {
+            let mut tasks = self
+                .u7_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        self.u7_required.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Attach the storage Providers to the production shared Runner.
+    pub(crate) async fn start_u7_controller_runners(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        let _runner_guard = self.u7_runner_lock.lock().await;
+        let result = self
+            .start_u7_controller_runners_locked(Arc::clone(&state))
+            .await;
+        if result.is_ok() {
+            match self.u7_state.lock() {
+                Ok(mut current) => *current = Some(state),
+                Err(_) => {
+                    self.stop_u7_controller_runners_locked().await?;
+                    return Err(ResourceRuntimeError::AuthenticationUnavailable);
+                }
+            }
+        }
+        result
+    }
+
+    async fn start_u7_controller_runners_locked(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        if !self.readiness.resource_api_ready {
+            return Ok(());
+        }
+        {
+            let tasks = self
+                .u7_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            if tasks.iter().any(|task| !task.is_finished()) {
+                return Ok(());
+            }
+        }
+        let stale = {
+            let mut tasks = self
+                .u7_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in stale {
+            let _ = task.await;
+        }
+        let required = volume_provider_runtime::start(self, state).await?;
+        self.u7_required.store(required, Ordering::Release);
         Ok(())
     }
 
@@ -8124,6 +8224,19 @@ impl ZoneResourceRuntime {
         if !u12_ready {
             return Some(ResourceRuntimeError::HandlerNotReady);
         }
+        let u7_ready = if self.u7_required.load(Ordering::Acquire) {
+            self.u7_runner_tasks
+                .try_lock()
+                .map(|tasks| {
+                    !tasks.is_empty() && !tasks.iter().any(|task| task.is_finished())
+                })
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        if !u7_ready {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
         if !matches!(self.core_stage().ok(), Some(StartupStage::Ready)) {
             return Some(ResourceRuntimeError::HandlerNotReady);
         }
@@ -8723,6 +8836,7 @@ impl ZoneResourceRuntime {
             process_status_client,
             core_runner_tasks,
             u12_runner_tasks,
+            u7_runner_tasks,
             audio_watch_task,
             audio_runtime,
             device_binding_watch_task,
@@ -8751,6 +8865,13 @@ impl ZoneResourceRuntime {
             .into_inner()
             .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
         for task in u12_runner_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        let u7_runner_tasks = u7_runner_tasks
+            .into_inner()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        for task in u7_runner_tasks {
             task.abort();
             let _ = task.await;
         }

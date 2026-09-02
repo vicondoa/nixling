@@ -45,6 +45,7 @@ d2bd_shared_deps = [
     "//packages/d2b-provider-display-wayland:d2b_provider_display_wayland",
     "//packages/d2b-provider-network-local:d2b_provider_network_local",
     "//packages/d2b-provider-volume-local:d2b_provider_volume_local",
+    "//packages/d2b-provider-volume-virtiofs:d2b_provider_volume_virtiofs",
     "//packages/d2b-provider-notification-desktop:d2b_provider_notification_desktop",
     "//packages/d2b-provider-runtime-azure-container-apps:d2b_provider_runtime_azure_container_apps",
     "//packages/d2b-provider-runtime-cloud-hypervisor:d2b_provider_runtime_cloud_hypervisor",
@@ -456,6 +457,18 @@ rust_test(
         ":d2bd_lib_test_support",
         "//packages/d2b-contracts-resource:d2b_contracts_resource",
         "//packages/d2b-core-controller:d2b_core_controller_test_support",
+    ] + all_crate_deps(normal = True, normal_dev = True, cargo_only = True),
+)
+
+rust_test(
+    name = "volume_effect_adapter",
+    srcs = ["tests/volume_effect_adapter.rs"],
+    compile_data = ["Cargo.toml"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":d2bd_lib_test_support",
+        "//packages/d2b-contracts-resource:d2b_contracts_resource",
+        "//packages/d2b-provider-volume-local:d2b_provider_volume_local_test_support",
     ] + all_crate_deps(normal = True, normal_dev = True, cargo_only = True),
 )
 

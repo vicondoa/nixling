@@ -5,7 +5,7 @@ use d2b_contracts_resource::v3::execution_policy::BoundedToken;
 use d2b_provider_volume_virtiofs::testing::{PortCall, ScriptedPort, block_on, fixtures};
 use d2b_provider_volume_virtiofs::{
     EXPORT_FINALIZER, EXPORT_RESOURCE_TYPE, ExportPhase, ExportSpec, VirtiofsExportController,
-    VirtiofsExportError,
+    VirtiofsExportError, virtiofs_runner_contract,
 };
 
 fn reconcile(
@@ -240,4 +240,35 @@ fn a_virtio_blk_attachment_is_not_translated_into_an_export() {
         ExportSpec::from_attachment(fixtures::volume_ref(), &attachment).unwrap_err(),
         VirtiofsExportError::InvalidExport
     );
+}
+
+#[test]
+fn resource_export_spec_and_children_keep_one_qualified_owner() {
+    let spec = serde_json::json!({
+        "providerRef": "Provider/volume-virtiofs",
+        "volumeRef": "Volume/work-state",
+        "executionRef": "Guest/work-vm",
+        "view": "ro-store",
+        "access": "read-only",
+        "mountPath": "/nix/.ro-store",
+        "provider": {
+            "schemaId": "volume-virtiofs.d2bus.org/Export/spec",
+            "schemaVersion": "1.0",
+            "settings": {}
+        }
+    });
+    let export = ExportSpec::from_resource_spec(&spec).expect("resource Export spec");
+    assert_eq!(
+        export.provider_ref().to_canonical_string(),
+        "Provider/volume-virtiofs"
+    );
+    assert_ne!(
+        export.worker_process_ref().unwrap(),
+        export.endpoint_ref().unwrap()
+    );
+    let contract = virtiofs_runner_contract();
+    assert_eq!(contract.resource_type, EXPORT_RESOURCE_TYPE);
+    assert_eq!(contract.finalizer, EXPORT_FINALIZER);
+    assert!(contract.legacy_scheduler_disabled);
+    assert!(contract.watched_configuration_is_dependency);
 }

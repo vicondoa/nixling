@@ -948,7 +948,13 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
                 .list_all(
                     self.store.identity().zone(),
                     descriptor.resource_types().cloned().collect(),
-                    StoreProjection::MetadataOnly,
+                    if descriptor.watch_selectors().iter().any(|selector| {
+                        selector.field() == ChangeField::Spec && selector.exact_value().is_some()
+                    }) {
+                        StoreProjection::BaseOnly
+                    } else {
+                        StoreProjection::MetadataOnly
+                    },
                     "initial",
                 )
                 .await?;
@@ -958,7 +964,10 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
                     .filter(|resource| {
                         descriptor
                             .resource_types()
-                            .any(|resource_type| resource.resource_ref.resource_type() == resource_type)
+                            .any(|resource_type| {
+                                resource.resource_ref.resource_type() == resource_type
+                            })
+                            && initial_resource_matches(&descriptor, &resource)
                     })
                     .map(|resource| {
                         InitialResource::new(
@@ -1606,11 +1615,37 @@ fn selector_matches(
                     ChangeField::Deletion => "/metadata/deletionRequestedAt",
                     ChangeField::Metadata => unreachable!(),
                 };
-                value.pointer(field).is_some_and(|value| {
-                    value.as_str() == Some(expected) || value.to_string() == expected
-                })
+                value
+                    .pointer(field)
+                    .is_some_and(|value| selector_value_matches(value, expected))
             }),
     }
+}
+
+fn selector_value_matches(value: &Value, expected: &str) -> bool {
+    value.as_str() == Some(expected)
+        || value.to_string() == expected
+        || value
+            .get("providerRef")
+            .and_then(Value::as_str)
+            .is_some_and(|provider| provider == expected)
+}
+
+fn initial_resource_matches(
+    descriptor: &ControllerDescriptor,
+    resource: &StoredResource,
+) -> bool {
+    let selectors = descriptor
+        .watch_selectors()
+        .iter()
+        .filter(|selector| {
+            selector.field() == ChangeField::Spec && selector.exact_value().is_some()
+        })
+        .collect::<Vec<_>>();
+    selectors.is_empty()
+        || selectors
+            .into_iter()
+            .any(|selector| selector_matches(selector, resource))
 }
 
 fn change_for_entry(
@@ -1797,7 +1832,7 @@ fn selector_matches_event(
                 };
                 value.get(field).cloned()
             })
-            .is_some_and(|value| value.as_str() == Some(expected) || value.to_string() == expected),
+            .is_some_and(|value| selector_value_matches(&value, expected)),
         ChangeField::Finalizers | ChangeField::Deletion => true,
     }
 }

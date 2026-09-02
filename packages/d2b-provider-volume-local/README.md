@@ -54,6 +54,21 @@ the broker remains the sole privileged executor and audit owner.
 
 No service, worker template, or standalone binary is declared.
 
+The production `AnchoredVolumeEffectAdapter` is the fixed core-side adapter
+behind those ports. It accepts only an already broker-resolved, anchored
+directory FD, resolves typed User principals through trusted policy, and
+performs single-entry `openat2`/fd-relative operations under an `O_CLOEXEC`
+OFD lock. Layout replacement uses the existing `AtomicFilesystem` durable
+sequence; content projections use the same sequence and publish evidence only
+after complete readback. Marker identity is verified before mutation and a
+foreign, missing, or replaced marker fails closed without a cleanup sweep.
+
+`ContentProjection` is the generic typed content boundary for later Providers:
+each bounded file declares an anchored name, User owner/group, exact mode,
+SHA-256 digest, and a provenance tuple carrying resource, generation,
+assignment, and session fences. `ContentMaterializationEvidence` is the
+status-safe readback proof; it carries no file bytes or host paths.
+
 ## Placement and dependencies
 
 The controller is Host-placed: every effect it requests resolves against a

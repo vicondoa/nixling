@@ -23,6 +23,7 @@
 #![deny(missing_docs)]
 
 mod acl;
+mod content;
 mod controller;
 mod error;
 mod exports;
@@ -55,13 +56,24 @@ pub use acl::{
     AclAction, AclBinding, AclGrantSummary, AclObservation, plan_acl_reconciliation,
     user_revision_changed,
 };
-pub use controller::{VolumeLocalController, VolumeLocalProfile};
+pub use content::{
+    ContentFile, ContentFileEvidence, ContentMaterializationEvidence, ContentProjection,
+    ContentProvenance, GENERIC_CONTENT_SCHEMA_ID, MAX_CONTENT_BYTES, MAX_CONTENT_FILES,
+    MAX_CONTENT_PATH_BYTES, MAX_NETWORK_CONFIG_CONTENT_BYTES, NETWORK_CONFIG_CONTENT_KIND,
+    NETWORK_CONFIG_FILE_MODE, NETWORK_CONFIG_FILE_OWNER, NetworkConfigContentProjection,
+    NetworkConfigMaterializationEvidence, ObservedContentFile, VOLUME_CONTENT_SCHEMA_ID,
+    VOLUME_CONTENT_SCHEMA_VERSION,
+};
+pub use controller::{
+    VOLUME_FINALIZER, VolumeLocalController, VolumeLocalProfile, VolumeRunnerContract,
+    volume_runner_contract,
+};
 pub use error::VolumeLocalError;
 pub use exports::{EXPORT_RESOURCE_TYPE, ExportIntent, desired_export_intents};
 pub use finalization::{
     FinalizationAction, FinalizationObservation, FinalizationResult, finalization_plan,
 };
-pub use identity::{EntryDigest, MarkerState, OwnerProof, VolumeRootHandle};
+pub use identity::{EntryDigest, MarkerState, OwnerProof, VolumeRootHandle, VolumeRootHandleView};
 pub use layout::{
     ConditionSeverity, EntryCondition, EntryPlan, EntryRequest, plan_cleanup, plan_entry,
 };
