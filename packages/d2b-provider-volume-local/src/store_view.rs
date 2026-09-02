@@ -110,6 +110,15 @@ pub fn assert_ro_store_attachment(spec: &VolumeSpec) -> Result<(), VolumeLocalEr
     Ok(())
 }
 
+/// Read-only evidence for the store-view launch marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreViewMarkerEvidence {
+    /// The marker file exists.
+    pub present: bool,
+    /// The marker file has zero length.
+    pub zero_length: bool,
+}
+
 /// Read-only observations needed before a store-view sync or Export launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreViewObservation {

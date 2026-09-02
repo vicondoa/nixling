@@ -22,6 +22,7 @@ use crate::content::{
 use crate::error::VolumeLocalError;
 use crate::identity::{MarkerState, OwnerProof, VolumeRootHandle};
 use crate::layout::EntryRequest;
+use crate::store_view::StoreViewMarkerEvidence;
 
 /// One observed difference between an existing entry and its declared
 /// state.
@@ -203,5 +204,19 @@ pub trait VolumeLayoutEffectPort: Send + Sync {
     ) -> impl Future<Output = Result<NetworkConfigMaterializationEvidence, VolumeLocalError>> + Send
     {
         async { Err(VolumeLocalError::EffectFailed) }
+    }
+
+    /// Read the zero-length store-view marker through the anchored root.
+    fn observe_store_view_marker(
+        &self,
+        _root: &VolumeRootHandle,
+        _marker_path: &str,
+    ) -> impl Future<Output = Result<StoreViewMarkerEvidence, VolumeLocalError>> + Send {
+        async {
+            Ok(StoreViewMarkerEvidence {
+                present: false,
+                zero_length: false,
+            })
+        }
     }
 }

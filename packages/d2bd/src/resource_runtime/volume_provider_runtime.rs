@@ -29,7 +29,8 @@ use d2b_core_controller::{
     UpgradePlan, UpgradeStage, ValidationResult,
 };
 use d2b_provider_volume_local::{
-    VolumeLocalController, VolumeLocalProfile, VolumeRunnerContract, desired_export_intents,
+    VolumeLayoutEffectPort, VolumeLocalController, VolumeLocalProfile, VolumeRunnerContract,
+    VolumeSourceEffectPort, desired_export_intents, marker_path,
 };
 use d2b_provider_volume_virtiofs::{
     ExportSpec, LaunchedWorker, VirtiofsExportController, VirtiofsExportEffectPort,
@@ -371,6 +372,35 @@ impl DaemonVolumeProviderEffects {
             .map_err(|_| SharedVolumeEffectError::Unavailable)
     }
 
+    async fn committed_resource(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        target: ResourceRef,
+        operation_id: &str,
+    ) -> Result<StoredResource, SharedVolumeEffectError> {
+        let resource = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: operation_id.to_owned(),
+                    idempotency_key: None,
+                    correlation_id: operation_id.to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target,
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .map_err(|_| SharedVolumeEffectError::Unavailable)?;
+        if resource.zone != self.zone {
+            return Err(SharedVolumeEffectError::InvalidResource);
+        }
+        Ok(resource)
+    }
+
     fn volume_spec(value: &Value) -> Result<VolumeSpec, SharedVolumeEffectError> {
         let mut spec = value
             .get("spec")
@@ -607,10 +637,14 @@ impl DaemonVolumeProviderEffects {
         let export = ExportSpec::from_resource_spec(export_value)
             .map_err(|_| SharedVolumeEffectError::InvalidResource)?;
         let runtime = self.runtime()?;
-        let volume_value = runtime
-            .committed_resource_value(&export.volume_ref().clone(), &context.operation_id)
-            .await
-            .map_err(|_| SharedVolumeEffectError::Unavailable)?;
+        let volume_resource = self
+            .committed_resource(&runtime, export.volume_ref().clone(), &context.operation_id)
+            .await?;
+        if volume_resource.resource_ref != *export.volume_ref() {
+            return Err(SharedVolumeEffectError::InvalidResource);
+        }
+        let volume_value = serde_json::from_slice::<Value>(&volume_resource.canonical_json)
+            .map_err(|_| SharedVolumeEffectError::InvalidResource)?;
         let volume_spec = Self::volume_spec(&volume_value)?;
         let guest_value = runtime
             .committed_resource_value(&export.execution_ref().clone(), &context.operation_id)
@@ -630,6 +664,33 @@ impl DaemonVolumeProviderEffects {
             .map_err(|_| SharedVolumeEffectError::InvalidResource)?;
         let plan = VirtiofsdWorkerPlan::for_export(&export, view, vcpu_count, principal.clone())
             .map_err(|_| SharedVolumeEffectError::InvalidResource)?;
+        let store_view_marker_ready = if export.view().as_str() == "ro-store" {
+            let resolver = DaemonVolumeRootResolver::new(&self.state, self.zone.clone())
+                .map_err(|_| SharedVolumeEffectError::Unavailable)?;
+            let adapter = AnchoredVolumeEffectAdapter::new(resolver);
+            let settings = volume_spec.source().settings();
+            let root = adapter
+                .resolve_root_for(
+                    &volume_resource.uid,
+                    settings.source_policy_id(),
+                    settings.system_artifact_id(),
+                    settings.kind(),
+                )
+                .await
+                .map_err(|_| SharedVolumeEffectError::Unavailable)?;
+            let guest = BoundedToken::parse(export.execution_ref().name().as_str().to_owned())
+                .map_err(|_| SharedVolumeEffectError::InvalidResource)?;
+            let evidence = adapter
+                .observe_store_view_marker(&root, &marker_path(&guest))
+                .await
+                .map_err(|_| SharedVolumeEffectError::Unavailable)?;
+            evidence.present && evidence.zero_length
+        } else {
+            true
+        };
+        if export.view().as_str() == "ro-store" && !store_view_marker_ready {
+            return Ok(SharedVolumeEffectPhase::Pending);
+        }
         let desired = self.export_children(
             &self.zone,
             context.target.resource_ref(),
@@ -685,6 +746,7 @@ impl DaemonVolumeProviderEffects {
             endpoint_ref,
             socket_ready: process_ready,
             guest_mount_ready: endpoint_ready,
+            store_view_marker: store_view_marker_ready,
             zone: zone_token,
         };
         let report = VirtiofsExportController::new(port)
@@ -802,6 +864,7 @@ struct ChildReadinessPort {
     endpoint_ref: ResourceRef,
     socket_ready: bool,
     guest_mount_ready: bool,
+    store_view_marker: bool,
     zone: BoundedToken,
 }
 
@@ -829,6 +892,13 @@ impl VirtiofsExportEffectPort for ChildReadinessPort {
         _export: &ExportSpec,
     ) -> Result<bool, d2b_provider_volume_virtiofs::VirtiofsExportError> {
         Ok(self.guest_mount_ready)
+    }
+
+    async fn observe_store_view_marker(
+        &self,
+        _export: &ExportSpec,
+    ) -> Result<bool, d2b_provider_volume_virtiofs::VirtiofsExportError> {
+        Ok(self.store_view_marker)
     }
 
     async fn delete_worker(
@@ -1031,15 +1101,18 @@ impl SharedVolumeResourceReconciler {
         serde_json::to_vec(status).map_err(|_| SharedVolumeReconcileError::InvalidResource)
     }
 
-    fn finalizer_removal(
+    fn finalizer_mutation(
         resource: &ResourceSnapshot,
+        finalizer: &str,
+        add: bool,
     ) -> Result<ResourceMutationBatch, SharedVolumeReconcileError> {
+        let canonical = finalizer_candidate(resource.canonical_json(), finalizer, add)?;
         let mutation = d2b_core_controller::MutationIntent::new(
             resource.key().resource_ref().clone(),
             Some(resource.key().uid().clone()),
             Some(resource.revision()),
             d2b_core_controller::MutationIntentKind::UpdateFinalizers,
-            None,
+            Some(canonical),
         )
         .map_err(|_| SharedVolumeReconcileError::InvalidResource)?;
         ResourceMutationBatch::new(vec![mutation])
@@ -1122,23 +1195,33 @@ impl ResourceReconciler for SharedVolumeResourceReconciler {
         _dependencies: &[DependencySnapshot],
         _plan: &ReconcilePlan,
     ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
-        let result = context
-            .authorize_effect()
-            .map_err(|_| SharedVolumeReconcileError::Effect(SharedVolumeEffectError::Unavailable))
-            .and_then(|_| {
-                let status = Self::status_candidate(resource, SharedVolumeEffectPhase::Pending)?;
-                ReconcileResult::new(
+        let result = (|| {
+            context.authorize_effect().map_err(|_| {
+                SharedVolumeReconcileError::Effect(SharedVolumeEffectError::Unavailable)
+            })?;
+            let finalizer = self
+                .descriptor
+                .finalizers()
+                .first()
+                .ok_or(SharedVolumeReconcileError::InvalidResource)?;
+            if !resource.deleting() && !resource_has_finalizer(resource, finalizer)? {
+                return Ok(ReconcileResult::new(
                     resource.revision(),
                     resource.generation(),
+                    Some(Self::finalizer_mutation(resource, finalizer, true)?),
                     None,
-                    Some(status),
                     ReconcileDisposition::Pending,
                     None,
                     None,
-                    StatusPersistence::Pending,
+                    StatusPersistence::NotRequested,
                 )
-                .map_err(|_| SharedVolumeReconcileError::InvalidResource)
-            });
+                .map_err(|_| SharedVolumeReconcileError::InvalidResource)?);
+            }
+            Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ))
+        })();
         std::future::ready(result)
     }
 
@@ -1213,41 +1296,55 @@ impl ResourceReconciler for SharedVolumeResourceReconciler {
         context: &ReconcileContext,
         deleting_resource: &ResourceSnapshot,
     ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
-        let result = context
-            .authorize_effect()
-            .map(|_| {
-                ReconcileResult::converged(
+        let finalizer = self
+            .descriptor
+            .finalizers()
+            .first()
+            .cloned()
+            .ok_or(SharedVolumeReconcileError::InvalidResource);
+        let future = async move {
+            context.authorize_effect().map_err(|_| {
+                SharedVolumeReconcileError::Effect(SharedVolumeEffectError::Unavailable)
+            })?;
+            let finalizer = finalizer?;
+            if !resource_has_finalizer(deleting_resource, &finalizer)? {
+                return Ok(ReconcileResult::converged(
                     deleting_resource.revision(),
                     deleting_resource.generation(),
-                )
-            })
-            .map_err(|_| SharedVolumeReconcileError::Effect(SharedVolumeEffectError::Unavailable));
-        std::future::ready(result)
+                ));
+            }
+            self.effects
+                .finalize(self.kind, &self.effect_context(context), deleting_resource)
+                .await
+                .map_err(SharedVolumeReconcileError::Effect)?;
+            ReconcileResult::new(
+                deleting_resource.revision(),
+                deleting_resource.generation(),
+                Some(Self::finalizer_mutation(
+                    deleting_resource,
+                    &finalizer,
+                    false,
+                )?),
+                None,
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::NotRequested,
+            )
+            .map_err(|_| SharedVolumeReconcileError::InvalidResource)
+        };
+        future
     }
 
     async fn execute_finalize(
         &self,
-        context: &ReconcileContext,
+        _context: &ReconcileContext,
         deleting_resource: &ResourceSnapshot,
     ) -> Result<ReconcileResult, Self::Error> {
-        let _permit = context.authorize_effect().map_err(|_| {
-            SharedVolumeReconcileError::Effect(SharedVolumeEffectError::Unavailable)
-        })?;
-        self.effects
-            .finalize(self.kind, &self.effect_context(context), deleting_resource)
-            .await
-            .map_err(SharedVolumeReconcileError::Effect)?;
-        ReconcileResult::new(
+        Ok(ReconcileResult::converged(
             deleting_resource.revision(),
             deleting_resource.generation(),
-            Some(Self::finalizer_removal(deleting_resource)?),
-            None,
-            ReconcileDisposition::Pending,
-            None,
-            None,
-            StatusPersistence::NotRequested,
-        )
-        .map_err(|_| SharedVolumeReconcileError::InvalidResource)
+        ))
     }
 
     fn health(
@@ -1478,6 +1575,54 @@ pub(crate) async fn start(
     Ok(true)
 }
 
+fn resource_has_finalizer(
+    resource: &ResourceSnapshot,
+    finalizer: &str,
+) -> Result<bool, SharedVolumeReconcileError> {
+    let value = serde_json::from_slice::<Value>(resource.canonical_json())
+        .map_err(|_| SharedVolumeReconcileError::InvalidResource)?;
+    Ok(value
+        .pointer("/metadata/finalizers")
+        .and_then(Value::as_array)
+        .is_some_and(|finalizers| {
+            finalizers
+                .iter()
+                .any(|value| value.as_str() == Some(finalizer))
+        }))
+}
+
+fn finalizer_candidate(
+    canonical_json: &[u8],
+    finalizer: &str,
+    add: bool,
+) -> Result<Vec<u8>, SharedVolumeReconcileError> {
+    let value = serde_json::from_slice::<Value>(canonical_json)
+        .map_err(|_| SharedVolumeReconcileError::InvalidResource)?;
+    let finalizers = value
+        .pointer("/metadata/finalizers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut finalizers = finalizers
+        .into_iter()
+        .filter(|value| !(!add && value.as_str() == Some(finalizer)))
+        .collect::<Vec<_>>();
+    if add
+        && !finalizers
+            .iter()
+            .any(|value| value.as_str() == Some(finalizer))
+    {
+        finalizers.push(Value::String(finalizer.to_owned()));
+    }
+    let bytes = serde_json::to_vec(&json!({
+        "metadata": {"finalizers": finalizers}
+    }))
+    .map_err(|_| SharedVolumeReconcileError::InvalidResource)?;
+    CanonicalJsonValue::parse(&bytes)
+        .map(|value| value.to_canonical_bytes())
+        .map_err(|_| SharedVolumeReconcileError::InvalidResource)
+}
+
 async fn provider_generations(
     runtime: &ZoneResourceRuntime,
 ) -> Result<
@@ -1527,4 +1672,37 @@ async fn provider_generations(
         }
     }
     Ok((active, generations))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_child_readiness_port_fails_closed_before_ro_store_launch() {
+        let export = d2b_provider_volume_virtiofs::testing::fixtures::export("read-only");
+        let volume = d2b_provider_volume_local::testing::fixtures::store_view_volume();
+        let port = ChildReadinessPort {
+            process_ref: ResourceRef::parse("Process/virtiofs-worker").expect("process ref"),
+            endpoint_ref: ResourceRef::parse("Endpoint/virtiofs-worker").expect("endpoint ref"),
+            socket_ready: true,
+            guest_mount_ready: true,
+            store_view_marker: false,
+            zone: d2b_provider_volume_virtiofs::testing::fixtures::zone(),
+        };
+        let report = d2b_provider_volume_virtiofs::testing::block_on(
+            VirtiofsExportController::new(port).reconcile(
+                &export,
+                &volume,
+                4,
+                d2b_provider_volume_virtiofs::testing::fixtures::principal(),
+            ),
+        )
+        .expect("export report");
+        assert_eq!(
+            report.phase,
+            d2b_provider_volume_virtiofs::ExportPhase::Pending
+        );
+        assert!(report.worker_process_ref.is_none());
+    }
 }

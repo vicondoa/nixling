@@ -2,8 +2,8 @@
 
 use d2b_contracts_resource::v3::{ResourceGeneration, ResourceRef, ResourceUid};
 use d2b_provider_volume_local::{
-    ContentFile, ContentProjection, ContentProvenance, VolumeLocalController, VolumeLocalError,
-    VolumeLocalProfile,
+    ContentFile, ContentProjection, ContentProvenance, VolumeLayoutEffectPort,
+    VolumeLocalController, VolumeLocalError, VolumeLocalProfile, VolumeSourceEffectPort,
 };
 use d2bd::resource_runtime::{AnchoredVolumeEffectAdapter, FdRootResolver};
 
@@ -125,6 +125,46 @@ fn production_content_status_is_published_only_after_full_readback() {
         std::fs::read(base.join("config")).expect("readback"),
         b"declared\n"
     );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn production_store_view_marker_evidence_requires_a_zero_length_file() {
+    let (base, adapter) = adapter_root("store-view-marker");
+    let uid = volume_uid();
+    let spec = volume_spec();
+    std::fs::create_dir_all(base.join("live")).expect("live directory");
+    let root = d2b_provider_volume_local::testing::block_on(adapter.resolve_root_for(
+        &uid,
+        spec.source().settings().source_policy_id(),
+        spec.source().settings().system_artifact_id(),
+        spec.source().settings().kind(),
+    ))
+    .expect("resolve anchored root");
+    let marker_path = "live/.d2b-marker-work-vm";
+
+    let missing = d2b_provider_volume_local::testing::block_on(
+        adapter.observe_store_view_marker(&root, marker_path),
+    )
+    .expect("missing marker evidence");
+    assert!(!missing.present);
+    assert!(!missing.zero_length);
+
+    std::fs::write(base.join(marker_path), b"not-ready").expect("non-empty marker");
+    let non_empty = d2b_provider_volume_local::testing::block_on(
+        adapter.observe_store_view_marker(&root, marker_path),
+    )
+    .expect("non-empty marker evidence");
+    assert!(non_empty.present);
+    assert!(!non_empty.zero_length);
+
+    std::fs::write(base.join(marker_path), []).expect("zero-length marker");
+    let ready = d2b_provider_volume_local::testing::block_on(
+        adapter.observe_store_view_marker(&root, marker_path),
+    )
+    .expect("ready marker evidence");
+    assert!(ready.present);
+    assert!(ready.zero_length);
     let _ = std::fs::remove_dir_all(base);
 }
 

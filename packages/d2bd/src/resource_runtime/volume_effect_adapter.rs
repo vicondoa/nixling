@@ -40,8 +40,8 @@ use d2b_contracts_resource::v3::{
 use d2b_provider_volume_local::{
     ContentFile, ContentMaterializationEvidence, ContentProjection, DriftClass, EntryRequest,
     MarkerState, NetworkConfigContentProjection, NetworkConfigMaterializationEvidence,
-    ObservedContentFile, ObservedEntry, OwnerProof, QuotaCapability, VolumeLayoutEffectPort,
-    VolumeLocalError, VolumeRootHandle, VolumeSourceEffectPort,
+    ObservedContentFile, ObservedEntry, OwnerProof, QuotaCapability, StoreViewMarkerEvidence,
+    VolumeLayoutEffectPort, VolumeLocalError, VolumeRootHandle, VolumeSourceEffectPort,
     atomic::{AtomicFilesystem, AtomicWriteError, replace_bytes},
     lock::{
         LockError, LockGuard, LockId, LockSet, LockSpec, LockTransferPolicy, OfdLockBackend,
@@ -379,6 +379,15 @@ impl<R: VolumeRootResolver> VolumeLayoutEffectPort for AnchoredVolumeEffectAdapt
         let result = self.materialize_network_config_sync(root, projection);
         async move { result }
     }
+
+    fn observe_store_view_marker(
+        &self,
+        root: &VolumeRootHandle,
+        marker_path: &str,
+    ) -> impl Future<Output = Result<StoreViewMarkerEvidence, VolumeLocalError>> + Send {
+        let result = self.observe_store_view_marker_sync(root, marker_path);
+        async move { result }
+    }
 }
 
 impl<R: VolumeRootResolver> VolumeSourceEffectPort for &AnchoredVolumeEffectAdapter<R> {
@@ -480,6 +489,14 @@ impl<R: VolumeRootResolver> VolumeLayoutEffectPort for &AnchoredVolumeEffectAdap
     ) -> impl Future<Output = Result<NetworkConfigMaterializationEvidence, VolumeLocalError>> + Send
     {
         (*self).materialize_network_config(root, projection)
+    }
+
+    fn observe_store_view_marker(
+        &self,
+        root: &VolumeRootHandle,
+        marker_path: &str,
+    ) -> impl Future<Output = Result<StoreViewMarkerEvidence, VolumeLocalError>> + Send {
+        (*self).observe_store_view_marker(root, marker_path)
     }
 }
 
@@ -728,6 +745,31 @@ impl<R: VolumeRootResolver> AnchoredVolumeEffectAdapter<R> {
         })
     }
 
+    fn observe_store_view_marker_sync(
+        &self,
+        root: &VolumeRootHandle,
+        marker_path: &str,
+    ) -> Result<StoreViewMarkerEvidence, VolumeLocalError> {
+        validate_store_view_marker_path(marker_path)?;
+        self.with_lock(root, |_guard| {
+            let fd = root_fd(root)?.ok_or(VolumeLocalError::EffectFailed)?;
+            ensure_root_identity(root)?;
+            let Some((target, _parent)) = open_entry(fd, marker_path, false)? else {
+                return Ok(StoreViewMarkerEvidence {
+                    present: false,
+                    zero_length: false,
+                });
+            };
+            let stat = fstat(&target).map_err(|_| VolumeLocalError::EffectFailed)?;
+            let present = FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+                && stat.st_nlink == 1;
+            Ok(StoreViewMarkerEvidence {
+                present,
+                zero_length: present && stat.st_size == 0,
+            })
+        })
+    }
+
     fn materialize_files_locked(
         &self,
         root: &VolumeRootHandle,
@@ -882,6 +924,20 @@ fn validate_component(value: &str) -> Result<(), VolumeLocalError> {
         || value.contains('\0')
     {
         return Err(VolumeLocalError::InvariantViolated);
+    }
+    Ok(())
+}
+
+fn validate_store_view_marker_path(path: &str) -> Result<(), VolumeLocalError> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path.contains('\0')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(VolumeLocalError::InvalidSpec);
     }
     Ok(())
 }

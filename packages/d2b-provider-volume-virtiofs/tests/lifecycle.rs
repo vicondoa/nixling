@@ -4,9 +4,36 @@ use d2b_contracts_resource::v3::ResourceRef;
 use d2b_contracts_resource::v3::execution_policy::BoundedToken;
 use d2b_provider_volume_virtiofs::testing::{PortCall, ScriptedPort, block_on, fixtures};
 use d2b_provider_volume_virtiofs::{
-    EXPORT_FINALIZER, EXPORT_RESOURCE_TYPE, ExportPhase, ExportSpec, VirtiofsExportController,
-    VirtiofsExportError, virtiofs_runner_contract,
+    EXPORT_FINALIZER, EXPORT_RESOURCE_TYPE, ExportPhase, ExportSpec, LaunchedWorker,
+    VirtiofsExportController, VirtiofsExportEffectPort, VirtiofsExportError, VirtiofsdWorkerPlan,
+    virtiofs_runner_contract,
 };
+
+struct DefaultMarkerPort {
+    inner: ScriptedPort,
+}
+
+impl VirtiofsExportEffectPort for &DefaultMarkerPort {
+    async fn launch_worker(
+        &self,
+        export: &ExportSpec,
+        plan: &VirtiofsdWorkerPlan,
+    ) -> Result<LaunchedWorker, VirtiofsExportError> {
+        (&self.inner).launch_worker(export, plan).await
+    }
+
+    async fn observe_socket(&self, worker: &LaunchedWorker) -> Result<bool, VirtiofsExportError> {
+        (&self.inner).observe_socket(worker).await
+    }
+
+    async fn observe_guest_mount(&self, export: &ExportSpec) -> Result<bool, VirtiofsExportError> {
+        (&self.inner).observe_guest_mount(export).await
+    }
+
+    async fn delete_worker(&self, worker: &LaunchedWorker) -> Result<(), VirtiofsExportError> {
+        (&self.inner).delete_worker(worker).await
+    }
+}
 
 fn reconcile(
     port: &ScriptedPort,
@@ -20,6 +47,24 @@ fn reconcile(
         fixtures::principal(),
     ))
     .expect("reconcile reports")
+}
+
+#[test]
+fn the_default_marker_probe_fails_closed_before_a_store_view_launch() {
+    let port = DefaultMarkerPort {
+        inner: ScriptedPort::serving(),
+    };
+    let controller = VirtiofsExportController::new(&port);
+    let report = block_on(controller.reconcile(
+        &fixtures::export("read-only"),
+        &fixtures::store_view_volume(),
+        4,
+        fixtures::principal(),
+    ))
+    .expect("reconcile reports");
+    assert_eq!(report.phase, ExportPhase::Pending);
+    assert!(report.worker_process_ref.is_none());
+    assert!(!port.inner.calls().contains(&PortCall::LaunchWorker));
 }
 
 #[test]

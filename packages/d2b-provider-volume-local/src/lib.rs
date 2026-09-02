@@ -87,8 +87,9 @@ pub use source::{
 pub use status::{AttachmentState, AttachmentStatus, LayoutPhase, VolumeStatusReport};
 pub use store_view::{
     CURRENT_LINK, GCROOTS_DIR, GENERATIONS_DIR, LIVE_DIR, META_DIR, REJECTED_GCROOTS_DIR,
-    STATE_DIR, SYNC_LOCK, StoreViewAction, StoreViewObservation, assert_ro_store_attachment,
-    assert_store_view_layout, classify_store_view, marker_path, validate_store_view_observation,
+    STATE_DIR, SYNC_LOCK, StoreViewAction, StoreViewMarkerEvidence, StoreViewObservation,
+    assert_ro_store_attachment, assert_store_view_layout, classify_store_view, marker_path,
+    validate_store_view_observation,
 };
 pub use swtpm_volume::{SwtpmDisposition, assert_swtpm_volume, evaluate_swtpm_state};
 pub use views::{AttachmentPlan, admit_access, admit_attachments, is_read_only, resolve_view};
