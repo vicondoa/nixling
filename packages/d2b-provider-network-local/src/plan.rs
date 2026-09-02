@@ -81,7 +81,7 @@ impl core::fmt::Debug for NetworkReconcilePlan {
 /// Compute the complete ordered plan without performing effects.
 pub fn compute_plan(
     _spec: &NetworkSpec,
-    mdns_enabled: bool,
+    _mdns_enabled: bool,
     actual: ActualState,
 ) -> NetworkReconcilePlan {
     let mut steps = Vec::new();
@@ -113,7 +113,7 @@ pub fn compute_plan(
     if actual.attachment_ready && !actual.agent_ready {
         steps.push(PlanStep::UpsertAgent);
     }
-    if !actual.mdns_matches || mdns_enabled {
+    if !actual.mdns_matches {
         steps.push(PlanStep::ReconcileMdns);
     }
     steps.push(PlanStep::ReconcileAttachments);

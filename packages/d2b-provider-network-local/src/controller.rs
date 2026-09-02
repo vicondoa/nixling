@@ -41,6 +41,60 @@ pub const CONFIG_VOLUME_MAX_BYTES: u64 = 4 * 1024 * 1024;
 pub const CONFIG_VOLUME_MAX_INODES: u64 = 128;
 /// Guest mount path for the read-only config view.
 pub const CONFIG_MOUNT_PATH: &str = "/run/d2b/net-config";
+/// Network-local's exact Resource finalizer.
+pub const NETWORK_FINALIZER: &str = "network.d2bus.org/fabric-cleanup";
+/// Default descriptor repair interval.
+pub const NETWORK_REPAIR_INTERVAL_SECS: u64 = 30;
+/// Maximum descriptor repair interval.
+pub const NETWORK_MAX_REPAIR_INTERVAL_SECS: u64 = 60;
+
+/// The cutover contract for the Network resource owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkRunnerContract {
+    resource_type: &'static str,
+    finalizer: &'static str,
+    repair_interval_secs: u64,
+    legacy_scheduler_disabled: bool,
+    watched_configuration_is_dependency: bool,
+}
+
+impl NetworkRunnerContract {
+    /// Return the owned ResourceType.
+    pub const fn resource_type(self) -> &'static str {
+        self.resource_type
+    }
+
+    /// Return the exact Network finalizer.
+    pub const fn finalizer(self) -> &'static str {
+        self.finalizer
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Whether the legacy Network scheduler is disabled.
+    pub const fn legacy_scheduler_disabled(self) -> bool {
+        self.legacy_scheduler_disabled
+    }
+
+    /// Whether watched configuration is treated as a dependency.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+}
+
+/// Return the one shared-Runner registration for Network-local.
+pub const fn network_runner_contract() -> NetworkRunnerContract {
+    NetworkRunnerContract {
+        resource_type: "Network",
+        finalizer: NETWORK_FINALIZER,
+        repair_interval_secs: NETWORK_REPAIR_INTERVAL_SECS,
+        legacy_scheduler_disabled: true,
+        watched_configuration_is_dependency: true,
+    }
+}
 
 /// Closed condition reason emitted by the state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -20,6 +20,7 @@ use d2b_provider_network_local::{
         NetworkEffectPort, NetworkReconciler, NetworkResourcePort, ReconcileInput,
         ReconcileProgress,
     },
+    plan::{PlanStep, compute_plan, ActualState},
 };
 
 #[derive(Clone, Default)]
@@ -538,4 +539,24 @@ fn finalizer_removes_volume_attachment_before_guest_and_volume() {
         resources.events(),
         ["volume-detach", "guest-delete", "volume-delete"]
     );
+}
+
+#[test]
+fn matching_mdns_state_does_not_schedule_a_second_effect() {
+    let plan = compute_plan(
+        &spec("10.20.0.0/24", "192.0.2.0/30"),
+        true,
+        ActualState {
+            bridges_ready: true,
+            sysctls_ready: true,
+            firewall_ready: true,
+            volume_ready: true,
+            guest_ready: true,
+            attachment_ready: true,
+            agent_ready: true,
+            mdns_matches: true,
+        },
+    );
+
+    assert!(!plan.steps().contains(&PlanStep::ReconcileMdns));
 }
