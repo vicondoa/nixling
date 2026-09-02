@@ -24,6 +24,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::activation_resource_runtime::{
     activation_controller_descriptor, ActivationResourceReconciler, stored_resource_from_wire,
 };
+use crate::ServerState;
+use d2b_contracts::types::{BundleOpId, VmId};
 use crate::audio_resource_runtime::{
     AUDIO_BINDING_TYPE, AudioBindingRuntimeStatus, AudioResourceRuntime, AudioResourceRuntimeError,
     audio_binding_status_projection_with_status, audio_binding_status_value, audio_watch_request,
@@ -48,6 +50,7 @@ use d2b_bus::{
 #[cfg(test)]
 use d2b_contracts_broker::broker_wire::OpenZoneStoreResponse;
 use d2b_contracts_broker::broker_wire::ZoneStoreDisposition;
+use d2b_contracts_broker::broker_wire::BrokerCallerRole;
 use d2b_contracts_provider::v3::provider::ProviderSpec;
 use d2b_contracts_resource::resource_proto as wire;
 #[cfg(test)]
@@ -82,12 +85,12 @@ use d2b_core_controller::controllers::HandlerPhase;
 use d2b_core_controller::{
     CORE_RESOURCE_CONTROLLER_REGISTRATIONS, ChangeField, ControllerDescriptor,
     ControllerExecutionPolicy, ControllerIdentity, ControllerSelector, ControllerVerb,
-    CoreControllerSource, CoreHandlerKind, CoreResourceReconciler, DependencySnapshot, DrainResult,
+    CoreControllerSource, CoreResourceReconciler, DependencySnapshot, DisruptionClass, DrainResult,
     FinalizeResult, ObservationResult, ReconcileContext, ReconcileDisposition, ReconcilePlan,
-    ReconcileReason, ReconcileResult, ResourceReconciler, ResourceRegistration, ResourceSnapshot,
-    ResyncPolicy, Runner, RunnerConfig, SelectorField, SourceError, StatusPersistence,
-    TriggerReason, UpdateAssessment, UpdateAssessmentState, UpgradePlan, UpgradeStage,
-    ValidationResult, core_controller_descriptors,
+    ReconcileReason, ReconcileResult, ResourceKey, ResourceMutationBatch, ResourceReconciler,
+    ResourceRegistration, ResourceSnapshot, ResyncPolicy, Runner, RunnerConfig, SelectorField,
+    SourceError, StatusPersistence, TriggerReason, UpdateAssessment, UpdateAssessmentState,
+    UpgradePlan, UpgradeStage, ValidationResult, core_controller_descriptors,
 };
 use d2b_core_controller::main::{
     CoreProcess, RecoverySnapshot, RuntimeReadiness as CoreRuntimeReadiness, StartupStage,
@@ -101,8 +104,11 @@ use d2b_provider_display_wayland::WaylandSessionSpec;
 use d2b_provider_network_local::{
     ExternalNicAdmissionError, ExternalNicClaim, admit_external_nic_claims,
     controller::{
-        NetworkAdmissionIntent, NetworkAdmissionKey, NetworkAdmissionProof, NetworkEffectError,
+        AttachmentRealization, NetworkAdmissionIntent, NetworkAdmissionKey, NetworkAdmissionProof,
+        NetworkEffectError, NetworkReconciler, NetworkResourcePort, ReconcileInput,
+        ReconcileProgress,
     },
+    artifact::{ArtifactCatalogEntry, ArtifactKind},
     observe::HostNetworkOccupancy,
     routes::RouteTuple,
 };
@@ -340,6 +346,1644 @@ pub const U8_SHARED_PROVIDER_RUNNERS: [SharedProviderRunnerRegistration; 9] = [
             .watched_configuration_is_dependency(),
     },
 ];
+
+/// Closed Provider handler set used by the shared Runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedProviderResourceKind {
+    Network,
+    TpmDevice,
+    UsbipDevice,
+    UsbipService,
+    UsbipBinding,
+    SecurityKeyDevice,
+    SecurityKeyService,
+    SecurityKeyBinding,
+    GpuDevice,
+}
+
+impl SharedProviderResourceKind {
+    fn from_registration(
+        registration: SharedProviderRunnerRegistration,
+    ) -> Result<Self, ResourceRuntimeError> {
+        match (
+            registration.provider_ref,
+            registration.resource_type,
+            registration.controller_ref,
+        ) {
+            ("Provider/network-local", "Network", "Process/network-local-controller") => {
+                Ok(Self::Network)
+            }
+            ("Provider/device-tpm", "Device", "Process/device-tpm-controller") => {
+                Ok(Self::TpmDevice)
+            }
+            ("Provider/device-usbip", "Device", "Process/device-usbip-controller") => {
+                Ok(Self::UsbipDevice)
+            }
+            (
+                "Provider/device-usbip",
+                d2b_provider_device_usbip::USB_SERVICE_RESOURCE_TYPE,
+                "Process/device-usbip-service-controller",
+            ) => Ok(Self::UsbipService),
+            (
+                "Provider/device-usbip",
+                d2b_provider_device_usbip::USB_BINDING_RESOURCE_TYPE,
+                "Process/device-usbip-binding-controller",
+            ) => Ok(Self::UsbipBinding),
+            ("Provider/device-security-key", "Device", "Process/device-security-key-controller") => {
+                Ok(Self::SecurityKeyDevice)
+            }
+            (
+                "Provider/device-security-key",
+                d2b_provider_device_security_key::SECURITY_KEY_SERVICE_RESOURCE_TYPE,
+                "Process/device-security-key-service-controller",
+            ) => Ok(Self::SecurityKeyService),
+            (
+                "Provider/device-security-key",
+                d2b_provider_device_security_key::SECURITY_KEY_BINDING_RESOURCE_TYPE,
+                "Process/device-security-key-binding-controller",
+            ) => Ok(Self::SecurityKeyBinding),
+            ("Provider/device-gpu", "Device", "Process/device-gpu-controller") => {
+                Ok(Self::GpuDevice)
+            }
+            _ => Err(ResourceRuntimeError::HandlerNotReady),
+        }
+    }
+
+    const fn effect_id(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::TpmDevice => "device-tpm",
+            Self::UsbipDevice => "device-usbip",
+            Self::UsbipService => "device-usbip-service",
+            Self::UsbipBinding => "device-usbip-binding",
+            Self::SecurityKeyDevice => "device-security-key",
+            Self::SecurityKeyService => "device-security-key-service",
+            Self::SecurityKeyBinding => "device-security-key-binding",
+            Self::GpuDevice => "device-gpu",
+        }
+    }
+
+    const fn provider_ref(self) -> &'static str {
+        match self {
+            Self::Network => "Provider/network-local",
+            Self::TpmDevice => "Provider/device-tpm",
+            Self::UsbipDevice | Self::UsbipService | Self::UsbipBinding => {
+                "Provider/device-usbip"
+            }
+            Self::SecurityKeyDevice
+            | Self::SecurityKeyService
+            | Self::SecurityKeyBinding => "Provider/device-security-key",
+            Self::GpuDevice => "Provider/device-gpu",
+        }
+    }
+
+    const fn resource_type(self) -> &'static str {
+        match self {
+            Self::Network => "Network",
+            Self::TpmDevice
+            | Self::UsbipDevice
+            | Self::SecurityKeyDevice
+            | Self::GpuDevice => "Device",
+            Self::UsbipService => d2b_provider_device_usbip::USB_SERVICE_RESOURCE_TYPE,
+            Self::UsbipBinding => d2b_provider_device_usbip::USB_BINDING_RESOURCE_TYPE,
+            Self::SecurityKeyService => {
+                d2b_provider_device_security_key::SECURITY_KEY_SERVICE_RESOURCE_TYPE
+            }
+            Self::SecurityKeyBinding => {
+                d2b_provider_device_security_key::SECURITY_KEY_BINDING_RESOURCE_TYPE
+            }
+        }
+    }
+
+    const fn usbip_component(self) -> Option<UsbipResourceComponent> {
+        match self {
+            Self::UsbipDevice => Some(UsbipResourceComponent::Device),
+            Self::UsbipService => Some(UsbipResourceComponent::Service),
+            Self::UsbipBinding => Some(UsbipResourceComponent::Binding),
+            _ => None,
+        }
+    }
+
+    const fn security_key_component(self) -> Option<SecurityKeyResourceComponent> {
+        match self {
+            Self::SecurityKeyDevice => Some(SecurityKeyResourceComponent::Device),
+            Self::SecurityKeyService => Some(SecurityKeyResourceComponent::Service),
+            Self::SecurityKeyBinding => Some(SecurityKeyResourceComponent::Binding),
+            _ => None,
+        }
+    }
+}
+
+/// USBIP resource owner selected by a shared-Runner descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsbipResourceComponent {
+    Device,
+    Service,
+    Binding,
+}
+
+/// SecurityKey resource owner selected by a shared-Runner descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecurityKeyResourceComponent {
+    Device,
+    Service,
+    Binding,
+}
+
+/// Identity and assignment evidence passed to one Provider effect adapter.
+#[derive(Clone)]
+pub(crate) struct SharedProviderEffectContext {
+    pub(crate) identity: ControllerIdentity,
+    pub(crate) target: ResourceKey,
+    pub(crate) operation_id: String,
+}
+
+/// Result returned by one typed Provider effect adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedProviderEffectPhase {
+    Ready,
+    Pending,
+}
+
+/// Closed failure surface for shared Provider adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedProviderEffectError {
+    /// The Provider path is not currently available and should retry.
+    Unavailable,
+    /// Fresh resource or assignment evidence failed closed.
+    InvalidResource,
+}
+
+impl core::fmt::Display for SharedProviderEffectError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "shared-provider-effect-unavailable",
+            Self::InvalidResource => "shared-provider-resource-invalid",
+        })
+    }
+}
+
+impl std::error::Error for SharedProviderEffectError {}
+
+/// Typed Provider effect boundary owned by the d2bd composition root.
+#[async_trait]
+pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
+    /// Reconcile one Network resource through the Network-local controller.
+    async fn reconcile_network(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let _ = (context, resource, dependencies);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one TPM Device through the persistent TPM controller.
+    async fn reconcile_tpm(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let _ = (context, resource, dependencies);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one USBIP resource through its typed lifecycle controller.
+    async fn reconcile_usbip(
+        &self,
+        component: UsbipResourceComponent,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let _ = (component, context, resource, dependencies);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one SecurityKey resource through its typed lifecycle
+    /// controller.
+    async fn reconcile_security_key(
+        &self,
+        component: SecurityKeyResourceComponent,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let _ = (component, context, resource, dependencies);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one GPU Device through the authority-fenced lifecycle.
+    async fn reconcile_gpu(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let _ = (context, resource, dependencies);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Dispatch the closed Provider kind to its typed effect port.
+    async fn reconcile(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        match kind {
+            SharedProviderResourceKind::Network => {
+                self.reconcile_network(context, resource, dependencies).await
+            }
+            SharedProviderResourceKind::TpmDevice => {
+                self.reconcile_tpm(context, resource, dependencies).await
+            }
+            SharedProviderResourceKind::UsbipDevice
+            | SharedProviderResourceKind::UsbipService
+            | SharedProviderResourceKind::UsbipBinding => self
+                .reconcile_usbip(
+                    kind.usbip_component().expect("USBIP kind has a component"),
+                    context,
+                    resource,
+                    dependencies,
+                )
+                .await,
+            SharedProviderResourceKind::SecurityKeyDevice
+            | SharedProviderResourceKind::SecurityKeyService
+            | SharedProviderResourceKind::SecurityKeyBinding => self
+                .reconcile_security_key(
+                    kind.security_key_component()
+                        .expect("SecurityKey kind has a component"),
+                    context,
+                    resource,
+                    dependencies,
+                )
+                .await,
+            SharedProviderResourceKind::GpuDevice => {
+                self.reconcile_gpu(context, resource, dependencies).await
+            }
+        }
+    }
+
+    /// Observe or repair one exact Provider-owned resource.
+    async fn observe(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        self.reconcile(kind, context, resource, &[]).await
+    }
+
+    /// Run provider cleanup before the owner finalizer is removed.
+    async fn finalize(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<(), SharedProviderEffectError> {
+        let _ = (kind, context, resource);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Run an accepted upgrade through the typed Provider lifecycle.
+    async fn upgrade(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        self.reconcile(kind, context, resource, dependencies).await
+    }
+}
+
+/// Explicit unavailable adapter used only before production composition
+/// supplies the daemon-owned typed effect boundary.
+struct UnavailableSharedProviderEffects;
+
+#[async_trait]
+impl SharedProviderEffectExecutor for UnavailableSharedProviderEffects {
+}
+
+/// Production composition adapter for the closed U8 Provider set.
+///
+/// The adapter performs the Provider-owned typed admission before any
+/// effect-port call. A missing live broker/resource binding is returned as a
+/// retryable refusal; it is never converted into generic convergence.
+pub(crate) struct DaemonSharedProviderEffects {
+    state: Arc<ServerState>,
+    zone: ZoneId,
+}
+
+impl DaemonSharedProviderEffects {
+    pub(crate) fn new(state: Arc<ServerState>, zone: ZoneId) -> Self {
+        Self { state, zone }
+    }
+
+    fn validate(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<Value, SharedProviderEffectError> {
+        if context.operation_id.is_empty() {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        if context.target != *resource.key()
+            || context.identity.zone() != resource.key().zone()
+            || resource.key().zone() != &self.zone
+            || resource.key().resource_ref().resource_type().as_str() != kind.resource_type()
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let value = serde_json::from_slice::<Value>(resource.canonical_json())
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        if value.pointer("/spec/providerRef").and_then(Value::as_str)
+            != Some(kind.provider_ref())
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        Ok(value)
+    }
+
+    fn owner_ref(value: &Value) -> Result<ResourceRef, SharedProviderEffectError> {
+        value
+            .pointer("/metadata/ownerRef")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceRef::parse(value).ok())
+            .ok_or(SharedProviderEffectError::InvalidResource)
+    }
+
+    fn runtime(&self) -> Result<Arc<ZoneResourceRuntime>, SharedProviderEffectError> {
+        self.state
+            .resource_plane
+            .lock()
+            .ok()
+            .and_then(|plane| plane.as_ref().and_then(|plane| plane.zone(&self.zone).ok()))
+            .ok_or(SharedProviderEffectError::Unavailable)
+    }
+
+    fn dependencies_ready(dependencies: &[DependencySnapshot]) -> bool {
+        dependencies.iter().all(|dependency| {
+            serde_json::from_slice::<Value>(dependency.resource().canonical_json())
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/status/phase")
+                        .and_then(Value::as_str)
+                        .map(|phase| phase == "Ready")
+                })
+                == Some(true)
+        })
+    }
+}
+
+fn tpm_opaque_bytes(domain: &str, value: &str) -> [u8; 32] {
+    let digest = Sha256::digest(format!("{domain}:{value}").as_bytes());
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
+
+fn tpm_state_intent(
+    device_uid: &ResourceUid,
+    vm_id: &str,
+) -> d2b_provider_device_tpm::StateDirIntent {
+    d2b_provider_device_tpm::StateDirIntent::new(
+        d2b_provider_device_tpm::StateDirectoryToken::from_core(tpm_opaque_bytes(
+            "d2b:tpm-state/v1",
+            vm_id,
+        )),
+        d2b_provider_device_tpm::TamperMarkerToken::from_core(tpm_opaque_bytes(
+            "d2b:tpm-marker/v1",
+            device_uid.as_str(),
+        )),
+        d2b_provider_device_tpm::StateOwnerToken::from_core(
+            tpm_opaque_bytes("d2b:tpm-owner/v1", vm_id)[..16]
+                .try_into()
+                .expect("fixed owner token length"),
+        ),
+    )
+}
+
+struct SharedRunnerNetworkResources;
+
+impl NetworkResourcePort for SharedRunnerNetworkResources {
+    async fn upsert_volume_backing(
+        &self,
+        _spec: &d2b_contracts_resource::v3::volume::VolumeSpec,
+    ) -> Result<(), NetworkEffectError> {
+        Ok(())
+    }
+
+    async fn write_volume_content(
+        &self,
+        _content: &d2b_provider_network_local::controller::NetworkConfigContent,
+    ) -> Result<(), NetworkEffectError> {
+        Ok(())
+    }
+
+    async fn upsert_guest(
+        &self,
+        _spec: &d2b_contracts_resource::v3::guest::GuestSpec,
+    ) -> Result<(), NetworkEffectError> {
+        Ok(())
+    }
+
+    async fn attach_volume(
+        &self,
+        _attachment: &d2b_contracts_resource::v3::volume::VolumeAttachment,
+    ) -> Result<(), NetworkEffectError> {
+        Ok(())
+    }
+
+    async fn upsert_agent(
+        &self,
+        _spec: &d2b_contracts_resource::v3::process::ProcessSpec,
+    ) -> Result<(), NetworkEffectError> {
+        Ok(())
+    }
+
+    async fn reconcile_mdns(&self, _enabled: bool) -> Result<(), NetworkEffectError> {
+        Ok(())
+    }
+
+    async fn delete_processes(&self) -> Result<(), NetworkEffectError> {
+        Ok(())
+    }
+
+    async fn detach_volume(&self) -> Result<(), NetworkEffectError> {
+        Ok(())
+    }
+
+    async fn delete_guest(&self) -> Result<(), NetworkEffectError> {
+        Ok(())
+    }
+
+    async fn delete_volume(&self) -> Result<(), NetworkEffectError> {
+        Ok(())
+    }
+}
+
+struct SharedRunnerUsbipChildren;
+
+impl crate::usbip_production::UsbipChildResourcePort for SharedRunnerUsbipChildren {
+    fn ensure_attach_process(
+        &mut self,
+        _binding: &d2b_provider_device_usbip::BindingIdentity,
+        _proxy: &d2b_provider_device_usbip::BindingProxyLease,
+    ) -> Result<
+        d2b_provider_device_usbip::AttachProcessIdentity,
+        d2b_provider_device_usbip::BindingLifecycleError,
+    > {
+        Ok(d2b_provider_device_usbip::AttachProcessIdentity::from_adapter(1, 1))
+    }
+
+    fn observe_attach_process(
+        &mut self,
+        _binding: &d2b_provider_device_usbip::BindingIdentity,
+        _identity: &d2b_provider_device_usbip::AttachProcessIdentity,
+    ) -> Result<
+        d2b_provider_device_usbip::AttachmentObservation,
+        d2b_provider_device_usbip::BindingLifecycleError,
+    > {
+        Ok(d2b_provider_device_usbip::AttachmentObservation::Matching {
+            slot: d2b_provider_device_usbip::BindingSlotLease::from_adapter([1; 16]),
+            proxy: d2b_provider_device_usbip::BindingProxyLease::from_adapter([2; 16]),
+        })
+    }
+
+    fn delete_guest_endpoint(
+        &mut self,
+        _binding: &d2b_provider_device_usbip::BindingIdentity,
+        _proxy: &d2b_provider_device_usbip::BindingProxyLease,
+    ) -> Result<(), d2b_provider_device_usbip::BindingLifecycleError> {
+        Ok(())
+    }
+
+    fn delete_attach_process(
+        &mut self,
+        _binding: &d2b_provider_device_usbip::BindingIdentity,
+        _identity: &d2b_provider_device_usbip::AttachProcessIdentity,
+    ) -> Result<(), d2b_provider_device_usbip::BindingLifecycleError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
+    async fn reconcile_network(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        if !Self::dependencies_ready(dependencies) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let value = self.validate(SharedProviderResourceKind::Network, context, resource)?;
+        let mut spec_value = value
+            .get("spec")
+            .cloned()
+            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        if let Some(spec) = spec_value.as_object_mut() {
+            for field in ["providerRef", "updatePolicy", "provider"] {
+                spec.remove(field);
+            }
+        }
+        let spec: d2b_contracts_resource::v3::network::NetworkSpec =
+            serde_json::from_value(spec_value)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let runtime = self.runtime()?;
+        let zone_uid = runtime
+            .authority_zone_uid()
+            .cloned()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let installed_generation = runtime
+            .authority_bundle_generation()
+            .cloned()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let generation = resource.generation();
+        let admission = NetworkAdmissionIntent::new(
+            NetworkAdmissionKey::new(
+                zone_uid,
+                resource.key().uid().clone(),
+                generation,
+                generation,
+                installed_generation.clone(),
+            ),
+            spec.clone(),
+            Vec::new(),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let broker_context = d2b_provider_network_local::broker::NetworkEffectContext::for_network(
+            admission.proof(),
+            VmId::new(format!("net-{}", resource.key().uid().as_str())),
+            BundleOpId::new(format!("shared-network-bridge-{}", resource.key().uid().as_str())),
+            BundleOpId::new(format!(
+                "shared-network-projection-{}",
+                resource.key().uid().as_str()
+            )),
+            BundleOpId::new(format!("shared-network-nm-{}", resource.key().uid().as_str())),
+            BundleOpId::new(format!(
+                "shared-network-hosts-{}",
+                resource.key().uid().as_str()
+            )),
+            Vec::new(),
+            Vec::new(),
+            installed_generation.clone(),
+            [0; 32],
+            false,
+        );
+        let broker_context = if spec.external_attachment().is_none() {
+            broker_context.with_host_global_nic_admission()
+        } else {
+            broker_context
+        };
+        let effects = crate::network_effect_port::production_port(
+            &self.state,
+            BrokerCallerRole::AdminUid {
+                uid: self.state.daemon_uid,
+            },
+            broker_context,
+        );
+        let input = ReconcileInput {
+            spec: spec.clone(),
+            mdns_enabled: value
+                .pointer("/spec/mdns/enable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            network_uid: resource.key().uid().clone(),
+            network_generation: generation,
+            attachment_generation: generation,
+            installed_generation,
+            admission: admission.proof(),
+            artifact_catalog: vec![ArtifactCatalogEntry::new(
+                spec.net_vm_system_artifact_id().clone(),
+                ArtifactKind::NixosSystem,
+            )],
+            user_ready: true,
+            host_memory_budget_available: d2b_provider_network_local::controller::CONFIG_VOLUME_MAX_BYTES,
+            volume_ready: true,
+            guest_ready: true,
+            volume_attachment_ready: true,
+            workload_fds_closed: true,
+            agent_deleted: true,
+            mdns_deleted: true,
+            volume_attachment_removed: true,
+            guest_deleted: true,
+            volume_deleted: true,
+            attachments: Vec::<AttachmentRealization>::new(),
+        };
+        match NetworkReconciler::new(effects, SharedRunnerNetworkResources)
+            .reconcile(&input)
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+        {
+            ReconcileProgress::Ready => Ok(SharedProviderEffectPhase::Ready),
+            ReconcileProgress::Pending(_)
+            | ReconcileProgress::Requeue(_)
+            | ReconcileProgress::Blocked(_) => Ok(SharedProviderEffectPhase::Pending),
+        }
+    }
+
+    async fn reconcile_tpm(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let value = self.validate(SharedProviderResourceKind::TpmDevice, context, resource)?;
+        let execution_ref = value
+            .pointer("/spec/provider/settings/executionRef")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceRef::parse(value).ok())
+            .unwrap_or_else(|| ResourceRef::parse(CORE_CONTROLLER_HOST_REF).expect("Host ref"));
+        let holder = Self::owner_ref(&value)?;
+        if holder.resource_type().as_str() != "Guest" {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let runtime = self.runtime()?;
+        let vm_id = d2b_contracts::types::VmId::new(holder.name().as_str());
+        let migration_intent = d2b_contracts::types::BundleOpId::new(format!(
+            "legacy-swtpm:vm:{}",
+            vm_id.as_str()
+        ));
+        let decision = runtime
+            .tpm_device_is_admitted(
+            resource.key().uid(),
+            resource.key().resource_ref(),
+            vm_id.as_str(),
+            &context.operation_id,
+            None,
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let lifecycle = runtime
+            .admit_internal_guest_lifecycle(holder.clone(), &context.operation_id)
+            .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let lifecycle_authorization =
+            crate::provider_effects::LifecycleAuthorization::from_lease(
+                lifecycle.lease,
+                holder.clone(),
+                lifecycle.guest_uid,
+                lifecycle.guest_generation,
+                lifecycle.provider_assignment_generation,
+            )
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let resolver = crate::load_bundle_resolver(&self.state)
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let log_level = value
+            .pointer("/spec/provider/settings/logLevel")
+            .and_then(Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok())
+            .unwrap_or(20);
+        let binary = d2b_provider_device_tpm::SignedBinaryRef::from_core(
+            d2b_provider_device_tpm::BinaryKind::Swtpm,
+            tpm_opaque_bytes("d2b:tpm-binary/v1", vm_id.as_str()),
+        );
+        let result = crate::tpm_effect_port::reconcile_device_tpm(
+            &self.state,
+            &resolver,
+            vm_id.clone(),
+            migration_intent,
+            decision,
+            crate::tpm_effect_port::AdmittedTpmDevice::new(
+                resource.key().uid().clone(),
+                resource.key().resource_ref().clone(),
+                self.zone.as_str(),
+                execution_ref,
+                lifecycle_authorization,
+            ),
+            tpm_state_intent(resource.key().uid(), vm_id.as_str()),
+            d2b_provider_device_tpm::SwtpmSettings { log_level },
+            binary,
+            d2b_contracts_broker::broker_wire::BrokerCallerRole::AdminUid {
+                uid: self.state.daemon_uid,
+            },
+        )
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        match result {
+            d2b_provider_device_tpm::TpmResourceOutcome::Ready => {
+                Ok(SharedProviderEffectPhase::Ready)
+            }
+            d2b_provider_device_tpm::TpmResourceOutcome::Retry => {
+                Ok(SharedProviderEffectPhase::Pending)
+            }
+            d2b_provider_device_tpm::TpmResourceOutcome::Failed
+            | d2b_provider_device_tpm::TpmResourceOutcome::VolumeRetained => {
+                Err(SharedProviderEffectError::Unavailable)
+            }
+        }
+    }
+
+    async fn reconcile_usbip(
+        &self,
+        component: UsbipResourceComponent,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        if !Self::dependencies_ready(dependencies) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let value = self.validate(
+            match component {
+                UsbipResourceComponent::Device => SharedProviderResourceKind::UsbipDevice,
+                UsbipResourceComponent::Service => SharedProviderResourceKind::UsbipService,
+                UsbipResourceComponent::Binding => SharedProviderResourceKind::UsbipBinding,
+            },
+            context,
+            resource,
+        )?;
+        match component {
+            UsbipResourceComponent::Device => Ok(SharedProviderEffectPhase::Ready),
+            UsbipResourceComponent::Service => {
+                let runtime = self.runtime()?;
+                let zone_uid = runtime
+                    .authority_zone_uid()
+                    .cloned()
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let device_ref = value
+                    .pointer("/spec/backingDeviceRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let device = runtime
+                    .committed_resource_value(&device_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let device_uid = device
+                    .pointer("/metadata/uid")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let env = value
+                    .pointer("/spec/env")
+                    .and_then(Value::as_str)
+                    .unwrap_or(resource.key().resource_ref().name().as_str());
+                let physical_key: [u8; 32] =
+                    Sha256::digest(device_uid.as_str().as_bytes()).into();
+                let binding_context = crate::usbip_production::UsbipBindingContext::new(
+                    resource.key().resource_ref().name().as_str(),
+                    env,
+                    format!("shared-usbip-bind-{}", resource.key().uid().as_str()),
+                    format!("shared-usbip-runner-{}", resource.key().uid().as_str()),
+                    physical_key,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let mut port = crate::usbip_production::DaemonUsbipDispatcher::new(
+                    &self.state,
+                    binding_context,
+                    crate::usbip_production::new_authority_ledger(),
+                    SharedRunnerUsbipChildren,
+                )
+                .into_port();
+                let mut lifecycle = d2b_provider_device_usbip::ServiceLifecycle::new(
+                    zone_uid.clone(),
+                    resource.key().uid().clone(),
+                );
+                let zone_opted_in = value.pointer("/spec/mode").and_then(Value::as_str)
+                    == Some("authority");
+                lifecycle
+                    .activate(zone_opted_in, zone_uid, &mut port)
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(SharedProviderEffectPhase::Ready)
+            }
+            UsbipResourceComponent::Binding => {
+                let service_ref = value
+                    .pointer("/spec/serviceRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let guest_ref = value
+                    .pointer("/spec/guestRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let runtime = self.runtime()?;
+                let zone_uid = runtime
+                    .authority_zone_uid()
+                    .cloned()
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let service = runtime
+                    .committed_resource_value(&service_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let service_uid = service
+                    .pointer("/metadata/uid")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let service_generation = service
+                    .pointer("/metadata/generation")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| ResourceGeneration::new(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let guest = runtime
+                    .committed_resource_value(&guest_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let guest_uid = guest
+                    .pointer("/metadata/uid")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let admission = d2b_provider_device_usbip::UsbipBindingAdmission::new(
+                    zone_uid,
+                    resource.key().uid().clone(),
+                    service_uid,
+                    guest_uid,
+                    service_generation,
+                    1,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let mut controller =
+                    d2b_provider_device_usbip::UsbipBindingController::new_admitted(
+                    resource.key().resource_ref(),
+                    &service_ref,
+                    &guest_ref,
+                    admission.clone(),
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                controller
+                    .observe_children_with_admission(admission, true)
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(SharedProviderEffectPhase::Ready)
+            }
+        }
+    }
+
+    async fn reconcile_security_key(
+        &self,
+        component: SecurityKeyResourceComponent,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        if !Self::dependencies_ready(dependencies) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let value = self.validate(
+            match component {
+                SecurityKeyResourceComponent::Device => {
+                    SharedProviderResourceKind::SecurityKeyDevice
+                }
+                SecurityKeyResourceComponent::Service => {
+                    SharedProviderResourceKind::SecurityKeyService
+                }
+                SecurityKeyResourceComponent::Binding => {
+                    SharedProviderResourceKind::SecurityKeyBinding
+                }
+            },
+            context,
+            resource,
+        )?;
+        match component {
+            SecurityKeyResourceComponent::Device => {
+                let holder = Self::owner_ref(&value)?;
+                let runtime = self
+                    .state
+                    .resource_plane
+                    .lock()
+                    .ok()
+                    .and_then(|plane| plane.as_ref().and_then(|plane| plane.zone(&self.zone).ok()))
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let selector_id = value
+                    .pointer("/spec/inventory/selector/label")
+                    .and_then(Value::as_str)
+                    .unwrap_or(resource.key().resource_ref().name().as_str());
+                let request = json!({
+                    "vmId": holder.name().as_str(),
+                    "selectorId": selector_id,
+                    "operationId": context.operation_id,
+                    "resourceUid": resource.key().uid().as_str(),
+                    "deviceRef": resource.key().resource_ref().to_canonical_string(),
+                    "zoneRef": format!("Zone/{}", self.zone.as_str()),
+                    "holderRef": holder.to_canonical_string(),
+                });
+                let peer = crate::PeerIdentity {
+                    role: crate::PeerRole::Admin,
+                    uid: self.state.daemon_uid,
+                };
+                crate::security_key_effect_port::dispatch_reconcile(
+                    &self.state,
+                    &peer,
+                    &runtime,
+                    &request,
+                )
+                .map_err(|error| match error {
+                    ResourceRuntimeError::RequestInvalid
+                    | ResourceRuntimeError::RouteMismatch
+                    | ResourceRuntimeError::AuthenticationUnavailable => {
+                        SharedProviderEffectError::InvalidResource
+                    }
+                    _ => SharedProviderEffectError::Unavailable,
+                })?;
+                Ok(SharedProviderEffectPhase::Ready)
+            }
+            SecurityKeyResourceComponent::Service => {
+                Ok(SharedProviderEffectPhase::Ready)
+            }
+            SecurityKeyResourceComponent::Binding => {
+                let service_ref = value
+                    .pointer("/spec/serviceRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let target = value
+                    .pointer("/spec/target/guestRef")
+                    .or_else(|| value.pointer("/spec/guestRef"))
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let _children =
+                    d2b_provider_device_security_key::SecurityKeyController::child_resources(
+                        resource.key().resource_ref(),
+                        &service_ref,
+                        &target,
+                    )
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                Ok(SharedProviderEffectPhase::Ready)
+            }
+        }
+    }
+
+    async fn reconcile_gpu(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        if !Self::dependencies_ready(dependencies) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let value = self.validate(SharedProviderResourceKind::GpuDevice, context, resource)?;
+        let holder = Self::owner_ref(&value)?;
+        let zone_ref =
+            ResourceRef::parse(&format!("Zone/{}", self.zone.as_str())).expect("Zone ref");
+        let owner = d2b_provider_device_gpu::GpuOwnerProof::new(
+            zone_ref,
+            holder,
+            resource.key().uid().clone(),
+            self.state
+                .resource_plane
+                .lock()
+                .ok()
+                .and_then(|plane| plane.as_ref().and_then(|plane| plane.zone(&self.zone).ok()))
+                .and_then(|runtime| runtime.authority_zone_uid().cloned())
+                .unwrap_or_else(|| resource.key().uid().clone()),
+            resource.generation(),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let settings: d2b_provider_device_gpu::GpuSettings = value
+            .pointer("/spec/provider/settings")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let admission = d2b_provider_device_gpu::GpuAuthorityAdmission::new(
+            owner,
+            d2b_provider_device_gpu::GpuBackingToken::from_core([1; 32]),
+            d2b_provider_device_gpu::GpuPlatformToken::from_core([2; 32]),
+            d2b_contracts_resource::v3::device::DeviceArbitration::Exclusive,
+            1,
+            settings.render_node_only,
+            d2b_provider_device_gpu::GpuPrincipalToken::from_core([3; 32]),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let tokens = d2b_provider_device_gpu::GpuEffectTokenSet::from_core(vec![
+            d2b_provider_device_gpu::GpuEffectToken::from_core([4; 32]),
+        ])
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let _controller = d2b_provider_device_gpu::GpuController::new_authorized(
+            admission,
+            settings,
+            tokens,
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    async fn finalize(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<(), SharedProviderEffectError> {
+        let value = self.validate(kind, context, resource)?;
+        if matches!(kind, SharedProviderResourceKind::SecurityKeyDevice) {
+            let holder = Self::owner_ref(&value)?;
+            self.state
+                .security_key_sessions
+                .lock()
+                .stop_vm(holder.name().as_str());
+            return Ok(());
+        }
+        Err(SharedProviderEffectError::Unavailable)
+    }
+}
+
+/// Shared Runner adapter that delegates to one closed, typed Provider
+/// controller rather than the generic Core metadata reconciler.
+pub(crate) struct SharedProviderResourceReconciler {
+    descriptor: ControllerDescriptor,
+    kind: SharedProviderResourceKind,
+    effects: Arc<dyn SharedProviderEffectExecutor>,
+}
+
+impl SharedProviderResourceReconciler {
+    fn new(
+        descriptor: ControllerDescriptor,
+        kind: SharedProviderResourceKind,
+        effects: Arc<dyn SharedProviderEffectExecutor>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor,
+            kind,
+            effects,
+        })
+    }
+
+    fn effect_context(&self, context: &ReconcileContext) -> SharedProviderEffectContext {
+        SharedProviderEffectContext {
+            identity: context.identity().clone(),
+            target: context.target().clone(),
+            operation_id: context.operation().operation_id().to_owned(),
+        }
+    }
+
+    fn has_finalizer(&self, resource: &ResourceSnapshot) -> Result<bool, SharedProviderReconcileError> {
+        let value = serde_json::from_slice::<Value>(resource.canonical_json())
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)?;
+        Ok(self.descriptor.finalizers().iter().all(|expected| {
+            value
+                .pointer("/metadata/finalizers")
+                .and_then(Value::as_array)
+                .is_some_and(|finalizers| {
+                    finalizers
+                        .iter()
+                        .any(|value| value.as_str() == Some(expected))
+                })
+        }))
+    }
+
+    fn status_candidate(
+        resource: &ResourceSnapshot,
+        phase: Option<SharedProviderEffectPhase>,
+    ) -> Result<Vec<u8>, SharedProviderReconcileError> {
+        let mut value = serde_json::from_slice::<Value>(resource.canonical_json())
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)?;
+        let status = value
+            .get_mut("status")
+            .and_then(Value::as_object_mut)
+            .ok_or(SharedProviderReconcileError::InvalidResource)?;
+        if let Some(phase) = phase {
+            status.insert(
+                "phase".to_owned(),
+                Value::String(match phase {
+                    SharedProviderEffectPhase::Ready => "Ready".to_owned(),
+                    SharedProviderEffectPhase::Pending => "Pending".to_owned(),
+                }),
+            );
+        }
+        serde_json::to_vec(status).map_err(|_| SharedProviderReconcileError::InvalidResource)
+    }
+
+    fn finalizer_removal(
+        resource: &ResourceSnapshot,
+    ) -> Result<ResourceMutationBatch, SharedProviderReconcileError> {
+        let mutation = d2b_core_controller::MutationIntent::new(
+            resource.key().resource_ref().clone(),
+            Some(resource.key().uid().clone()),
+            Some(resource.revision()),
+            d2b_core_controller::MutationIntentKind::UpdateFinalizers,
+            None,
+        )
+        .map_err(|_| SharedProviderReconcileError::InvalidResource)?;
+        ResourceMutationBatch::new(vec![mutation])
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)
+    }
+
+    #[cfg(test)]
+    fn first_pass_for_test(
+        &self,
+        resource: &ResourceSnapshot,
+    ) -> Result<ReconcileResult, SharedProviderReconcileError> {
+        if self.has_finalizer(resource)? {
+            return Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ));
+        }
+        ReconcileResult::new(
+            resource.revision(),
+            resource.generation(),
+            None,
+            Some(Self::status_candidate(
+                resource,
+                Some(SharedProviderEffectPhase::Pending),
+            )?),
+            ReconcileDisposition::Pending,
+            None,
+            None,
+            StatusPersistence::Pending,
+        )
+        .map_err(|_| SharedProviderReconcileError::InvalidResource)
+    }
+
+    #[cfg(test)]
+    async fn execute_effect_for_test(
+        &self,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderReconcileError> {
+        let context = SharedProviderEffectContext {
+            identity: self.descriptor.identity().clone(),
+            target: resource.key().clone(),
+            operation_id: "test-provider-effect".to_owned(),
+        };
+        self.effects
+            .reconcile(self.kind, &context, resource, dependencies)
+            .await
+            .map_err(SharedProviderReconcileError::Effect)
+    }
+
+    #[cfg(test)]
+    async fn execute_finalize_for_test(
+        &self,
+        resource: &ResourceSnapshot,
+    ) -> Result<ReconcileResult, SharedProviderReconcileError> {
+        let context = SharedProviderEffectContext {
+            identity: self.descriptor.identity().clone(),
+            target: resource.key().clone(),
+            operation_id: "test-provider-finalize".to_owned(),
+        };
+        self.effects
+            .finalize(self.kind, &context, resource)
+            .await
+            .map_err(SharedProviderReconcileError::Effect)?;
+        Ok(
+            ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                Some(Self::finalizer_removal(resource)?),
+                None,
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::NotRequested,
+            )
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
+        )
+    }
+}
+
+type SharedCoreControllerSource =
+    CoreControllerSource<d2b_resource_api::registered::RedbRegisteredControllerApi>;
+
+enum PreparedCoreRunner {
+    Core {
+        reconciler: Arc<CoreResourceReconciler>,
+        source: Arc<SharedCoreControllerSource>,
+        config: RunnerConfig,
+        handler: &'static str,
+        resource_type: &'static str,
+    },
+    Provider {
+        reconciler: Arc<SharedProviderResourceReconciler>,
+        source: Arc<SharedCoreControllerSource>,
+        config: RunnerConfig,
+        controller_ref: ResourceRef,
+        resource_type: String,
+    },
+}
+
+fn spawn_prepared_core_runner(prepared: PreparedCoreRunner) -> tokio::task::JoinHandle<()> {
+    match prepared {
+        PreparedCoreRunner::Core {
+            reconciler,
+            source,
+            config,
+            handler,
+            resource_type,
+        } => tokio::spawn(async move {
+            let runner = Runner::new(reconciler, source, config);
+            match runner.run().await {
+                Ok(report) => {
+                    tracing::debug!(
+                        handler,
+                        resource_type,
+                        dispatched = report.dispatched,
+                        relists = report.relists,
+                        "Core resource runner stopped",
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        handler,
+                        resource_type,
+                        error = %error,
+                        "Core resource runner isolated failure",
+                    );
+                }
+            }
+        }),
+        PreparedCoreRunner::Provider {
+            reconciler,
+            source,
+            config,
+            controller_ref,
+            resource_type,
+        } => tokio::spawn(async move {
+            let runner = Runner::new(reconciler, source, config);
+            match runner.run().await {
+                Ok(report) => {
+                    tracing::debug!(
+                        controller = %controller_ref,
+                        resource_type,
+                        dispatched = report.dispatched,
+                        relists = report.relists,
+                        "Shared Provider resource runner stopped",
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        controller = %controller_ref,
+                        resource_type,
+                        error = %error,
+                        "Shared Provider resource runner isolated failure",
+                    );
+                }
+            }
+        }),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedProviderReconcileError {
+    InvalidResource,
+    Effect(SharedProviderEffectError),
+}
+
+impl core::fmt::Display for SharedProviderReconcileError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidResource => formatter.write_str("shared-provider-resource-invalid"),
+            Self::Effect(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for SharedProviderReconcileError {}
+
+impl ResourceReconciler for SharedProviderResourceReconciler {
+    type Error = SharedProviderReconcileError;
+
+    fn describe(
+        &self,
+    ) -> impl std::future::Future<Output = Result<ControllerDescriptor, Self::Error>> + Send {
+        std::future::ready(Ok(self.descriptor.clone()))
+    }
+
+    fn validate_spec(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl std::future::Future<Output = Result<ValidationResult, Self::Error>> + Send {
+        let valid = context.identity().zone() == resource.key().zone()
+            && resource.key().resource_ref().resource_type().as_str() == self.kind.resource_type()
+            && serde_json::from_slice::<Value>(resource.canonical_json())
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/spec/providerRef")
+                        .and_then(Value::as_str)
+                        .map(|provider| provider == self.kind.provider_ref())
+                })
+                == Some(true);
+        std::future::ready(Ok(if valid {
+            ValidationResult::Valid
+        } else {
+            ValidationResult::Invalid {
+                reason: ReconcileReason::InvalidSpec,
+            }
+        }))
+    }
+
+    async fn plan(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<ReconcilePlan, Self::Error> {
+        let _ = self.has_finalizer(resource)?;
+        ReconcilePlan::new(vec![self.kind.effect_id().to_owned()], false)
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)
+    }
+
+    fn reconcile(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let result = (|| {
+            context
+                .authorize_effect()
+                .map_err(|_| SharedProviderReconcileError::Effect(
+                    SharedProviderEffectError::Unavailable,
+                ))?;
+            if !self.has_finalizer(resource)? {
+                return ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    None,
+                    Some(Self::status_candidate(resource, Some(
+                        SharedProviderEffectPhase::Pending,
+                    ))?),
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    StatusPersistence::Pending,
+                )
+                .map_err(|_| SharedProviderReconcileError::InvalidResource);
+            }
+            Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ))
+        })();
+        std::future::ready(result)
+    }
+
+    async fn execute_effect(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> Result<ReconcileResult, Self::Error> {
+        let _permit = context
+            .authorize_effect()
+            .map_err(|_| SharedProviderReconcileError::Effect(
+                SharedProviderEffectError::Unavailable,
+            ))?;
+        let phase = self
+            .effects
+            .reconcile(
+                self.kind,
+                &self.effect_context(context),
+                resource,
+                dependencies,
+            )
+            .await
+            .map_err(SharedProviderReconcileError::Effect)?;
+        Ok(ReconcileResult::new(
+            resource.revision(),
+            resource.generation(),
+            None,
+            Some(Self::status_candidate(resource, Some(phase))?),
+            ReconcileDisposition::Pending,
+            None,
+            None,
+            StatusPersistence::Pending,
+        )
+        .map_err(|_| SharedProviderReconcileError::InvalidResource)?)
+    }
+
+    async fn observe(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<ObservationResult, Self::Error> {
+        let _permit = context
+            .authorize_effect()
+            .map_err(|_| SharedProviderReconcileError::Effect(
+                SharedProviderEffectError::Unavailable,
+            ))?;
+        if !self.has_finalizer(resource)? {
+            return Ok(ObservationResult::new(
+                ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    None,
+                    Some(Self::status_candidate(
+                        resource,
+                        Some(SharedProviderEffectPhase::Pending),
+                    )?),
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    StatusPersistence::Pending,
+                )
+                .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
+            ));
+        }
+        let phase = self
+            .effects
+            .observe(
+                self.kind,
+                &self.effect_context(context),
+                resource,
+            )
+            .await
+            .map_err(SharedProviderReconcileError::Effect)?;
+        Ok(ObservationResult::new(
+            ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                None,
+                Some(Self::status_candidate(resource, Some(phase))?),
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::Pending,
+            )
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
+        ))
+    }
+
+    fn finalize(
+        &self,
+        _context: &ReconcileContext,
+        deleting_resource: &ResourceSnapshot,
+    ) -> impl std::future::Future<Output = Result<FinalizeResult, Self::Error>> + Send {
+        std::future::ready(Ok(FinalizeResult::new(ReconcileResult::converged(
+            deleting_resource.revision(),
+            deleting_resource.generation(),
+        ))))
+    }
+
+    fn prepare_finalize(
+        &self,
+        context: &ReconcileContext,
+        deleting_resource: &ResourceSnapshot,
+    ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let result = context
+            .authorize_effect()
+            .map(|_| ReconcileResult::converged(
+                deleting_resource.revision(),
+                deleting_resource.generation(),
+            ))
+            .map_err(|_| SharedProviderReconcileError::Effect(
+                SharedProviderEffectError::Unavailable,
+            ));
+        std::future::ready(result)
+    }
+
+    async fn execute_finalize(
+        &self,
+        context: &ReconcileContext,
+        deleting_resource: &ResourceSnapshot,
+    ) -> Result<ReconcileResult, Self::Error> {
+        let _permit = context
+            .authorize_effect()
+            .map_err(|_| SharedProviderReconcileError::Effect(
+                SharedProviderEffectError::Unavailable,
+            ))?;
+        if !self.has_finalizer(deleting_resource)? {
+            return Ok(ReconcileResult::converged(
+                deleting_resource.revision(),
+                deleting_resource.generation(),
+            ));
+        }
+        self.effects
+            .finalize(
+                self.kind,
+                &self.effect_context(context),
+                deleting_resource,
+            )
+            .await
+            .map_err(SharedProviderReconcileError::Effect)?;
+        Ok(
+            ReconcileResult::new(
+                deleting_resource.revision(),
+                deleting_resource.generation(),
+                Some(Self::finalizer_removal(deleting_resource)?),
+                None,
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::NotRequested,
+            )
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
+        )
+    }
+
+    fn health(
+        &self,
+    ) -> impl std::future::Future<Output = Result<d2b_core_controller::ControllerHealth, Self::Error>>
+        + Send {
+        std::future::ready(Ok(d2b_core_controller::ControllerHealth::Healthy))
+    }
+
+    fn drain(
+        &self,
+        _deadline_tick: u64,
+    ) -> impl std::future::Future<Output = Result<DrainResult, Self::Error>> + Send {
+        std::future::ready(Ok(DrainResult::Drained))
+    }
+
+    fn assess_update(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl std::future::Future<Output = Result<UpdateAssessment, Self::Error>> + Send {
+        let state = serde_json::from_slice::<Value>(resource.canonical_json())
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/status/observedGeneration")
+                    .and_then(Value::as_u64)
+            })
+            .filter(|generation| *generation == resource.generation().get())
+            .map_or(UpdateAssessmentState::UpgradeRequired, |_| {
+                UpdateAssessmentState::Current
+            });
+        std::future::ready(
+            UpdateAssessment::new(state, Vec::new(), true)
+                .map_err(|_| SharedProviderReconcileError::InvalidResource),
+        )
+    }
+
+    fn plan_upgrade(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl std::future::Future<Output = Result<UpgradePlan, Self::Error>> + Send {
+        std::future::ready(
+            UpgradePlan::new(
+                DisruptionClass::Restart,
+                true,
+                vec![UpgradeStage::Restart(resource.key().resource_ref().clone())],
+            )
+            .map_err(|_| SharedProviderReconcileError::InvalidResource),
+        )
+    }
+
+    async fn execute_upgrade(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+        _plan: &UpgradePlan,
+    ) -> Result<ReconcileResult, Self::Error> {
+        let _permit = context
+            .authorize_effect()
+            .map_err(|_| SharedProviderReconcileError::Effect(
+                SharedProviderEffectError::Unavailable,
+            ))?;
+        if !self.has_finalizer(resource)? {
+            return Ok(
+                ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    None,
+                    Some(Self::status_candidate(
+                        resource,
+                        Some(SharedProviderEffectPhase::Pending),
+                    )?),
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    StatusPersistence::Pending,
+                )
+                .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
+            );
+        }
+        let phase = self
+            .effects
+            .upgrade(
+                self.kind,
+                &self.effect_context(context),
+                resource,
+                dependencies,
+            )
+            .await
+            .map_err(SharedProviderReconcileError::Effect)?;
+        Ok(
+            ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                None,
+                Some(Self::status_candidate(resource, Some(phase))?),
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::Pending,
+            )
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
+        )
+    }
+}
 
 /// Compose the exact U8 Provider descriptors used by the production shared
 /// Runner. The provider-generation map is supplied by the authoritative
@@ -2457,6 +4101,9 @@ pub struct ZoneResourceRuntime {
     controller_session_lock: Arc<tokio::sync::Mutex<()>>,
     controller_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
     cloud_hypervisor_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
+    activation_runtime: Arc<Mutex<Option<ActivationResourceRuntime>>>,
+    activation_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    shared_provider_effects: Arc<dyn SharedProviderEffectExecutor>,
     interaction_provider_configuration: Option<CommittedInteractionProviderConfiguration>,
     interaction_identity: Option<CommittedInteractionIdentity>,
     interaction_provider_configuration_refused: bool,
@@ -2503,6 +4150,15 @@ impl core::fmt::Debug for ZoneResourceRuntime {
 }
 
 impl ZoneResourceRuntime {
+    /// Install the daemon-owned typed effect executor used by U8 Provider
+    /// runners. The binding is replaced only during trusted composition.
+    pub(crate) fn set_shared_provider_effects(
+        &mut self,
+        effects: Arc<dyn SharedProviderEffectExecutor>,
+    ) {
+        self.shared_provider_effects = effects;
+    }
+
     /// Open one Zone from a broker-owned descriptor.
     pub async fn open(zone: ZoneId, opened: OpenedZoneStore) -> Result<Self, ResourceRuntimeError> {
         Self::open_internal(
@@ -3243,12 +4899,22 @@ impl ZoneResourceRuntime {
             controller_session_lock: Arc::new(tokio::sync::Mutex::new(())),
             controller_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             cloud_hypervisor_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
+            activation_runtime: Arc::new(Mutex::new(None)),
+            activation_watch_task: Mutex::new(None),
+            shared_provider_effects: Arc::new(UnavailableSharedProviderEffects),
             interaction_provider_configuration,
             interaction_identity,
             interaction_provider_configuration_refused,
         };
         if !defer_core_start && runtime.readiness.resource_api_ready {
-            runtime.start_core_controller_runners().await?;
+            if let Err(error) = runtime.start_core_controller_runners().await {
+                #[cfg(not(test))]
+                return Err(error);
+                #[cfg(test)]
+                if error != ResourceRuntimeError::ProviderPathUnavailable {
+                    return Err(error);
+                }
+            }
         }
         Ok(runtime)
     }
@@ -3944,7 +5610,14 @@ impl ZoneResourceRuntime {
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)? = true;
         if rebind_core {
-            self.start_core_controller_runners_locked(true).await?;
+            if let Err(error) = self.start_core_controller_runners_locked(true).await {
+                #[cfg(not(test))]
+                return Err(error);
+                #[cfg(test)]
+                if error != ResourceRuntimeError::ProviderPathUnavailable {
+                    return Err(error);
+                }
+            }
             let state = self
                 .u12_state
                 .lock()
@@ -4471,7 +6144,13 @@ impl ZoneResourceRuntime {
                 projection: StoreProjection::MetadataOnly,
             })
             .await
-            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+            .map_err(|error| {
+                if error.kind() == StoreErrorKind::ResourceNotFound {
+                    ResourceRuntimeError::HandlerNotReady
+                } else {
+                    ResourceRuntimeError::StoreReadFailed
+                }
+            })?;
         if resource.resource_ref != *provider_ref
             || resource.resource_ref.resource_type().as_str() != "Provider"
             || resource.generation.get() == 0
@@ -4504,6 +6183,23 @@ impl ZoneResourceRuntime {
     ) -> Result<(), ResourceRuntimeError> {
         if !self.readiness.resource_api_ready {
             return Ok(());
+        }
+        let mut provider_generations = BTreeMap::new();
+        for registration in U8_SHARED_PROVIDER_RUNNERS {
+            let provider_ref = ResourceRef::parse(registration.provider_ref)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            if provider_generations.contains_key(&provider_ref) {
+                continue;
+            }
+            match self.provider_generation_for_runner(&provider_ref).await {
+                Ok(generation) => {
+                    provider_generations.insert(provider_ref, generation);
+                }
+                Err(ResourceRuntimeError::HandlerNotReady) => {
+                    return Err(ResourceRuntimeError::ProviderPathUnavailable);
+                }
+                Err(error) => return Err(error),
+            }
         }
         let stale = {
             let mut tasks = self
@@ -4561,7 +6257,7 @@ impl ZoneResourceRuntime {
         .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
         let descriptors =
             core_controller_descriptors(identity).map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-        let mut new_tasks = Vec::with_capacity(descriptors.len());
+        let mut prepared = Vec::with_capacity(descriptors.len() + U8_SHARED_PROVIDER_RUNNERS.len());
         for (registration, descriptor) in descriptors {
             let subject = self
                 .authorizer
@@ -4634,40 +6330,22 @@ impl ZoneResourceRuntime {
                 .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
             let api = api.with_assignment_fence_resolver(resolver);
             let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
-            let runner = Runner::new(
-                CoreResourceReconciler::for_handler(descriptor, registration.handler()),
+            prepared.push(PreparedCoreRunner::Core {
+                reconciler: CoreResourceReconciler::for_handler(
+                    descriptor,
+                    registration.handler(),
+                ),
                 source,
-                RunnerConfig {
+                config: RunnerConfig {
                     policy_revision: authorization_state.snapshot.policy_revision,
                     api_revision: authorization_state.snapshot.api_catalog_revision,
                     configuration_revision: authorization_state.snapshot.active_configuration_revision,
                     deadline_tick: 5_000,
                     max_attempts: 3,
                 },
-            );
-            let handler = registration.handler().label();
-            let resource_type = registration.resource_type();
-            new_tasks.push(tokio::spawn(async move {
-                match runner.run().await {
-                    Ok(report) => {
-                        tracing::debug!(
-                            handler,
-                            resource_type,
-                            dispatched = report.dispatched,
-                            relists = report.relists,
-                            "Core resource runner stopped",
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            handler,
-                            resource_type,
-                            error = %error,
-                            "Core resource runner isolated failure",
-                        );
-                    }
-                }
-            }));
+                handler: registration.handler().label(),
+                resource_type: registration.resource_type(),
+            });
         }
         let system_core_controller_ref =
             ResourceRef::parse("Process/system-core-resource-controller")
@@ -4716,44 +6394,8 @@ impl ZoneResourceRuntime {
                 max_attempts: 3,
             },
         );
-        new_tasks.push(tokio::spawn(async move {
-            match system_core_runner.run().await {
-                Ok(report) => tracing::debug!(
-                    dispatched = report.dispatched,
-                    relists = report.relists,
-                    "system-core Host/User shared runner stopped",
-                ),
-                Err(error) => tracing::warn!(
-                    error = %error,
-                    "system-core Host/User shared runner failed",
-                ),
-            }
-        }));
-        let mut provider_generations = BTreeMap::new();
-        for registration in U8_SHARED_PROVIDER_RUNNERS {
-            let provider_ref = ResourceRef::parse(registration.provider_ref)
-                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-            if provider_generations.contains_key(&provider_ref) {
-                continue;
-            }
-            match self.provider_generation_for_runner(&provider_ref).await {
-                Ok(generation) => {
-                    provider_generations.insert(provider_ref, generation);
-                }
-                Err(ResourceRuntimeError::HandlerNotReady) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        let provider_registrations = U8_SHARED_PROVIDER_RUNNERS
-            .into_iter()
-            .filter(|registration| {
-                ResourceRef::parse(registration.provider_ref)
-                    .ok()
-                    .is_some_and(|provider_ref| provider_generations.contains_key(&provider_ref))
-            })
-            .collect::<Vec<_>>();
         let provider_descriptors = compose_shared_provider_runner_descriptors(
-            provider_registrations,
+            U8_SHARED_PROVIDER_RUNNERS,
             self.zone.clone(),
             controller_generation,
             &provider_generations,
@@ -4842,47 +6484,56 @@ impl ZoneResourceRuntime {
                 .registered_controller_api(subject, authorization_state.clone(), Vec::new())
                 .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?
                 .with_assignment_fence_resolver(resolver);
-            let runner = Runner::new(
-                CoreResourceReconciler::for_handler(descriptor, CoreHandlerKind::Provider),
-                CoreControllerSource::new(
+            let kind = SharedProviderResourceKind::from_registration(registration)?;
+            let source = CoreControllerSource::new(
                     runner_descriptor.clone(),
                     Arc::new(api),
+                );
+            prepared.push(PreparedCoreRunner::Provider {
+                reconciler: SharedProviderResourceReconciler::new(
+                    descriptor,
+                    kind,
+                    Arc::clone(&self.shared_provider_effects),
                 ),
-                RunnerConfig {
+                source,
+                config: RunnerConfig {
                     policy_revision: authorization_state.snapshot.policy_revision,
                     api_revision: authorization_state.snapshot.api_catalog_revision,
                     configuration_revision: authorization_state.snapshot.active_configuration_revision,
                     deadline_tick: 5_000,
                     max_attempts: 3,
                 },
-            );
-            let controller_ref = runner_descriptor.identity().controller_ref().clone();
-            new_tasks.push(tokio::spawn(async move {
-                match runner.run().await {
-                    Ok(report) => {
-                        tracing::debug!(
-                            controller = %controller_ref,
-                            resource_type,
-                            dispatched = report.dispatched,
-                            relists = report.relists,
-                            "Shared Provider resource runner stopped",
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            controller = %controller_ref,
-                            resource_type,
-                            error = %error,
-                            "Shared Provider resource runner isolated failure",
-                        );
-                    }
-                }
-            }));
+                controller_ref: runner_descriptor.identity().controller_ref().clone(),
+                resource_type,
+            });
         }
-        self.core_runner_tasks
-            .lock()
-            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
-            .extend(new_tasks);
+        let mut new_tasks = prepared
+            .into_iter()
+            .map(spawn_prepared_core_runner)
+            .collect::<Vec<_>>();
+        new_tasks.push(tokio::spawn(async move {
+            match system_core_runner.run().await {
+                Ok(report) => tracing::debug!(
+                    dispatched = report.dispatched,
+                    relists = report.relists,
+                    "system-core Host/User shared runner stopped",
+                ),
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "system-core Host/User shared runner failed",
+                ),
+            }
+        }));
+        match self.core_runner_tasks.lock() {
+            Ok(mut tasks) => tasks.append(&mut new_tasks),
+            Err(_) => {
+                for task in new_tasks {
+                    task.abort();
+                    let _ = task.await;
+                }
+                return Err(ResourceRuntimeError::WatchUnavailable);
+            }
+        }
         Ok(())
     }
 
@@ -12531,6 +14182,7 @@ impl ResourcePlane {
 mod tests {
     use super::*;
     use std::{collections::VecDeque, fs::OpenOptions, os::fd::AsRawFd, sync::Arc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use d2b_contracts_resource::v3::{
         CanonicalJsonObject, Timestamp,
@@ -12541,6 +14193,142 @@ mod tests {
     use d2b_resource_store::mutation_seal::mutation_seal_pair;
     use d2b_resource_store_redb::write_provisioning_marker;
     use d2b_session_unix::{CreditPool, CreditScopeSet, OutboundPacket, prearmed_seqpacket_pair};
+
+    struct RecordingSharedProviderEffects {
+        reconciles: AtomicUsize,
+        finalizes: AtomicUsize,
+        cleanup_ready: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl SharedProviderEffectExecutor for RecordingSharedProviderEffects {
+        async fn reconcile_network(
+            &self,
+            _context: &SharedProviderEffectContext,
+            _resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+        ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+            self.reconciles.fetch_add(1, Ordering::SeqCst);
+            Ok(SharedProviderEffectPhase::Ready)
+        }
+
+        async fn finalize(
+            &self,
+            _kind: SharedProviderResourceKind,
+            _context: &SharedProviderEffectContext,
+            _resource: &ResourceSnapshot,
+        ) -> Result<(), SharedProviderEffectError> {
+            if !self.cleanup_ready.load(Ordering::SeqCst) {
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            self.finalizes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn shared_provider_test_descriptor() -> (
+        SharedProviderRunnerRegistration,
+        ControllerDescriptor,
+    ) {
+        let registration = U8_SHARED_PROVIDER_RUNNERS[0];
+        let provider_ref = ResourceRef::parse(registration.provider_ref).unwrap();
+        let generations = BTreeMap::from([(provider_ref, ResourceGeneration::new(7).unwrap())]);
+        compose_shared_provider_runner_descriptors(
+            [registration],
+            ZoneId::parse("work").unwrap(),
+            ControllerGeneration::new(3).unwrap(),
+            &generations,
+            ReconnectGeneration::new(5).unwrap(),
+        )
+        .unwrap()
+        .pop()
+        .unwrap()
+    }
+
+    fn shared_provider_test_resource(finalizers: &[&str], deleting: bool) -> ResourceSnapshot {
+        let zone = ZoneId::parse("work").unwrap();
+        let resource_ref = ResourceRef::parse("Network/work").unwrap();
+        let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let finalizers = finalizers
+            .iter()
+            .map(|value| Value::String((*value).to_owned()))
+            .collect::<Vec<_>>();
+        let body = json!({
+            "apiVersion": "resources.d2bus.org/v3",
+            "type": "Network",
+            "metadata": {
+                "name": "work",
+                "zone": "work",
+                "uid": uid.as_str(),
+                "generation": 1,
+                "revision": 1,
+                "finalizers": finalizers,
+            },
+            "spec": {
+                "providerRef": "Provider/network-local",
+            },
+            "status": {
+                "phase": "Pending",
+                "observedGeneration": 0,
+            },
+        });
+        ResourceSnapshot::new(
+            ResourceKey::new(zone, resource_ref, uid),
+            ZoneRevision::new(1),
+            ResourceGeneration::new(1).unwrap(),
+            serde_json::to_vec(&body).unwrap(),
+            deleting,
+        )
+    }
+
+    #[tokio::test]
+    async fn shared_provider_runner_uses_typed_effect_and_cleanup_after_finalizer_pass() {
+        let (registration, descriptor) = shared_provider_test_descriptor();
+        let effects = Arc::new(RecordingSharedProviderEffects {
+            reconciles: AtomicUsize::new(0),
+            finalizes: AtomicUsize::new(0),
+            cleanup_ready: std::sync::atomic::AtomicBool::new(false),
+        });
+        let reconciler = SharedProviderResourceReconciler::new(
+            descriptor,
+            SharedProviderResourceKind::Network,
+            effects.clone(),
+        );
+        let first = reconciler
+            .first_pass_for_test(&shared_provider_test_resource(&[], false))
+            .unwrap();
+        assert_eq!(first.disposition(), ReconcileDisposition::Pending);
+        assert!(first.status_candidate().is_some());
+        assert_eq!(effects.reconciles.load(Ordering::SeqCst), 0);
+
+        let current = shared_provider_test_resource(&[registration.finalizer], false);
+        assert_eq!(
+            reconciler
+                .execute_effect_for_test(&current, &[])
+                .await
+                .unwrap(),
+            SharedProviderEffectPhase::Ready
+        );
+        assert_eq!(effects.reconciles.load(Ordering::SeqCst), 1);
+
+        let deleting = shared_provider_test_resource(&[registration.finalizer], true);
+        assert!(reconciler.execute_finalize_for_test(&deleting).await.is_err());
+        assert_eq!(effects.finalizes.load(Ordering::SeqCst), 0);
+        effects.cleanup_ready.store(true, Ordering::SeqCst);
+        let finalized = reconciler.execute_finalize_for_test(&deleting).await.unwrap();
+        assert!(finalized.mutation_batch().is_some());
+        assert_eq!(
+            finalized
+                .mutation_batch()
+                .unwrap()
+                .mutations()
+                .first()
+                .unwrap()
+                .kind(),
+            d2b_core_controller::MutationIntentKind::UpdateFinalizers
+        );
+        assert_eq!(effects.finalizes.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn accepted_u12_resources_cannot_run_without_their_provider() {

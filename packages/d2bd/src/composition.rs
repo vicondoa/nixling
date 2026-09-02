@@ -16661,6 +16661,12 @@ async fn open_resource_plane(
                     return Err(error);
                 }
             };
+        runtime.set_shared_provider_effects(Arc::new(
+            resource_runtime::DaemonSharedProviderEffects::new(
+                Arc::new(state.clone()),
+                zone.clone(),
+            ),
+        ));
         runtime.set_provider_path_ready(provider_ready);
         let descriptors = materialization_bundle
             .resources

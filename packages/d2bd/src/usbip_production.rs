@@ -118,6 +118,10 @@ impl AuthorityLedger {
     }
 }
 
+pub(crate) fn new_authority_ledger() -> Arc<Mutex<AuthorityLedger>> {
+    Arc::new(Mutex::new(AuthorityLedger::default()))
+}
+
 /// Core-owned child-resource seam for USBIP Binding realization.
 ///
 /// The daemon dispatcher supplies authority and broker effects, while this

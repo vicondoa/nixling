@@ -184,6 +184,42 @@ fn provider_composition_builds_real_runner_descriptors_with_exact_fences() {
 }
 
 #[test]
+fn provider_composition_rejects_a_missing_accepted_provider_before_runner_spawn() {
+    let missing = ResourceRef::parse("Provider/device-gpu").unwrap();
+    let provider_generations = U8_SHARED_PROVIDER_RUNNERS
+        .iter()
+        .filter_map(|registration| {
+            let provider_ref = ResourceRef::parse(registration.provider_ref).unwrap();
+            (provider_ref != missing)
+                .then_some((provider_ref, ResourceGeneration::new(7).unwrap()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        compose_shared_provider_runner_descriptors(
+            U8_SHARED_PROVIDER_RUNNERS,
+            ZoneId::parse("work").unwrap(),
+            ControllerGeneration::new(3).unwrap(),
+            &provider_generations,
+            ReconnectGeneration::new(5).unwrap(),
+        ),
+        Err(d2bd::resource_runtime::ResourceRuntimeError::HandlerNotReady)
+    );
+    provider_generations.insert(missing, ResourceGeneration::new(8).unwrap());
+    assert_eq!(
+        compose_shared_provider_runner_descriptors(
+            U8_SHARED_PROVIDER_RUNNERS,
+            ZoneId::parse("work").unwrap(),
+            ControllerGeneration::new(3).unwrap(),
+            &provider_generations,
+            ReconnectGeneration::new(5).unwrap(),
+        )
+        .unwrap()
+        .len(),
+        U8_SHARED_PROVIDER_RUNNERS.len()
+    );
+}
+
+#[test]
 fn u8_reconcile_dispatch_has_no_legacy_production_call_sites() {
     let source = include_str!("../src/composition.rs");
     assert!(!source.contains("match dispatch_wave6_resource_reconcile("));
