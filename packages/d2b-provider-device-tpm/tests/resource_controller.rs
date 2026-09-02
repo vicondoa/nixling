@@ -78,8 +78,28 @@ fn persisted_evidence_rehydrates_without_recreating_children() {
     assert_eq!(restored.status(), status);
     assert_eq!(
         restored_effects.events.lock().unwrap().as_slice(),
-        ["endpoint"]
+        ["volume", "endpoint"]
     );
+}
+
+#[test]
+fn tampered_persisted_status_fails_before_child_reuse() {
+    let device = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+    let device_ref = ResourceRef::parse("Device/work-tpm").unwrap();
+    let execution = ResourceRef::parse("Host/host-system").unwrap();
+    let effects = ScriptedEffects::default();
+    let mut controller =
+        TpmResourceController::new(device.clone(), device_ref.clone(), execution.clone()).unwrap();
+    block_on(controller.reconcile(&effects)).unwrap();
+    let mut status = controller.status();
+    status.marker_status = d2b_provider_device_tpm::TpmMarkerStatus::Tampered;
+
+    assert!(matches!(
+        TpmResourceController::from_status(device, device_ref, execution, &status),
+        Err(d2b_provider_device_tpm::TpmResourceControllerError::Effect(
+            TpmResourceEffectError::StateIntegrity
+        ))
+    ));
 }
 
 #[test]

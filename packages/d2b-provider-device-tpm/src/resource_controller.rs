@@ -133,6 +133,7 @@ pub struct TpmResourceController {
     endpoint_ref: Option<ResourceRef>,
     marker_status: TpmMarkerStatus,
     last_error: Option<TpmResourceEffectError>,
+    needs_state_verification: bool,
 }
 
 impl TpmResourceController {
@@ -163,6 +164,7 @@ impl TpmResourceController {
             endpoint_ref: None,
             marker_status: TpmMarkerStatus::NeverProvisioned,
             last_error: None,
+            needs_state_verification: true,
         })
     }
 
@@ -174,6 +176,25 @@ impl TpmResourceController {
         status: &TpmStatusReport,
     ) -> Result<Self, TpmResourceControllerError> {
         let mut controller = Self::new(device_uid, device_ref, execution_ref)?;
+        if matches!(
+            status.marker_status,
+            TpmMarkerStatus::Missing
+                | TpmMarkerStatus::Replaced
+                | TpmMarkerStatus::Tampered
+        ) {
+            return Err(TpmResourceControllerError::Effect(
+                TpmResourceEffectError::StateIntegrity,
+            ));
+        }
+        if status.state_volume_ref.is_none()
+            && (status.swtpm_process_ref.is_some()
+                || status.last_flush_ref.is_some()
+                || status.tpm_endpoint_ref.is_some())
+        {
+            return Err(TpmResourceControllerError::Effect(
+                TpmResourceEffectError::StateIntegrity,
+            ));
+        }
         for (reference, expected_type) in [
             (status.state_volume_ref.as_ref(), "Volume"),
             (status.swtpm_process_ref.as_ref(), "Process"),
@@ -194,14 +215,7 @@ impl TpmResourceController {
         controller.flush_ref = status.last_flush_ref.clone();
         controller.endpoint_ref = status.tpm_endpoint_ref.clone();
         controller.marker_status = status.marker_status;
-        controller.last_error = if matches!(
-            status.marker_status,
-            TpmMarkerStatus::Missing
-                | TpmMarkerStatus::Replaced
-                | TpmMarkerStatus::Tampered
-        ) {
-            Some(TpmResourceEffectError::StateIntegrity)
-        } else if status.phase == TpmResourcePhase::Failed {
+        controller.last_error = if status.phase == TpmResourcePhase::Failed {
             Some(TpmResourceEffectError::EffectRejected)
         } else {
             None
@@ -254,9 +268,7 @@ impl TpmResourceController {
             ));
         }
         self.phase = TpmResourcePhase::Reconciling;
-        let volume = if let Some(volume) = self.volume_ref.clone() {
-            volume
-        } else {
+        let volume = if self.needs_state_verification || self.volume_ref.is_none() {
             let volume = match port
                 .ensure_state_volume(&self.device_uid, &self.device_ref, &self.execution_ref)
                 .await
@@ -264,9 +276,21 @@ impl TpmResourceController {
                 Ok(value) => value,
                 Err(error) => return self.effect_failed(error),
             };
+            if self
+                .volume_ref
+                .as_ref()
+                .is_some_and(|current| current != &volume)
+            {
+                return self.effect_failed(TpmResourceEffectError::StateIntegrity);
+            }
             self.marker_status = TpmMarkerStatus::Verified;
             self.volume_ref = Some(volume.clone());
+            self.needs_state_verification = false;
             volume
+        } else {
+            self.volume_ref
+                .clone()
+                .ok_or(TpmResourceControllerError::InvalidState)?
         };
         if self.flush_ref.is_none() {
             let flush = match port
