@@ -3,9 +3,10 @@ use d2b_contracts_resource::v3::{
 };
 use d2b_provider_device_gpu::{
     GpuAuthorityAdmission, GpuAuthorityLease, GpuBackingToken, GpuClosureProof, GpuController,
-    GpuEffectError, GpuEffectToken, GpuEffectTokenSet, GpuLaunchTicket, GpuLifecycleEffectPort,
-    GpuOwnerProof, GpuPlatformToken, GpuPrincipalToken, GpuProcessIdentity, GpuProcessObservation,
-    GpuProcessRole, GpuReconcileOutcome, GpuSettings, GpuWorkerSpec, VideoWorkerSpec,
+    GpuDependentResource, GpuEffectError, GpuEffectToken, GpuEffectTokenSet, GpuLaunchTicket,
+    GpuLifecycleEffectPort, GpuOwnerProof, GpuPlatformToken, GpuPrincipalToken,
+    GpuProcessIdentity, GpuProcessObservation, GpuProcessRole, GpuReconcileOutcome, GpuSettings,
+    GpuWorkerSpec, VideoWorkerSpec,
 };
 
 #[derive(Default)]
@@ -355,5 +356,48 @@ fn mismatched_matching_observation_is_quarantined() {
     assert_eq!(
         controller.phase(),
         d2b_provider_device_gpu::GpuPhase::Quarantined
+    );
+}
+
+#[test]
+fn gpu_upgrade_requires_dependents_to_drain_before_replacement() {
+    let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+    let owner = GpuOwnerProof::new(
+        ResourceRef::parse("Zone/dev").unwrap(),
+        ResourceRef::parse("Guest/workload").unwrap(),
+        uid.clone(),
+        ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap(),
+        ResourceGeneration::new(1).unwrap(),
+    )
+    .unwrap();
+    let admission = GpuAuthorityAdmission::new(
+        owner,
+        GpuBackingToken::from_core([7; 32]),
+        GpuPlatformToken::from_core([8; 32]),
+        DeviceArbitration::Exclusive,
+        1,
+        false,
+        GpuPrincipalToken::from_core([9; 32]),
+    )
+    .unwrap();
+    let tokens = GpuEffectTokenSet::from_core(vec![GpuEffectToken::from_core([2; 32])]).unwrap();
+    let mut controller =
+        GpuController::new_authorized(admission, GpuSettings::default(), tokens).unwrap();
+    let desired = GpuSettings {
+        vulkan: false,
+        ..GpuSettings::default()
+    };
+    let dependency = GpuDependentResource::new(
+        ResourceRef::parse("Guest/workload").unwrap(),
+        true,
+        false,
+    )
+    .unwrap();
+    let plan = controller
+        .plan_upgrade(desired, std::slice::from_ref(&dependency))
+        .unwrap();
+    assert_eq!(
+        controller.execute_upgrade(&plan, &mut FakePort::default()),
+        Err(d2b_provider_device_gpu::GpuControllerError::DependenciesNotDrained)
     );
 }

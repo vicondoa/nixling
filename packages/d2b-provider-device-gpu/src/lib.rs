@@ -32,7 +32,11 @@ pub use authority::{
     GpuBackingToken, GpuClosureProof, GpuOwnerProof, GpuPlatformToken, GpuPrincipalToken,
     GpuProcessIdentity, GpuProcessObservation, GpuRecoveryRecord, GpuRecoverySnapshot,
 };
-pub use controller::{GpuController, GpuControllerError, GpuPhase, GpuReconcileOutcome};
+pub use controller::{
+    GPU_MAX_REPAIR_INTERVAL_SECS, GPU_REPAIR_INTERVAL_SECS, GpuController, GpuControllerError,
+    GpuDependentResource, GpuPhase, GpuReconcileOutcome, GpuRunnerContract, GpuUpdateState,
+    GpuUpgradePlan, gpu_runner_contract,
+};
 pub use descriptor::{GpuComponentDescriptor, GpuDescriptorError};
 pub use effects::{
     GpuEffectError, GpuEffectPort, GpuEffectToken, GpuEffectTokenSet, GpuLaunchTicket,

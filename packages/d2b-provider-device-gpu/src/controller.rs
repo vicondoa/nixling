@@ -1,7 +1,7 @@
 //! Combined GPU/video Device reconcile state machine.
 
 use core::fmt;
-use d2b_contracts_resource::v3::{ResourceUid, device::DeviceArbitration};
+use d2b_contracts_resource::v3::{ResourceRef, ResourceUid, device::DeviceArbitration};
 
 use crate::{
     GpuAuthorityAdmission, GpuAuthorityError, GpuAuthorityLease, GpuClosureProof, GpuEffectError,
@@ -9,6 +9,11 @@ use crate::{
     GpuProcessObservation, GpuProcessRole, GpuProcessSelectionError, GpuSettings, GpuWorkerSpec,
     VideoWorkerSpec, process::select_processes,
 };
+
+/// Default descriptor repair interval.
+pub const GPU_REPAIR_INTERVAL_SECS: u64 = 30;
+/// Maximum descriptor repair interval.
+pub const GPU_MAX_REPAIR_INTERVAL_SECS: u64 = 60;
 
 /// GPU controller lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +53,12 @@ pub enum GpuControllerError {
     Authority(GpuAuthorityError),
     /// Restart observation was ambiguous.
     Quarantined,
+    /// A dependency reference cannot be owned by the GPU controller.
+    DependencyInvalid,
+    /// A dependency is not ready for an upgrade.
+    DependenciesNotReady,
+    /// A dependency has not drained before replacement.
+    DependenciesNotDrained,
 }
 
 impl fmt::Display for GpuControllerError {
@@ -58,6 +69,9 @@ impl fmt::Display for GpuControllerError {
             Self::InvalidState => "gpu-invalid-state",
             Self::Authority(error) => return error.fmt(formatter),
             Self::Quarantined => "gpu-authority-quarantined",
+            Self::DependencyInvalid => "gpu-dependency-invalid",
+            Self::DependenciesNotReady => "gpu-dependencies-not-ready",
+            Self::DependenciesNotDrained => "gpu-dependencies-not-drained",
         })
     }
 }
@@ -71,6 +85,126 @@ pub enum GpuReconcileOutcome {
     Converged,
     /// A transient effect should be retried.
     Retry,
+}
+
+/// A fresh dependency observation used by the GPU upgrade planner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuDependentResource {
+    resource_ref: ResourceRef,
+    ready: bool,
+    drained: bool,
+}
+
+impl GpuDependentResource {
+    /// Construct a dependency observation for a Guest, Process, or Endpoint.
+    pub fn new(
+        resource_ref: ResourceRef,
+        ready: bool,
+        drained: bool,
+    ) -> Result<Self, GpuControllerError> {
+        if !matches!(
+            resource_ref.resource_type().as_str(),
+            "Guest" | "Process" | "Endpoint"
+        ) {
+            return Err(GpuControllerError::DependencyInvalid);
+        }
+        Ok(Self {
+            resource_ref,
+            ready,
+            drained,
+        })
+    }
+
+    /// Borrow the dependent ResourceRef.
+    pub const fn resource_ref(&self) -> &ResourceRef {
+        &self.resource_ref
+    }
+
+    /// Whether the dependent is currently Ready.
+    pub const fn ready(&self) -> bool {
+        self.ready
+    }
+
+    /// Whether the dependent has stopped using the current GPU realization.
+    pub const fn drained(&self) -> bool {
+        self.drained
+    }
+}
+
+/// Result of comparing the current and desired GPU settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuUpdateState {
+    /// No disruptive change is required.
+    Current,
+    /// A dependency-aware recycle is required.
+    UpgradeRequired,
+}
+
+/// Dependency-aware GPU replacement plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuUpgradePlan {
+    desired_settings: GpuSettings,
+    dependents: Vec<GpuDependentResource>,
+}
+
+impl GpuUpgradePlan {
+    /// Borrow the settings to install after drain.
+    pub const fn desired_settings(&self) -> &GpuSettings {
+        &self.desired_settings
+    }
+
+    /// Borrow fresh dependent observations.
+    pub fn dependents(&self) -> &[GpuDependentResource] {
+        &self.dependents
+    }
+}
+
+/// The cutover contract for the GPU Device owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuRunnerContract {
+    resource_type: &'static str,
+    finalizer: &'static str,
+    repair_interval_secs: u64,
+    legacy_scheduler_disabled: bool,
+    watched_configuration_is_dependency: bool,
+}
+
+impl GpuRunnerContract {
+    /// Return the owned ResourceType.
+    pub const fn resource_type(self) -> &'static str {
+        self.resource_type
+    }
+
+    /// Return the exact Device finalizer.
+    pub const fn finalizer(self) -> &'static str {
+        self.finalizer
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Whether legacy GPU scheduling is disabled.
+    pub const fn legacy_scheduler_disabled(self) -> bool {
+        self.legacy_scheduler_disabled
+    }
+
+    /// Whether watched configuration is treated as a dependency.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+}
+
+/// Return the one shared-Runner registration for the GPU Device owner.
+pub const fn gpu_runner_contract() -> GpuRunnerContract {
+    GpuRunnerContract {
+        resource_type: "Device",
+        finalizer: crate::DEVICE_GPU_FINALIZER,
+        repair_interval_secs: GPU_REPAIR_INTERVAL_SECS,
+        legacy_scheduler_disabled: true,
+        watched_configuration_is_dependency: true,
+    }
 }
 
 /// Combined GPU/video controller.
@@ -136,6 +270,40 @@ impl GpuController {
     /// Return the current controller phase.
     pub const fn phase(&self) -> GpuPhase {
         self.phase
+    }
+
+    /// Borrow the current desired settings.
+    pub const fn settings(&self) -> &GpuSettings {
+        &self.settings
+    }
+
+    /// Compare desired settings without starting an effect.
+    pub fn assess_update(&self, desired: &GpuSettings) -> GpuUpdateState {
+        if &self.settings == desired {
+            GpuUpdateState::Current
+        } else {
+            GpuUpdateState::UpgradeRequired
+        }
+    }
+
+    /// Build a replacement plan from fresh, dependency-owned observations.
+    pub fn plan_upgrade(
+        &self,
+        desired_settings: GpuSettings,
+        dependents: &[GpuDependentResource],
+    ) -> Result<GpuUpgradePlan, GpuControllerError> {
+        desired_settings
+            .validate(self.arbitration)
+            .map_err(|error| GpuControllerError::Selection(
+                GpuProcessSelectionError::Settings(error),
+            ))?;
+        if dependents.iter().any(|dependent| !dependent.ready()) {
+            return Err(GpuControllerError::DependenciesNotReady);
+        }
+        Ok(GpuUpgradePlan {
+            desired_settings,
+            dependents: dependents.to_vec(),
+        })
     }
 
     /// Return whether the Provider finalizer remains installed.
@@ -284,6 +452,25 @@ impl GpuController {
         }
         self.phase = GpuPhase::Ready;
         Ok(GpuReconcileOutcome::Converged)
+    }
+
+    /// Drain dependents, recycle the realization, and install new settings.
+    pub fn execute_upgrade<P: GpuLifecycleEffectPort>(
+        &mut self,
+        plan: &GpuUpgradePlan,
+        port: &mut P,
+    ) -> Result<GpuReconcileOutcome, GpuControllerError> {
+        if plan.dependents.iter().any(|dependent| !dependent.drained()) {
+            return Err(GpuControllerError::DependenciesNotDrained);
+        }
+        if self.assess_update(&plan.desired_settings) == GpuUpdateState::Current {
+            return Ok(GpuReconcileOutcome::Converged);
+        }
+        self.finalize_lifecycle(port)?;
+        self.settings = plan.desired_settings.clone();
+        self.finalizer = true;
+        self.phase = GpuPhase::Pending;
+        self.reconcile_lifecycle(port)
     }
 
     /// Adopt matching GPU/video workers after a daemon restart.
