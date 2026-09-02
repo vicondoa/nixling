@@ -207,6 +207,7 @@ fn validate_observability_environment() -> Result<(), ResourceRuntimeError> {
         .map_err(|_| ResourceRuntimeError::ProviderPathUnavailable)
 }
 
+#[cfg(test)]
 fn validate_observability_environment_keys(
     keys: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<(), ResourceRuntimeError> {
