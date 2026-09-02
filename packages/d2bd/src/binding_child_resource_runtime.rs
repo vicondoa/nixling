@@ -30,6 +30,13 @@ const CHILD_TYPES: [&str; 4] = [
     "Endpoint",
     "virtiofs.d2bus.org.Export",
 ];
+const GUEST_CHILD_TYPES: [&str; 5] = [
+    "Process",
+    "EphemeralProcess",
+    "Endpoint",
+    "Volume",
+    "virtiofs.d2bus.org.Export",
+];
 const OWNER_INDEX_MAX_DEPTH: usize = 8;
 const OWNER_INDEX_MAX_WORK_ITEMS: usize = 64;
 /// Finalizer held by semantic Bindings while Core drains their children.
@@ -56,6 +63,99 @@ pub(crate) struct OwnedChildOwner {
     pub desired: Option<Vec<OwnedChildIntent>>,
     /// The parent is malformed or has a dangling relationship.
     pub fenced: bool,
+}
+
+/// Result of one bounded owner-child reconciliation step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OneOwnedChildProgress {
+    /// The complete desired child set is present and current.
+    Converged,
+    /// One child mutation was submitted; the owner must be re-entered.
+    Mutated,
+    /// Progress remains blocked on a fresh child observation.
+    Pending,
+}
+
+/// Reconcile one Guest-owned child mutation, including provider-created
+/// Volumes.
+pub(crate) async fn reconcile_one_guest_child(
+    store: &RedbResourceStore,
+    client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
+    zone: &ZoneId,
+    owner: &OwnedChildOwner,
+) -> Result<OneOwnedChildProgress, BindingChildRuntimeError> {
+    reconcile_one_owned_child_for_types(store, client, zone, owner, &GUEST_CHILD_TYPES).await
+}
+
+async fn reconcile_one_owned_child_for_types(
+    store: &RedbResourceStore,
+    client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
+    zone: &ZoneId,
+    owner: &OwnedChildOwner,
+    resource_types: &[&str],
+) -> Result<OneOwnedChildProgress, BindingChildRuntimeError> {
+    if owner.fenced {
+        return Ok(OneOwnedChildProgress::Pending);
+    }
+    let children = list_children_of_types(store, zone, resource_types).await?;
+    validate_child_relist(&children)?;
+    let limits = OwnerLimits::new(OWNER_INDEX_MAX_DEPTH, OWNER_INDEX_MAX_WORK_ITEMS)
+        .expect("closed owner limits are valid");
+    let mut reconciler = BindingChildReconciler::new(limits);
+    let owner_target = HintTarget::new(
+        owner.resource.zone.clone(),
+        owner.resource.resource_ref.clone(),
+        owner.resource.uid.clone(),
+    );
+    let observed = children
+        .iter()
+        .filter(|child| child_owner_ref(child) == Some(owner.resource.resource_ref.clone()))
+        .map(|child| {
+            observed_child_from_resource(
+                HintTarget::new(
+                    child.zone.clone(),
+                    child.resource_ref.clone(),
+                    child.uid.clone(),
+                ),
+                &owner_target,
+                owner.resource.generation,
+                child.revision,
+                &child.canonical_json,
+                deletion_requested(child),
+                deletion_ready(child),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(BindingChildRuntimeError::Core)?;
+    reconciler
+        .relist_with_owner_generation(owner_target.clone(), owner.resource.generation, observed)
+        .map_err(|error| {
+            BindingChildRuntimeError::Core(BindingChildMaterializationError::OwnerReconcile(error))
+        })?;
+    let plan = match &owner.desired {
+        Some(desired) => reconciler
+            .plan_owned(&owner_target, desired.iter().cloned())
+            .map_err(BindingChildRuntimeError::Core)?,
+        None => reconciler
+            .plan_owned(&owner_target, std::iter::empty())
+            .map_err(BindingChildRuntimeError::Core)?,
+    };
+    let mutation = first_guest_child_mutation(plan.mutations());
+    if let Some(mutation) = mutation {
+        apply_mutation(client, &owner.resource, &children, mutation).await?;
+        return Ok(OneOwnedChildProgress::Mutated);
+    }
+    if plan.is_converged() {
+        Ok(OneOwnedChildProgress::Converged)
+    } else {
+        Ok(OneOwnedChildProgress::Pending)
+    }
+}
+
+fn first_guest_child_mutation(mutations: &[OwnerMutation]) -> Option<&OwnerMutation> {
+    mutations
+        .iter()
+        .find(|mutation| !matches!(mutation, OwnerMutation::Delete { .. }))
 }
 
 /// Reconcile a generic Provider-owned child set through the same bounded
@@ -905,6 +1005,14 @@ async fn list_children(
     store: &RedbResourceStore,
     zone: &ZoneId,
 ) -> Result<Vec<StoredResource>, BindingChildRuntimeError> {
+    list_children_of_types(store, zone, &CHILD_TYPES).await
+}
+
+async fn list_children_of_types(
+    store: &RedbResourceStore,
+    zone: &ZoneId,
+    resource_types: &[&str],
+) -> Result<Vec<StoredResource>, BindingChildRuntimeError> {
     let mut request = StoreListRequest {
         operation: StoreOperationContext {
             operation_id: "binding-child-relist".to_owned(),
@@ -914,7 +1022,7 @@ async fn list_children(
             deadline_ms: 10_000,
         },
         zone: zone.clone(),
-        resource_types: CHILD_TYPES
+        resource_types: resource_types
             .iter()
             .map(|resource_type| {
                 ResourceTypeName::parse(*resource_type).expect("closed child type")
@@ -1130,6 +1238,31 @@ mod tests {
             expected_revision: d2b_contracts_resource::v3::ZoneRevision::new(1),
         };
         assert!(mutation_order(&delete_endpoint) < mutation_order(&delete_process));
+    }
+
+    #[test]
+    fn guest_child_progress_never_issues_a_second_delete() {
+        let child_uid = d2b_contracts_resource::v3::ResourceUid::parse(
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .unwrap();
+        let child_revision = d2b_contracts_resource::v3::ZoneRevision::new(2);
+        let requested = OwnerMutation::Delete {
+            target: target("Process", "child"),
+            expected_uid: child_uid.clone(),
+            expected_revision: child_revision,
+        };
+        assert!(first_guest_child_mutation(&[requested]).is_none());
+
+        let request = OwnerMutation::RequestDeletion {
+            target: target("Process", "child"),
+            expected_uid: child_uid,
+            expected_revision: child_revision,
+        };
+        assert!(matches!(
+            first_guest_child_mutation(&[request]),
+            Some(OwnerMutation::RequestDeletion { .. })
+        ));
     }
 
     #[test]

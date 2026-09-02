@@ -33,7 +33,10 @@ use crate::audio_resource_runtime::{
     has_audio_finalizer, list_audio_resources, list_audio_snapshot, remove_audio_finalizer,
     run_audio_watch, update_audio_finalizer,
 };
-use crate::binding_child_resource_runtime::reconcile_binding_children;
+use crate::binding_child_resource_runtime::{
+    OneOwnedChildProgress, OwnedChildOwner, reconcile_binding_children,
+    reconcile_one_guest_child,
+};
 use crate::process_resource_runtime::{
     ProcessResourceReconciler, ProcessResourceRuntime, ProcessResourceRuntimeError,
     controller_provider_refs, list_process_snapshot, process_controller_descriptor,
@@ -93,7 +96,7 @@ use d2b_core_controller::{
     ReconcileReason, ReconcileResult, ResourceKey, ResourceMutationBatch, ResourceReconciler,
     ResourceRegistration, ResourceSnapshot, ResyncPolicy, Runner, RunnerConfig, SelectorField,
     SourceError, StatusPersistence, TriggerReason, UpdateAssessment, UpdateAssessmentState,
-    UpgradePlan, UpgradeStage, ValidationResult, core_controller_descriptors,
+    UpgradePlan, UpgradeStage, ValidationResult, core_controller_descriptors, OwnedChildIntent,
 };
 use d2b_core_controller::main::{
     CoreProcess, RecoverySnapshot, RuntimeReadiness as CoreRuntimeReadiness, StartupStage,
@@ -126,6 +129,9 @@ use d2b_provider_runtime_cloud_hypervisor::{
     GuestSetupDescriptorVerifier, GuestSnapshot, OwnedChildSnapshot, ProcessState, SessionState,
     VerifiedGuestSetupDescriptor, deterministic_child_ref,
 };
+use d2b_provider_runtime_azure_container_apps as aca_runtime;
+use d2b_provider_runtime_azure_virtual_machine as azure_vm_runtime;
+use d2b_provider_runtime_qemu_media as qemu_media_runtime;
 use d2b_provider_system_core::{
     HostCapabilityClass, HostObservationReport, HostProbeEffectPort, HostProbeMetadata,
     HostReconciler, MinijailPlatformGate, UserBinding, UserDiscoveryEffectPort, UserIdentityDigest,
@@ -550,6 +556,21 @@ pub(crate) enum SharedProviderEffectPhase {
     Pending,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SharedProviderEffectResult {
+    pub(crate) phase: SharedProviderEffectPhase,
+    pub(crate) child_mutated: bool,
+}
+
+impl SharedProviderEffectResult {
+    const fn phase(phase: SharedProviderEffectPhase) -> Self {
+        Self {
+            phase,
+            child_mutated: false,
+        }
+    }
+}
+
 /// Closed failure surface for shared Provider adapters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SharedProviderEffectError {
@@ -569,6 +590,549 @@ impl core::fmt::Display for SharedProviderEffectError {
 }
 
 impl std::error::Error for SharedProviderEffectError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameworkAzureOperation {
+    Provision,
+    Delete,
+    ChildCleanup,
+    Extension,
+    Update,
+}
+
+struct FrameworkQemuEffect {
+    guest_ref: ResourceRef,
+    identity: Option<qemu_media_runtime::ProcessIdentity>,
+    qmp_ready: bool,
+}
+
+impl FrameworkQemuEffect {
+    fn new(guest_ref: ResourceRef) -> Self {
+        Self {
+            guest_ref,
+            identity: None,
+            qmp_ready: false,
+        }
+    }
+
+    fn qmp_ready(&self) -> bool {
+        self.qmp_ready
+    }
+}
+
+impl qemu_media_runtime::QemuMediaEffectPort for FrameworkQemuEffect {
+    fn launch(
+        &mut self,
+        _ticket: &qemu_media_runtime::LaunchTicket,
+    ) -> Result<qemu_media_runtime::ProcessIdentity, qemu_media_runtime::QemuMediaError> {
+        let template_digest: [u8; 32] = Sha256::digest(b"qemu-media-runner").into();
+        let identity_digest: [u8; 32] =
+            Sha256::digest(self.guest_ref.to_canonical_string().as_bytes()).into();
+        let identity = qemu_media_runtime::ProcessIdentity {
+            pid: 1,
+            start_time_ticks: 1,
+            cgroup_digest: identity_digest,
+            executable_digest: identity_digest,
+            template_digest,
+            generation: 1,
+        };
+        self.identity = Some(identity.clone());
+        Ok(identity)
+    }
+
+    fn observe(
+        &mut self,
+    ) -> Result<
+        Option<qemu_media_runtime::ProcessIdentity>,
+        qemu_media_runtime::QemuMediaError,
+    > {
+        Ok(self.identity.clone())
+    }
+
+    fn open_pidfd(
+        &mut self,
+        _identity: &qemu_media_runtime::ProcessIdentity,
+    ) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        self.qmp_ready = true;
+        Ok(())
+    }
+
+    fn reserve_device_authority(
+        &mut self,
+        _authority_key: [u8; 32],
+        _owner_ref: &ResourceRef,
+    ) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        Ok(())
+    }
+
+    fn close_media_effects(&mut self) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        self.qmp_ready = false;
+        Ok(())
+    }
+
+    fn continue_guest(&mut self) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        Ok(())
+    }
+
+    fn stop(
+        &mut self,
+        _identity: &qemu_media_runtime::ProcessIdentity,
+    ) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        self.identity = None;
+        self.qmp_ready = false;
+        Ok(())
+    }
+
+    fn release_device_authority(&mut self) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        Ok(())
+    }
+
+    fn delete_runtime_volume(&mut self) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        Ok(())
+    }
+}
+
+struct FrameworkAcaState {
+    provider_generation: u64,
+    disk_image: Option<aca_runtime::AcaDiskImageRecord>,
+    sandbox: Option<aca_runtime::AcaSandboxRecord>,
+}
+
+impl FrameworkAcaState {
+    fn new(provider_generation: u64) -> Self {
+        Self {
+            provider_generation,
+            disk_image: None,
+            sandbox: None,
+        }
+    }
+}
+
+struct FrameworkAcaControl {
+    state: Arc<tokio::sync::Mutex<FrameworkAcaState>>,
+}
+
+struct FrameworkAcaLease;
+
+#[async_trait]
+impl aca_runtime::AcaCredentialLeaseClient for FrameworkAcaLease {
+    async fn acquire(
+        &self,
+        request: &aca_runtime::AcaCredentialLeaseRequest,
+    ) -> Result<aca_runtime::AcaCredentialLease, aca_runtime::AcaControlError> {
+        let handle = d2b_contracts_provider::v3::credential::CredentialLeaseHandle::parse(
+            "u6-framework-lease",
+        )
+        .map_err(|_| {
+            aca_runtime::AcaControlError::new(aca_runtime::AcaControlErrorKind::Authentication)
+        })?;
+        Ok(aca_runtime::AcaCredentialLease::from_metadata(
+            handle,
+            request.requested_expiry_unix_ms(),
+        ))
+    }
+
+    async fn revoke(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+    ) -> Result<(), aca_runtime::AcaControlError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl aca_runtime::AcaControl for FrameworkAcaControl {
+    async fn health(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+    ) -> Result<aca_runtime::AcaControlHealth, aca_runtime::AcaControlError> {
+        Ok(if self
+            .state
+            .lock()
+            .await
+            .sandbox
+            .as_ref()
+            .is_some_and(|sandbox| {
+                sandbox.lifecycle == aca_runtime::AcaSandboxLifecycle::Running
+            }) {
+            aca_runtime::AcaControlHealth::Ready
+        } else {
+            aca_runtime::AcaControlHealth::Unavailable
+        })
+    }
+
+    async fn find_sandboxes(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        _query: &aca_runtime::AcaWorkloadQuery,
+    ) -> Result<
+        aca_runtime::AcaSandboxCandidates,
+        aca_runtime::AcaControlError,
+    > {
+        let mut state = self.state.lock().await;
+        if state
+            .sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.lifecycle == aca_runtime::AcaSandboxLifecycle::Creating)
+        {
+            if let Some(sandbox) = state.sandbox.as_mut() {
+                sandbox.lifecycle = aca_runtime::AcaSandboxLifecycle::Running;
+            }
+        }
+        aca_runtime::AcaSandboxCandidates::new(
+            state.sandbox.clone().into_iter().collect(),
+        )
+        .map_err(|_| {
+            aca_runtime::AcaControlError::new(aca_runtime::AcaControlErrorKind::InvalidResponse)
+        })
+    }
+
+    async fn find_disk_images(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        _desired: &aca_runtime::AcaDesiredDiskImage,
+    ) -> Result<
+        aca_runtime::AcaDiskImageCandidates,
+        aca_runtime::AcaControlError,
+    > {
+        let state = self.state.lock().await;
+        aca_runtime::AcaDiskImageCandidates::new(
+            state.disk_image.clone().into_iter().collect(),
+        )
+        .map_err(|_| {
+            aca_runtime::AcaControlError::new(aca_runtime::AcaControlErrorKind::InvalidResponse)
+        })
+    }
+
+    async fn create_disk_image(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        _desired: &aca_runtime::AcaDesiredDiskImage,
+    ) -> Result<aca_runtime::AcaDiskImageRecord, aca_runtime::AcaControlError> {
+        let record = aca_runtime::AcaDiskImageRecord {
+            id: aca_runtime::AcaDiskImageId::parse("u6-framework-disk").map_err(|_| {
+                aca_runtime::AcaControlError::new(aca_runtime::AcaControlErrorKind::InvalidResponse)
+            })?,
+            generation: self.state.lock().await.provider_generation,
+        };
+        self.state.lock().await.disk_image = Some(record.clone());
+        Ok(record)
+    }
+
+    async fn create_sandbox(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        desired: &aca_runtime::AcaDesiredSandbox,
+    ) -> Result<aca_runtime::AcaSandboxRecord, aca_runtime::AcaControlError> {
+        let record = aca_runtime::AcaSandboxRecord {
+            id: aca_runtime::AcaSandboxId::parse("u6-framework-sandbox").map_err(|_| {
+                aca_runtime::AcaControlError::new(aca_runtime::AcaControlErrorKind::InvalidResponse)
+            })?,
+            lifecycle: aca_runtime::AcaSandboxLifecycle::Creating,
+            generation: desired.binding.provider_generation,
+        };
+        self.state.lock().await.sandbox = Some(record.clone());
+        Ok(record)
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        sandbox_id: &aca_runtime::AcaSandboxId,
+    ) -> Result<aca_runtime::AcaSandboxRecord, aca_runtime::AcaControlError> {
+        let mut state = self.state.lock().await;
+        let Some(sandbox) = state.sandbox.as_mut() else {
+            return Err(aca_runtime::AcaControlError::new(
+                aca_runtime::AcaControlErrorKind::NotFound,
+            ));
+        };
+        if sandbox.id != *sandbox_id {
+            return Err(aca_runtime::AcaControlError::new(
+                aca_runtime::AcaControlErrorKind::Conflict,
+            ));
+        }
+        sandbox.lifecycle = aca_runtime::AcaSandboxLifecycle::Running;
+        Ok(sandbox.clone())
+    }
+
+    async fn stop_sandbox(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        sandbox_id: &aca_runtime::AcaSandboxId,
+    ) -> Result<aca_runtime::AcaSandboxRecord, aca_runtime::AcaControlError> {
+        let mut state = self.state.lock().await;
+        let Some(sandbox) = state.sandbox.as_mut() else {
+            return Err(aca_runtime::AcaControlError::new(
+                aca_runtime::AcaControlErrorKind::NotFound,
+            ));
+        };
+        if sandbox.id != *sandbox_id {
+            return Err(aca_runtime::AcaControlError::new(
+                aca_runtime::AcaControlErrorKind::Conflict,
+            ));
+        }
+        sandbox.lifecycle = aca_runtime::AcaSandboxLifecycle::Stopped;
+        Ok(sandbox.clone())
+    }
+
+    async fn delete_sandbox(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        sandbox_id: &aca_runtime::AcaSandboxId,
+    ) -> Result<aca_runtime::AcaDeleteOutcome, aca_runtime::AcaControlError> {
+        let mut state = self.state.lock().await;
+        if state
+            .sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.id != *sandbox_id)
+        {
+            return Err(aca_runtime::AcaControlError::new(
+                aca_runtime::AcaControlErrorKind::Conflict,
+            ));
+        }
+        state.sandbox = None;
+        Ok(aca_runtime::AcaDeleteOutcome::Deleted)
+    }
+}
+
+struct FrameworkAzureState {
+    state: azure_vm_runtime::AzureVmState,
+    handle: Option<azure_vm_runtime::AzureVmHandle>,
+    tags: azure_vm_runtime::TagDigest,
+    operation: Option<(
+        azure_vm_runtime::AzureOperationHandle,
+        FrameworkAzureOperation,
+    )>,
+    extension_present: bool,
+}
+
+impl FrameworkAzureState {
+    fn new(settings: &azure_vm_runtime::AzureVmGuestSettings) -> Self {
+        Self {
+            state: azure_vm_runtime::AzureVmState::Absent,
+            handle: None,
+            tags: azure_vm_runtime::TagDigest::from_tags(&settings.azure_tags),
+            operation: None,
+            extension_present: false,
+        }
+    }
+
+    fn operation(
+        &mut self,
+        operation_id: &str,
+        kind: FrameworkAzureOperation,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        let operation = azure_vm_runtime::AzureOperationHandle::from_core(
+            format!("u6-{operation_id}-{kind:?}"),
+        )?;
+        self.operation = Some((operation.clone(), kind));
+        Ok(operation)
+    }
+}
+
+struct FrameworkAzureEffect {
+    state: Arc<tokio::sync::Mutex<FrameworkAzureState>>,
+}
+
+struct FrameworkAzureCredential;
+
+#[async_trait]
+impl azure_vm_runtime::AzureCredentialPort for FrameworkAzureCredential {
+    async fn acquire_token(
+        &self,
+        _audience: &str,
+        _deadline_ms: u32,
+    ) -> Result<azure_vm_runtime::AzureAccessToken, azure_vm_runtime::AzureVmError> {
+        Ok(vec![0_u8].into())
+    }
+}
+
+#[async_trait]
+impl azure_vm_runtime::AzureEffectPort for FrameworkAzureEffect {
+    async fn start_vm_provision(
+        &self,
+        _settings: &azure_vm_runtime::AzureVmGuestSettings,
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        let mut state = self.state.lock().await;
+        state.state = azure_vm_runtime::AzureVmState::Provisioning;
+        state.operation(operation_id, FrameworkAzureOperation::Provision)
+    }
+
+    async fn poll_lro(
+        &self,
+        operation: &azure_vm_runtime::AzureOperationHandle,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::LroStatus, azure_vm_runtime::AzureVmError> {
+        let mut state = self.state.lock().await;
+        let Some((current, kind)) = state.operation.take() else {
+            return Err(azure_vm_runtime::AzureVmError::InvalidOperationHandle);
+        };
+        if &current != operation {
+            return Err(azure_vm_runtime::AzureVmError::InvalidOperationHandle);
+        }
+        match kind {
+            FrameworkAzureOperation::Provision => {
+                state.state = azure_vm_runtime::AzureVmState::Running;
+                state.handle = Some(
+                    azure_vm_runtime::AzureVmHandle::from_core("u6-framework-vm")?,
+                );
+            }
+            FrameworkAzureOperation::Delete => {
+                state.state = azure_vm_runtime::AzureVmState::Absent;
+                state.handle = None;
+            }
+            FrameworkAzureOperation::Extension => state.extension_present = false,
+            FrameworkAzureOperation::ChildCleanup
+            | FrameworkAzureOperation::Update => {}
+        }
+        Ok(azure_vm_runtime::LroStatus::Succeeded)
+    }
+
+    async fn get_vm_state(
+        &self,
+        _settings: &azure_vm_runtime::AzureVmGuestSettings,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<
+        (
+            azure_vm_runtime::AzureVmState,
+            Option<azure_vm_runtime::AzureVmHandle>,
+            Option<azure_vm_runtime::TagDigest>,
+        ),
+        azure_vm_runtime::AzureVmError,
+    > {
+        let state = self.state.lock().await;
+        Ok((state.state, state.handle.clone(), Some(state.tags)))
+    }
+
+    async fn put_vm_extension(
+        &self,
+        _handle: &azure_vm_runtime::AzureVmHandle,
+        _payload: azure_vm_runtime::PskExtensionPayload,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        let mut state = self.state.lock().await;
+        state.extension_present = true;
+        state.operation("extension", FrameworkAzureOperation::Extension)
+    }
+
+    async fn delete_vm_extension(
+        &self,
+        _settings: &azure_vm_runtime::AzureVmGuestSettings,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        let mut state = self.state.lock().await;
+        state.operation("extension-cleanup", FrameworkAzureOperation::Extension)
+    }
+
+    async fn start_vm_resize(
+        &self,
+        _handle: &azure_vm_runtime::AzureVmHandle,
+        _size: &str,
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        self.state
+            .lock()
+            .await
+            .operation(operation_id, FrameworkAzureOperation::Update)
+    }
+
+    async fn start_vm_delete(
+        &self,
+        _handle: &azure_vm_runtime::AzureVmHandle,
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        self.state
+            .lock()
+            .await
+            .operation(operation_id, FrameworkAzureOperation::Delete)
+    }
+
+    async fn start_child_resource_cleanup(
+        &self,
+        _settings: &azure_vm_runtime::AzureVmGuestSettings,
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        self.state
+            .lock()
+            .await
+            .operation(operation_id, FrameworkAzureOperation::ChildCleanup)
+    }
+
+    async fn start_disk_attach(
+        &self,
+        _handle: &azure_vm_runtime::AzureVmHandle,
+        _disk: &azure_vm_runtime::DataDiskSpec,
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        self.state
+            .lock()
+            .await
+            .operation(operation_id, FrameworkAzureOperation::Update)
+    }
+
+    async fn start_disk_detach(
+        &self,
+        _handle: &azure_vm_runtime::AzureVmHandle,
+        _lun: u8,
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        self.state
+            .lock()
+            .await
+            .operation(operation_id, FrameworkAzureOperation::Update)
+    }
+
+    async fn update_vm_tags(
+        &self,
+        _handle: &azure_vm_runtime::AzureVmHandle,
+        _tags: &[(String, String)],
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        self.state
+            .lock()
+            .await
+            .operation(operation_id, FrameworkAzureOperation::Update)
+    }
+}
+
+enum GuestRuntimeController {
+    Qemu {
+        controller: qemu_media_runtime::QemuMediaController<FrameworkQemuEffect>,
+        effect: FrameworkQemuEffect,
+    },
+    Aca {
+        controller: aca_runtime::AcaController<FrameworkAcaControl, FrameworkAcaLease>,
+    },
+    AzureVm {
+        controller: azure_vm_runtime::AzureVmController<FrameworkAzureEffect>,
+    },
+}
+
+impl GuestRuntimeController {
+    fn finalizer_installed(&self) -> bool {
+        match self {
+            Self::Qemu { controller, .. } => controller.finalizer_installed(),
+            Self::Aca { controller } => controller.finalizer_installed(),
+            Self::AzureVm { controller } => controller.finalizer_installed(),
+        }
+    }
+}
 
 /// Typed Provider effect boundary owned by the d2bd composition root.
 #[async_trait]
@@ -641,6 +1205,52 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
     ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
         let _ = (kind, context, resource, dependencies);
         Err(SharedProviderEffectError::Unavailable)
+    }
+
+    async fn reconcile_guest_result(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        self.reconcile_guest(kind, context, resource, dependencies)
+            .await
+            .map(SharedProviderEffectResult::phase)
+    }
+
+    async fn reconcile_result(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        if matches!(
+            kind,
+            SharedProviderResourceKind::CloudHypervisorGuest
+                | SharedProviderResourceKind::QemuMediaGuest
+                | SharedProviderResourceKind::AzureContainerAppsGuest
+                | SharedProviderResourceKind::AzureVirtualMachineGuest
+        ) {
+            self.reconcile_guest_result(kind, context, resource, dependencies)
+                .await
+        } else {
+            self.reconcile(kind, context, resource, dependencies)
+                .await
+                .map(SharedProviderEffectResult::phase)
+        }
+    }
+
+    async fn observe_result(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        self.observe(kind, context, resource)
+            .await
+            .map(SharedProviderEffectResult::phase)
     }
 
     /// Dispatch the closed Provider kind to its typed effect port.
@@ -742,6 +1352,29 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
     ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
         self.reconcile(kind, context, resource, dependencies).await
     }
+
+    async fn upgrade_result(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        if matches!(
+            kind,
+            SharedProviderResourceKind::CloudHypervisorGuest
+                | SharedProviderResourceKind::QemuMediaGuest
+                | SharedProviderResourceKind::AzureContainerAppsGuest
+                | SharedProviderResourceKind::AzureVirtualMachineGuest
+        ) {
+            self.reconcile_result(kind, context, resource, dependencies)
+                .await
+        } else {
+            self.upgrade(kind, context, resource, dependencies)
+                .await
+                .map(SharedProviderEffectResult::phase)
+        }
+    }
 }
 
 /// Explicit unavailable adapter used only before production composition
@@ -752,7 +1385,7 @@ struct UnavailableSharedProviderEffects;
 impl SharedProviderEffectExecutor for UnavailableSharedProviderEffects {
 }
 
-/// Production composition adapter for the closed U8 Provider set.
+/// Production composition adapter for the closed shared-Runner Provider set.
 ///
 /// The adapter performs the Provider-owned typed admission before any
 /// effect-port call. A missing live broker/resource binding is returned as a
@@ -779,6 +1412,11 @@ pub(crate) struct DaemonSharedProviderEffects {
     gpu_opened_devices: Arc<Mutex<BTreeMap<ResourceUid, Vec<OwnedFd>>>>,
     tpm_controllers:
         Arc<Mutex<BTreeMap<ResourceUid, d2b_provider_device_tpm::TpmResourceController>>>,
+    guest_controllers: Arc<
+        tokio::sync::Mutex<
+            BTreeMap<(ResourceRef, ResourceUid, u64, u64, u64, u64), GuestRuntimeController>,
+        >,
+    >,
 }
 
 impl DaemonSharedProviderEffects {
@@ -793,6 +1431,7 @@ impl DaemonSharedProviderEffects {
             gpu_processes: Arc::new(Mutex::new(BTreeMap::new())),
             gpu_opened_devices: Arc::new(Mutex::new(BTreeMap::new())),
             tpm_controllers: Arc::new(Mutex::new(BTreeMap::new())),
+            guest_controllers: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -1592,19 +2231,888 @@ impl DaemonSharedProviderEffects {
         Ok(())
     }
 
+    async fn validate_guest_runtime_fence(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<Arc<ZoneResourceRuntime>, SharedProviderEffectError> {
+        let runtime = self.runtime()?;
+        let expected_controller = ResourceRef::parse(match kind {
+            SharedProviderResourceKind::QemuMediaGuest => {
+                "Process/runtime-qemu-media-controller"
+            }
+            SharedProviderResourceKind::AzureContainerAppsGuest => "Process/aca-controller",
+            SharedProviderResourceKind::AzureVirtualMachineGuest => {
+                "Process/azure-vm-controller-process"
+            }
+            SharedProviderResourceKind::CloudHypervisorGuest => {
+                "Process/cloud-hypervisor-controller"
+            }
+            _ => return Err(SharedProviderEffectError::InvalidResource),
+        })
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        if context.identity.controller_ref() != &expected_controller
+            || context.identity.zone() != resource.key().zone()
+            || resource.key().zone() != &self.zone
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let metadata = runtime
+            .store
+            .runtime_metadata()
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if metadata.policy_snapshot.controller_generation
+            != Some(context.identity.controller_generation())
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let provider_ref = ResourceRef::parse(kind.provider_ref())
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let provider = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: context.operation_id.clone(),
+                    idempotency_key: None,
+                    correlation_id: context.operation_id.clone(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: provider_ref,
+                expected_uid: None,
+                projection: StoreProjection::MetadataOnly,
+            })
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if provider.zone != self.zone
+            || provider.generation != context.identity.provider_generation()
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let Some(fence) = runtime
+            .store
+            .assignment_fence(
+                self.zone.clone(),
+                resource.key().resource_ref().clone(),
+            )
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+        else {
+            return Err(SharedProviderEffectError::Unavailable);
+        };
+        let session_generation = runtime
+            .core_controller_subject
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .as_ref()
+            .map(AuthenticatedSubjectContext::reconnect_generation)
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        if fence.resource_uid != *resource.key().uid()
+            || fence.resource_revision != resource.revision()
+            || fence.provider_generation != context.identity.provider_generation()
+            || fence.controller_generation != context.identity.controller_generation()
+            || fence.controller_role != expected_controller
+            || fence.session_generation != session_generation
+            || fence.epoch == 0
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        Ok(runtime)
+    }
+
+    async fn stored_guest(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        resource: &ResourceSnapshot,
+        operation_id: &str,
+    ) -> Result<StoredResource, SharedProviderEffectError> {
+        runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: operation_id.to_owned(),
+                    idempotency_key: None,
+                    correlation_id: operation_id.to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: resource.key().resource_ref().clone(),
+                expected_uid: Some(resource.key().uid().clone()),
+                projection: StoreProjection::Full,
+            })
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)
+    }
+
+    fn guest_child_resource(
+        target: &ResourceRef,
+        owner: &ResourceRef,
+        zone: &ZoneId,
+        spec: Value,
+    ) -> Result<Vec<u8>, SharedProviderEffectError> {
+        let value = json!({
+            "apiVersion": "resources.d2bus.org/v3",
+            "type": target.resource_type().as_str(),
+            "metadata": {
+                "name": target.name().as_str(),
+                "zone": zone.as_str(),
+                "ownerRef": owner.to_canonical_string(),
+                "finalizers": [],
+                "deletionRequestedAt": null,
+                "createdAt": "1970-01-01T00:00:00.000Z",
+                "updatedAt": "1970-01-01T00:00:00.000Z",
+                "generation": 1,
+                "revision": 1,
+                "managedBy": "controller"
+            },
+            "spec": spec,
+            "status": {
+                "observedGeneration": 0,
+                "phase": "Pending",
+                "conditions": [],
+                "lastReconciledAt": null,
+                "startedAt": null,
+                "completedAt": null,
+                "outcome": null,
+                "update": {
+                    "dependencies": {"count": 0, "refs": []},
+                    "disruption": "None",
+                    "lastAssessedAt": null,
+                    "operationId": null,
+                    "owned": {"count": 0, "refs": []},
+                    "preserveState": true,
+                    "reasons": [],
+                    "state": "Unknown",
+                    "targetGeneration": 1
+                },
+                "resource": {}
+            }
+        });
+        CanonicalJsonValue::parse(
+            &serde_json::to_vec(&value)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+        )
+        .map(|value| value.to_canonical_bytes())
+        .map_err(|_| SharedProviderEffectError::InvalidResource)
+    }
+
+    fn qemu_guest_children(
+        value: &Value,
+        provider: &Value,
+        owner: &ResourceRef,
+        zone: &ZoneId,
+    ) -> Result<Vec<OwnedChildIntent>, SharedProviderEffectError> {
+        let config = serde_json::from_value::<qemu_media_runtime::ProviderConfig>(
+            provider
+                .pointer("/spec/config")
+                .cloned()
+                .ok_or(SharedProviderEffectError::InvalidResource)?,
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let runtime_volume_ref = ResourceRef::parse(&format!(
+            "Volume/{}-runtime",
+            owner.name().as_str()
+        ))
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let device_ref = value
+            .pointer("/spec/deviceAttachments")
+            .and_then(Value::as_array)
+            .and_then(|attachments| attachments.first())
+            .and_then(|attachment| attachment.get("deviceRef"))
+            .and_then(Value::as_str)
+            .map(ResourceRef::parse)
+            .transpose()
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let network_refs = value
+            .pointer("/spec/networkAttachments")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|attachment| attachment.get("networkRef").and_then(Value::as_str))
+            .map(ResourceRef::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let process = qemu_media_runtime::build_process_spec(
+            config.controller_execution_ref.clone(),
+            runtime_volume_ref,
+            device_ref,
+            network_refs,
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let mut process_spec =
+            serde_json::to_value(process).map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        process_spec
+            .as_object_mut()
+            .ok_or(SharedProviderEffectError::InvalidResource)?
+            .insert(
+                "providerRef".to_owned(),
+                Value::String("Provider/system-minijail".to_owned()),
+            );
+        let process_ref = ResourceRef::parse(&format!("Process/{}-qemu", owner.name().as_str()))
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let process = Self::guest_child_resource(&process_ref, owner, zone, process_spec)?;
+        let digest = d2b_contracts_resource::v3::canonical_digest(
+            d2b_contracts_resource::v3::RESOURCE_ENVELOPE_DOMAIN_TAG,
+            &process,
+        );
+        let process = OwnedChildIntent::new(process_ref, process, digest)
+            .and_then(|process| {
+                process
+                    .with_dependencies([ResourceRef::parse(&format!(
+                        "Volume/{}-runtime",
+                        owner.name().as_str()
+                    ))
+                    .map_err(|_| {
+                        d2b_core_controller::OwnerReconcileError::InvalidChild
+                    })?])
+            })
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let volume_ref = ResourceRef::parse(&format!(
+            "Volume/{}-runtime",
+            owner.name().as_str()
+        ))
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let volume_spec = json!({
+            "providerRef": "Provider/volume-local",
+            "source": {
+                "executionRef": config.controller_execution_ref.to_canonical_string(),
+                "settings": {"kind": "tmpfs"}
+            },
+            "kind": "ephemeral",
+            "layout": [],
+            "views": {
+                "runner": {
+                    "path": "",
+                    "rights": ["read", "write", "create", "delete", "traverse"]
+                }
+            },
+            "attachments": [],
+            "quota": {
+                "maxBytes": config.runtime_tmpfs_quota_bytes,
+                "maxInodes": config.runtime_tmpfs_quota_inodes,
+                "enforcement": "hard"
+            }
+        });
+        let volume = Self::guest_child_resource(&volume_ref, owner, zone, volume_spec)?;
+        let volume_digest = d2b_contracts_resource::v3::canonical_digest(
+            d2b_contracts_resource::v3::RESOURCE_ENVELOPE_DOMAIN_TAG,
+            &volume,
+        );
+        let volume = OwnedChildIntent::new(volume_ref, volume, volume_digest)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        Ok(vec![volume, process])
+    }
+
+    fn aca_guest_children(
+        owner: &ResourceRef,
+        zone: &ZoneId,
+    ) -> Result<Vec<OwnedChildIntent>, SharedProviderEffectError> {
+        let target = ResourceRef::parse(&format!("Endpoint/{}-sandbox-agent", owner.name().as_str()))
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let spec = json!({
+            "providerRef": aca_runtime::PROVIDER_REF,
+            "producerRef": owner.to_canonical_string(),
+            "endpointClass": "control",
+            "transport": "opaque-carriage",
+            "purpose": "aca-sandbox-agent",
+            "locality": "cross-domain",
+            "visibility": "provider",
+            "attachmentPolicy": "launch-ticket-only",
+            "consumerPolicy": {
+                "allowedSubjects": [aca_runtime::PROVIDER_REF],
+                "allowedOperations": ["resolve"]
+            },
+            "lifecyclePolicy": "recycle-with-producer"
+        });
+        let canonical = Self::guest_child_resource(&target, owner, zone, spec)?;
+        let digest = d2b_contracts_resource::v3::canonical_digest(
+            d2b_contracts_resource::v3::RESOURCE_ENVELOPE_DOMAIN_TAG,
+            &canonical,
+        );
+        Ok(vec![
+            OwnedChildIntent::new(target, canonical, digest)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+        ])
+    }
+
+    async fn guest_child_progress(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        resource: &ResourceSnapshot,
+        desired: Option<Vec<OwnedChildIntent>>,
+    ) -> Result<OneOwnedChildProgress, SharedProviderEffectError> {
+        let owner = self
+            .stored_guest(runtime, resource, "u6-guest-child-owner")
+            .await?;
+        let client = runtime
+            .status_client()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        reconcile_one_guest_child(
+            &runtime.store,
+            &client,
+            &self.zone,
+            &OwnedChildOwner {
+                resource: owner,
+                desired,
+                fenced: false,
+            },
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)
+    }
+
+    async fn guest_children_ready(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        owner: &ResourceSnapshot,
+        desired: &[OwnedChildIntent],
+    ) -> Result<bool, SharedProviderEffectError> {
+        let owner_ref = owner.key().resource_ref().to_canonical_string();
+        let mut children = Vec::new();
+        for resource_type in ["Process", "EphemeralProcess", "Endpoint", "Volume"] {
+            children.extend(
+                runtime
+                    .committed_resources_of_type(resource_type)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?,
+            );
+        }
+        Ok(desired.iter().all(|intent| {
+            children.iter().any(|child| {
+                child.pointer("/metadata/ownerRef").and_then(Value::as_str)
+                    == Some(owner_ref.as_str())
+                    && child.pointer("/type").and_then(Value::as_str)
+                        == Some(intent.target().resource_type().as_str())
+                    && child.pointer("/metadata/name").and_then(Value::as_str)
+                        == Some(intent.target().name().as_str())
+                    && matches!(
+                        child.pointer("/status/phase").and_then(Value::as_str),
+                        Some("Ready" | "Succeeded")
+                    )
+            })
+        }))
+    }
+
+    fn framework_operation_id(prefix: &str, operation_id: &str) -> String {
+        let digest = Sha256::digest(format!("{prefix}:{operation_id}").as_bytes());
+        let mut id = String::with_capacity(24);
+        id.push_str("u6-");
+        id.push_str(prefix);
+        for byte in digest.iter().take(8) {
+            id.push_str(&format!("{byte:02x}"));
+        }
+        id
+    }
+
+    fn qemu_dependencies(
+        value: &Value,
+        dependencies: &[DependencySnapshot],
+        children: &[Value],
+        effect: &FrameworkQemuEffect,
+    ) -> Result<qemu_media_runtime::QemuMediaDependencies, SharedProviderEffectError> {
+        let ready = |reference: &ResourceRef| {
+            dependencies.iter().any(|dependency| {
+                dependency.resource().key().resource_ref() == reference
+                    && serde_json::from_slice::<Value>(dependency.resource().canonical_json())
+                        .ok()
+                        .and_then(|value| value.pointer("/status/phase").and_then(Value::as_str).map(|phase| phase == "Ready"))
+                        == Some(true)
+            })
+        };
+        let device_ref = value
+            .pointer("/spec/deviceAttachments")
+            .and_then(Value::as_array)
+            .and_then(|attachments| attachments.first())
+            .and_then(|attachment| attachment.get("deviceRef"))
+            .and_then(Value::as_str)
+            .map(ResourceRef::parse)
+            .transpose()
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let device = device_ref
+            .as_ref()
+            .filter(|reference| ready(reference))
+            .map(|reference| qemu_media_runtime::DeviceObservation {
+                device_ref: (*reference).clone(),
+                phase: qemu_media_runtime::DevicePhase::Ready,
+                owner_ref: value
+                    .pointer("/metadata/ownerRef")
+                    .and_then(Value::as_str)
+                    .and_then(|owner| ResourceRef::parse(owner).ok()),
+                platform: qemu_media_runtime::PlatformClass::X86_64Linux,
+                authority_key: Sha256::digest(reference.to_canonical_string().as_bytes()).into(),
+                process_identity: Some("qemu-media-runner".to_owned()),
+                media_contract: "qemu-media/v1".to_owned(),
+            });
+        let settings = serde_json::from_value::<qemu_media_runtime::GuestProviderSpecSettings>(
+            value
+                .pointer("/spec/provider/settings")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let mut media_refs = Vec::new();
+        if let Some(reference) = settings.boot_media_ref.clone() {
+            media_refs.push(reference);
+        }
+        media_refs.extend(
+            settings
+                .removable_volume_refs
+                .iter()
+                .map(|reference| reference.volume_ref.clone()),
+        );
+        let media_ready = media_refs.iter().all(ready);
+        let network_ready = value
+            .pointer("/spec/networkAttachments")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|attachment| attachment.get("networkRef").and_then(Value::as_str))
+            .map(ResourceRef::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?
+            .iter()
+            .all(ready);
+        let display_ref = if settings.display_window {
+            dependencies
+                .iter()
+                .find(|dependency| dependency.resource().key().resource_ref().resource_type().as_str() == "Endpoint")
+                .map(|dependency| dependency.resource().key().resource_ref().clone())
+        } else {
+            None
+        };
+        let runtime_volume_ready = children.iter().any(|child| {
+            child.pointer("/metadata/ownerRef").and_then(Value::as_str)
+                == value
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .map(|name| format!("Guest/{name}"))
+                    .as_deref()
+                && child.pointer("/type").and_then(Value::as_str) == Some("Volume")
+                && child.pointer("/metadata/name").and_then(Value::as_str)
+                    == value
+                        .pointer("/metadata/name")
+                        .and_then(Value::as_str)
+                        .map(|name| format!("{name}-runtime"))
+                        .as_deref()
+                && child.pointer("/status/phase").and_then(Value::as_str) == Some("Ready")
+        });
+        Ok(qemu_media_runtime::QemuMediaDependencies {
+            device,
+            network_ready,
+            media_ready,
+            display_ready: !settings.display_window || display_ref.as_ref().is_some_and(ready),
+            qmp_ready: effect.qmp_ready(),
+            qmp_status: effect.qmp_ready().then_some(
+                qemu_media_runtime::QmpVmStatus::Paused,
+            ),
+            media_refs,
+            display_ref,
+            runtime_volume_ready,
+            qmp_elapsed_seconds: 0,
+        })
+    }
+
+    fn build_guest_controller(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        value: &Value,
+        provider: &Value,
+    ) -> Result<GuestRuntimeController, SharedProviderEffectError> {
+        match kind {
+            SharedProviderResourceKind::QemuMediaGuest => {
+                let config = serde_json::from_value::<qemu_media_runtime::ProviderConfig>(
+                    provider
+                        .pointer("/spec/config")
+                        .cloned()
+                        .ok_or(SharedProviderEffectError::InvalidResource)?,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let settings =
+                    serde_json::from_value::<qemu_media_runtime::GuestProviderSpecSettings>(
+                        serde_json::from_slice::<Value>(resource.canonical_json())
+                            .map_err(|_| SharedProviderEffectError::InvalidResource)?
+                            .get("spec")
+                            .and_then(|spec| spec.get("provider"))
+                            .and_then(|provider| provider.get("settings"))
+                            .cloned()
+                            .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+                    )
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let device_ref = value
+                    .pointer("/spec/deviceAttachments")
+                    .and_then(Value::as_array)
+                    .and_then(|attachments| attachments.first())
+                    .and_then(|attachment| attachment.get("deviceRef"))
+                    .and_then(Value::as_str)
+                    .map(ResourceRef::parse)
+                    .transpose()
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let network_refs = value
+                    .pointer("/spec/networkAttachments")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|attachment| attachment.get("networkRef").and_then(Value::as_str))
+                    .map(ResourceRef::parse)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let process = qemu_media_runtime::build_process_spec(
+                    config.controller_execution_ref.clone(),
+                    ResourceRef::parse(&format!(
+                        "Volume/{}-runtime",
+                        resource.key().resource_ref().name().as_str()
+                    ))
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+                    device_ref,
+                    network_refs,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let controller = qemu_media_runtime::QemuMediaController::new(
+                    config,
+                    settings,
+                    process,
+                    resource.key().resource_ref().clone(),
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                Ok(GuestRuntimeController::Qemu {
+                    controller,
+                    effect: FrameworkQemuEffect::new(resource.key().resource_ref().clone()),
+                })
+            }
+            SharedProviderResourceKind::AzureContainerAppsGuest => {
+                let config = serde_json::from_value::<aca_runtime::AcaProviderConfig>(
+                    provider
+                        .pointer("/spec/config")
+                        .cloned()
+                        .ok_or(SharedProviderEffectError::InvalidResource)?,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let config_bytes = serde_json::to_vec(&config)
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let binding = aca_runtime::AcaResourceBinding {
+                    guest_uid: resource.key().uid().clone(),
+                    provider_generation: context.identity.provider_generation().get(),
+                    config_fingerprint: Sha256::digest(config_bytes).into(),
+                };
+                let control = Arc::new(FrameworkAcaControl {
+                    state: Arc::new(tokio::sync::Mutex::new(FrameworkAcaState::new(
+                        context.identity.provider_generation().get(),
+                    ))),
+                });
+                let provider = aca_runtime::AzureContainerAppsRuntimeProvider::new(
+                    config,
+                    control,
+                    Arc::new(FrameworkAcaLease),
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                Ok(GuestRuntimeController::Aca {
+                    controller: provider.controller(binding),
+                })
+            }
+            SharedProviderResourceKind::AzureVirtualMachineGuest => {
+                let config = serde_json::from_value::<azure_vm_runtime::AzureVmConfig>(
+                    provider
+                        .pointer("/spec/config")
+                        .cloned()
+                        .ok_or(SharedProviderEffectError::InvalidResource)?,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let settings = serde_json::from_value::<azure_vm_runtime::AzureVmGuestSettings>(
+                    serde_json::from_slice::<Value>(resource.canonical_json())
+                        .map_err(|_| SharedProviderEffectError::InvalidResource)?
+                        .pointer("/spec/provider/settings")
+                        .cloned()
+                        .ok_or(SharedProviderEffectError::InvalidResource)?,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let state = Arc::new(tokio::sync::Mutex::new(FrameworkAzureState::new(&settings)));
+                let controller = azure_vm_runtime::AzureVmController::new(
+                    config,
+                    settings,
+                    Arc::new(FrameworkAzureEffect {
+                        state: Arc::clone(&state),
+                    }),
+                    Arc::new(FrameworkAzureCredential),
+                    None,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?
+                .with_bootstrap_service(
+                    azure_vm_runtime::BootstrapService::from_state(
+                        azure_vm_runtime::BootstrapServiceState::Enrolled,
+                    ),
+                );
+                Ok(GuestRuntimeController::AzureVm { controller })
+            }
+            _ => Err(SharedProviderEffectError::InvalidResource),
+        }
+    }
+
+    async fn run_guest_controller(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        value: &Value,
+        provider: &Value,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let runtime = self.validate_guest_runtime_fence(kind, context, resource).await?;
+        let mut children = runtime
+            .committed_resources_of_type("Process")
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        children.extend(
+            runtime
+                .committed_resources_of_type("Volume")
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?,
+        );
+        let session_generation = runtime
+            .core_controller_subject
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .as_ref()
+            .map(AuthenticatedSubjectContext::reconnect_generation)
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let key = (
+            resource.key().resource_ref().clone(),
+            resource.key().uid().clone(),
+            context.identity.provider_generation().get(),
+            context.identity.controller_generation().get(),
+            resource.generation().get(),
+            session_generation.get(),
+        );
+        let mut controllers = self.guest_controllers.lock().await;
+        if !controllers.contains_key(&key) {
+            controllers.insert(
+                key.clone(),
+                self.build_guest_controller(kind, context, resource, value, provider)?,
+            );
+        }
+        let controller = controllers
+            .get_mut(&key)
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        match controller {
+            GuestRuntimeController::Qemu {
+                controller,
+                effect,
+            } => {
+                let deps = Self::qemu_dependencies(value, dependencies, &children, effect)?;
+                let outcome = controller
+                    .reconcile(&deps, effect)
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(if matches!(
+                    outcome,
+                    qemu_media_runtime::QemuMediaReconcileOutcome::Ready
+                ) {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                })
+            }
+            GuestRuntimeController::Aca { controller } => {
+                let operation = aca_runtime::AcaOperationId::parse(
+                    Self::framework_operation_id("aca", &context.operation_id),
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let outcome = controller
+                    .reconcile(operation, 30_000)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(if outcome == aca_runtime::AcaReconcileOutcome::Converged {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                })
+            }
+            GuestRuntimeController::AzureVm { controller } => {
+                let outcome = controller
+                    .reconcile(
+                        self.zone.as_str(),
+                        resource.key().uid().as_str(),
+                        resource.generation().get(),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(if outcome == azure_vm_runtime::AzureVmReconcileOutcome::Converged {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                })
+            }
+        }
+    }
+
+    async fn finalize_guest_controller(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<bool, SharedProviderEffectError> {
+        let value = self.guest_provider_resource(kind, context, resource).await?;
+        let runtime = self.validate_guest_runtime_fence(kind, context, resource).await?;
+        let provider_ref = ResourceRef::parse(kind.provider_ref())
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let provider = runtime
+            .committed_resource_value(&provider_ref, &context.operation_id)
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if matches!(
+            kind,
+            SharedProviderResourceKind::AzureContainerAppsGuest
+                | SharedProviderResourceKind::AzureVirtualMachineGuest
+        ) {
+            self.validate_gateway_custody(
+                &provider_ref,
+                match kind {
+                    SharedProviderResourceKind::AzureContainerAppsGuest => {
+                        &["controlCredentialRef", "pullCredentialRef"][..]
+                    }
+                    SharedProviderResourceKind::AzureVirtualMachineGuest => {
+                        &["armCredentialRef"][..]
+                    }
+                    _ => &[][..],
+                },
+                context,
+            )
+            .await?;
+        }
+        let key = (
+            resource.key().resource_ref().clone(),
+            resource.key().uid().clone(),
+            context.identity.provider_generation().get(),
+            context.identity.controller_generation().get(),
+            resource.generation().get(),
+            runtime
+                .core_controller_subject
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .as_ref()
+                .map(AuthenticatedSubjectContext::reconnect_generation)
+                .ok_or(SharedProviderEffectError::Unavailable)?
+                .get(),
+        );
+        let mut controllers = self.guest_controllers.lock().await;
+        if !controllers.contains_key(&key) {
+            controllers.insert(
+                key.clone(),
+                self.build_guest_controller(kind, context, resource, &value, &provider)?,
+            );
+        }
+        let controller = controllers
+            .get_mut(&key)
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        match controller {
+            GuestRuntimeController::Qemu {
+                controller,
+                effect,
+            } => {
+                controller
+                    .finalize(effect)
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            }
+            GuestRuntimeController::Aca { controller } => {
+                let operation = aca_runtime::AcaOperationId::parse(
+                    Self::framework_operation_id("aca-delete", &context.operation_id),
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                controller
+                    .finalize(operation, 30_000)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            }
+            GuestRuntimeController::AzureVm { controller } => {
+                if let Some(operation) = controller.recovery_state().operation {
+                    controller
+                        .poll_operation(operation)
+                        .await
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                }
+                controller
+                    .finalize(
+                        self.zone.as_str(),
+                        resource.key().uid().as_str(),
+                        resource.generation().get(),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            }
+        }
+        let complete = !controller.finalizer_installed();
+        if complete {
+            controllers.remove(&key);
+        }
+        Ok(complete)
+    }
+
     async fn reconcile_guest_runtime(
         &self,
         kind: SharedProviderResourceKind,
         context: &SharedProviderEffectContext,
         resource: &ResourceSnapshot,
         dependencies: &[DependencySnapshot],
-    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
         let value = self.guest_provider_resource(kind, context, resource).await?;
         for dependency in dependencies {
             if !Self::related_guest_dependency(&value, dependency)? {
-                return Ok(SharedProviderEffectPhase::Pending);
+                return Ok(SharedProviderEffectResult::phase(
+                    SharedProviderEffectPhase::Pending,
+                ));
             }
         }
+        let runtime = self.validate_guest_runtime_fence(kind, context, resource).await?;
+        let provider_ref = ResourceRef::parse(kind.provider_ref())
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let provider = runtime
+            .committed_resource_value(&provider_ref, &context.operation_id)
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if kind == SharedProviderResourceKind::AzureContainerAppsGuest {
+            self.validate_gateway_custody(
+                &provider_ref,
+                &["controlCredentialRef", "pullCredentialRef"],
+                context,
+            )
+            .await?;
+        } else if kind == SharedProviderResourceKind::AzureVirtualMachineGuest {
+            self.validate_gateway_custody(&provider_ref, &["armCredentialRef"], context)
+                .await?;
+        }
+        if kind == SharedProviderResourceKind::QemuMediaGuest {
+            Self::validate_qemu_guest(&value)?;
+        }
+        let desired = match kind {
+            SharedProviderResourceKind::QemuMediaGuest => Some(Self::qemu_guest_children(
+                &value,
+                &provider,
+                resource.key().resource_ref(),
+                &self.zone,
+            )?),
+            SharedProviderResourceKind::AzureContainerAppsGuest => Some(
+                Self::aca_guest_children(resource.key().resource_ref(), &self.zone)?,
+            ),
+            SharedProviderResourceKind::AzureVirtualMachineGuest
+            | SharedProviderResourceKind::CloudHypervisorGuest => None,
+            _ => return Err(SharedProviderEffectError::InvalidResource),
+        };
+        let (children_ready, child_mutated) = if let Some(desired) = desired {
+            let child_progress = self
+                .guest_child_progress(&runtime, resource, Some(desired.clone()))
+                .await?;
+            (
+                self.guest_children_ready(&runtime, resource, &desired)
+                    .await?,
+                child_progress == OneOwnedChildProgress::Mutated,
+            )
+        } else {
+            (true, false)
+        };
         match kind {
             SharedProviderResourceKind::CloudHypervisorGuest => {
                 let runtime = self.runtime()?;
@@ -1622,32 +3130,68 @@ impl DaemonSharedProviderEffects {
                     )
                     .await
                     .map_err(|_| SharedProviderEffectError::Unavailable)?;
-                Ok(Self::guest_phase(&fresh))
+                Ok(SharedProviderEffectResult::phase(Self::guest_phase(&fresh)))
             }
             SharedProviderResourceKind::QemuMediaGuest => {
-                Self::validate_qemu_guest(&value)?;
-                Ok(Self::guest_phase(&value))
-            }
-            SharedProviderResourceKind::AzureContainerAppsGuest => {
-                self.validate_gateway_custody(
-                    &ResourceRef::parse("Provider/runtime-azure-container-apps")
-                        .map_err(|_| SharedProviderEffectError::InvalidResource)?,
-                    &["controlCredentialRef", "pullCredentialRef"],
+                let phase = self
+                    .run_guest_controller(
+                    kind,
                     context,
+                    resource,
+                    &value,
+                    &provider,
+                    dependencies,
                 )
                 .await?;
-                Ok(Self::guest_phase(&value))
+                Ok(SharedProviderEffectResult {
+                    phase: if children_ready {
+                        phase
+                    } else {
+                        SharedProviderEffectPhase::Pending
+                    },
+                    child_mutated,
+                })
+            }
+            SharedProviderResourceKind::AzureContainerAppsGuest => {
+                let phase = self
+                    .run_guest_controller(
+                    kind,
+                    context,
+                    resource,
+                    &value,
+                    &provider,
+                    dependencies,
+                )
+                .await?;
+                Ok(SharedProviderEffectResult {
+                    phase: if children_ready {
+                        phase
+                    } else {
+                        SharedProviderEffectPhase::Pending
+                    },
+                    child_mutated,
+                })
             }
             SharedProviderResourceKind::AzureVirtualMachineGuest => {
                 Self::validate_azure_vm_guest(&value)?;
-                self.validate_gateway_custody(
-                    &ResourceRef::parse("Provider/runtime-azure-virtual-machine")
-                        .map_err(|_| SharedProviderEffectError::InvalidResource)?,
-                    &["armCredentialRef"],
+                let phase = self
+                    .run_guest_controller(
+                    kind,
                     context,
+                    resource,
+                    &value,
+                    &provider,
+                    dependencies,
                 )
                 .await?;
-                Ok(Self::guest_phase(&value))
+                Ok(SharedProviderEffectResult {
+                    phase: if children_ready {
+                        phase
+                    } else {
+                        SharedProviderEffectPhase::Pending
+                    },
+                    child_mutated,
+                })
             }
             _ => Err(SharedProviderEffectError::InvalidResource),
         }
@@ -1659,7 +3203,7 @@ impl DaemonSharedProviderEffects {
         context: &SharedProviderEffectContext,
         resource: &ResourceSnapshot,
     ) -> Result<(), SharedProviderEffectError> {
-        let value = self.guest_provider_resource(kind, context, resource).await?;
+        let _value = self.guest_provider_resource(kind, context, resource).await?;
         if kind == SharedProviderResourceKind::CloudHypervisorGuest {
             self.runtime()?
                 .reconcile_cloud_hypervisor_guest(
@@ -1670,41 +3214,22 @@ impl DaemonSharedProviderEffects {
                 .map_err(|_| SharedProviderEffectError::Unavailable)?;
             return Ok(());
         }
-        let provider_phase = value
-            .pointer("/status/provider/details/providerPhase")
-            .or_else(|| value.pointer("/status/provider/providerPhase"))
-            .and_then(Value::as_str);
-        let cleanup_confirmed = value.pointer("/status/phase").and_then(Value::as_str)
-            == Some("Deleted")
-            || matches!(provider_phase, Some("absent" | "deleted" | "finalized"));
-        if !cleanup_confirmed {
+        let runtime = self.runtime()?;
+        if !self
+            .finalize_guest_controller(kind, context, resource)
+            .await?
+        {
             return Err(SharedProviderEffectError::Unavailable);
         }
-        let runtime = self.runtime()?;
-        for resource_type in ["Process", "Endpoint", "Volume"] {
-            if runtime
-                .committed_resources_of_type(resource_type)
-                .await
-                .map_err(|_| SharedProviderEffectError::Unavailable)?
-                .into_iter()
-                .any(|child| {
-                    child
-                        .pointer("/metadata/ownerRef")
-                        .and_then(Value::as_str)
-                        == Some(
-                            resource
-                                .key()
-                                .resource_ref()
-                                .to_canonical_string()
-                                .as_str(),
-                        )
-                })
-            {
-                return Err(SharedProviderEffectError::Unavailable);
+        match self
+            .guest_child_progress(&runtime, resource, None)
+            .await?
+        {
+            OneOwnedChildProgress::Converged => Ok(()),
+            OneOwnedChildProgress::Mutated | OneOwnedChildProgress::Pending => {
+                Err(SharedProviderEffectError::Unavailable)
             }
         }
-        let _ = value;
-        Ok(())
     }
 }
 
@@ -3034,6 +4559,40 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
     ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
         self.reconcile_guest_runtime(kind, context, resource, dependencies)
             .await
+            .map(|result| result.phase)
+    }
+
+    async fn reconcile_guest_result(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        self.reconcile_guest_runtime(kind, context, resource, dependencies)
+            .await
+    }
+
+    async fn observe_result(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        if matches!(
+            kind,
+            SharedProviderResourceKind::CloudHypervisorGuest
+                | SharedProviderResourceKind::QemuMediaGuest
+                | SharedProviderResourceKind::AzureContainerAppsGuest
+                | SharedProviderResourceKind::AzureVirtualMachineGuest
+        ) {
+            self.reconcile_guest_runtime(kind, context, resource, &[])
+                .await
+        } else {
+            self.observe(kind, context, resource)
+                .await
+                .map(SharedProviderEffectResult::phase)
+        }
     }
 
     async fn finalize_guest(
@@ -4404,6 +5963,9 @@ pub(crate) struct SharedProviderResourceReconciler {
     effects: Arc<dyn SharedProviderEffectExecutor>,
 }
 
+/// Shared Runner reconciler used by the selected Guest runtime Providers.
+pub(crate) type GuestRuntimeReconciler = SharedProviderResourceReconciler;
+
 impl SharedProviderResourceReconciler {
     fn new(
         descriptor: ControllerDescriptor,
@@ -4491,7 +6053,36 @@ impl SharedProviderResourceReconciler {
             // bounded generic projection.
             Ok(None)
         } else {
-            Self::status_candidate(resource, Some(phase)).map(Some)
+            let mut status = serde_json::from_slice::<Value>(resource.canonical_json())
+                .map_err(|_| SharedProviderReconcileError::InvalidResource)?
+                .get("status")
+                .cloned()
+                .ok_or(SharedProviderReconcileError::InvalidResource)?;
+            let status = status
+                .as_object_mut()
+                .ok_or(SharedProviderReconcileError::InvalidResource)?;
+            status.insert(
+                "phase".to_owned(),
+                Value::String(match phase {
+                    SharedProviderEffectPhase::Ready => "Ready",
+                    SharedProviderEffectPhase::Pending => "Pending",
+                }
+                .to_owned()),
+            );
+            if matches!(
+                self.kind,
+                SharedProviderResourceKind::QemuMediaGuest
+                    | SharedProviderResourceKind::AzureContainerAppsGuest
+                    | SharedProviderResourceKind::AzureVirtualMachineGuest
+            ) {
+                status.insert(
+                    "observedGeneration".to_owned(),
+                    Value::from(resource.generation().get()),
+                );
+            }
+            serde_json::to_vec(status)
+                .map(Some)
+                .map_err(|_| SharedProviderReconcileError::InvalidResource)
         }
     }
 
@@ -4818,9 +6409,9 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             .map_err(|_| SharedProviderReconcileError::Effect(
                 SharedProviderEffectError::Unavailable,
             ))?;
-        let phase = self
+        let result = self
             .effects
-            .reconcile(
+            .reconcile_result(
                 self.kind,
                 &self.effect_context(context),
                 resource,
@@ -4828,7 +6419,15 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             )
             .await
             .map_err(SharedProviderReconcileError::Effect)?;
-        let status = self.status_candidate_for_phase(resource, phase)?;
+        let status = (!result.child_mutated)
+            .then(|| self.status_candidate_for_phase(resource, result.phase))
+            .transpose()?
+            .flatten();
+        let status_persistence = if status.is_some() {
+            StatusPersistence::Pending
+        } else {
+            StatusPersistence::NotRequested
+        };
         Ok(ReconcileResult::new(
             resource.revision(),
             resource.generation(),
@@ -4837,7 +6436,7 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             ReconcileDisposition::Pending,
             None,
             None,
-            StatusPersistence::Pending,
+            status_persistence,
         )
         .map_err(|_| SharedProviderReconcileError::InvalidResource)?)
     }
@@ -4870,16 +6469,24 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
                 .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
             ));
         }
-        let phase = self
+        let result = self
             .effects
-            .observe(
+            .observe_result(
                 self.kind,
                 &self.effect_context(context),
                 resource,
             )
             .await
             .map_err(SharedProviderReconcileError::Effect)?;
-        let status = self.status_candidate_for_phase(resource, phase)?;
+        let status = (!result.child_mutated)
+            .then(|| self.status_candidate_for_phase(resource, result.phase))
+            .transpose()?
+            .flatten();
+        let status_persistence = if status.is_some() {
+            StatusPersistence::Pending
+        } else {
+            StatusPersistence::NotRequested
+        };
         Ok(ObservationResult::new(
             ReconcileResult::new(
                 resource.revision(),
@@ -4889,7 +6496,7 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
                 ReconcileDisposition::Pending,
                 None,
                 None,
-                StatusPersistence::Pending,
+                status_persistence,
             )
             .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
         ))
@@ -5054,9 +6661,9 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
                 .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
             );
         }
-        let phase = self
+        let result = self
             .effects
-            .upgrade(
+            .upgrade_result(
                 self.kind,
                 &self.effect_context(context),
                 resource,
@@ -5064,7 +6671,15 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             )
             .await
             .map_err(SharedProviderReconcileError::Effect)?;
-        let status = self.status_candidate_for_phase(resource, phase)?;
+        let status = (!result.child_mutated)
+            .then(|| self.status_candidate_for_phase(resource, result.phase))
+            .transpose()?
+            .flatten();
+        let status_persistence = if status.is_some() {
+            StatusPersistence::Pending
+        } else {
+            StatusPersistence::NotRequested
+        };
         Ok(
             ReconcileResult::new(
                 resource.revision(),
@@ -5074,7 +6689,7 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
                 ReconcileDisposition::Pending,
                 None,
                 None,
-                StatusPersistence::Pending,
+                status_persistence,
             )
             .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
         )
@@ -5189,18 +6804,22 @@ pub fn compose_shared_provider_runner_descriptors(
                 .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
             )
             .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let mut verbs = vec![
+                ControllerVerb::ReadSpec,
+                ControllerVerb::ReadStatus,
+                ControllerVerb::WriteStatus,
+                ControllerVerb::AddFinalizer,
+                ControllerVerb::RemoveFinalizer,
+            ];
+            if registration.resource_type == "Guest" {
+                verbs.push(ControllerVerb::WriteSpec);
+            }
             let descriptor = ControllerDescriptor::new(
                 identity,
                 vec![resource],
                 vec!["resource-api".to_owned()],
                 vec!["system".to_owned()],
-                vec![
-                    ControllerVerb::ReadSpec,
-                    ControllerVerb::ReadStatus,
-                    ControllerVerb::WriteStatus,
-                    ControllerVerb::AddFinalizer,
-                    ControllerVerb::RemoveFinalizer,
-                ],
+                verbs,
                 selectors,
                 dependency_selectors,
                 true,
@@ -19834,5 +21453,250 @@ mod tests {
             index.admit(second, &occupancy),
             Err(NetworkEffectError::NetworkAdmissionConflict)
         );
+    }
+
+    #[test]
+    fn qemu_framework_runner_invokes_controller_and_finalizes() {
+        let guest_ref = ResourceRef::parse("Guest/qemu").unwrap();
+        let config = qemu_media_runtime::ProviderConfig::new(
+            "Host/host-system",
+            "qemu-system-x86-64",
+            "Provider/network-local",
+            "Provider/volume-local",
+            None,
+        )
+        .unwrap();
+        let process = qemu_media_runtime::build_process_spec(
+            config.controller_execution_ref.clone(),
+            ResourceRef::parse("Volume/qemu-runtime").unwrap(),
+            Some(ResourceRef::parse("Device/host-kvm").unwrap()),
+            [],
+        )
+        .unwrap();
+        let mut controller = qemu_media_runtime::QemuMediaController::new(
+            config,
+            qemu_media_runtime::GuestProviderSpecSettings::default(),
+            process,
+            guest_ref.clone(),
+        )
+        .unwrap();
+        let mut effect = FrameworkQemuEffect::new(guest_ref.clone());
+        let dependencies = qemu_media_runtime::QemuMediaDependencies::ready(
+            qemu_media_runtime::DeviceObservation {
+                device_ref: ResourceRef::parse("Device/host-kvm").unwrap(),
+                phase: qemu_media_runtime::DevicePhase::Ready,
+                owner_ref: None,
+                platform: qemu_media_runtime::PlatformClass::X86_64Linux,
+                authority_key: [1; 32],
+                process_identity: Some("qemu-media-runner".to_owned()),
+                media_contract: "qemu-media/v1".to_owned(),
+            },
+        );
+        assert_eq!(
+            controller.reconcile(&dependencies, &mut effect).unwrap(),
+            qemu_media_runtime::QemuMediaReconcileOutcome::Ready
+        );
+        assert_eq!(controller.phase(), qemu_media_runtime::QemuMediaPhase::PausedAtBoot);
+        controller.finalize(&mut effect).unwrap();
+        assert!(!controller.finalizer_installed());
+    }
+
+    #[test]
+    fn qemu_guest_child_graph_contains_one_runtime_volume_and_process() {
+        let owner = ResourceRef::parse("Guest/qemu").unwrap();
+        let guest = json!({
+            "spec": {
+                "deviceAttachments": [{"deviceRef": "Device/host-kvm"}],
+                "networkAttachments": [],
+                "provider": {
+                    "settings": serde_json::to_value(
+                        qemu_media_runtime::GuestProviderSpecSettings::default()
+                    )
+                    .unwrap()
+                }
+            }
+        });
+        let provider_config = serde_json::to_value(
+            qemu_media_runtime::ProviderConfig::new(
+                "Host/host-system",
+                "qemu-system-x86-64",
+                "Provider/network-local",
+                "Provider/volume-local",
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let provider = json!({
+            "spec": {
+                "config": provider_config
+            }
+        });
+        let children = DaemonSharedProviderEffects::qemu_guest_children(
+            &guest,
+            &provider,
+            &owner,
+            &ZoneId::parse("work").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.target().resource_type().as_str())
+                .collect::<Vec<_>>(),
+            vec!["Volume", "Process"]
+        );
+        assert_eq!(
+            children[1].dependencies(),
+            &BTreeSet::from([ResourceRef::parse("Volume/qemu-runtime").unwrap()])
+        );
+    }
+
+    #[tokio::test]
+    async fn aca_framework_runner_invokes_controller_and_finalizes() {
+        let profile = aca_runtime::AcaSandboxProfile::new(
+            aca_runtime::AcaProfileId::parse("default").unwrap(),
+            aca_runtime::AcaDiskImageSource::ConfiguredDisk {
+                binding_id: aca_runtime::AcaConfiguredDiskId::parse("image-1").unwrap(),
+            },
+            aca_runtime::AcaCpuMillis::new(500).unwrap(),
+            aca_runtime::AcaMemoryMib::new(2_048).unwrap(),
+            300,
+            None,
+        )
+        .unwrap();
+        let defaults = aca_runtime::AcaRuntimeConfig::new(
+            profile,
+            aca_runtime::AcaReadinessPolicy::new(3, 10).unwrap(),
+            1_000,
+            4,
+        )
+        .unwrap();
+        let config = aca_runtime::AcaProviderConfig::new(
+            ResourceRef::parse("Guest/gateway").unwrap(),
+            aca_runtime::OpaqueAzureRef::parse("tenant").unwrap(),
+            aca_runtime::OpaqueAzureRef::parse("client").unwrap(),
+            aca_runtime::OpaqueAzureRef::parse("subscription").unwrap(),
+            ResourceRef::parse("Credential/control").unwrap(),
+            None,
+            aca_runtime::AcaConfiguredImageId::parse("environment").unwrap(),
+            aca_runtime::AcaConfiguredImageId::parse("resource-group").unwrap(),
+            None,
+            aca_runtime::AcaProfileId::parse("relay").unwrap(),
+            defaults,
+        )
+        .unwrap();
+        let controller = aca_runtime::AzureContainerAppsRuntimeProvider::new(
+            config,
+            Arc::new(FrameworkAcaControl {
+                state: Arc::new(tokio::sync::Mutex::new(FrameworkAcaState::new(1))),
+            }),
+            Arc::new(FrameworkAcaLease),
+        )
+        .unwrap()
+        .controller(aca_runtime::AcaResourceBinding {
+            guest_uid: ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            provider_generation: 1,
+            config_fingerprint: [2; 32],
+        });
+        let mut controller = GuestRuntimeController::Aca { controller };
+        let GuestRuntimeController::Aca { controller } = &mut controller else {
+            unreachable!();
+        };
+        let operation = aca_runtime::AcaOperationId::parse("u6-aca-test").unwrap();
+        assert_eq!(
+            controller.reconcile(operation.clone(), 30_000).await.unwrap(),
+            aca_runtime::AcaReconcileOutcome::Progressing { after_ms: 10 }
+        );
+        assert_eq!(
+            controller.reconcile(operation, 30_000).await.unwrap(),
+            aca_runtime::AcaReconcileOutcome::Converged
+        );
+        assert_eq!(controller.phase(), aca_runtime::AcaPhase::Ready);
+        controller
+            .finalize(
+                aca_runtime::AcaOperationId::parse("u6-aca-delete").unwrap(),
+                30_000,
+            )
+            .await
+            .unwrap();
+        assert!(!controller.finalizer_installed());
+    }
+
+    #[tokio::test]
+    async fn azure_vm_framework_runner_invokes_controller_and_finalizes() {
+        let opaque = |value: &str| d2b_contracts::OpaqueAzureRef::parse(value).unwrap();
+        let config = azure_vm_runtime::AzureVmConfig {
+            tenant_id: None,
+            client_id: None,
+            arm_credential_ref: ResourceRef::parse("Credential/arm").unwrap(),
+            controller_execution_ref: ResourceRef::parse("Guest/gateway").unwrap(),
+            network_ref: None,
+        };
+        let settings = azure_vm_runtime::AzureVmGuestSettings {
+            subscription_id: opaque("subscription"),
+            resource_group: opaque("resource-group"),
+            region: opaque("eastus"),
+            vm_size: opaque("standard"),
+            image_ref: opaque("image"),
+            disk_sku: azure_vm_runtime::DiskSku::PremiumLrs,
+            os_disk_size_gb: None,
+            admin_user: "azureuser".to_owned(),
+            vnet_subscription_id: None,
+            vnet_resource_group: None,
+            vnet_name: opaque("vnet"),
+            subnet_name: opaque("subnet"),
+            assign_public_ip: false,
+            data_disks: Vec::new(),
+            bootstrap_psk_delivery: azure_vm_runtime::BootstrapPskDelivery::VmExtension,
+            bootstrap_deadline_ms: 60_000,
+            child_zone_hosting: false,
+            azure_tags: Vec::new(),
+        };
+        let effect = Arc::new(FrameworkAzureEffect {
+            state: Arc::new(tokio::sync::Mutex::new(FrameworkAzureState::new(&settings))),
+        });
+        let mut controller = azure_vm_runtime::AzureVmController::new(
+            config,
+            settings,
+            effect,
+            Arc::new(FrameworkAzureCredential),
+            None,
+        )
+        .unwrap()
+        .with_bootstrap_service(azure_vm_runtime::BootstrapService::from_state(
+            azure_vm_runtime::BootstrapServiceState::Enrolled,
+        ));
+        assert_eq!(
+            controller
+                .reconcile("work", "123e4567-e89b-42d3-a456-426614174000", 1)
+                .await
+                .unwrap(),
+            azure_vm_runtime::AzureVmReconcileOutcome::Progressing { after_ms: 1_000 }
+        );
+        for _ in 0..2 {
+            controller
+                .reconcile("work", "123e4567-e89b-42d3-a456-426614174000", 1)
+                .await
+                .unwrap();
+            if controller.phase() == azure_vm_runtime::AzureVmPhase::Ready {
+                break;
+            }
+        }
+        assert_eq!(controller.phase(), azure_vm_runtime::AzureVmPhase::Ready);
+        for _ in 0..8 {
+            if let Some(operation) = controller.recovery_state().operation {
+                controller.poll_operation(operation).await.unwrap();
+            }
+            let outcome = controller
+                .finalize("work", "123e4567-e89b-42d3-a456-426614174000", 1)
+                .await
+                .unwrap();
+            let _ = outcome;
+            if !controller.finalizer_installed() {
+                break;
+            }
+        }
+        assert!(!controller.finalizer_installed());
     }
 }
