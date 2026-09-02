@@ -817,7 +817,10 @@ impl<E: CoreTpmEffectExecutor + Send> TpmResourceEffectPort for LiveTpmResourceE
         device_ref: &ResourceRef,
         execution_ref: &ResourceRef,
     ) -> Result<ResourceRef, TpmResourceEffectError> {
-        if device_ref != &self.device_ref || execution_ref != &self.execution_ref {
+        if device_uid != &self.device_uid
+            || device_ref != &self.device_ref
+            || execution_ref != &self.execution_ref
+        {
             return Err(TpmResourceEffectError::StateIntegrity);
         }
         build_tpm_state_volume_resource(device_uid, device_ref, &self.zone, execution_ref)?;
@@ -854,6 +857,9 @@ impl<E: CoreTpmEffectExecutor + Send> TpmResourceEffectPort for LiveTpmResourceE
         device_uid: &ResourceUid,
         execution_ref: &ResourceRef,
     ) -> Result<ResourceRef, TpmResourceEffectError> {
+        if device_uid != &self.device_uid || execution_ref != &self.execution_ref {
+            return Err(TpmResourceEffectError::StateIntegrity);
+        }
         build_swtpm_flush_spec(device_uid, execution_ref)?;
         let ticket = self
             .preparation
@@ -873,9 +879,16 @@ impl<E: CoreTpmEffectExecutor + Send> TpmResourceEffectPort for LiveTpmResourceE
     async fn request_swtpm_process(
         &self,
         device_uid: &ResourceUid,
-        _volume_ref: &ResourceRef,
+        volume_ref: &ResourceRef,
         execution_ref: &ResourceRef,
     ) -> Result<ResourceRef, TpmResourceEffectError> {
+        if device_uid != &self.device_uid || execution_ref != &self.execution_ref {
+            return Err(TpmResourceEffectError::StateIntegrity);
+        }
+        let expected_volume = child_ref("Volume", device_uid, "tpm-state")?;
+        if volume_ref != &expected_volume {
+            return Err(TpmResourceEffectError::StateIntegrity);
+        }
         build_swtpm_process_spec(device_uid, execution_ref)?;
         let ticket = self
             .preparation
@@ -894,8 +907,12 @@ impl<E: CoreTpmEffectExecutor + Send> TpmResourceEffectPort for LiveTpmResourceE
 
     async fn stop_swtpm_process(
         &self,
-        _process_ref: &ResourceRef,
+        process_ref: &ResourceRef,
     ) -> Result<(), TpmResourceEffectError> {
+        let expected = child_ref("Process", &self.device_uid, "swtpm")?;
+        if process_ref != &expected {
+            return Err(TpmResourceEffectError::StateIntegrity);
+        }
         self.effect
             .lock()
             .map_err(|_| TpmResourceEffectError::Transient)?
@@ -905,15 +922,23 @@ impl<E: CoreTpmEffectExecutor + Send> TpmResourceEffectPort for LiveTpmResourceE
 
     async fn delete_flush_process(
         &self,
-        _process_ref: &ResourceRef,
+        process_ref: &ResourceRef,
     ) -> Result<(), TpmResourceEffectError> {
+        let expected = child_ref("EphemeralProcess", &self.device_uid, "tpm-flush")?;
+        if process_ref != &expected {
+            return Err(TpmResourceEffectError::StateIntegrity);
+        }
         Ok(())
     }
 
     async fn watch_tpm_endpoint(
         &self,
-        _process_ref: &ResourceRef,
+        process_ref: &ResourceRef,
     ) -> Result<ResourceRef, TpmResourceEffectError> {
+        let expected = child_ref("Process", &self.device_uid, "swtpm")?;
+        if process_ref != &expected {
+            return Err(TpmResourceEffectError::StateIntegrity);
+        }
         self.effect
             .lock()
             .map_err(|_| TpmResourceEffectError::Transient)?

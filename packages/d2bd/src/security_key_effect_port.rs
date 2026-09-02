@@ -101,7 +101,7 @@ pub(crate) fn dispatch_reconcile(
         .map_err(|_| ResourceRuntimeError::ProviderPathUnavailable)?;
     let target = relay_target(&resolver, vm_id)?;
     let admission = SecurityKeyAdmission::from_core(
-        admitted.zone_ref,
+        admitted.zone_ref.clone(),
         admitted.device_uid.clone(),
         admitted.holder_ref.clone(),
         backing,
@@ -117,6 +117,9 @@ pub(crate) fn dispatch_reconcile(
         vm_id: VmId::new(vm_id),
         selector_id: admitted.selector_id,
         device_ref: device_ref.clone(),
+        zone_ref: admitted.zone_ref.clone(),
+        device_uid: admitted.device_uid.clone(),
+        holder_ref: admitted.holder_ref.clone(),
         target,
         caller_role: crate::broker_caller_role_for_peer(peer),
         claimed_backing: None,
@@ -177,6 +180,9 @@ struct LiveSecurityKeyEffectPort<'a> {
     vm_id: VmId,
     selector_id: String,
     device_ref: ResourceRef,
+    zone_ref: ResourceRef,
+    device_uid: ResourceUid,
+    holder_ref: ResourceRef,
     target: RelayTarget,
     caller_role: d2b_contracts_broker::broker_wire::BrokerCallerRole,
     claimed_backing: Option<PhysicalUsbBackingToken>,
@@ -187,7 +193,10 @@ impl SecurityKeyEffectPort for LiveSecurityKeyEffectPort<'_> {
         &mut self,
         claim: &PhysicalUsbBackingClaim,
     ) -> Result<PhysicalAuthorityLease, SecurityKeyEffectError> {
-        if claim.device_uid().is_none() || claim.holder_ref().is_none() {
+        if claim.device_uid() != Some(&self.device_uid)
+            || claim.zone_ref() != Some(&self.zone_ref)
+            || claim.holder_ref() != Some(&self.holder_ref)
+        {
             return Err(SecurityKeyEffectError::AuthorizationDenied);
         }
         let backing = claim.token().clone();
@@ -210,7 +219,11 @@ impl SecurityKeyEffectPort for LiveSecurityKeyEffectPort<'_> {
         &mut self,
         intent: &SecurityKeyOpenIntent,
     ) -> Result<RelayLaunchTicket, SecurityKeyEffectError> {
-        if intent.device_uid() != intent.backing().device_uid().unwrap() {
+        if intent.device_uid() != &self.device_uid
+            || intent.backing().device_uid() != Some(&self.device_uid)
+            || intent.backing().zone_ref() != Some(&self.zone_ref)
+            || intent.backing().holder_ref() != Some(&self.holder_ref)
+        {
             return Err(SecurityKeyEffectError::AuthorizationDenied);
         }
         let (response, fds) = crate::dispatch_broker_request_with_fds_timeout_as(
