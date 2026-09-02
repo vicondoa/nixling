@@ -2088,18 +2088,6 @@ pub(crate) fn current_meta(database: &Database) -> Result<StoreMeta, StoreError>
     read_meta(&read)
 }
 
-pub(crate) fn authority_prepare(
-    database: &Database,
-    operation_id: &str,
-    payload: Vec<u8>,
-    request_digest: String,
-) -> Result<(), StoreError> {
-    authority_prepare_batch(
-        database,
-        &[(operation_id.to_owned(), payload, request_digest)],
-    )
-}
-
 pub(crate) fn authority_prepare_batch(
     database: &Database,
     requests: &[(String, Vec<u8>, String)],

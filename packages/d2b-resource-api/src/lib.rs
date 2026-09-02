@@ -25,6 +25,7 @@ pub use adapter::{
     attach_scoped_query_frame, decode_scoped_commit_request, reject_scoped_commit_frame,
 };
 pub use admission::{AdmissionError, AdmittedMutation};
+pub use protobuf;
 pub use authz::{AuthorizationLease, StoreSealHandoffError};
 pub use client::ResourceApiClient;
 pub use registered::RedbRegisteredControllerApi;

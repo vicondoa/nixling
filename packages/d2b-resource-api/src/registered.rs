@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -50,6 +50,9 @@ pub type AssignmentFenceResolver = Arc<
         + Sync,
 >;
 
+/// Optional production-path observer for durable effect acceptance timing.
+pub type EffectAcceptanceObserver = Arc<dyn Fn(&ResourceUid) + Send + Sync>;
+
 /// A production `RegisteredControllerApi` backed by one owned redb store.
 ///
 /// The mutation issuer is paired with the acceptor installed in the store by
@@ -64,6 +67,7 @@ pub struct RedbRegisteredControllerApi {
     acknowledge_after: tokio::sync::Mutex<Option<ZoneRevision>>,
     watch_open: AtomicBool,
     watch_stopped: AtomicBool,
+    effect_acceptances_in_flight: AtomicUsize,
     watch_stop: tokio::sync::Notify,
     accepted:
         Arc<Mutex<BTreeMap<String, Arc<d2b_resource_store_redb::AuthorityOperationCapability>>>>,
@@ -77,6 +81,7 @@ struct NativeCommitPath {
     zone_uid: Option<ResourceUid>,
     assignments: Arc<Mutex<BTreeMap<ResourceRef, ResourceAssignmentFence>>>,
     assignment_resolver: Option<AssignmentFenceResolver>,
+    effect_acceptance_observer: Option<EffectAcceptanceObserver>,
     require_assignment: bool,
 }
 
@@ -134,6 +139,7 @@ impl RedbRegisteredControllerApi {
                 zone_uid: service.zone_uid(),
                 assignments: Arc::new(Mutex::new(assignments.into_iter().collect())),
                 assignment_resolver: None,
+                effect_acceptance_observer: None,
                 require_assignment: true,
             }),
             descriptor: Mutex::new(None),
@@ -142,6 +148,7 @@ impl RedbRegisteredControllerApi {
             acknowledge_after: tokio::sync::Mutex::new(None),
             watch_open: AtomicBool::new(false),
             watch_stopped: AtomicBool::new(false),
+            effect_acceptances_in_flight: AtomicUsize::new(0),
             watch_stop: tokio::sync::Notify::new(),
             accepted: Arc::new(Mutex::new(BTreeMap::new())),
         })
@@ -158,6 +165,7 @@ impl RedbRegisteredControllerApi {
             acknowledge_after: tokio::sync::Mutex::new(None),
             watch_open: AtomicBool::new(false),
             watch_stopped: AtomicBool::new(false),
+            effect_acceptances_in_flight: AtomicUsize::new(0),
             watch_stop: tokio::sync::Notify::new(),
             accepted: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -185,6 +193,7 @@ impl RedbRegisteredControllerApi {
                 zone_uid: service.zone_uid(),
                 assignments: Arc::new(Mutex::new(BTreeMap::new())),
                 assignment_resolver: None,
+                effect_acceptance_observer: None,
                 require_assignment: false,
             }),
             descriptor: Mutex::new(None),
@@ -193,6 +202,7 @@ impl RedbRegisteredControllerApi {
             acknowledge_after: tokio::sync::Mutex::new(None),
             watch_open: AtomicBool::new(false),
             watch_stopped: AtomicBool::new(false),
+            effect_acceptances_in_flight: AtomicUsize::new(0),
             watch_stop: tokio::sync::Notify::new(),
             accepted: Arc::new(Mutex::new(BTreeMap::new())),
         })
@@ -210,6 +220,18 @@ impl RedbRegisteredControllerApi {
     ) -> Self {
         if let Some(commit) = self.commit.as_mut() {
             commit.assignment_resolver = Some(resolver);
+        }
+        self
+    }
+
+    /// Attach a non-authorizing observer to the durable effect acceptance
+    /// boundary for production-path measurements.
+    pub fn with_effect_acceptance_observer(
+        mut self,
+        observer: EffectAcceptanceObserver,
+    ) -> Self {
+        if let Some(commit) = self.commit.as_mut() {
+            commit.effect_acceptance_observer = Some(observer);
         }
         self
     }
@@ -325,37 +347,50 @@ impl RedbRegisteredControllerApi {
         &self,
         key: &ResourceKey,
     ) -> Result<Result<StoredResource, ZoneRevision>, SourceError> {
-        match self
-            .store
-            .get(StoreGetRequest {
-                operation: Self::operation(format!(
-                    "fresh:{}",
-                    key.resource_ref().to_canonical_string()
-                )),
-                zone: key.zone().clone(),
-                target: key.resource_ref().clone(),
-                expected_uid: Some(key.uid().clone()),
-                projection: StoreProjection::Full,
-            })
-            .await
-        {
-            Ok(resource) => Ok(Ok(resource)),
-            Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
-                let revision = match error.current_revision() {
-                    Some(revision) => revision,
-                    None => self
-                        .store
-                        .runtime_metadata()
-                        .await
-                        .map(|metadata| metadata.current_revision)
-                        .map_err(|metadata_error| {
-                            source_error(metadata_error, ZoneRevision::new(1))
-                        })?,
-                };
-                Ok(Err(revision))
+        for _ in 0..4096 {
+            match self
+                .store
+                .get(StoreGetRequest {
+                    operation: Self::operation(format!(
+                        "fresh:{}",
+                        key.resource_ref().to_canonical_string()
+                    )),
+                    zone: key.zone().clone(),
+                    target: key.resource_ref().clone(),
+                    expected_uid: Some(key.uid().clone()),
+                    projection: StoreProjection::Full,
+                })
+                .await
+            {
+                Ok(resource) => return Ok(Ok(resource)),
+                Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                    let revision = match error.current_revision() {
+                        Some(revision) => revision,
+                        None => self
+                            .store
+                            .runtime_metadata()
+                            .await
+                            .map(|metadata| metadata.current_revision)
+                            .map_err(|metadata_error| {
+                                source_error(metadata_error, ZoneRevision::new(1))
+                            })?,
+                    };
+                    return Ok(Err(revision));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        StoreErrorKind::Backpressure
+                            | StoreErrorKind::StoreBackpressure
+                            | StoreErrorKind::Timeout
+                    ) =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(source_error(error, ZoneRevision::new(1))),
             }
-            Err(error) => Err(source_error(error, ZoneRevision::new(1))),
         }
+        Err(SourceError::Backpressure)
     }
 
     async fn dependencies(
@@ -548,32 +583,48 @@ impl RedbRegisteredControllerApi {
                 });
             }
         }
-        let grant = commit
-            .authorizer
-            .authorize(
-                commit.subject.claims(),
-                &AuthorizationRequest {
-                    method: ApiMethod::CommitBatch,
-                    zone: zone.clone(),
-                    targets,
-                },
-                &commit.state,
-            )
+        for _ in 0..4096 {
+            let grant = commit
+                .authorizer
+                .authorize(
+                    commit.subject.claims(),
+                    &AuthorizationRequest {
+                        method: ApiMethod::CommitBatch,
+                        zone: zone.clone(),
+                        targets: targets.clone(),
+                    },
+                    &commit.state,
+                )
+                .map_err(|_| SourceError::Integrity)?;
+            let admitted = if let Some(zone_uid) = commit.zone_uid.clone() {
+                grant.admit_with_zone_uid(mutations.clone(), operation.clone(), zone_uid)
+            } else {
+                grant.admit(mutations.clone(), operation.clone())
+            }
             .map_err(|_| SourceError::Integrity)?;
-        let admitted = if let Some(zone_uid) = commit.zone_uid.clone() {
-            grant.admit_with_zone_uid(mutations, operation, zone_uid)
-        } else {
-            grant.admit(mutations, operation)
+            match commit.checked.commit(admitted).await {
+                Ok(StoreCommitResult { revision, .. }) => {
+                    return Ok(CommitOutcome::Committed(revision));
+                }
+                Err(error) if is_conflict(&error) => {
+                    return Ok(CommitOutcome::Conflict(
+                        error.current_revision().unwrap_or(fallback_revision),
+                    ));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        StoreErrorKind::Backpressure
+                            | StoreErrorKind::StoreBackpressure
+                            | StoreErrorKind::Timeout
+                    ) =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(source_error(error, fallback_revision)),
+            }
         }
-        .map_err(|_| SourceError::Integrity)?;
-        let result = commit.checked.commit(admitted).await;
-        match result {
-            Ok(StoreCommitResult { revision, .. }) => Ok(CommitOutcome::Committed(revision)),
-            Err(error) if is_conflict(&error) => Ok(CommitOutcome::Conflict(
-                error.current_revision().unwrap_or(fallback_revision),
-            )),
-            Err(error) => Err(source_error(error, fallback_revision)),
-        }
+        Err(SourceError::Backpressure)
     }
 
     fn resource_operation_id(context: &ReconcileContext) -> String {
@@ -1031,31 +1082,58 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
         let effect_identity = self.effect_identity(context, plan);
         let store = Arc::clone(&self.store);
         let accepted = self.accepted.clone();
+        let accepting = effect_identity.is_ok();
+        if accepting {
+            self.effect_acceptances_in_flight
+                .fetch_add(1, Ordering::AcqRel);
+        }
         async move {
-            let (authority_operation_id, claim_digest, operation_class, effect_ids) =
-                effect_identity?;
-            let payload = serde_json::to_vec(&serde_json::json!({
-                "version": 1,
-                "kind": "controller-effect",
-                "state": "pending",
-                "operationClass": operation_class,
-                "effectIds": effect_ids,
-                "resourceUid": context.target().uid().as_str(),
-                "generation": context.generation().get(),
-                "operationId": authority_operation_id,
-                "claimDigest": claim_digest,
-                "storeBindingDigest": store.authority_binding_digest(&claim_digest),
-            }))
-            .map_err(|_| SourceError::Integrity)?;
-            let capability = store
-                .prepare_authority_operation(authority_operation_id.clone(), payload, &claim_digest)
-                .await
-                .map_err(|error| source_error(error, context.revision()))?;
-            accepted.lock().map_err(|_| SourceError::Integrity)?.insert(
-                context.operation().operation_id().to_owned(),
-                Arc::new(capability),
-            );
-            Ok(())
+            let result = async {
+                let (authority_operation_id, claim_digest, operation_class, effect_ids) =
+                    effect_identity?;
+                let payload = serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "kind": "controller-effect",
+                    "state": "pending",
+                    "operationClass": operation_class,
+                    "effectIds": effect_ids,
+                    "resourceUid": context.target().uid().as_str(),
+                    "generation": context.generation().get(),
+                    "operationId": authority_operation_id,
+                    "claimDigest": claim_digest,
+                    "storeBindingDigest": store.authority_binding_digest(&claim_digest),
+                }))
+                .map_err(|_| SourceError::Integrity)?;
+                let capability = store
+                    .prepare_authority_operation(
+                        authority_operation_id.clone(),
+                        payload,
+                        &claim_digest,
+                    )
+                    .await
+                    .map_err(|error| source_error(error, context.revision()))?;
+                if let Some(observer) = self
+                    .commit
+                    .as_ref()
+                    .and_then(|commit| commit.effect_acceptance_observer.clone())
+                {
+                    observer(context.target().uid());
+                }
+                accepted
+                    .lock()
+                    .map_err(|_| SourceError::Integrity)?
+                    .insert(
+                        context.operation().operation_id().to_owned(),
+                        Arc::new(capability),
+                    );
+                Ok(())
+            }
+            .await;
+            if accepting {
+                self.effect_acceptances_in_flight
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+            result
         }
     }
 
@@ -1083,6 +1161,13 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
         result: &ReconcileResult,
     ) -> impl Future<Output = Result<CommitOutcome, SourceError>> + Send {
         async move {
+            while self
+                .effect_acceptances_in_flight
+                .load(Ordering::Acquire)
+                != 0
+            {
+                tokio::task::yield_now().await;
+            }
             let descriptor = self.descriptor()?;
             if let Some(finalizer) = self.finalizer_first(&descriptor, context).await? {
                 return self
