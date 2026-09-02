@@ -38,7 +38,7 @@ use crate::transaction::{
     audit_outbox_pending, authority_operations, authority_prepare, authority_update, backpressure,
     current_meta, decode, mark_audit_outbox_complete, pending_audit_outboxes,
     pending_deferred_activation_operation_ids, resource_key, stored_resource, timeout,
-    validate_deferred_broker_evidence_marker,
+    validate_deferred_broker_evidence_marker, authority_prepare_batch,
 };
 use d2b_resource_store::mutation_seal::OpenedMutation;
 
@@ -570,6 +570,25 @@ impl WriterHandle {
             .map_err(|_| crate::transaction::integrity("authority-response-closed"))?
     }
 
+    pub(crate) async fn authority_prepare_batch(
+        &self,
+        operations: Vec<(String, Vec<u8>, String)>,
+    ) -> Result<(), StoreError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| crate::transaction::integrity("writer-closed"))?
+            .send(WriterCommand::AuthorityPrepareBatch {
+                operations,
+                response,
+            })
+            .await
+            .map_err(|_| crate::transaction::integrity("writer-closed"))?;
+        receiver
+            .await
+            .map_err(|_| crate::transaction::integrity("authority-response-closed"))?
+    }
+
     pub(crate) async fn authority_update(
         &self,
         operation_id: String,
@@ -850,6 +869,10 @@ enum WriterCommand {
         operation_id: String,
         payload: Vec<u8>,
         request_digest: String,
+        response: oneshot::Sender<Result<(), StoreError>>,
+    },
+    AuthorityPrepareBatch {
+        operations: Vec<(String, Vec<u8>, String)>,
         response: oneshot::Sender<Result<(), StoreError>>,
     },
     AuthorityUpdate {
@@ -1169,6 +1192,18 @@ impl WriterActor {
                 } => {
                     let result =
                         authority_prepare(&self.database, &operation_id, payload, request_digest);
+                    if let Err(error) = &result
+                        && error.kind() == d2b_resource_store::StoreErrorKind::StoreIntegrityFailure
+                    {
+                        self.quarantine(error.clone());
+                    }
+                    let _ = response.send(result);
+                }
+                WriterCommand::AuthorityPrepareBatch {
+                    operations,
+                    response,
+                } => {
+                    let result = authority_prepare_batch(&self.database, &operations);
                     if let Err(error) = &result
                         && error.kind() == d2b_resource_store::StoreErrorKind::StoreIntegrityFailure
                     {
@@ -1654,6 +1689,9 @@ impl WriterActor {
                     let _ = response.send(Err(crate::transaction::quarantined()));
                 }
                 WriterCommand::AuthorityPrepare { response, .. } => {
+                    let _ = response.send(Err(crate::transaction::quarantined()));
+                }
+                WriterCommand::AuthorityPrepareBatch { response, .. } => {
                     let _ = response.send(Err(crate::transaction::quarantined()));
                 }
                 WriterCommand::AuthorityUpdate { response, .. } => {

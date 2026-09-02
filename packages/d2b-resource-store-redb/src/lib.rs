@@ -967,6 +967,69 @@ impl RedbResourceStore {
         })
     }
 
+    /// Prepare several Core-validated authority operations in one durable
+    /// ledger transaction and return one store-bound capability per row.
+    pub async fn prepare_authority_operations(
+        self: &Arc<Self>,
+        operations: Vec<(String, Vec<u8>, String)>,
+    ) -> Result<Vec<AuthorityOperationCapability>, StoreError> {
+        if operations.is_empty() {
+            return Err(transaction::integrity("authority-operation-batch-empty"));
+        }
+        if operations.len() > 128 {
+            return Err(transaction::integrity("authority-operation-batch-bound"));
+        }
+        let mut prepared = Vec::with_capacity(operations.len());
+        for (operation_id, payload, claim_digest) in operations {
+            let expected_binding = self.authority_binding_digest(&claim_digest);
+            let envelope: serde_json::Value = serde_json::from_slice(&payload)
+                .map_err(|_| transaction::integrity("authority-operation-payload-invalid"))?;
+            if envelope
+                .get("claimDigest")
+                .and_then(serde_json::Value::as_str)
+                != Some(claim_digest.as_str())
+                || envelope
+                    .get("storeBindingDigest")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(expected_binding.as_str())
+            {
+                return Err(transaction::integrity(
+                    "authority-operation-claim-envelope-invalid",
+                ));
+            }
+            let request_digest = transaction::authority_payload_digest_value(&envelope)?;
+            prepared.push((
+                operation_id,
+                payload,
+                request_digest,
+                expected_binding,
+            ));
+        }
+        self.writer
+            .authority_prepare_batch(
+                prepared
+                    .iter()
+                    .map(|(operation_id, payload, request_digest, _)| {
+                        (operation_id.clone(), payload.clone(), request_digest.clone())
+                    })
+                    .collect(),
+            )
+            .await?;
+        Ok(prepared
+            .into_iter()
+            .map(
+                |(operation_id, _payload, _request_digest, binding_digest)| {
+                    AuthorityOperationCapability {
+                        store: Arc::clone(self),
+                        nonce: self.authority_capability_nonce,
+                        operation_id,
+                        binding_digest,
+                    }
+                },
+            )
+            .collect())
+    }
+
     /// Resume a non-terminal operation with a capability bound to its
     /// committed row and store instance.
     pub async fn resume_authority_operation(

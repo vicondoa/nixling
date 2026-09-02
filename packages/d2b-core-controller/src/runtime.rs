@@ -9,19 +9,22 @@ use std::{
     },
 };
 
-use d2b_contracts_resource::v3::ZoneRevision;
+use d2b_contracts_resource::v3::{ResourceTypeName, ZoneRevision};
 use d2b_controller_toolkit::{
-    CommitOutcome, ControllerDescriptor, ControllerHealth, ControllerSource, DependencySnapshot,
-    DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot, HandlerFailure, InitialList,
-    ObservationResult, OperationContext, ReconcileContext, ReconcilePlan, ReconcileProjection,
-    ReconcileReason, ReconcileResult, ResourceKey, ResourceReconciler, ResourceSnapshot,
-    SourceError, StatusPersistence, UpdateAssessment, UpdateAssessmentState, UpgradePlan,
-    ValidationResult, WatchEvent, WatchFailure,
+    CommitOutcome, ControllerDescriptor, ControllerExecutionPolicy, ControllerHealth,
+    ControllerIdentity, ControllerSelector, ControllerSource, ControllerVerb, DependencySnapshot,
+    DescriptorError, DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot, HandlerFailure,
+    InitialList, ObservationResult, OperationContext, ReconcileContext, ReconcilePlan,
+    ReconcileProjection, ReconcileReason, ReconcileResult, ResourceKey, ResourceRegistration,
+    ResourceReconciler, ResourceSnapshot, ResyncPolicy, SelectorField, SourceError,
+    StatusPersistence, UpdateAssessment, UpdateAssessmentState, UpgradePlan, ValidationResult,
+    WatchEvent, WatchFailure,
 };
 
 use crate::{
-    ChangeRecord, ControllerHint, ControllerLeaseKey, FairAdmission, HintAdmissionError,
-    HintAdmissionOutcome, SuppressionDecision, WatchPlan,
+    ChangeRecord, ControllerHint, ControllerLeaseKey, CoreResourceControllerRegistration,
+    FairAdmission, HintAdmissionError, HintAdmissionOutcome, SuppressionDecision,
+    WatchPlan, CORE_RESOURCE_CONTROLLER_REGISTRATIONS,
 };
 
 /// Core adapter construction or hint dispatch failure.
@@ -498,6 +501,93 @@ where
     }
 }
 
+/// Failure while constructing the fixed Core controller descriptors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreControllerDescriptorError {
+    /// A fixed Core ResourceType could not be parsed.
+    InvalidResourceType,
+    /// The shared descriptor contract rejected a fixed Core descriptor.
+    Descriptor(DescriptorError),
+}
+
+impl core::fmt::Display for CoreControllerDescriptorError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidResourceType => formatter.write_str("core-resource-type-invalid"),
+            Self::Descriptor(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CoreControllerDescriptorError {}
+
+impl From<DescriptorError> for CoreControllerDescriptorError {
+    fn from(error: DescriptorError) -> Self {
+        Self::Descriptor(error)
+    }
+}
+
+/// Build the fixed Core ResourceType descriptors from one authenticated
+/// controller identity.
+pub fn core_controller_descriptors(
+    identity: ControllerIdentity,
+) -> Result<
+    Vec<(CoreResourceControllerRegistration, ControllerDescriptor)>,
+    CoreControllerDescriptorError,
+> {
+    CORE_RESOURCE_CONTROLLER_REGISTRATIONS
+        .into_iter()
+        .map(|registration| {
+            let resource_type = ResourceTypeName::parse(registration.resource_type())
+                .map_err(|_| CoreControllerDescriptorError::InvalidResourceType)?;
+            let resource = ResourceRegistration::new(resource_type.clone(), vec![1], 5_000, 3)?;
+            let selectors = [
+                SelectorField::Spec,
+                SelectorField::Status,
+                SelectorField::Metadata,
+                SelectorField::Finalizers,
+                SelectorField::Deletion,
+            ]
+            .into_iter()
+            .map(|field| ControllerSelector::new(resource_type.clone(), field, None))
+            .collect::<Result<Vec<_>, _>>()?;
+            let finalizers = registration
+                .finalizer()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let descriptor = ControllerDescriptor::new(
+                identity.clone(),
+                vec![resource],
+                vec!["resource-api".to_owned()],
+                vec!["system".to_owned()],
+                vec![
+                    ControllerVerb::ReadSpec,
+                    ControllerVerb::ReadStatus,
+                    ControllerVerb::WriteStatus,
+                    ControllerVerb::AddFinalizer,
+                    ControllerVerb::RemoveFinalizer,
+                ],
+                selectors,
+                Vec::new(),
+                registration.consumes_owner_triggers(),
+                finalizers,
+                vec!["d2b.resource.v3".to_owned()],
+                vec!["resources.d2bus.org/v3".to_owned()],
+                ControllerExecutionPolicy::new(
+                    8,
+                    4,
+                    256,
+                    8,
+                    256,
+                    ResyncPolicy::new(None, 5_000)?,
+                )?,
+            )?;
+            Ok((registration, descriptor))
+        })
+        .collect()
+}
+
 /// Core reconcile adapter error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoreReconcileError;
@@ -510,15 +600,62 @@ impl core::fmt::Display for CoreReconcileError {
 
 impl std::error::Error for CoreReconcileError {}
 
+fn resource_has_finalizer(
+    resource: &ResourceSnapshot,
+    expected: &str,
+) -> Result<bool, CoreReconcileError> {
+    let value = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .map_err(|_| CoreReconcileError)?;
+    Ok(value
+        .pointer("/metadata/finalizers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(CoreReconcileError)?
+        .iter()
+        .any(|value| value.as_str() == Some(expected)))
+}
+
+fn status_candidate(resource: &ResourceSnapshot) -> Result<Vec<u8>, CoreReconcileError> {
+    let value = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .map_err(|_| CoreReconcileError)?;
+    let status = value.get("status").cloned().ok_or(CoreReconcileError)?;
+    if !status.is_object() {
+        return Err(CoreReconcileError);
+    }
+    serde_json::to_vec(&status).map_err(|_| CoreReconcileError)
+}
+
 /// Core's baseline reconciler for metadata-only convergence.
 pub struct CoreResourceReconciler {
     descriptor: ControllerDescriptor,
+    handler: crate::CoreHandlerKind,
+    ensure_finalizer: bool,
 }
 
 impl CoreResourceReconciler {
     /// Bind the reconciler to its complete signed descriptor.
     pub fn new(descriptor: ControllerDescriptor) -> Arc<Self> {
-        Arc::new(Self { descriptor })
+        Arc::new(Self {
+            descriptor,
+            handler: crate::CoreHandlerKind::Store,
+            ensure_finalizer: false,
+        })
+    }
+
+    /// Bind the reconciler to one fixed Core ResourceType handler.
+    pub fn for_handler(
+        descriptor: ControllerDescriptor,
+        handler: crate::CoreHandlerKind,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor,
+            handler,
+            ensure_finalizer: true,
+        })
+    }
+
+    /// Return the fixed Core handler represented by this reconciler.
+    pub const fn handler(&self) -> crate::CoreHandlerKind {
+        self.handler
     }
 }
 
@@ -554,7 +691,7 @@ impl ResourceReconciler for CoreResourceReconciler {
         _dependencies: &[DependencySnapshot],
     ) -> Result<ReconcilePlan, Self::Error> {
         tokio::task::yield_now().await;
-        ReconcilePlan::new(Vec::new(), true).map_err(|_| CoreReconcileError)
+        ReconcilePlan::new(Vec::new(), !self.ensure_finalizer).map_err(|_| CoreReconcileError)
     }
 
     fn reconcile(
@@ -564,12 +701,42 @@ impl ResourceReconciler for CoreResourceReconciler {
         _dependencies: &[DependencySnapshot],
         _plan: &ReconcilePlan,
     ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
-        std::future::ready(
+        std::future::ready((|| {
             context
                 .authorize_effect()
-                .map_err(|_| CoreReconcileError)
-                .map(|_| ReconcileResult::converged(resource.revision(), resource.generation())),
-        )
+                .map_err(|_| CoreReconcileError)?;
+            if !self.ensure_finalizer {
+                return Ok(ReconcileResult::converged(
+                    resource.revision(),
+                    resource.generation(),
+                ));
+            }
+            let mut finalizer_missing = false;
+            for finalizer in self.descriptor.finalizers() {
+                if !resource_has_finalizer(resource, finalizer)? {
+                    finalizer_missing = true;
+                    break;
+                }
+            }
+            if !finalizer_missing {
+                return Ok(ReconcileResult::converged(
+                    resource.revision(),
+                    resource.generation(),
+                ));
+            }
+            let status = status_candidate(resource)?;
+            ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                None,
+                Some(status),
+                d2b_controller_toolkit::ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::Pending,
+            )
+            .map_err(|_| CoreReconcileError)
+        })())
     }
 
     fn observe(
@@ -883,7 +1050,7 @@ mod tests {
             vec![ControllerSelector::new(resource_type, SelectorField::Spec, None).unwrap()],
             Vec::new(),
             true,
-            vec!["d2b.io/core".to_owned()],
+            Vec::new(),
             vec!["service.v1".to_owned()],
             vec!["schema.v1".to_owned()],
             ControllerExecutionPolicy::new(
@@ -1166,4 +1333,60 @@ mod tests {
         assert_eq!(outcomes[0].1, ZoneRevision::new(3));
         assert_eq!(outcomes[1].1, ZoneRevision::new(4));
     }
+
+    #[test]
+    fn core_controller_catalog_covers_every_fixed_resource_owner() {
+        let identity = descriptor(8).identity().clone();
+        let registrations =
+            core_controller_descriptors(identity).expect("fixed Core descriptors are valid");
+        let resource_types = registrations
+            .iter()
+            .map(|(_, descriptor)| {
+                descriptor
+                    .resource_types()
+                    .next()
+                    .expect("each Core descriptor owns one ResourceType")
+                    .as_str()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resource_types,
+            vec![
+                "Zone",
+                "ZoneLink",
+                "Provider",
+                "Role",
+                "RoleBinding",
+                "Quota",
+                "EmergencyPolicy",
+                "ResourceExport",
+                "ResourceImport",
+            ]
+        );
+        assert!(
+            registrations
+                .iter()
+                .all(|(_, descriptor)| descriptor.watch_selectors().len() == 5)
+        );
+        let mut finalizers = registrations
+            .iter()
+            .filter_map(|(_, descriptor)| descriptor.finalizers().first())
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        finalizers.sort_unstable();
+        assert_eq!(
+            finalizers,
+            vec![
+                "core.emergency-drain",
+                "core.provider-api-binding",
+                "core.quota-drain",
+                "core.resource-export-drain",
+                "core.resource-import-drain",
+                "core.role-binding-drain",
+                "core.zone-link-drain",
+            ]
+        );
+    }
+
 }

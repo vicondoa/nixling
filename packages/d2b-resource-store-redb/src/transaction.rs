@@ -2094,75 +2094,89 @@ pub(crate) fn authority_prepare(
     payload: Vec<u8>,
     request_digest: String,
 ) -> Result<(), StoreError> {
-    if operation_id.is_empty() || operation_id.len() > 512 {
-        return Err(integrity("authority-operation-id-invalid"));
+    authority_prepare_batch(
+        database,
+        &[(operation_id.to_owned(), payload, request_digest)],
+    )
+}
+
+pub(crate) fn authority_prepare_batch(
+    database: &Database,
+    requests: &[(String, Vec<u8>, String)],
+) -> Result<(), StoreError> {
+    if requests.is_empty() {
+        return Err(integrity("authority-operation-batch-empty"));
     }
-    if payload.is_empty() || payload.len() > 64 * 1024 {
-        return Err(integrity("authority-operation-payload-invalid"));
+    if requests.len() > 128 {
+        return Err(integrity("authority-operation-batch-bound"));
     }
-    if !valid_digest(&request_digest) {
-        return Err(integrity("authority-operation-digest-invalid"));
-    }
-    let key = operation_key(operation_id)?;
     let mut write = database.begin_write().map_err(integrity)?;
     set_full_durability(&mut write)?;
     let current_revision = read_meta_in_write(&write)?.current_revision;
-    let existing = {
-        let table = write.open_table(OPERATIONS).map_err(integrity)?;
-        table
+    let mut table = write.open_table(OPERATIONS).map_err(integrity)?;
+    for (operation_id, payload, request_digest) in requests {
+        if operation_id.is_empty() || operation_id.len() > 512 {
+            return Err(integrity("authority-operation-id-invalid"));
+        }
+        if payload.is_empty() || payload.len() > 64 * 1024 {
+            return Err(integrity("authority-operation-payload-invalid"));
+        }
+        if !valid_digest(request_digest) {
+            return Err(integrity("authority-operation-digest-invalid"));
+        }
+        let key = operation_key(operation_id)?;
+        let existing = table
             .get(key.as_slice())
             .map_err(integrity)?
             .map(|value| decode::<OperationRecord>(ValueKind::OperationRecord, value.value()))
-            .transpose()?
-    };
-    if let Some(existing) = existing {
-        let Some(authority) = existing.authority else {
-            return Err(conflict(
-                current_revision,
-                0,
-                "authority-operation-id-reused",
-            ));
-        };
-        if authority_payload_digest(&authority.payload)? == request_digest {
-            if matches!(
-                authority.state.as_str(),
-                "effect-confirmed" | "effect-terminal" | "released" | "closed"
-            ) {
+            .transpose()?;
+        if let Some(existing) = existing {
+            let Some(authority) = existing.authority else {
                 return Err(conflict(
                     current_revision,
                     0,
                     "authority-operation-id-reused",
                 ));
+            };
+            if authority_payload_digest(&authority.payload)?.as_str() == request_digest {
+                if matches!(
+                    authority.state.as_str(),
+                    "effect-confirmed" | "effect-terminal" | "released" | "closed"
+                ) {
+                    return Err(conflict(
+                        current_revision,
+                        0,
+                        "authority-operation-id-reused",
+                    ));
+                }
+                continue;
             }
-            write.abort().map_err(integrity)?;
-            return Ok(());
+            return Err(conflict(
+                current_revision,
+                0,
+                "authority-operation-id-reused",
+            ));
         }
-        return Err(conflict(
-            current_revision,
-            0,
-            "authority-operation-id-reused",
-        ));
+        let operation = OperationRecord {
+            request_digest: request_digest.clone(),
+            resource_uids: Vec::new(),
+            resources: Vec::new(),
+            outcome: "committed".to_owned(),
+            error_code: None,
+            accepted_revision: current_revision,
+            finished_revision: current_revision,
+            audit_outbox: None,
+            authority: Some(AuthorityOperationStorage {
+                payload: payload.clone(),
+                state: "pending".to_owned(),
+            }),
+        };
+        let value = encode(ValueKind::OperationRecord, &operation)?;
+        table
+            .insert(key.as_slice(), value.as_slice())
+            .map_err(integrity)?;
     }
-    let operation = OperationRecord {
-        request_digest,
-        resource_uids: Vec::new(),
-        resources: Vec::new(),
-        outcome: "committed".to_owned(),
-        error_code: None,
-        accepted_revision: current_revision,
-        finished_revision: current_revision,
-        audit_outbox: None,
-        authority: Some(AuthorityOperationStorage {
-            payload,
-            state: "pending".to_owned(),
-        }),
-    };
-    let value = encode(ValueKind::OperationRecord, &operation)?;
-    write
-        .open_table(OPERATIONS)
-        .map_err(integrity)?
-        .insert(key.as_slice(), value.as_slice())
-        .map_err(integrity)?;
+    drop(table);
     write.commit().map_err(integrity)
 }
 

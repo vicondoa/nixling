@@ -448,6 +448,18 @@ rust_test(
 )
 
 rust_test(
+    name = "core_composition",
+    srcs = ["tests/core_composition.rs"],
+    compile_data = ["Cargo.toml"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":d2bd_lib_test_support",
+        "//packages/d2b-contracts-resource:d2b_contracts_resource",
+        "//packages/d2b-core-controller:d2b_core_controller_test_support",
+    ] + all_crate_deps(normal = True, normal_dev = True, cargo_only = True),
+)
+
+rust_test(
     name = "resource_operator_activation",
     srcs = [
         "tests/resource_operator_activation.rs",

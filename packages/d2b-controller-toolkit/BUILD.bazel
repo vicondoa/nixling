@@ -62,6 +62,7 @@ rust_test(
     deps = [
         "//packages/d2b-contracts-resource:d2b_contracts_resource",
         "//packages/d2b-contracts-zone-session:d2b_contracts_zone_session",
+        "//packages/d2b-core-controller:d2b_core_controller",
         ":d2b_controller_toolkit",
         "//packages/d2b-bus:d2b_bus_production_rss_fixture",
         "//packages/d2b-process:d2b_process",

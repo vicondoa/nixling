@@ -51,7 +51,9 @@ use d2b_contracts_provider::v3::provider::ProviderSpec;
 use d2b_contracts_resource::resource_proto as wire;
 #[cfg(test)]
 use d2b_contracts_resource::v3::ConfigurationGeneration;
-use d2b_contracts_resource::v3::identity::{BindingDigest, EvidenceClass, ReconnectGeneration};
+use d2b_contracts_resource::v3::identity::{
+    AuthenticatedSubjectContext, BindingDigest, EvidenceClass, ReconnectGeneration,
+};
 use d2b_contracts_resource::v3::{
     CanonicalJsonValue, ControllerGeneration, DesiredLifecycle, NixosGenerationSpec,
     PlacementTargetKind, ResourceBundleGenerationId, ResourceEnvelope, ResourceGeneration,
@@ -76,6 +78,10 @@ use d2b_core_controller::controller_assignment::{
     ResourceClientLease,
 };
 use d2b_core_controller::controllers::HandlerPhase;
+use d2b_core_controller::{
+    ControllerIdentity, CoreControllerSource, CoreResourceReconciler,
+    CORE_RESOURCE_CONTROLLER_REGISTRATIONS, Runner, RunnerConfig, core_controller_descriptors,
+};
 use d2b_core_controller::main::{
     CoreProcess, RecoverySnapshot, RuntimeReadiness as CoreRuntimeReadiness, StartupStage,
 };
@@ -114,8 +120,9 @@ use d2b_resource_api::{
     service::UnavailableUpgradeDispatcher,
 };
 use d2b_resource_store::{
-    PolicySnapshot, StoreErrorKind, StoreGetRequest, StoreListRequest, StoreListResult,
-    StoreOperationContext, StoreProjection, StoredResource,
+    PolicySnapshot, ResourceAssignmentFence, ResourceAssignmentScope, StoreErrorKind,
+    StoreGetRequest, StoreListRequest, StoreListResult, StoreOperationContext, StoreProjection,
+    StoredResource,
 };
 use d2b_resource_store_redb::{
     AuthorityOperationState, BrokerEvidenceIndex, LogicalBackup, RedbResourceStore,
@@ -166,6 +173,10 @@ use protobuf::{EnumOrUnknown, MessageField};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+const CORE_CONTROLLER_PROCESS_REF: &str = "Process/d2b-core-controller";
+const CORE_CONTROLLER_PROVIDER_REF: &str = "Provider/system-core";
+const CORE_CONTROLLER_HOST_REF: &str = "Host/host-system";
 
 #[derive(Clone)]
 pub(crate) struct CommittedInteractionProviderConfiguration {
@@ -2098,6 +2109,9 @@ pub struct ZoneResourceRuntime {
     service_task: Mutex<Option<tokio::task::JoinHandle<Result<(), SessionServerError>>>>,
     process_status_client:
         Mutex<Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>>>,
+    core_controller_subject: Mutex<Option<AuthenticatedSubjectContext>>,
+    core_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    core_runner_lock: Arc<tokio::sync::Mutex<()>>,
     core: Mutex<CoreProcess>,
     readiness: ZoneRuntimeReadiness,
     policy_installed: bool,
@@ -2553,6 +2567,7 @@ impl ZoneResourceRuntime {
         let mut ingress = None;
         let mut service_task = None;
         let mut process_status_client = None;
+        let mut core_controller_subject = None;
         let defer_activation = authority_identity.is_some();
         let (
             resource_api_ready,
@@ -2620,17 +2635,19 @@ impl ZoneResourceRuntime {
                         tracing::error!(zone = %zone.as_str(), error = ?error, "resource runtime Zone bus setup failed");
                         ResourceRuntimeError::AuthenticationUnavailable
                     })?;
-            let (zone_ingress, zone_service_task, status_client) = register_system_core_session(
-                &mut zone_registrar,
-                Arc::clone(&api),
-                Arc::clone(&authorizer),
-                state.clone(),
-            )
-            .await
-            .inspect_err(|error| {
-                tracing::error!(zone = %zone.as_str(), error = ?error, "resource runtime system-core session registration failed");
-            })?;
+            let (zone_ingress, zone_service_task, status_client, subject_context) =
+                register_system_core_session(
+                    &mut zone_registrar,
+                    Arc::clone(&api),
+                    Arc::clone(&authorizer),
+                    state.clone(),
+                )
+                .await
+                .inspect_err(|error| {
+                    tracing::error!(zone = %zone.as_str(), error = ?error, "resource runtime system-core session registration failed");
+                })?;
             process_status_client = Some(Arc::clone(&status_client));
+            core_controller_subject = Some(subject_context);
             if defer_activation {
                 bus = Some(zone_bus);
                 registrar = Some(zone_registrar);
@@ -2830,7 +2847,8 @@ impl ZoneResourceRuntime {
             .runtime_metadata()
             .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        Ok(Self {
+        let defer_core_start = authority_identity.is_some();
+        let runtime = Self {
             zone,
             authority_identity,
             bootstrap_provisioned_store: bootstrap_provisioned_store
@@ -2851,6 +2869,9 @@ impl ZoneResourceRuntime {
             ingress: Mutex::new(ingress),
             service_task: Mutex::new(service_task),
             process_status_client: Mutex::new(process_status_client),
+            core_controller_subject: Mutex::new(core_controller_subject),
+            core_runner_tasks: Mutex::new(Vec::new()),
+            core_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
             core: Mutex::new(core),
             readiness: ZoneRuntimeReadiness {
                 store_ready: true,
@@ -2892,7 +2913,11 @@ impl ZoneResourceRuntime {
             interaction_provider_configuration,
             interaction_identity,
             interaction_provider_configuration_refused,
-        })
+        };
+        if !defer_core_start && runtime.readiness.resource_api_ready {
+            runtime.start_core_controller_runners().await?;
+        }
+        Ok(runtime)
     }
 
     /// Materialize the verified bundle after the complete local generation
@@ -3113,6 +3138,7 @@ impl ZoneResourceRuntime {
     /// transition below therefore observes the published desired resources.
     pub(crate) async fn activate_published_bundle(&mut self) -> Result<(), ResourceRuntimeError> {
         self.refresh_authorization_policy().await?;
+        self.start_core_controller_runners().await?;
         let store_metadata = self
             .store
             .runtime_metadata()
@@ -3560,6 +3586,14 @@ impl ZoneResourceRuntime {
             .policy_loaded
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)? = true;
+        if self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .is_some()
+        {
+            self.restart_core_controller_runners().await?;
+        }
         Ok(())
     }
 
@@ -3597,13 +3631,14 @@ impl ZoneResourceRuntime {
         let Some(mut registrar) = registrar else {
             return Ok(());
         };
-        let (new_ingress, new_task, status_client) = register_system_core_session(
-            &mut registrar,
-            Arc::clone(&self.api),
-            Arc::clone(&self.authorizer),
-            state,
-        )
-        .await?;
+        let (new_ingress, new_task, status_client, subject_context) =
+            register_system_core_session(
+                &mut registrar,
+                Arc::clone(&self.api),
+                Arc::clone(&self.authorizer),
+                state,
+            )
+            .await?;
         *self
             .registrar
             .lock()
@@ -3620,6 +3655,10 @@ impl ZoneResourceRuntime {
             .process_status_client
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = Some(status_client);
+        *self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = Some(subject_context);
         Ok(())
     }
 
@@ -3881,6 +3920,246 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .clone()
             .ok_or(ResourceRuntimeError::AuthenticationUnavailable)
+    }
+
+    async fn core_assignment_fences(
+        &self,
+    ) -> Result<
+        (
+            Vec<(ResourceRef, ResourceAssignmentFence)>,
+            ResourceGeneration,
+            ControllerGeneration,
+            ReconnectGeneration,
+        ),
+        ResourceRuntimeError,
+    > {
+        let subject = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let metadata = self
+            .store
+            .runtime_metadata()
+            .await
+            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        let controller_generation = metadata
+            .policy_snapshot
+            .controller_generation
+            .unwrap_or_else(|| ControllerGeneration::new(1).expect("generation one"));
+        let resource_types = CORE_RESOURCE_CONTROLLER_REGISTRATIONS
+            .iter()
+            .map(|registration| {
+                ResourceTypeName::parse(registration.resource_type().to_owned())
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut resources = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .store
+                .list(StoreListRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "core-controller-assignment-relist".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "core-controller-assignment-relist".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: self.zone.clone(),
+                    resource_types: resource_types.clone(),
+                    resource_names: Vec::new(),
+                    filters: Vec::new(),
+                    page_size: 256,
+                    cursor,
+                    projection: StoreProjection::MetadataOnly,
+                })
+                .await
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+            resources.extend(page.resources);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let provider_ref = ResourceRef::parse(CORE_CONTROLLER_PROVIDER_REF)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let provider_generation = resources
+            .iter()
+            .find(|resource| resource.resource_ref == provider_ref)
+            .map(|resource| resource.generation)
+            .unwrap_or_else(|| ResourceGeneration::new(1).expect("generation one"));
+        let controller_ref = ResourceRef::parse(CORE_CONTROLLER_PROCESS_REF)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let target = ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let session_generation = subject.reconnect_generation();
+        let assignments = resources
+            .into_iter()
+            .map(|resource| {
+                let fence = ResourceAssignmentFence {
+                    resource_uid: resource.uid.clone(),
+                    resource_revision: resource.revision,
+                    provider_generation,
+                    controller_generation,
+                    controller_role: controller_ref.clone(),
+                    target: target.clone(),
+                    session_generation,
+                    epoch: 1,
+                    scope: ResourceAssignmentScope::Primary,
+                };
+                (resource.resource_ref, fence)
+            })
+            .collect();
+        Ok((
+            assignments,
+            provider_generation,
+            controller_generation,
+            session_generation,
+        ))
+    }
+
+    async fn stop_core_controller_runners(&self) -> Result<(), ResourceRuntimeError> {
+        let tasks = {
+            let mut tasks = self
+                .core_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        Ok(())
+    }
+
+    async fn restart_core_controller_runners(&self) -> Result<(), ResourceRuntimeError> {
+        self.stop_core_controller_runners().await?;
+        self.start_core_controller_runners().await
+    }
+
+    async fn start_core_controller_runners(&self) -> Result<(), ResourceRuntimeError> {
+        if !self.readiness.resource_api_ready {
+            return Ok(());
+        }
+        let _start = self.core_runner_lock.lock().await;
+        let stale = {
+            let mut tasks = self
+                .core_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            if tasks.iter().any(|task| !task.is_finished()) {
+                return Ok(());
+            }
+            std::mem::take(&mut *tasks)
+        };
+        for task in stale {
+            let _ = task.await;
+        }
+        let subject_context = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let authorization_state = self
+            .authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let (assignments, provider_generation, controller_generation, _) =
+            self.core_assignment_fences().await?;
+        let controller_ref = ResourceRef::parse(CORE_CONTROLLER_PROCESS_REF)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let provider_ref = ResourceRef::parse(CORE_CONTROLLER_PROVIDER_REF)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let host_ref = ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let identity = ControllerIdentity::new(
+            self.zone.clone(),
+            controller_ref,
+            controller_generation,
+            provider_ref,
+            provider_generation,
+            ResourceRef::parse(CORE_CONTROLLER_PROCESS_REF)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+            host_ref,
+            None,
+        )
+        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let descriptors =
+            core_controller_descriptors(identity).map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let mut new_tasks = Vec::with_capacity(descriptors.len());
+        for (registration, descriptor) in descriptors {
+            let subject = self
+                .authorizer
+                .issue_authenticated_subject(subject_context.clone(), authorization_state.clone())
+                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+            let resource_assignments = assignments
+                .iter()
+                .filter(|(target, _)| {
+                    target.resource_type().as_str() == registration.resource_type()
+                })
+                .cloned()
+                .collect();
+            let api = self
+                .api
+                .registered_controller_api(subject, authorization_state.clone(), resource_assignments)
+                .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
+            let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+            let runner = Runner::new(
+                CoreResourceReconciler::for_handler(descriptor, registration.handler()),
+                source,
+                RunnerConfig {
+                    policy_revision: authorization_state.snapshot.policy_revision,
+                    api_revision: authorization_state.snapshot.api_catalog_revision,
+                    configuration_revision: authorization_state.snapshot.active_configuration_revision,
+                    deadline_tick: 5_000,
+                    max_attempts: 3,
+                },
+            );
+            let handler = registration.handler().label();
+            let resource_type = registration.resource_type();
+            new_tasks.push(tokio::spawn(async move {
+                match runner.run().await {
+                    Ok(report) => {
+                        tracing::debug!(
+                            handler,
+                            resource_type,
+                            dispatched = report.dispatched,
+                            relists = report.relists,
+                            "Core resource runner stopped",
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            handler,
+                            resource_type,
+                            error = %error,
+                            "Core resource runner isolated failure",
+                        );
+                    }
+                }
+            }));
+        }
+        self.core_runner_tasks
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
+            .extend(new_tasks);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn core_controller_runner_count(&self) -> usize {
+        self.core_runner_tasks
+            .lock()
+            .map(|tasks| tasks.len())
+            .unwrap_or_default()
     }
 
     /// Persist a provider reconcile phase through the authenticated Resource
@@ -7840,6 +8119,7 @@ impl ZoneResourceRuntime {
             authority_persistence,
             authority_recovery,
             process_status_client,
+            core_runner_tasks,
             audio_watch_task,
             audio_runtime,
             semantic_binding_watch_task,
@@ -7856,6 +8136,13 @@ impl ZoneResourceRuntime {
             .into_inner()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
         {
+            task.abort();
+            let _ = task.await;
+        }
+        let core_runner_tasks = core_runner_tasks
+            .into_inner()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        for task in core_runner_tasks {
             task.abort();
             let _ = task.await;
         }

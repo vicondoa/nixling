@@ -700,6 +700,7 @@ pub async fn register_system_core_session(
         BusIngress,
         tokio::task::JoinHandle<Result<(), SessionServerError>>,
         Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+        AuthenticatedSubjectContext,
     ),
     ResourceRuntimeError,
 > {
@@ -752,15 +753,13 @@ pub async fn register_system_core_session(
         .snapshot
         .controller_generation
         .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+    let subject_context = candidate
+        .route_binding()
+        .context()
+        .clone()
+        .with_controller_generation(controller_generation);
     let subject = authorizer
-        .issue_authenticated_subject(
-            candidate
-                .route_binding()
-                .context()
-                .clone()
-                .with_controller_generation(controller_generation),
-            authz_state,
-        )
+        .issue_authenticated_subject(subject_context.clone(), authz_state.clone())
         .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
     let service = Arc::new(
         ResourceBusAdapter::bind_component_session(api, subject)
@@ -776,7 +775,7 @@ pub async fn register_system_core_session(
         Arc::new(responder.into_driver()),
         services,
     ));
-    Ok((ingress, service_task, status_client))
+    Ok((ingress, service_task, status_client, subject_context))
 }
 
 #[derive(Debug, Clone, Copy)]
