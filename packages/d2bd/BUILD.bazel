@@ -41,6 +41,7 @@ d2bd_shared_deps = [
     "//packages/d2b-provider-device-security-key:d2b_provider_device_security_key",
     "//packages/d2b-provider-device-tpm:d2b_provider_device_tpm",
     "//packages/d2b-provider-device-usbip:d2b_provider_device_usbip",
+    "//packages/d2b-provider-device-gpu:d2b_provider_device_gpu",
     "//packages/d2b-provider-observability-otel:d2b_provider_observability_otel",
     "//packages/d2b-provider-display-wayland:d2b_provider_display_wayland",
     "//packages/d2b-provider-network-local:d2b_provider_network_local",
@@ -451,7 +452,7 @@ rust_test(
 rust_test(
     name = "core_composition",
     srcs = ["tests/core_composition.rs"],
-    compile_data = ["Cargo.toml"],
+    compile_data = ["Cargo.toml", "src/composition.rs"],
     visibility = ["//visibility:public"],
     deps = [
         ":d2bd_lib_test_support",

@@ -2115,6 +2115,16 @@ mod tests {
         )
     }
 
+    #[test]
+    fn provider_ref_selector_matches_nested_spec_identity() {
+        let spec = serde_json::json!({
+            "providerRef": "Provider/device-gpu",
+            "settings": {}
+        });
+        assert!(selector_value_matches(&spec, "Provider/device-gpu"));
+        assert!(!selector_value_matches(&spec, "Provider/device-tpm"));
+    }
+
     fn descriptor() -> ControllerDescriptor {
         let resource_type = ResourceTypeName::parse("Host").unwrap();
         ControllerDescriptor::new(

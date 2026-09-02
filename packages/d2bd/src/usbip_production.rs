@@ -82,6 +82,7 @@ impl UsbipBindingContext {
     }
 
     /// Resolve Core-owned context before any host firewall or runner effect.
+    #[allow(dead_code)]
     pub(crate) fn before_host_effects(
         vm_id: impl Into<String>,
         env: impl Into<String>,

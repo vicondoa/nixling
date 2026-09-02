@@ -5,6 +5,8 @@
 //! the state/runner operations; this adapter is the only place that maps the
 //! private decision to the typed broker operation.
 
+#![allow(dead_code)]
+
 use std::{sync::Mutex, time::Duration};
 
 use d2b_contracts::types::{BundleOpId, PathClass, RoleId, VmId};

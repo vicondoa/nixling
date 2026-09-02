@@ -4,7 +4,9 @@
 // in plan.md §D-typed-error-boxing. Suppressed until that refactor lands.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io;
+#[cfg(test)]
+use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 #[cfg(test)]
 use std::os::unix::fs::PermissionsExt;
@@ -38,14 +40,13 @@ use d2b_contracts_broker::broker_wire::{
     ActivationMode as BrokerActivationMode, ActivationPhase as BrokerActivationPhase,
     ApplyNftablesRequest as BrokerApplyNftablesRequest,
     ApplyNmUnmanagedRequest as BrokerApplyNmUnmanagedRequest, AuditJoinContext, BrokerCallerRole,
-    BrokerErrorResponse, BrokerRequest, BrokerRequestEnvelope, BrokerResponse,
+    BrokerRequest, BrokerRequestEnvelope, BrokerResponse,
     CanonicalAuditDigest, DeregisterRunnerPidfdRequest, ExportBrokerAuditRequest, HelloRequest,
     LegacySwtpmMigrationOutcome, MigrateLegacySwtpmStateRequest,
     OpenPidfdRequest as BrokerOpenPidfdRequest, OpenZoneStoreRequest as BrokerOpenZoneStoreRequest,
     QemuMediaBootRequest as BrokerQemuMediaBootRequest,
     QemuMediaHotplugRequest as BrokerQemuMediaHotplugRequest,
     QemuMediaRefreshRegistryRequest as BrokerQemuMediaRefreshRegistryRequest,
-    ReconcileStorageScopeRequest as BrokerReconcileStorageScopeRequest,
     ResourceActivationAuditRequest as BrokerResourceActivationAuditRequest,
     RunActivationRequest as BrokerRunActivationRequest, RunGcRequest as BrokerRunGcRequest,
     RunHostInstallRequest as BrokerRunHostInstallRequest,
@@ -55,6 +56,10 @@ use d2b_contracts_broker::broker_wire::{
     RunRotateKnownHostRequest as BrokerRunRotateKnownHostRequest, RunnerRole, RunnerSignal,
     SignalRunnerRequest, SpawnRunnerRequest as BrokerSpawnRunnerRequest,
     StoreVerifyRequest as BrokerStoreVerifyRequest,
+};
+#[cfg(test)]
+use d2b_contracts_broker::broker_wire::{
+    BrokerErrorResponse, ReconcileStorageScopeRequest as BrokerReconcileStorageScopeRequest,
     UsbipBindFirewallRuleRequest as BrokerUsbipBindFirewallRuleRequest,
     UsbipBindRequest as BrokerUsbipBindRequest,
     UsbipProxyReconcileRequest as BrokerUsbipProxyReconcileRequest,
@@ -67,16 +72,22 @@ use d2b_contracts_resource::resource_proto as resource_wire;
 use d2b_contracts_resource::v3::identity::ReconnectGeneration;
 use d2b_contracts_resource::v3::storage::ZoneStoreId;
 use d2b_contracts_resource::v3::{
-    NetworkProvenance, ResourceBundleGenerationId, ResourceEnvelope, ResourceErrorKind,
+    NetworkProvenance, ResourceEnvelope,
     ResourceGeneration, ResourcePhase, ResourceRef, ResourceUid, SchemaFingerprint, ZoneId,
     ZoneResourceIdentity, ZoneRevision,
     endpoint::{
         EndpointClass, EndpointLocality, EndpointOperation, EndpointSpec, EndpointTransport,
         EndpointVisibility,
     },
+    process::ProcessSpec,
+};
+#[cfg(test)]
+use d2b_contracts_resource::v3::ResourceBundleGenerationId;
+#[cfg(test)]
+use d2b_contracts_resource::v3::{
+    ResourceErrorKind,
     guest::GuestSpec,
     network::NetworkSpec,
-    process::ProcessSpec,
     volume::{VolumeAttachment, VolumeSpec},
 };
 use d2b_contracts_resource::v3::{ResourceName, activation_nixos::NIXOS_GENERATION_RESOURCE_TYPE};
@@ -92,10 +103,13 @@ use d2b_core::bundle::Bundle;
 use d2b_core::bundle_resolver::{
     BundleResolver, intent_id_activation, intent_id_gc_host, intent_id_installer_host,
     intent_id_keys_rotate, intent_id_legacy_runner, intent_id_migrate_host,
+    intent_id_nft_host, intent_id_nm_unmanaged_host, intent_id_rotate_known_host, intent_id_trust,
+};
+#[cfg(test)]
+use d2b_core::bundle_resolver::{
     intent_id_network_bridge_uids, intent_id_network_hosts_uids, intent_id_network_projection_uids,
-    intent_id_network_route_uids, intent_id_network_sysctl_uids, intent_id_nft_host,
-    intent_id_nm_unmanaged_host, intent_id_rotate_known_host, intent_id_trust,
-    intent_id_usbip_bind, intent_id_usbip_firewall,
+    intent_id_network_route_uids, intent_id_network_sysctl_uids, intent_id_usbip_bind,
+    intent_id_usbip_firewall,
 };
 use d2b_core::closures::ClosureMetadata;
 use d2b_core::error::BundleError;
@@ -111,13 +125,16 @@ use d2b_core_controller::zone_links::{
 use d2b_core_controller::zonelink::{ZoneLinkController, ZoneLinkOwnerProof};
 use d2b_host::ssh_keygen;
 use d2b_process_conformance::{ConfigurationDigest, GuestExecutionBinding};
+use d2b_provider_network_local::broker::resolve_tap_identity;
+use d2b_provider_network_local::controller::NetworkAdmissionProof;
+#[cfg(test)]
 use d2b_provider_network_local::{
     artifact::{ArtifactCatalogEntry, ArtifactKind},
-    broker::{NetworkEffectContext, resolve_tap_identity},
+    broker::NetworkEffectContext,
     controller::{
-        CONFIG_VOLUME_MAX_BYTES, NetworkAdmissionIntent, NetworkAdmissionKey,
-        NetworkAdmissionProof, NetworkConfigContent, NetworkEffectError, NetworkReconciler,
-        NetworkResourcePort, ReconcileInput, ReconcileProgress,
+        CONFIG_VOLUME_MAX_BYTES, NetworkAdmissionIntent, NetworkAdmissionKey, NetworkConfigContent,
+        NetworkEffectError, NetworkReconciler, NetworkResourcePort, ReconcileInput,
+        ReconcileProgress,
     },
     ifname::derive_network_child_name,
     observe::observe_host_network,
@@ -154,9 +171,13 @@ pub use d2bd_runtime::public_read_model::{
     request_invalidates_public_status_model,
 };
 pub(crate) use d2bd_runtime::readiness::{
-    wait_for_one_shot_exit, wait_for_readiness, wait_for_tcp_port,
+    wait_for_one_shot_exit, wait_for_readiness,
 };
+#[cfg(test)]
+use d2bd_runtime::readiness::wait_for_tcp_port;
 pub(crate) use d2bd_runtime::resource_api::resource_runtime_error_frame;
+#[cfg(test)]
+use d2bd_runtime::resource_api::projection_digest_bytes;
 use d2bd_runtime::supervisor::pidfd_table::{
     BrokerReapLog, PidfdEntry, PidfdRegistration, PidfdTable, PidfdTableError, WaitTermination,
 };
@@ -170,7 +191,7 @@ pub(crate) use d2bd_runtime::unix_transport::{
 #[cfg(test)]
 use d2bd_runtime::wire_response_helpers::response_remediation;
 pub(crate) use d2bd_runtime::wire_response_helpers::{
-    api_ready_timeout_response, append_response_summary, applied_response, broker_failure_response,
+    api_ready_timeout_response, applied_response, broker_failure_response,
     daemon_failure_response, invalid_request_response, invalid_request_response_with_summary,
     response_outcome, response_summary, retarget_mutating_response,
 };
@@ -216,8 +237,10 @@ pub use d2bd_runtime::runtime_process::{
     write_daemon_version_file,
 };
 use d2bd_runtime::runtime_util::{
-    block_on_future, duplicate_received_fd, hex_bytes, projection_digest_bytes,
+    block_on_future, duplicate_received_fd, hex_bytes,
 };
+#[cfg(test)]
+use d2bd_runtime::runtime_util::projection_digest_bytes;
 #[cfg(test)]
 use d2bd_runtime::shell_backend::shell_poll_timeout;
 use d2bd_runtime::shell_backend::{
@@ -1689,8 +1712,8 @@ mod zone_link_gateway_composition_tests {
             .find("Some(\"Start\" | \"Stop\" | \"Restart\")")
             .expect("lifecycle dispatch");
         let reconcile = source
-            .find("if is_device_tpm_reconcile_request")
-            .expect("reconcile dispatch");
+            .find("if request.value().get(\"method\").and_then(Value::as_str) == Some(\"Reconcile\")")
+            .expect("shared Runner reconcile refusal");
         assert!(classification < forwarding);
         assert!(classification < admission);
         assert!(classification < lifecycle);
@@ -6750,44 +6773,10 @@ fn dispatch_resource_request(
             return Ok(resource_runtime_error_frame(error));
         }
     };
-    if security_key_effect_port::is_reconcile_request(&request.value()) {
-        return Ok(security_key_effect_port::dispatch_reconcile(
-            state,
-            peer,
-            runtime.as_ref(),
-            &request.value(),
-        )
-        .unwrap_or_else(resource_runtime_error_frame));
-    }
-    if request.value().get("method").and_then(Value::as_str) == Some("Reconcile")
-        && !matches!(peer.role, PeerRole::Admin)
-    {
-        return Ok(resource_runtime_error_frame(
-            resource_runtime::ResourceRuntimeError::AuthenticationUnavailable,
-        ));
-    }
-    if is_device_tpm_reconcile_request(&request.value()) {
-        return Ok(dispatch_device_tpm_reconcile(state, peer, &request.value())
-            .unwrap_or_else(resource_runtime_error_frame));
-    }
     if request.value().get("method").and_then(Value::as_str) == Some("Reconcile") {
-        return Ok(
-            match dispatch_wave6_resource_reconcile(state, peer, runtime.as_ref(), &request.value())
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::warn!(
-                        error = error.code(),
-                        method = ?request.method(),
-                        zone_ref = ?request.value().get("zoneRef"),
-                        resource_type = ?request.value().get("resourceType"),
-                        resource_ref = ?request.value().get("resourceRef"),
-                        "resource reconcile refused"
-                    );
-                    resource_runtime_error_frame(error)
-                }
-            },
-        );
+        return Ok(resource_runtime_error_frame(
+            resource_runtime::ResourceRuntimeError::CapabilityUnavailable,
+        ));
     }
     if typed_shell {
         return Ok(
@@ -7475,6 +7464,7 @@ fn dispatch_device_usb_resource_request(
     }
 }
 
+#[cfg(test)]
 fn resolve_volume_storage_ref(
     resource: &Value,
     resolver: &BundleResolver,
@@ -7514,6 +7504,7 @@ fn resolve_volume_storage_ref(
     Ok(BundleOpId::new(storage_id))
 }
 
+#[cfg(test)]
 fn resolve_network_effect_context(
     resource: &Value,
     resolver: &BundleResolver,
@@ -7655,10 +7646,12 @@ fn resolve_network_effect_context(
 // This compatibility boundary records the completion of the child mutations
 // it invokes. It is not the readiness authority: each pass commits a typed
 // projection and the next pass reads that projection back from Resource API.
+#[cfg(test)]
 struct PublicNetworkResourceBoundary {
     state: Arc<Mutex<PublicNetworkResourceState>>,
 }
 
+#[cfg(test)]
 impl Default for PublicNetworkResourceBoundary {
     fn default() -> Self {
         Self {
@@ -7668,6 +7661,7 @@ impl Default for PublicNetworkResourceBoundary {
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct PublicNetworkResourceState {
     volume_upserted: bool,
     volume_written: bool,
@@ -7676,15 +7670,18 @@ struct PublicNetworkResourceState {
     agent_upserted: bool,
 }
 
+#[cfg(test)]
 const MAX_NETWORK_CHILD_READINESS_PASSES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 struct PublicNetworkChildReadiness {
     volume_ready: bool,
     guest_ready: bool,
     volume_attachment_ready: bool,
 }
 
+#[cfg(test)]
 impl PublicNetworkChildReadiness {
     const fn pending() -> Self {
         Self {
@@ -7716,6 +7713,7 @@ impl PublicNetworkChildReadiness {
     }
 }
 
+#[cfg(test)]
 impl PublicNetworkResourceBoundary {
     fn completed_child_readiness(&self) -> Result<PublicNetworkChildReadiness, NetworkEffectError> {
         let state = self
@@ -7726,6 +7724,7 @@ impl PublicNetworkResourceBoundary {
     }
 }
 
+#[cfg(test)]
 fn network_child_readiness_projection(readiness: PublicNetworkChildReadiness) -> Value {
     let phase = |ready| {
         json!({
@@ -7739,6 +7738,7 @@ fn network_child_readiness_projection(readiness: PublicNetworkChildReadiness) ->
     })
 }
 
+#[cfg(test)]
 fn network_child_readiness_projection_for_resource(
     resource: &Value,
     readiness: PublicNetworkChildReadiness,
@@ -7756,6 +7756,7 @@ fn network_child_readiness_projection_for_resource(
     Value::Object(projection)
 }
 
+#[cfg(test)]
 fn network_child_readiness_from_resource(resource: &Value) -> PublicNetworkChildReadiness {
     let Some(projection) = resource
         .get("status")
@@ -7778,6 +7779,7 @@ fn network_child_readiness_from_resource(resource: &Value) -> PublicNetworkChild
     }
 }
 
+#[cfg(test)]
 fn fetch_public_resource(
     runtime: &resource_runtime::ZoneResourceRuntime,
     peer: &PeerIdentity,
@@ -7867,6 +7869,7 @@ mod public_network_child_readiness_tests {
     }
 }
 
+#[cfg(test)]
 impl NetworkResourcePort for PublicNetworkResourceBoundary {
     async fn upsert_volume_backing(&self, _spec: &VolumeSpec) -> Result<(), NetworkEffectError> {
         self.state
@@ -7967,6 +7970,7 @@ impl NetworkResourcePort for PublicNetworkResourceBoundary {
     }
 }
 
+#[cfg(test)]
 fn dispatch_wave6_resource_reconcile(
     state: &ServerState,
     peer: &PeerIdentity,
@@ -8138,6 +8142,7 @@ fn dispatch_wave6_resource_reconcile(
     }))
 }
 
+#[cfg(test)]
 fn public_resource_get_error(resource: &Value) -> Option<resource_runtime::ResourceRuntimeError> {
     let kind = resource
         .get("error")
@@ -8152,6 +8157,7 @@ fn public_resource_get_error(resource: &Value) -> Option<resource_runtime::Resou
     )
 }
 
+#[cfg(test)]
 struct Wave6NetworkEffectRequest<'a> {
     state: &'a ServerState,
     peer: &'a PeerIdentity,
@@ -8164,6 +8170,7 @@ struct Wave6NetworkEffectRequest<'a> {
     ensure_host_base: bool,
 }
 
+#[cfg(test)]
 fn parse_committed_network_spec(
     resource: &Value,
 ) -> Result<NetworkSpec, resource_runtime::ResourceRuntimeError> {
@@ -8290,6 +8297,7 @@ fn same_zone_resource_identity(left: &ZoneResourceIdentity, right: &ZoneResource
     )
 }
 
+#[cfg(test)]
 fn network_deletion_completed(resource: &Value) -> bool {
     resource
         .get("status")
@@ -8303,6 +8311,7 @@ fn network_deletion_completed(resource: &Value) -> bool {
             .is_some_and(Vec::is_empty)
 }
 
+#[cfg(test)]
 fn release_completed_network_admission(
     state: &ServerState,
     runtime: &resource_runtime::ZoneResourceRuntime,
@@ -8330,6 +8339,7 @@ fn release_completed_network_admission(
     Ok(())
 }
 
+#[cfg(test)]
 fn resolve_network_admission(
     state: &ServerState,
     runtime: &resource_runtime::ZoneResourceRuntime,
@@ -8452,6 +8462,7 @@ fn resolve_network_admission(
         })
 }
 
+#[cfg(test)]
 fn reconcile_wave6_network_effect(
     request: Wave6NetworkEffectRequest<'_>,
 ) -> Result<bool, resource_runtime::ResourceRuntimeError> {
@@ -8676,6 +8687,7 @@ fn reconcile_wave6_network_effect(
     Err(resource_runtime::ResourceRuntimeError::ProviderPathUnavailable)
 }
 
+#[cfg(test)]
 fn is_device_tpm_reconcile_request(request: &Value) -> bool {
     request.get("method").and_then(Value::as_str) == Some("Reconcile")
         && request.get("resourceType").and_then(Value::as_str) == Some("Device")
@@ -8683,6 +8695,7 @@ fn is_device_tpm_reconcile_request(request: &Value) -> bool {
             == Some(d2b_provider_device_tpm::PROVIDER_REF)
 }
 
+#[cfg(test)]
 fn dispatch_device_tpm_reconcile(
     state: &ServerState,
     peer: &PeerIdentity,
@@ -8691,6 +8704,7 @@ fn dispatch_device_tpm_reconcile(
     dispatch_device_tpm_reconcile_inner(state, peer, request)
 }
 
+#[cfg(test)]
 fn dispatch_device_tpm_reconcile_inner(
     state: &ServerState,
     peer: &PeerIdentity,
@@ -8831,6 +8845,7 @@ fn dispatch_device_tpm_reconcile_inner(
     }))
 }
 
+#[cfg(test)]
 fn trusted_tpm_migration_anchor(
     intent: &str,
     inventory: LegacySwtpmMigrationOutcome,
@@ -8847,6 +8862,7 @@ fn trusted_tpm_migration_anchor(
     }
 }
 
+#[cfg(test)]
 fn tpm_opaque_bytes(domain: &str, value: &str) -> [u8; 32] {
     let digest = Sha256::digest(format!("{domain}:{value}").as_bytes());
     let mut bytes = [0; 32];
@@ -8854,6 +8870,7 @@ fn tpm_opaque_bytes(domain: &str, value: &str) -> [u8; 32] {
     bytes
 }
 
+#[cfg(test)]
 fn tpm_state_intent(
     device_uid: &ResourceUid,
     vm_id: &str,
@@ -10811,6 +10828,7 @@ fn validate_usbip_bus_id_for_daemon(verb: &str, bus_id: &str) -> Result<(), Valu
     })
 }
 
+#[cfg(test)]
 fn usbip_lifecycle_claim_for_intent(
     resolver: &BundleResolver,
     vm: &str,
@@ -10833,6 +10851,7 @@ fn usbip_lifecycle_claim_for_intent(
     )
 }
 
+#[cfg(test)]
 fn read_usbip_claim_lock_owner_path(lock_path: &Path) -> io::Result<String> {
     let file = File::open(lock_path)?;
     let mut owner = String::new();
@@ -10840,6 +10859,7 @@ fn read_usbip_claim_lock_owner_path(lock_path: &Path) -> io::Result<String> {
     Ok(owner.trim().to_owned())
 }
 
+#[cfg(test)]
 fn bounded_usbip_owner_label(owner: &str) -> &str {
     if owner.len() <= 63
         && owner
@@ -10854,6 +10874,7 @@ fn bounded_usbip_owner_label(owner: &str) -> &str {
     }
 }
 
+#[cfg(test)]
 fn same_vm_declared_usbip_start_claims_with_reader(
     resolver: &BundleResolver,
     vm: &str,
@@ -10892,6 +10913,7 @@ fn same_vm_declared_usbip_start_claims_with_reader(
         .collect()
 }
 
+#[cfg(test)]
 fn same_vm_declared_usbip_start_claims(
     resolver: &BundleResolver,
     vm: &str,
@@ -10899,6 +10921,7 @@ fn same_vm_declared_usbip_start_claims(
     same_vm_declared_usbip_start_claims_with_reader(resolver, vm, read_usbip_claim_lock_owner_path)
 }
 
+#[cfg(test)]
 fn same_vm_persisted_usbip_stop_claims_with_reader(
     resolver: &BundleResolver,
     vm: &str,
@@ -10915,6 +10938,7 @@ fn same_vm_persisted_usbip_stop_claims_with_reader(
         .collect()
 }
 
+#[cfg(test)]
 fn same_vm_persisted_usbip_stop_claims(
     resolver: &BundleResolver,
     vm: &str,
@@ -10922,6 +10946,7 @@ fn same_vm_persisted_usbip_stop_claims(
     same_vm_persisted_usbip_stop_claims_with_reader(resolver, vm, read_usbip_claim_lock_owner_path)
 }
 
+#[cfg(test)]
 fn lifecycle_broker_error_kind(
     error: &BrokerErrorResponse,
 ) -> d2b_provider_device_usbip::reconcile_state::UsbipLifecycleFailureKind {
@@ -10978,6 +11003,7 @@ fn lifecycle_broker_error_kind(
     }
 }
 
+#[cfg(test)]
 fn lifecycle_broker_ack(
     state: &ServerState,
     op_name: &str,
@@ -11010,12 +11036,14 @@ fn lifecycle_broker_ack(
     }
 }
 
+#[cfg(test)]
 struct DaemonUsbipStartReconcileExecutor<'a> {
     state: &'a ServerState,
     resolver: &'a BundleResolver,
     caller_role: BrokerCallerRole,
 }
 
+#[cfg(test)]
 impl d2b_provider_device_usbip::reconcile_state::UsbipVmStartReconcileExecutor
     for DaemonUsbipStartReconcileExecutor<'_>
 {
@@ -11106,11 +11134,13 @@ impl d2b_provider_device_usbip::reconcile_state::UsbipVmStartReconcileExecutor
     }
 }
 
+#[cfg(test)]
 struct DaemonUsbipStopCleanupExecutor<'a> {
     state: &'a ServerState,
     caller_role: BrokerCallerRole,
 }
 
+#[cfg(test)]
 impl d2b_provider_device_usbip::reconcile_state::UsbipVmStopCarrierCleanup
     for DaemonUsbipStopCleanupExecutor<'_>
 {
@@ -11171,6 +11201,7 @@ impl d2b_provider_device_usbip::reconcile_state::UsbipVmStopCarrierCleanup
     }
 }
 
+#[cfg(test)]
 fn emit_usbip_lifecycle_observations(
     phase: &str,
     report: &d2b_provider_device_usbip::reconcile_state::UsbipLifecycleReconcileReport,
@@ -11193,6 +11224,7 @@ fn emit_usbip_lifecycle_observations(
     }
 }
 
+#[cfg(test)]
 fn usbip_lifecycle_report_summary(
     phase: &str,
     report: &d2b_provider_device_usbip::reconcile_state::UsbipLifecycleReconcileReport,
@@ -11241,6 +11273,7 @@ fn usbip_lifecycle_report_summary(
     Some(summary)
 }
 
+#[cfg(test)]
 fn new_usbip_reconcile_attempt(
     phase: &str,
 ) -> d2b_provider_device_usbip::reconcile_state::UsbipReconcileAttemptContext {
@@ -11264,12 +11297,14 @@ fn new_usbip_reconcile_attempt(
     d2b_provider_device_usbip::reconcile_state::UsbipReconcileAttemptContext { correlation_id }
 }
 
+#[cfg(test)]
 fn tracing_span_id_for_usbip_attempt(
     attempt: &d2b_provider_device_usbip::reconcile_state::UsbipReconcileAttemptContext,
 ) -> TracingSpanId {
     TracingSpanId::new(attempt.correlation_id.as_str().to_owned())
 }
 
+#[cfg(test)]
 fn reconcile_usbip_after_vm_start(
     state: &ServerState,
     resolver: &BundleResolver,
@@ -11295,9 +11330,12 @@ fn reconcile_usbip_after_vm_start(
     Some(report)
 }
 
+#[cfg(test)]
 const USBIP_STRICT_RECONCILE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
 const USBIP_STRICT_RECONCILE_BACKOFF: Duration = Duration::from_secs(2);
 
+#[cfg(test)]
 fn reconcile_usbip_after_vm_start_until_converged(
     state: &ServerState,
     resolver: &BundleResolver,
@@ -11316,25 +11354,31 @@ fn reconcile_usbip_after_vm_start_until_converged(
     }
 }
 
+#[cfg(test)]
 fn usbip_start_reconciles_synchronously(request: &public_wire::VmLifecycleRequest) -> bool {
     !request.no_wait_api
 }
 
+#[cfg(test)]
 const USBIP_BACKGROUND_RECONCILE_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
 const USBIP_BACKGROUND_RECONCILE_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum UsbipBackgroundReconcileSpawn {
     NoClaims,
     AlreadyRunning,
     Spawned,
 }
 
+#[cfg(test)]
 struct UsbipBackgroundReconcileGuard {
     coordinator: Arc<Mutex<ZoneCoordinator>>,
     zone: ZoneId,
 }
 
+#[cfg(test)]
 impl UsbipBackgroundReconcileGuard {
     fn try_acquire(state: &ServerState, vm: &str) -> Option<Self> {
         let zone =
@@ -11346,6 +11390,7 @@ impl UsbipBackgroundReconcileGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for UsbipBackgroundReconcileGuard {
     fn drop(&mut self) {
         if let Ok(mut coordinator) = self.coordinator.lock() {
@@ -11354,6 +11399,7 @@ impl Drop for UsbipBackgroundReconcileGuard {
     }
 }
 
+#[cfg(test)]
 fn spawn_usbip_reconcile_after_vm_start(
     state: &ServerState,
     resolver: &BundleResolver,
@@ -11437,6 +11483,7 @@ fn spawn_usbip_reconcile_after_vm_start(
     UsbipBackgroundReconcileSpawn::Spawned
 }
 
+#[cfg(test)]
 fn cleanup_usbip_before_vm_stop(
     state: &ServerState,
     resolver: &BundleResolver,
@@ -11459,12 +11506,14 @@ fn cleanup_usbip_before_vm_stop(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 enum UsbipClaimLockProbe {
     None,
     Present,
     Unknown(String),
 }
 
+#[cfg(test)]
 fn probe_usbip_claim_locks_for_vm_without_bundle(
     state: &ServerState,
     vm: &str,
@@ -11509,6 +11558,7 @@ fn probe_usbip_claim_locks_for_vm_without_bundle(
     UsbipClaimLockProbe::None
 }
 
+#[cfg(test)]
 fn ensure_usbipd_env_ready_for_attach(
     state: &ServerState,
     resolver: &BundleResolver,
@@ -16199,6 +16249,7 @@ fn dispatch_broker_request_with_optional_request_fds(
     Ok((decoded, received_fds))
 }
 
+#[allow(dead_code)]
 fn dispatch_broker_ack_request(
     state: &ServerState,
     verb: &str,
@@ -16808,14 +16859,6 @@ async fn open_resource_plane(
                 let _ = runtime.shutdown().await;
             }
             return Err(error);
-        }
-        if !runtime.device_tpm_controller_registered() {
-            let _ = runtime.shutdown().await;
-            let _ = plane.shutdown().await;
-            while let Some((_, runtime, _)) = remaining.next() {
-                let _ = runtime.shutdown().await;
-            }
-            return Err(resource_runtime::ResourceRuntimeError::ProviderPathUnavailable);
         }
         if let Err(error) = plane.insert(runtime) {
             let _ = plane.shutdown().await;
@@ -21435,64 +21478,6 @@ fn dispatch_broker_vm_start_inner(
         if let Some(response) =
             existing_vm_start_response_if_ready(state, &request.vm, runner_role_id)
         {
-            let mut response = response;
-            if usbip_start_reconciles_synchronously(&request) {
-                if let Some(usb_report) = reconcile_usbip_after_vm_start_until_converged(
-                    state,
-                    &resolver,
-                    &request.vm,
-                    caller_role.clone(),
-                    USBIP_STRICT_RECONCILE_TIMEOUT,
-                    USBIP_STRICT_RECONCILE_BACKOFF,
-                ) {
-                    if usb_report.fatal() {
-                        let summary = usbip_lifecycle_report_summary("start", &usb_report)
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "USBIP reconciliation for already-running VM '{}' failed before device exposure",
-                                    request.vm
-                                )
-                            });
-                        let fatal = usb_report.first_fatal_reason();
-                        return Ok(broker_failure_response(
-                            VERB,
-                            summary,
-                            fatal
-                                .map(|reason| reason.remediation.clone())
-                                .unwrap_or_else(|| {
-                                    format!(
-                                        "Fix USBIP policy or host-session claim state for VM '{}', then retry `d2b vm start {} --apply`.",
-                                        request.vm, request.vm
-                                    )
-                                }),
-                            None,
-                        ));
-                    }
-                    if let Some(usb_summary) = usbip_lifecycle_report_summary("start", &usb_report)
-                    {
-                        append_response_summary(&mut response, &usb_summary);
-                    }
-                }
-            } else {
-                let scheduled = spawn_usbip_reconcile_after_vm_start(
-                    state,
-                    &resolver,
-                    &request.vm,
-                    runner_role_id,
-                    caller_role.clone(),
-                );
-                match scheduled {
-                    UsbipBackgroundReconcileSpawn::Spawned => append_response_summary(
-                        &mut response,
-                        "USBIP reconciliation scheduled in background",
-                    ),
-                    UsbipBackgroundReconcileSpawn::AlreadyRunning => append_response_summary(
-                        &mut response,
-                        "USBIP background reconciliation already running",
-                    ),
-                    UsbipBackgroundReconcileSpawn::NoClaims => {}
-                }
-            }
             return Ok(response);
         }
         return Ok(invalid_request_response(
@@ -21599,7 +21584,6 @@ fn dispatch_broker_vm_start_inner(
         ));
     }
     if report.overall_ok {
-        let mut usb_lifecycle_summary = None;
         // Structured degraded annotation for the OtelHostBridge readiness
         // gate: set to the typed-error envelope when the gate times out in
         // non-strict mode so the success response carries machine-readable
@@ -21703,75 +21687,12 @@ fn dispatch_broker_vm_start_inner(
                     )
                 }
             }
-            if usbip_start_reconciles_synchronously(&request)
-                && let Some(usb_report) = reconcile_usbip_after_vm_start_until_converged(
-                    state,
-                    &resolver,
-                    &request.vm,
-                    caller_role.clone(),
-                    USBIP_STRICT_RECONCILE_TIMEOUT,
-                    USBIP_STRICT_RECONCILE_BACKOFF,
-                )
-            {
-                if usb_report.fatal() {
-                    let fatal = usb_report.first_fatal_reason();
-                    let summary = usbip_lifecycle_report_summary("start", &usb_report)
-                        .unwrap_or_else(|| {
-                            format!(
-                                "USBIP reconciliation for VM '{}' failed before device exposure",
-                                request.vm
-                            )
-                        });
-                    if let Err(response) = rollback_failed_vm_start(
-                        state,
-                        &request.vm,
-                        &tracked_roles,
-                        caller_role.clone(),
-                    ) {
-                        return Ok(response);
-                    }
-                    return Ok(broker_failure_response(
-                        VERB,
-                        summary,
-                        fatal
-                            .map(|reason| reason.remediation.clone())
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "Fix USBIP policy or host-session claim state for VM '{}', then retry `d2b vm start {} --apply`.",
-                                    request.vm, request.vm
-                                )
-                            }),
-                        None,
-                    ));
-                }
-                usb_lifecycle_summary = usbip_lifecycle_report_summary("start", &usb_report);
-            }
         }
-        let mut summary = if request.no_wait_api {
+        let summary = if request.no_wait_api {
             format!("vm.{}: process-alive: ok; api-ready: pending", request.vm)
         } else {
             vm_start_success_summary(&report)
         };
-        if let Some(usb_summary) = usb_lifecycle_summary {
-            summary.push_str("; ");
-            summary.push_str(&usb_summary);
-        } else if !usbip_start_reconciles_synchronously(&request) {
-            match spawn_usbip_reconcile_after_vm_start(
-                state,
-                &resolver,
-                &request.vm,
-                vm_start_primary_runner_role_id(&tracked_roles),
-                caller_role.clone(),
-            ) {
-                UsbipBackgroundReconcileSpawn::Spawned => {
-                    summary.push_str("; USBIP reconciliation scheduled in background");
-                }
-                UsbipBackgroundReconcileSpawn::AlreadyRunning => {
-                    summary.push_str("; USBIP background reconciliation already running");
-                }
-                UsbipBackgroundReconcileSpawn::NoClaims => {}
-            }
-        }
         let mut response = applied_response(VERB, summary);
         if request.no_wait_api {
             response.as_object_mut().unwrap().insert(
@@ -22113,44 +22034,6 @@ fn dispatch_broker_vm_stop_with_timeout_as_inner(
         ));
     }
 
-    let usb_lifecycle_summary = match load_bundle_resolver(state) {
-        Ok(resolver) => {
-            cleanup_usbip_before_vm_stop(state, &resolver, &request.vm, caller_role.clone())
-                .and_then(|report| usbip_lifecycle_report_summary("stop", &report))
-        }
-        Err(error) => match probe_usbip_claim_locks_for_vm_without_bundle(state, &request.vm) {
-            UsbipClaimLockProbe::None => {
-                tracing::warn!(
-                    vm = %request.vm,
-                    error = ?error,
-                    "vm stop: USBIP carrier cleanup skipped because bundle resolver could not load and no host-session claim locks matched the VM"
-                );
-                None
-            }
-            UsbipClaimLockProbe::Present => {
-                tracing::warn!(
-                    vm = %request.vm,
-                    error = ?error,
-                    "vm stop: USBIP carrier cleanup degraded because bundle resolver could not load while a host-session claim lock matched the VM"
-                );
-                Some(format!(
-                    "USBIP cleanup degraded: could not load trusted bundle; host-session claims were left unchanged ({error:?})"
-                ))
-            }
-            UsbipClaimLockProbe::Unknown(detail) => {
-                tracing::warn!(
-                    vm = %request.vm,
-                    error = ?error,
-                    detail = %detail,
-                    "vm stop: USBIP carrier cleanup degraded because bundle resolver and host-session claim lock probing failed"
-                );
-                Some(format!(
-                    "USBIP cleanup degraded: could not load trusted bundle or inspect host-session claims; claims may be left unchanged ({error:?}; {detail})"
-                ))
-            }
-        },
-    };
-
     let mut drained_roles = Vec::with_capacity(stop_entries.len());
     let mut sigkill_roles = Vec::new();
     let mut shutdown_outcomes = Vec::new();
@@ -22234,10 +22117,6 @@ fn dispatch_broker_vm_stop_with_timeout_as_inner(
             .collect::<Vec<_>>()
             .join(", ");
         summary.push_str(&format!("; provider shutdown outcomes: {labels}"));
-    }
-    if let Some(usb_summary) = usb_lifecycle_summary {
-        summary.push_str("; ");
-        summary.push_str(&usb_summary);
     }
     summary.push_str(&format!(" ({})", drained_roles.join(", ")));
     state

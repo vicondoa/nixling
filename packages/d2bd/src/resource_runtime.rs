@@ -81,13 +81,13 @@ use d2b_core_controller::controller_assignment::{
 use d2b_core_controller::controllers::HandlerPhase;
 use d2b_core_controller::{
     CORE_RESOURCE_CONTROLLER_REGISTRATIONS, ChangeField, ControllerDescriptor,
-    ControllerExecutionPolicy, ControllerIdentity, ControllerVerb, CoreControllerSource,
-    CoreResourceReconciler, DependencySnapshot, DrainResult, FinalizeResult, ObservationResult,
-    ReconcileContext, ReconcileDisposition, ReconcilePlan, ReconcileReason, ReconcileResult,
-    ResourceReconciler, ResourceRegistration, ResourceSnapshot, ResyncPolicy, Runner, RunnerConfig,
-    SourceError, StatusPersistence, TriggerReason, UpdateAssessment, UpdateAssessmentState,
-    UpgradePlan, UpgradeStage, ValidationResult, WatchSelector as ControllerSelector,
-    core_controller_descriptors,
+    ControllerExecutionPolicy, ControllerIdentity, ControllerSelector, ControllerVerb,
+    CoreControllerSource, CoreHandlerKind, CoreResourceReconciler, DependencySnapshot, DrainResult,
+    FinalizeResult, ObservationResult, ReconcileContext, ReconcileDisposition, ReconcilePlan,
+    ReconcileReason, ReconcileResult, ResourceReconciler, ResourceRegistration, ResourceSnapshot,
+    ResyncPolicy, Runner, RunnerConfig, SelectorField, SourceError, StatusPersistence,
+    TriggerReason, UpdateAssessment, UpdateAssessmentState, UpgradePlan, UpgradeStage,
+    ValidationResult, core_controller_descriptors,
 };
 use d2b_core_controller::main::{
     CoreProcess, RecoverySnapshot, RuntimeReadiness as CoreRuntimeReadiness, StartupStage,
@@ -194,6 +194,261 @@ pub use volume_effect_adapter::{
 const CORE_CONTROLLER_PROCESS_REF: &str = "Process/d2b-core-controller";
 const CORE_CONTROLLER_PROVIDER_REF: &str = "Provider/system-core";
 const CORE_CONTROLLER_HOST_REF: &str = "Host/host-system";
+
+/// One Provider-owned ResourceType registration served by the shared Runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedProviderRunnerRegistration {
+    /// Static controller process identity.
+    pub controller_ref: &'static str,
+    /// Provider identity selected by the Resource spec.
+    pub provider_ref: &'static str,
+    /// ResourceType owned by this runner.
+    pub resource_type: &'static str,
+    /// Exact finalizer installed by the owner.
+    pub finalizer: &'static str,
+    /// Descriptor repair/resync interval in runner ticks.
+    pub repair_interval_ticks: u64,
+    /// Whether the legacy scheduler/watch path is disabled.
+    pub legacy_scheduler_disabled: bool,
+    /// Whether watched configuration is dependency-only.
+    pub watched_configuration_is_dependency: bool,
+}
+
+/// The U8 Provider ResourceTypes attached to the production shared Runner.
+///
+/// USBIP and SecurityKey each have separate Service, Binding, and Device
+/// ownership rows because the toolkit finalizer is per descriptor.
+pub const U8_SHARED_PROVIDER_RUNNERS: [SharedProviderRunnerRegistration; 9] = [
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/network-local-controller",
+        provider_ref: "Provider/network-local",
+        resource_type: "Network",
+        finalizer: d2b_provider_network_local::controller::network_runner_contract().finalizer(),
+        repair_interval_ticks: d2b_provider_network_local::controller::network_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        legacy_scheduler_disabled: d2b_provider_network_local::controller::network_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency:
+            d2b_provider_network_local::controller::network_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-tpm-controller",
+        provider_ref: "Provider/device-tpm",
+        resource_type: "Device",
+        finalizer: d2b_provider_device_tpm::DEVICE_TPM_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_tpm::tpm_runner_contract().repair_interval_secs()
+            * 1_000,
+        legacy_scheduler_disabled: d2b_provider_device_tpm::tpm_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency: d2b_provider_device_tpm::tpm_runner_contract()
+            .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-usbip-controller",
+        provider_ref: "Provider/device-usbip",
+        resource_type: "Device",
+        finalizer: d2b_contracts_resource::v3::device::DEVICE_USBIP_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_usbip::usbip_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        legacy_scheduler_disabled: d2b_provider_device_usbip::usbip_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency: d2b_provider_device_usbip::usbip_runner_contract()
+            .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-usbip-service-controller",
+        provider_ref: "Provider/device-usbip",
+        resource_type: d2b_provider_device_usbip::USB_SERVICE_RESOURCE_TYPE,
+        finalizer: d2b_provider_device_usbip::USBIP_SERVICE_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_usbip::usbip_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        legacy_scheduler_disabled: d2b_provider_device_usbip::usbip_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency: d2b_provider_device_usbip::usbip_runner_contract()
+            .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-usbip-binding-controller",
+        provider_ref: "Provider/device-usbip",
+        resource_type: d2b_provider_device_usbip::USB_BINDING_RESOURCE_TYPE,
+        finalizer: d2b_provider_device_usbip::USBIP_BINDING_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_usbip::usbip_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        legacy_scheduler_disabled: d2b_provider_device_usbip::usbip_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency: d2b_provider_device_usbip::usbip_runner_contract()
+            .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-security-key-controller",
+        provider_ref: "Provider/device-security-key",
+        resource_type: "Device",
+        finalizer: d2b_contracts_resource::v3::device::DEVICE_SECURITY_KEY_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_security_key::security_key_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        legacy_scheduler_disabled: d2b_provider_device_security_key::security_key_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency:
+            d2b_provider_device_security_key::security_key_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-security-key-service-controller",
+        provider_ref: "Provider/device-security-key",
+        resource_type: d2b_provider_device_security_key::SECURITY_KEY_SERVICE_RESOURCE_TYPE,
+        finalizer: d2b_provider_device_security_key::SECURITY_KEY_SERVICE_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_security_key::security_key_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        legacy_scheduler_disabled: d2b_provider_device_security_key::security_key_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency:
+            d2b_provider_device_security_key::security_key_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-security-key-binding-controller",
+        provider_ref: "Provider/device-security-key",
+        resource_type: d2b_provider_device_security_key::SECURITY_KEY_BINDING_RESOURCE_TYPE,
+        finalizer: d2b_provider_device_security_key::SECURITY_KEY_BINDING_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_security_key::security_key_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        legacy_scheduler_disabled: d2b_provider_device_security_key::security_key_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency:
+            d2b_provider_device_security_key::security_key_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-gpu-controller",
+        provider_ref: "Provider/device-gpu",
+        resource_type: "Device",
+        finalizer: d2b_provider_device_gpu::gpu_runner_contract().finalizer(),
+        repair_interval_ticks: d2b_provider_device_gpu::gpu_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        legacy_scheduler_disabled: d2b_provider_device_gpu::gpu_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency: d2b_provider_device_gpu::gpu_runner_contract()
+            .watched_configuration_is_dependency(),
+    },
+];
+
+/// Compose the exact U8 Provider descriptors used by the production shared
+/// Runner. The provider-generation map is supplied by the authoritative
+/// Provider rows; no generation or assignment epoch is guessed.
+pub fn compose_shared_provider_runner_descriptors(
+    registrations: impl IntoIterator<Item = SharedProviderRunnerRegistration>,
+    zone: ZoneId,
+    controller_generation: ControllerGeneration,
+    provider_generations: &BTreeMap<ResourceRef, ResourceGeneration>,
+    _session_generation: ReconnectGeneration,
+) -> Result<
+    Vec<(SharedProviderRunnerRegistration, ControllerDescriptor)>,
+    ResourceRuntimeError,
+> {
+    registrations
+        .into_iter()
+        .map(|registration| {
+            if !registration.legacy_scheduler_disabled
+                || !registration.watched_configuration_is_dependency
+                || !(30_000..=60_000).contains(&registration.repair_interval_ticks)
+            {
+                return Err(ResourceRuntimeError::HandlerNotReady);
+            }
+            let provider_ref = ResourceRef::parse(registration.provider_ref)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let provider_generation = provider_generations
+                .get(&provider_ref)
+                .copied()
+                .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+            let resource_type = ResourceTypeName::parse(registration.resource_type.to_owned())
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let controller_ref = ResourceRef::parse(registration.controller_ref)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let identity = ControllerIdentity::new(
+                zone.clone(),
+                controller_ref.clone(),
+                controller_generation,
+                provider_ref,
+                provider_generation,
+                controller_ref,
+                ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                None,
+            )
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let resource = ResourceRegistration::new(
+                resource_type.clone(),
+                vec![1],
+                5_000,
+                3,
+            )
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let mut selectors = vec![
+                ControllerSelector::new(
+                    resource_type.clone(),
+                    SelectorField::Spec,
+                    Some(registration.provider_ref.to_owned()),
+                )
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+            ];
+            for field in [
+                SelectorField::Status,
+                SelectorField::Metadata,
+                SelectorField::Finalizers,
+                SelectorField::Deletion,
+            ] {
+                selectors.push(
+                    ControllerSelector::new(resource_type.clone(), field, None)
+                        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                );
+            }
+            let execution = ControllerExecutionPolicy::new(
+                8,
+                4,
+                256,
+                8,
+                256,
+                ResyncPolicy::new(
+                    Some(registration.repair_interval_ticks),
+                    registration.repair_interval_ticks,
+                )
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+            )
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let descriptor = ControllerDescriptor::new(
+                identity,
+                vec![resource],
+                vec!["resource-api".to_owned()],
+                vec!["system".to_owned()],
+                vec![
+                    ControllerVerb::ReadSpec,
+                    ControllerVerb::ReadStatus,
+                    ControllerVerb::WriteStatus,
+                    ControllerVerb::AddFinalizer,
+                    ControllerVerb::RemoveFinalizer,
+                ],
+                selectors,
+                Vec::new(),
+                true,
+                vec![registration.finalizer.to_owned()],
+                vec!["d2b.resource.v3".to_owned()],
+                vec!["resources.d2bus.org/v3".to_owned()],
+                execution,
+            )
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            Ok((registration, descriptor))
+        })
+        .collect()
+}
 
 #[derive(Clone)]
 struct CoreAssignmentAuthority {
@@ -2187,7 +2442,6 @@ pub struct ZoneResourceRuntime {
     authority_index: Arc<tokio::sync::Mutex<HostGlobalAuthorityIndex>>,
     authority_persistence: Arc<RedbAuthorityPersistence>,
     authority_recovery: Arc<AuthorityRecoveryCoordinator>,
-    device_tpm_controller: crate::tpm_effect_port::DeviceTpmControllerRegistration,
     zone_status: Mutex<ZoneStatusResource>,
     audio_runtime: Arc<Mutex<Option<AudioResourceRuntime>>>,
     audio_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -2213,6 +2467,8 @@ pub struct ZoneResourceRuntime {
 /// This contains only the exact values validated against the authoritative
 /// resource record. It is consumed by the Device effect adapter before it can
 /// request a broker-opened descriptor.
+#[allow(dead_code)]
+#[allow(dead_code)]
 pub(crate) struct SecurityKeyDeviceAdmission {
     pub(crate) zone_ref: ResourceRef,
     pub(crate) device_uid: ResourceUid,
@@ -2221,6 +2477,8 @@ pub(crate) struct SecurityKeyDeviceAdmission {
 }
 
 /// Request fields that select the Device admission record to validate.
+#[allow(dead_code)]
+#[allow(dead_code)]
 pub(crate) struct SecurityKeyDeviceAdmissionRequest<'a> {
     pub(crate) device_uid: &'a ResourceUid,
     pub(crate) device_ref: &'a ResourceRef,
@@ -2966,7 +3224,6 @@ impl ZoneResourceRuntime {
             authority_index,
             authority_persistence,
             authority_recovery,
-            device_tpm_controller: crate::tpm_effect_port::register_device_tpm_controller(),
             zone_status: Mutex::new(zone_status),
             audio_runtime: Arc::new(Mutex::new(None)),
             audio_watch_task: Mutex::new(None),
@@ -4194,6 +4451,37 @@ impl ZoneResourceRuntime {
         Ok(())
     }
 
+    async fn provider_generation_for_runner(
+        &self,
+        provider_ref: &ResourceRef,
+    ) -> Result<ResourceGeneration, ResourceRuntimeError> {
+        let resource = self
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "shared-provider-runner-provider".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "shared-provider-runner-provider".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: provider_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::MetadataOnly,
+            })
+            .await
+            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        if resource.resource_ref != *provider_ref
+            || resource.resource_ref.resource_type().as_str() != "Provider"
+            || resource.generation.get() == 0
+            || resource.revision.get() == 0
+        {
+            return Err(ResourceRuntimeError::HandlerNotReady);
+        }
+        Ok(resource.generation)
+    }
+
     async fn start_core_controller_runners(&self) -> Result<(), ResourceRuntimeError> {
         let _runner_guard = self.core_runner_lock.lock().await;
         #[cfg(test)]
@@ -4402,7 +4690,7 @@ impl ZoneResourceRuntime {
         let system_core_descriptor = system_core_resource_descriptor(system_core_identity)?;
         let system_core_subject = self
             .authorizer
-            .issue_authenticated_subject(subject_context, authorization_state.clone())
+            .issue_authenticated_subject(subject_context.clone(), authorization_state.clone())
             .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
         let system_core_api = self
             .api
@@ -4441,6 +4729,156 @@ impl ZoneResourceRuntime {
                 ),
             }
         }));
+        let mut provider_generations = BTreeMap::new();
+        for registration in U8_SHARED_PROVIDER_RUNNERS {
+            let provider_ref = ResourceRef::parse(registration.provider_ref)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            if provider_generations.contains_key(&provider_ref) {
+                continue;
+            }
+            match self.provider_generation_for_runner(&provider_ref).await {
+                Ok(generation) => {
+                    provider_generations.insert(provider_ref, generation);
+                }
+                Err(ResourceRuntimeError::HandlerNotReady) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let provider_registrations = U8_SHARED_PROVIDER_RUNNERS
+            .into_iter()
+            .filter(|registration| {
+                ResourceRef::parse(registration.provider_ref)
+                    .ok()
+                    .is_some_and(|provider_ref| provider_generations.contains_key(&provider_ref))
+            })
+            .collect::<Vec<_>>();
+        let provider_descriptors = compose_shared_provider_runner_descriptors(
+            provider_registrations,
+            self.zone.clone(),
+            controller_generation,
+            &provider_generations,
+            subject_context.reconnect_generation(),
+        )?;
+        for (registration, descriptor) in provider_descriptors {
+            let subject = self
+                .authorizer
+                .issue_authenticated_subject(subject_context.clone(), authorization_state.clone())
+                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+            let resource_type = registration.resource_type.to_owned();
+            let authority = CoreAssignmentAuthority {
+                provider_generation: *provider_generations
+                    .get(
+                        &ResourceRef::parse(registration.provider_ref)
+                            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                    )
+                    .ok_or(ResourceRuntimeError::HandlerNotReady)?,
+                controller_generation,
+                session_generation: subject_context.reconnect_generation(),
+                controller_role: descriptor.identity().controller_ref().clone(),
+                target: ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                epoch: self.core_assignment_epoch.load(Ordering::Acquire),
+            };
+            if authority.epoch == 0 {
+                return Err(ResourceRuntimeError::HandlerNotReady);
+            }
+            let resolver_store = Arc::clone(&self.store);
+            let resolver_zone = self.zone.clone();
+            let resolver_authority = Arc::new(authority);
+            let resolver_resource_type = resource_type.clone();
+            let resolver: AssignmentFenceResolver = Arc::new(move |target, uid, revision| {
+                let store = Arc::clone(&resolver_store);
+                let zone = resolver_zone.clone();
+                let authority = Arc::clone(&resolver_authority);
+                let resource_type = resolver_resource_type.clone();
+                Box::pin(async move {
+                    if target.resource_type().as_str() != resource_type {
+                        return Err(SourceError::Integrity);
+                    }
+                    if let Some(stored) = store
+                        .assignment_fence(zone, target.clone())
+                        .await
+                        .map_err(|error| match error.kind() {
+                            StoreErrorKind::Backpressure
+                            | StoreErrorKind::StoreBackpressure => SourceError::Backpressure,
+                            StoreErrorKind::Timeout => SourceError::Timeout,
+                            _ => SourceError::Unavailable,
+                        })?
+                    {
+                        if stored.resource_uid != uid
+                            || stored.epoch > authority.epoch
+                            || (stored.epoch == authority.epoch
+                                && (stored.provider_generation != authority.provider_generation
+                                    || stored.controller_generation
+                                        != authority.controller_generation
+                                    || stored.controller_role != authority.controller_role
+                                    || stored.target != authority.target
+                                    || stored.session_generation != authority.session_generation))
+                        {
+                            return Err(SourceError::Integrity);
+                        }
+                        if stored.epoch == authority.epoch
+                            && stored.resource_revision != revision
+                        {
+                            return Err(SourceError::Conflict(stored.resource_revision));
+                        }
+                    }
+                    Ok(ResourceAssignmentFence {
+                        resource_uid: uid,
+                        resource_revision: revision,
+                        provider_generation: authority.provider_generation,
+                        controller_generation: authority.controller_generation,
+                        controller_role: authority.controller_role.clone(),
+                        target: authority.target.clone(),
+                        session_generation: authority.session_generation,
+                        epoch: authority.epoch,
+                        scope: ResourceAssignmentScope::Primary,
+                    })
+                })
+            });
+            let runner_descriptor = descriptor.clone();
+            let api = self
+                .api
+                .registered_controller_api(subject, authorization_state.clone(), Vec::new())
+                .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?
+                .with_assignment_fence_resolver(resolver);
+            let runner = Runner::new(
+                CoreResourceReconciler::for_handler(descriptor, CoreHandlerKind::Provider),
+                CoreControllerSource::new(
+                    runner_descriptor.clone(),
+                    Arc::new(api),
+                ),
+                RunnerConfig {
+                    policy_revision: authorization_state.snapshot.policy_revision,
+                    api_revision: authorization_state.snapshot.api_catalog_revision,
+                    configuration_revision: authorization_state.snapshot.active_configuration_revision,
+                    deadline_tick: 5_000,
+                    max_attempts: 3,
+                },
+            );
+            let controller_ref = runner_descriptor.identity().controller_ref().clone();
+            new_tasks.push(tokio::spawn(async move {
+                match runner.run().await {
+                    Ok(report) => {
+                        tracing::debug!(
+                            controller = %controller_ref,
+                            resource_type,
+                            dispatched = report.dispatched,
+                            relists = report.relists,
+                            "Shared Provider resource runner stopped",
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            controller = %controller_ref,
+                            resource_type,
+                            error = %error,
+                            "Shared Provider resource runner isolated failure",
+                        );
+                    }
+                }
+            }));
+        }
         self.core_runner_tasks
             .lock()
             .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
@@ -5268,18 +5706,6 @@ impl ZoneResourceRuntime {
             .lock()
             .map(|core| core.stage())
             .map_err(|_| ResourceRuntimeError::CoreStartupFailed)
-    }
-
-    /// Whether the production Device TPM reconcile entry point is registered.
-    pub(crate) const fn device_tpm_controller_registered(&self) -> bool {
-        self.device_tpm_controller.is_registered()
-    }
-
-    /// Borrow the registered Device TPM reconcile entry point.
-    pub(crate) const fn device_tpm_controller(
-        &self,
-    ) -> crate::tpm_effect_port::DeviceTpmControllerRegistration {
-        self.device_tpm_controller
     }
 
     /// Borrow the production Zone status projection.
@@ -8584,6 +9010,8 @@ impl ZoneResourceRuntime {
     /// is read from the authenticated Device record, while the legacy-state
     /// decision comes from the trusted Core bundle resolver; request fields
     /// cannot select either independently.
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     pub(crate) async fn tpm_device_is_admitted(
         &self,
         device_uid: &ResourceUid,
@@ -8657,6 +9085,8 @@ impl ZoneResourceRuntime {
     /// Load and validate the persisted Device record before a security-key
     /// provider constructs its one-use admission. Request fields select a
     /// candidate only; the returned values all originate from the store.
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     pub(crate) async fn security_key_device_is_admitted(
         &self,
         request: SecurityKeyDeviceAdmissionRequest<'_>,
@@ -8758,6 +9188,8 @@ impl ZoneResourceRuntime {
         }
     }
 
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     fn tpm_device_targets_vm(resource: &Value, vm_id: &str) -> bool {
         resource
             .get("metadata")
@@ -8768,6 +9200,8 @@ impl ZoneResourceRuntime {
             == Some(vm_id)
     }
 
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     fn security_key_device_matches(
         resource: &Value,
         zone: &ZoneId,
@@ -8809,6 +9243,8 @@ impl ZoneResourceRuntime {
             == Some(selector_id)
     }
 
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     fn tpm_migration_decision(
         vm_id: &str,
         intent: &str,
@@ -13183,7 +13619,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(runtime.zone(), &zone);
-        assert!(runtime.device_tpm_controller_registered());
         assert!(runtime.readiness().store_ready);
         assert!(!runtime.readiness().resource_api_ready);
         assert!(!runtime.readiness().local_session_ready);
