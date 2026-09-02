@@ -7,6 +7,7 @@ use d2b_contracts_resource::v3::{
     ExecutionDomain, NixosGenerationSpec, ResourceName, ResourcePhase, ResourceRef,
     process::{EphemeralProcessSpec, ExecutionSpec, NamespaceClass, ProcessClass, SandboxSpec},
 };
+use ring::signature;
 use sha2::{Digest, Sha256};
 
 /// The target-local Process template used for activation effects.
@@ -306,6 +307,224 @@ impl core::fmt::Display for ActivationError {
 
 impl std::error::Error for ActivationError {}
 
+/// Closed trust state used by activation/application verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustStatus {
+    /// The trust state was explicitly cleared.
+    Clear,
+    /// The artifact or key was denied or revoked.
+    Denied,
+    /// The trust state could not be established.
+    Unknown,
+}
+
+/// Redacted trust evidence bound to one activation request.
+///
+/// Signature and key bytes are retained only for the verification call and
+/// are never rendered by `Debug` or copied into a resource projection.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ActivationTrust {
+    trust_epoch: u64,
+    revocation_ref: Option<String>,
+    revocation_status: TrustStatus,
+    deny_status: TrustStatus,
+    publisher_root: String,
+    signature_id: String,
+    public_key: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+impl core::fmt::Debug for ActivationTrust {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ActivationTrust")
+            .field("trust_epoch", &self.trust_epoch)
+            .field("has_revocation_ref", &self.revocation_ref.is_some())
+            .field("revocation_status", &self.revocation_status)
+            .field("deny_status", &self.deny_status)
+            .field("has_publisher_root", &!self.publisher_root.is_empty())
+            .field("has_signature_id", &!self.signature_id.is_empty())
+            .field("public_key_bytes", &self.public_key.len())
+            .field("signature_bytes", &self.signature.len())
+            .finish()
+    }
+}
+
+/// Expected trust and integrity facts for one activation/application.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ActivationTrustExpectation {
+    trust_epoch: u64,
+    revocation_ref: Option<String>,
+    publisher_root: String,
+    signature_id: String,
+    artifact_digest: String,
+    artifact_catalog_digest: String,
+    signed_payload: Vec<u8>,
+}
+
+impl core::fmt::Debug for ActivationTrustExpectation {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ActivationTrustExpectation")
+            .field("trust_epoch", &self.trust_epoch)
+            .field("has_revocation_ref", &self.revocation_ref.is_some())
+            .field("has_publisher_root", &!self.publisher_root.is_empty())
+            .field("has_signature_id", &!self.signature_id.is_empty())
+            .field("has_artifact_digest", &!self.artifact_digest.is_empty())
+            .field(
+                "has_artifact_catalog_digest",
+                &!self.artifact_catalog_digest.is_empty(),
+            )
+            .field("signed_payload_bytes", &self.signed_payload.len())
+            .finish()
+    }
+}
+
+/// Fail-closed activation/application verification failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationVerificationError {
+    /// The trust epoch was absent or mismatched.
+    TrustEpochMismatch,
+    /// The revocation reference was absent or mismatched.
+    RevocationRefMismatch,
+    /// Revocation or deny status was not explicitly clear.
+    TrustDenied,
+    /// The publisher root was absent or mismatched.
+    PublisherRootMismatch,
+    /// The signature identifier was absent or mismatched.
+    SignatureIdMismatch,
+    /// The Ed25519 signature did not verify.
+    SignatureInvalid,
+    /// The artifact bytes did not match the expected digest.
+    ArtifactDigestMismatch,
+    /// The activation-time catalog digest did not match.
+    ArtifactCatalogDigestMismatch,
+    /// A required verification token was malformed.
+    InvalidEvidence,
+}
+
+impl core::fmt::Display for ActivationVerificationError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::TrustEpochMismatch => "activation-trust-epoch-mismatch",
+            Self::RevocationRefMismatch => "activation-revocation-ref-mismatch",
+            Self::TrustDenied => "activation-trust-denied",
+            Self::PublisherRootMismatch => "activation-publisher-root-mismatch",
+            Self::SignatureIdMismatch => "activation-signature-id-mismatch",
+            Self::SignatureInvalid => "activation-signature-invalid",
+            Self::ArtifactDigestMismatch => "activation-artifact-digest-mismatch",
+            Self::ArtifactCatalogDigestMismatch => "activation-artifact-catalog-digest-mismatch",
+            Self::InvalidEvidence => "activation-trust-evidence-invalid",
+        })
+    }
+}
+
+impl std::error::Error for ActivationVerificationError {}
+
+impl ActivationTrust {
+    /// Construct trust evidence for one activation request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        trust_epoch: u64,
+        revocation_ref: Option<String>,
+        revocation_status: TrustStatus,
+        deny_status: TrustStatus,
+        publisher_root: impl Into<String>,
+        signature_id: impl Into<String>,
+        public_key: impl Into<Vec<u8>>,
+        signature: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            trust_epoch,
+            revocation_ref,
+            revocation_status,
+            deny_status,
+            publisher_root: publisher_root.into(),
+            signature_id: signature_id.into(),
+            public_key: public_key.into(),
+            signature: signature.into(),
+        }
+    }
+
+    /// Verify all trust, Ed25519, artifact, and activation-catalog fences.
+    pub fn verify(
+        &self,
+        expected: &ActivationTrustExpectation,
+        artifact_bytes: &[u8],
+        activation_catalog_digest: &str,
+    ) -> Result<(), ActivationVerificationError> {
+        if self.trust_epoch == 0 || self.trust_epoch != expected.trust_epoch {
+            return Err(ActivationVerificationError::TrustEpochMismatch);
+        }
+        if self.revocation_ref != expected.revocation_ref {
+            return Err(ActivationVerificationError::RevocationRefMismatch);
+        }
+        if self.revocation_status != TrustStatus::Clear || self.deny_status != TrustStatus::Clear {
+            return Err(ActivationVerificationError::TrustDenied);
+        }
+        if self.publisher_root.is_empty() || self.publisher_root != expected.publisher_root {
+            return Err(ActivationVerificationError::PublisherRootMismatch);
+        }
+        if self.signature_id.is_empty() || self.signature_id != expected.signature_id {
+            return Err(ActivationVerificationError::SignatureIdMismatch);
+        }
+        if !is_sha256_digest(&expected.artifact_digest)
+            || !is_sha256_digest(&expected.artifact_catalog_digest)
+            || activation_catalog_digest != expected.artifact_catalog_digest
+        {
+            return Err(ActivationVerificationError::ArtifactCatalogDigestMismatch);
+        }
+        let actual_artifact_digest = sha256_digest(artifact_bytes);
+        if actual_artifact_digest != expected.artifact_digest {
+            return Err(ActivationVerificationError::ArtifactDigestMismatch);
+        }
+        if self.public_key.len() != 32 || self.signature.len() != 64 {
+            return Err(ActivationVerificationError::InvalidEvidence);
+        }
+        signature::UnparsedPublicKey::new(&signature::ED25519, &self.public_key)
+            .verify(&expected.signed_payload, &self.signature)
+            .map_err(|_| ActivationVerificationError::SignatureInvalid)
+    }
+}
+
+impl ActivationTrustExpectation {
+    /// Construct expected trust and integrity facts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        trust_epoch: u64,
+        revocation_ref: Option<String>,
+        publisher_root: impl Into<String>,
+        signature_id: impl Into<String>,
+        artifact_digest: impl Into<String>,
+        artifact_catalog_digest: impl Into<String>,
+        signed_payload: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            trust_epoch,
+            revocation_ref,
+            publisher_root: publisher_root.into(),
+            signature_id: signature_id.into(),
+            artifact_digest: artifact_digest.into(),
+            artifact_catalog_digest: artifact_catalog_digest.into(),
+            signed_payload: signed_payload.into(),
+        }
+    }
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
 /// Result of one activation reconcile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerResult {
@@ -368,6 +587,17 @@ impl ActivationController {
         Self {
             retained_generations,
         }
+    }
+
+    /// Gate activation/application on the complete signed artifact envelope.
+    pub fn verify_application(
+        &self,
+        trust: &ActivationTrust,
+        expected: &ActivationTrustExpectation,
+        artifact_bytes: &[u8],
+        activation_catalog_digest: &str,
+    ) -> Result<(), ActivationVerificationError> {
+        trust.verify(expected, artifact_bytes, activation_catalog_digest)
     }
 
     /// Reconcile one desired generation.

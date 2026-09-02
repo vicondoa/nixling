@@ -1143,6 +1143,7 @@ dependencies = [
  "d2b-contracts-broker",
  "d2b-contracts-resource",
  "d2b-contracts-zone-session",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -1345,6 +1346,7 @@ dependencies = [
  "rustix 0.38.44",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

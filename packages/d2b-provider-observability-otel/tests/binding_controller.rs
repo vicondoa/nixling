@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use d2b_contracts_resource::v3::ResourceRef;
 use d2b_provider_observability_otel::{
     IdentityCanaries, Ingress, IngressOutcome, MetricFrame, MetricPoint,
-    TelemetryBindingController, TelemetryBindingPhase,
+    TelemetryBindingController, TelemetryBindingPhase, TelemetryComponentSession,
+    TelemetryControllerError, TelemetryServiceController, TelemetryServicePhase,
+    TelemetryServiceRole, TelemetryStreamRequest, TelemetryStreamSignal,
 };
 
 fn refs() -> (ResourceRef, ResourceRef, ResourceRef) {
@@ -93,4 +95,60 @@ fn finalization_blocks_reconcile_and_service_alone_cannot_create_children() {
             .is_err()
     );
     assert!(TelemetryBindingController::child_resources(&service, &service, &target).is_err());
+}
+
+#[test]
+fn service_resource_reconciliation_is_separate_from_stream_admission() {
+    let (binding, service, _target) = refs();
+    let provider = ResourceRef::parse("Provider/observability-otel").unwrap();
+    let endpoint = ResourceRef::parse("Endpoint/ingest").unwrap();
+    let mut service_controller = TelemetryServiceController::new();
+    let status = service_controller
+        .reconcile(
+            &service,
+            &provider,
+            TelemetryServiceRole::Authority,
+            &[endpoint],
+            true,
+            true,
+        )
+        .unwrap();
+    assert_eq!(status.phase, TelemetryServicePhase::Ready);
+    assert_eq!(service_controller.phase(), TelemetryServicePhase::Ready);
+
+    let session = TelemetryComponentSession;
+    let stream = session
+        .open_stream(TelemetryStreamRequest {
+            service_ref: service,
+            binding_ref: binding,
+            signal: TelemetryStreamSignal::Metrics,
+        })
+        .unwrap();
+    assert_eq!(stream.request().signal, TelemetryStreamSignal::Metrics);
+    assert_eq!(
+        TelemetryComponentSession::resource_mutation_forbidden(),
+        TelemetryControllerError::StreamOnly
+    );
+}
+
+#[test]
+fn service_authority_and_stream_target_mismatches_fail_closed() {
+    let mut controller = TelemetryServiceController::new();
+    let result = controller.reconcile(
+        &ResourceRef::parse("telemetry.d2bus.org.TelemetryBinding/incorrect").unwrap(),
+        &ResourceRef::parse("Provider/observability-otel").unwrap(),
+        TelemetryServiceRole::Authority,
+        &[ResourceRef::parse("Endpoint/ingest").unwrap()],
+        true,
+        true,
+    );
+    assert!(result.is_err());
+
+    let session = TelemetryComponentSession;
+    let result = session.open_stream(TelemetryStreamRequest {
+        service_ref: ResourceRef::parse("telemetry.d2bus.org.TelemetryService/ingest").unwrap(),
+        binding_ref: ResourceRef::parse("Process/not-a-binding").unwrap(),
+        signal: TelemetryStreamSignal::Logs,
+    });
+    assert_eq!(result, Err(TelemetryControllerError::Admission));
 }

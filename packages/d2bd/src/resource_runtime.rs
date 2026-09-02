@@ -22,9 +22,7 @@ use std::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::activation_resource_runtime::{
-    ActivationResourceRuntime, ActivationResourceRuntimeError, GuestActivationResourceClient,
-    activation_watch_request, list_activation_snapshot, run_activation_watch,
-    stored_resource_from_wire,
+    activation_controller_descriptor, ActivationResourceReconciler, stored_resource_from_wire,
 };
 use crate::audio_resource_runtime::{
     AUDIO_BINDING_TYPE, AudioBindingRuntimeStatus, AudioResourceRuntime, AudioResourceRuntimeError,
@@ -38,8 +36,8 @@ use crate::process_resource_runtime::{
     list_process_snapshot, process_watch_request, run_process_watch,
 };
 use crate::semantic_binding_resource_runtime::{
-    reconcile_semantic_binding_resources, run_semantic_binding_watch,
-    semantic_binding_watch_request,
+    reconcile_semantic_binding_resources, run_device_binding_watch, device_binding_watch_request,
+    telemetry_controller_descriptor, TelemetryResourceReconciler,
 };
 use async_trait::async_trait;
 use d2b_audit::{AuditSink, DurabilityEvidence};
@@ -58,7 +56,7 @@ use d2b_contracts_resource::v3::identity::{
     AuthenticatedSubjectContext, BindingDigest, EvidenceClass, ReconnectGeneration,
 };
 use d2b_contracts_resource::v3::{
-    CanonicalJsonValue, ControllerGeneration, DesiredLifecycle, NixosGenerationSpec,
+    CanonicalJsonValue, ControllerGeneration, DesiredLifecycle,
     PlacementTargetKind, ResourceBundleGenerationId, ResourceEnvelope, ResourceGeneration,
     ResourceName, ResourcePhase, ResourceRef, ResourceTypeName, ResourceUid, ZoneId, ZoneRevision,
     process::ProcessSpec,
@@ -2127,6 +2125,8 @@ pub struct ZoneResourceRuntime {
     core_controller_subject: Mutex<Option<AuthenticatedSubjectContext>>,
     core_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     core_runner_lock: Arc<tokio::sync::Mutex<()>>,
+    u12_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    u12_runner_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     core_runner_events: Arc<Mutex<Vec<&'static str>>>,
     core: Mutex<CoreProcess>,
@@ -2143,7 +2143,7 @@ pub struct ZoneResourceRuntime {
     zone_status: Mutex<ZoneStatusResource>,
     audio_runtime: Arc<Mutex<Option<AudioResourceRuntime>>>,
     audio_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    semantic_binding_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    device_binding_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     process_runtime: Arc<Mutex<Option<ProcessResourceRuntime>>>,
     process_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     guest_setup_descriptors: BTreeMap<String, Vec<u8>>,
@@ -2155,8 +2155,6 @@ pub struct ZoneResourceRuntime {
     controller_session_lock: Arc<tokio::sync::Mutex<()>>,
     controller_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
     cloud_hypervisor_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
-    activation_runtime: Arc<Mutex<Option<ActivationResourceRuntime>>>,
-    activation_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     interaction_provider_configuration: Option<CommittedInteractionProviderConfiguration>,
     interaction_identity: Option<CommittedInteractionIdentity>,
     interaction_provider_configuration_refused: bool,
@@ -2890,6 +2888,8 @@ impl ZoneResourceRuntime {
             core_controller_subject: Mutex::new(core_controller_subject),
             core_runner_tasks: Mutex::new(Vec::new()),
             core_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
+            u12_runner_tasks: Mutex::new(Vec::new()),
+            u12_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             core_runner_events: Arc::new(Mutex::new(Vec::new())),
             core: Mutex::new(core),
@@ -2913,7 +2913,7 @@ impl ZoneResourceRuntime {
             zone_status: Mutex::new(zone_status),
             audio_runtime: Arc::new(Mutex::new(None)),
             audio_watch_task: Mutex::new(None),
-            semantic_binding_watch_task: Mutex::new(None),
+            device_binding_watch_task: Mutex::new(None),
             process_runtime: Arc::new(Mutex::new(None)),
             process_watch_task: Mutex::new(None),
             guest_setup_descriptors: BTreeMap::new(),
@@ -2929,8 +2929,6 @@ impl ZoneResourceRuntime {
             controller_session_lock: Arc::new(tokio::sync::Mutex::new(())),
             controller_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             cloud_hypervisor_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
-            activation_runtime: Arc::new(Mutex::new(None)),
-            activation_watch_task: Mutex::new(None),
             interaction_provider_configuration,
             interaction_identity,
             interaction_provider_configuration_refused,
@@ -4304,6 +4302,356 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
             .extend(new_tasks);
         Ok(())
+    }
+
+    /// Attach the observability and activation handlers to the same Core
+    /// source/Runner path used by every resource owner.
+    pub(crate) async fn start_u12_controller_runners(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        let _runner_guard = self.u12_runner_lock.lock().await;
+        if !self.readiness.resource_api_ready {
+            return Ok(());
+        }
+        {
+            let tasks = self
+                .u12_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            if tasks.iter().any(|task| !task.is_finished()) {
+                return Ok(());
+            }
+        }
+        let stale = {
+            let mut tasks = self
+                .u12_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in stale {
+            let _ = task.await;
+        }
+
+        let subject_context = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let authorization_state = self
+            .authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let controller_generation = self
+            .store_metadata
+            .policy_snapshot
+            .controller_generation
+            .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+        let session_generation = subject_context.reconnect_generation();
+        let status_client = self.status_client()?;
+        let mut new_tasks = Vec::new();
+
+        enum U12ControllerKind {
+            Telemetry,
+            Activation,
+        }
+        let providers = [
+            (
+                "observability-otel",
+                ResourceRef::parse("Process/observability-otel-controller")
+                    .expect("observability controller ref"),
+                U12ControllerKind::Telemetry,
+            ),
+            (
+                "activation-nixos",
+                ResourceRef::parse("Process/activation-nixos-controller")
+                    .expect("activation controller ref"),
+                U12ControllerKind::Activation,
+            ),
+        ];
+
+        for (provider_name, controller_ref, kind) in providers {
+            let provider_ref =
+                ResourceRef::parse(&format!("Provider/{provider_name}"))
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let provider = match self
+                .store
+                .get(StoreGetRequest {
+                    operation: StoreOperationContext {
+                        operation_id: format!("u12-provider-{provider_name}"),
+                        idempotency_key: None,
+                        correlation_id: format!("u12-provider-{provider_name}"),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: self.zone.clone(),
+                    target: provider_ref.clone(),
+                    expected_uid: None,
+                    projection: StoreProjection::MetadataOnly,
+                })
+                .await
+            {
+                Ok(provider) => provider,
+                Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => continue,
+                Err(_) => return Err(ResourceRuntimeError::StoreReadFailed),
+            };
+            if provider.zone != self.zone
+                || provider.resource_ref != provider_ref
+                || provider.generation.get() == 0
+            {
+                return Err(ResourceRuntimeError::HandlerNotReady);
+            }
+            let identity = ControllerIdentity::new(
+                self.zone.clone(),
+                controller_ref.clone(),
+                controller_generation,
+                provider_ref.clone(),
+                provider.generation,
+                controller_ref.clone(),
+                ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                None,
+            )
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let descriptor = match kind {
+                U12ControllerKind::Telemetry => telemetry_controller_descriptor(identity.clone())
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                U12ControllerKind::Activation => activation_controller_descriptor(identity.clone())
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+            };
+            let (assignments, authority) = self
+                .u12_controller_assignments(
+                    &descriptor,
+                    controller_ref.clone(),
+                    provider.generation,
+                    controller_generation,
+                    session_generation,
+                )
+                .await?;
+            let subject = self
+                .authorizer
+                .issue_authenticated_subject(subject_context.clone(), authorization_state.clone())
+                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+            let api = self
+                .api
+                .registered_controller_api(
+                    subject,
+                    authorization_state.clone(),
+                    assignments,
+                )
+                .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
+            let allowed_types = descriptor.resource_types().cloned().collect::<BTreeSet<_>>();
+            let resolver_store = Arc::clone(&self.store);
+            let resolver_zone = self.zone.clone();
+            let resolver_authority = Arc::clone(&authority);
+            let resolver: AssignmentFenceResolver = Arc::new(move |target, uid, revision| {
+                let store = Arc::clone(&resolver_store);
+                let zone = resolver_zone.clone();
+                let authority = Arc::clone(&resolver_authority);
+                let allowed_types = allowed_types.clone();
+                Box::pin(async move {
+                    if !allowed_types.contains(target.resource_type()) {
+                        return Err(SourceError::Integrity);
+                    }
+                    if let Some(stored) = store
+                        .assignment_fence(zone.clone(), target.clone())
+                        .await
+                        .map_err(|error| match error.kind() {
+                            StoreErrorKind::Backpressure
+                            | StoreErrorKind::StoreBackpressure => SourceError::Backpressure,
+                            StoreErrorKind::Timeout => SourceError::Timeout,
+                            _ => SourceError::Unavailable,
+                        })?
+                    {
+                        if stored.resource_uid != uid
+                            || stored.epoch > authority.epoch
+                            || (stored.epoch == authority.epoch
+                                && (stored.provider_generation != authority.provider_generation
+                                    || stored.controller_generation
+                                        != authority.controller_generation
+                                    || stored.controller_role != authority.controller_role
+                                    || stored.target != authority.target
+                                    || stored.session_generation != authority.session_generation))
+                        {
+                            return Err(SourceError::Integrity);
+                        }
+                        if stored.epoch == authority.epoch
+                            && stored.resource_revision != revision
+                        {
+                            return Err(SourceError::Conflict(stored.resource_revision));
+                        }
+                    }
+                    Ok(ResourceAssignmentFence {
+                        resource_uid: uid,
+                        resource_revision: revision,
+                        provider_generation: authority.provider_generation,
+                        controller_generation: authority.controller_generation,
+                        controller_role: authority.controller_role.clone(),
+                        target: authority.target.clone(),
+                        session_generation: authority.session_generation,
+                        epoch: authority.epoch,
+                        scope: ResourceAssignmentScope::Primary,
+                    })
+                })
+            });
+            let api = api.with_assignment_fence_resolver(resolver);
+            let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+            let task = if matches!(kind, U12ControllerKind::Telemetry) {
+                let reconciler = Arc::new(TelemetryResourceReconciler::new(
+                    Arc::clone(&self.store),
+                    Arc::clone(&status_client),
+                    identity,
+                ));
+                let runner = Runner::new(
+                    reconciler,
+                    source,
+                    RunnerConfig {
+                        policy_revision: authorization_state.snapshot.policy_revision,
+                        api_revision: authorization_state.snapshot.api_catalog_revision,
+                        configuration_revision: authorization_state
+                            .snapshot
+                            .active_configuration_revision,
+                        deadline_tick: 5_000,
+                        max_attempts: 3,
+                    },
+                );
+                tokio::spawn(async move {
+                    let _ = runner.run().await;
+                })
+            } else {
+                let reconciler = Arc::new(ActivationResourceReconciler::new(
+                    Arc::clone(&self.store),
+                    Arc::clone(&status_client),
+                    Arc::clone(&state),
+                    identity,
+                ));
+                let runner = Runner::new(
+                    reconciler,
+                    source,
+                    RunnerConfig {
+                        policy_revision: authorization_state.snapshot.policy_revision,
+                        api_revision: authorization_state.snapshot.api_catalog_revision,
+                        configuration_revision: authorization_state
+                            .snapshot
+                            .active_configuration_revision,
+                        deadline_tick: 5_000,
+                        max_attempts: 3,
+                    },
+                );
+                tokio::spawn(async move {
+                    let _ = runner.run().await;
+                })
+            };
+            new_tasks.push(task);
+        }
+        self.u12_runner_tasks
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
+            .extend(new_tasks);
+        Ok(())
+    }
+
+    async fn u12_controller_assignments(
+        &self,
+        descriptor: &d2b_core_controller::ControllerDescriptor,
+        controller_ref: ResourceRef,
+        provider_generation: ResourceGeneration,
+        controller_generation: ControllerGeneration,
+        session_generation: ReconnectGeneration,
+    ) -> Result<
+        (
+            Vec<(ResourceRef, ResourceAssignmentFence)>,
+            Arc<CoreAssignmentAuthority>,
+        ),
+        ResourceRuntimeError,
+    > {
+        let resource_types = descriptor.resource_types().cloned().collect::<Vec<_>>();
+        let mut resources = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .store
+                .list(StoreListRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "u12-controller-assignment-relist".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "u12-controller-assignment-relist".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: self.zone.clone(),
+                    resource_types: resource_types.clone(),
+                    resource_names: Vec::new(),
+                    filters: Vec::new(),
+                    page_size: 256,
+                    cursor,
+                    projection: StoreProjection::MetadataOnly,
+                })
+                .await
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+            resources.extend(page.resources);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let target = ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let mut durable_epoch = 0;
+        for resource in &resources {
+            if let Some(fence) = self
+                .store
+                .assignment_fence(self.zone.clone(), resource.resource_ref.clone())
+                .await
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?
+            {
+                durable_epoch = durable_epoch.max(fence.epoch);
+            }
+        }
+        let epoch = self
+            .core_assignment_epoch
+            .load(Ordering::Acquire)
+            .max(durable_epoch)
+            .max(1);
+        let authority = Arc::new(CoreAssignmentAuthority {
+            provider_generation,
+            controller_generation,
+            session_generation,
+            controller_role: controller_ref.clone(),
+            target: target.clone(),
+            epoch,
+        });
+        let assignments = resources
+            .into_iter()
+            .filter(|resource| {
+                resource
+                    .resource_ref
+                    .resource_type()
+                    .to_canonical_string()
+                    != "Provider"
+            })
+            .map(|resource| {
+                (
+                    resource.resource_ref,
+                    ResourceAssignmentFence {
+                        resource_uid: resource.uid,
+                        resource_revision: resource.revision,
+                        provider_generation,
+                        controller_generation,
+                        controller_role: controller_ref.clone(),
+                        target: target.clone(),
+                        session_generation,
+                        epoch,
+                        scope: ResourceAssignmentScope::Primary,
+                    },
+                )
+            })
+            .collect();
+        Ok((assignments, authority))
     }
 
     #[cfg(test)]
@@ -5906,22 +6254,22 @@ impl ZoneResourceRuntime {
             })?;
         let start_watch = {
             let mut watch_task = self
-                .semantic_binding_watch_task
+                .device_binding_watch_task
                 .lock()
                 .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
             watch_needs_restart(&mut watch_task)
         };
         if start_watch {
             let watch = d2b_resource_api::watch::WatchService::new(Arc::clone(&self.store))
-                .open(semantic_binding_watch_request(&self.zone))
+                .open(device_binding_watch_request(&self.zone))
                 .await
                 .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
             let store = Arc::clone(&self.store);
             let zone = self.zone.clone();
             let client = client.clone();
-            let task = tokio::spawn(run_semantic_binding_watch(watch, store, zone, client));
+            let task = tokio::spawn(run_device_binding_watch(watch, store, zone, client));
             let mut watch_task = self
-                .semantic_binding_watch_task
+                .device_binding_watch_task
                 .lock()
                 .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
             if watch_task.is_none() {
@@ -7455,96 +7803,6 @@ impl ZoneResourceRuntime {
         Ok(())
     }
 
-    /// Relist and reconcile durable NixOS generation resources owned by this
-    /// Zone. Activation effects remain behind the typed broker or the
-    /// authenticated Guest ComponentSession route.
-    pub(crate) async fn reconcile_activation_resources(
-        &self,
-        state: Arc<crate::ServerState>,
-    ) -> Result<(), ResourceRuntimeError> {
-        if !self.readiness.resource_api_ready {
-            return Ok(());
-        }
-        let snapshot = list_activation_snapshot(&self.store, &self.zone)
-            .await
-            .map_err(map_activation_runtime_error)?;
-        let process_snapshot =
-            crate::process_resource_runtime::list_process_snapshot(&self.store, &self.zone)
-                .await
-                .map_err(map_process_runtime_error)?;
-        let runtime = match self.activation_runtime.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => return Err(ResourceRuntimeError::CapabilityUnavailable),
-        };
-        let mut runtime =
-            runtime.unwrap_or_else(|| ActivationResourceRuntime::new(self.zone.clone()));
-        runtime.clear_guest_clients();
-        if let Some(status_client) = self.process_resource_client() {
-            runtime.set_status_client(status_client);
-        }
-        let guest_targets = guest_activation_targets(&snapshot);
-        let mut process_snapshot = process_snapshot;
-        for guest in guest_targets {
-            let Ok(target) = crate::resolve_committed_guest_session_target(self, &guest).await
-            else {
-                continue;
-            };
-            let Ok(session) =
-                crate::connect_guest_component_session_for_guest(&state, &target).await
-            else {
-                continue;
-            };
-            match list_guest_process_snapshot(&session, &self.zone, &guest).await {
-                Ok(resources) => {
-                    runtime.set_guest_client(
-                        guest.clone(),
-                        Arc::new(GuestActivationResourceClient::new(Arc::clone(&session))),
-                    );
-                    process_snapshot.extend(resources);
-                }
-                Err(()) => {
-                    crate::invalidate_guest_component_session_for_guest(&state, &target).await;
-                }
-            }
-        }
-        let result = runtime
-            .reconcile(Arc::clone(&state), snapshot, process_snapshot)
-            .await;
-        match self.activation_runtime.lock() {
-            Ok(mut guard) => *guard = Some(runtime),
-            Err(_) => return Err(ResourceRuntimeError::CapabilityUnavailable),
-        }
-        result.map_err(map_activation_runtime_error)?;
-        let start_watch = {
-            let mut watch_task = self
-                .activation_watch_task
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            watch_needs_restart(&mut watch_task)
-        };
-        if start_watch {
-            let watch = d2b_resource_api::watch::WatchService::new(Arc::clone(&self.store))
-                .open(activation_watch_request(&self.zone))
-                .await
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            let store = Arc::clone(&self.store);
-            let zone = self.zone.clone();
-            let state = state.clone();
-            let registry = Arc::clone(&self.activation_runtime);
-            let task = tokio::spawn(run_activation_watch(watch, store, zone, state, registry));
-            let mut watch_task = self
-                .activation_watch_task
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            if watch_task.is_none() {
-                *watch_task = Some(task);
-            } else {
-                task.abort();
-            }
-        }
-        Ok(())
-    }
-
     /// Return the current daemon-owned AudioBinding projections.
     pub(crate) fn audio_binding_statuses(
         &self,
@@ -8273,15 +8531,14 @@ impl ZoneResourceRuntime {
             authority_recovery,
             process_status_client,
             core_runner_tasks,
+            u12_runner_tasks,
             audio_watch_task,
             audio_runtime,
-            semantic_binding_watch_task,
+            device_binding_watch_task,
             process_watch_task,
             process_runtime,
             controller_sessions,
             controller_session_reconcile_task,
-            activation_watch_task,
-            activation_runtime,
             assignments,
             ..
         } = self;
@@ -8299,6 +8556,13 @@ impl ZoneResourceRuntime {
             task.abort();
             let _ = task.await;
         }
+        let u12_runner_tasks = u12_runner_tasks
+            .into_inner()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        for task in u12_runner_tasks {
+            task.abort();
+            let _ = task.await;
+        }
         if let Some(task) = audio_watch_task
             .into_inner()
             .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
@@ -8307,7 +8571,7 @@ impl ZoneResourceRuntime {
             let _ = task.await;
         }
         drop(audio_runtime);
-        if let Some(task) = semantic_binding_watch_task
+        if let Some(task) = device_binding_watch_task
             .into_inner()
             .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
         {
@@ -8361,14 +8625,6 @@ impl ZoneResourceRuntime {
                 let _ = registrar.revoke_in_place(&mut ingress).await;
             }
         }
-        if let Some(task) = activation_watch_task
-            .into_inner()
-            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
-        {
-            task.abort();
-            let _ = task.await;
-        }
-        drop(activation_runtime);
         drop(process_status_client);
         drop(
             ingress
@@ -9708,90 +9964,6 @@ fn map_process_runtime_error(error: ProcessResourceRuntimeError) -> ResourceRunt
         | ProcessResourceRuntimeError::InvalidResource => {
             ResourceRuntimeError::CapabilityUnavailable
         }
-    }
-}
-
-pub(crate) fn guest_activation_targets(resources: &[StoredResource]) -> BTreeSet<ResourceRef> {
-    resources
-        .iter()
-        .filter(|resource| {
-            resource.resource_ref.resource_type().as_str()
-                == d2b_contracts_resource::v3::activation_nixos::NIXOS_GENERATION_RESOURCE_TYPE
-        })
-        .filter_map(|resource| {
-            let envelope = ResourceEnvelope::from_json(&resource.canonical_json).ok()?;
-            let spec = serde_json::from_slice::<NixosGenerationSpec>(
-                &envelope.spec().base().to_canonical_bytes(),
-            )
-            .ok()?;
-            (spec.execution_ref().resource_type().as_str() == "Guest")
-                .then(|| spec.execution_ref().clone())
-        })
-        .collect()
-}
-
-pub(crate) async fn list_guest_process_snapshot(
-    session: &d2bd_runtime::guest_component_session::GuestComponentSessionClient,
-    zone: &ZoneId,
-    guest: &ResourceRef,
-) -> Result<Vec<StoredResource>, ()> {
-    let mut request = wire::ListRequest::new();
-    let mut meta = wire::RequestMeta::new();
-    meta.operation_id = "activation-guest-process-relist".to_owned();
-    meta.idempotency_key = meta.operation_id.clone();
-    meta.correlation_id = meta.operation_id.clone();
-    meta.trace_id = meta.operation_id.clone();
-    meta.deadline_ms = 10_000;
-    request.meta = protobuf::MessageField::some(meta);
-    request.resource_types = vec!["Process".to_owned(), "EphemeralProcess".to_owned()];
-    request.page_size = 256;
-    let mut projection = wire::Projection::new();
-    projection.kind = protobuf::EnumOrUnknown::new(wire::ProjectionKind::PROJECTION_KIND_FULL);
-    request.projection = protobuf::MessageField::some(projection);
-
-    let client = session.resource_service_client();
-    let mut resources = Vec::new();
-    loop {
-        let response = client
-            .list(ttrpc::context::Context::default(), &request)
-            .await
-            .map_err(|_| ())?;
-        if response.error.is_some() {
-            return Err(());
-        }
-        for resource in &response.resources {
-            let resource = stored_resource_from_wire(resource).ok_or(())?;
-            if resource.zone != *zone {
-                return Err(());
-            }
-            let envelope = ResourceEnvelope::from_json(&resource.canonical_json).map_err(|_| ())?;
-            let execution_ref = envelope
-                .spec()
-                .base()
-                .get("executionRef")
-                .and_then(|value| match value {
-                    CanonicalJsonValue::String(value) => ResourceRef::parse(value).ok(),
-                    _ => None,
-                })
-                .ok_or(())?;
-            if execution_ref != *guest {
-                return Err(());
-            }
-            resources.push(resource);
-        }
-        let Some(cursor) = response.next_cursor.as_ref().cloned() else {
-            break;
-        };
-        request.cursor = protobuf::MessageField::some(cursor);
-    }
-    Ok(resources)
-}
-
-fn map_activation_runtime_error(error: ActivationResourceRuntimeError) -> ResourceRuntimeError {
-    match error {
-        ActivationResourceRuntimeError::Store => ResourceRuntimeError::StoreReadFailed,
-        ActivationResourceRuntimeError::InvalidResource
-        | ActivationResourceRuntimeError::Policy => ResourceRuntimeError::CapabilityUnavailable,
     }
 }
 

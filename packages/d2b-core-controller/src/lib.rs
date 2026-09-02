@@ -64,12 +64,13 @@ pub use controllers::{
 };
 pub use d2b_controller_toolkit::{
     CommitDecision, CommitOutcome, ControllerDescriptor, ControllerExecutionPolicy,
-    ControllerHealth, ControllerIdentity, ControllerSource, ControllerVerb, DependencySnapshot,
-    DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot, InitialList, InitialResource,
-    MutationIntent, MutationIntentKind, ObservationResult, OperationContext, ProjectionDisposition,
-    ReconcileContext, ReconcileDisposition, ReconcilePlan, ReconcileProjection, ReconcileReason,
-    ReconcileResult, ResourceKey, ResourceMutationBatch, ResourceReconciler, ResourceRegistration,
-    ResourceSnapshot, ResyncPolicy, Runner, RunnerConfig, SourceError, StatusPersistence,
+    ControllerHealth, ControllerIdentity, ControllerSelector, ControllerSource, ControllerVerb,
+    DependencySnapshot, DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot,
+    HandlerFailure, InitialList, InitialResource, MutationIntent, MutationIntentKind,
+    ObservationResult, OperationContext, ProjectionDisposition, ReconcileContext,
+    ReconcileDisposition, ReconcilePlan, ReconcileProjection, ReconcileReason, ReconcileResult,
+    ResourceKey, ResourceMutationBatch, ResourceReconciler, ResourceRegistration, ResourceSnapshot,
+    ResyncPolicy, Runner, RunnerConfig, SelectorField, SourceError, StatusPersistence,
     UpdateAssessment, UpdateAssessmentState, UpgradePlan, UpgradeStage, ValidationResult,
     WatchEvent, WatchFailure,
 };

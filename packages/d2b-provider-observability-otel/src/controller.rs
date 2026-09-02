@@ -14,6 +14,196 @@ use crate::{
 };
 
 const TELEMETRY_PROVIDER_REF: &str = "Provider/observability-otel";
+/// Qualified semantic telemetry Service type.
+pub const TELEMETRY_SERVICE_RESOURCE_TYPE: &str = "telemetry.d2bus.org.TelemetryService";
+/// Qualified semantic telemetry Binding type.
+pub const TELEMETRY_BINDING_RESOURCE_TYPE: &str = "telemetry.d2bus.org.TelemetryBinding";
+
+/// Semantic role of a telemetry Service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryServiceRole {
+    /// One Zone-local ingest authority.
+    Authority,
+    /// Core-owned projection of a remote authority.
+    Projection,
+}
+
+/// Lifecycle phase of a telemetry Service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryServicePhase {
+    /// The Service is waiting for an ingest route.
+    Pending,
+    /// The Service has a usable ingest route.
+    Ready,
+    /// The Service is ambiguous, revoked, or unavailable.
+    Degraded,
+    /// The Service was finalized.
+    Deleted,
+}
+
+/// Bounded, provider-neutral telemetry Service status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TelemetryServiceStatus {
+    /// Current Service lifecycle phase.
+    pub phase: TelemetryServicePhase,
+    /// Number of admitted ingest endpoints.
+    pub endpoint_count: u8,
+    /// Whether the authority index is unique.
+    pub authority_unique: bool,
+}
+
+/// Stable Service-controller failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryServiceError {
+    /// The Service or Provider reference used the wrong type.
+    InvalidReference,
+    /// An authority did not have the required bounded endpoint set.
+    InvalidAuthority,
+    /// A finalized Service cannot be reconciled.
+    Finalized,
+}
+
+impl core::fmt::Display for TelemetryServiceError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidReference => "telemetry-service-reference-invalid",
+            Self::InvalidAuthority => "telemetry-service-authority-invalid",
+            Self::Finalized => "telemetry-service-finalized",
+        })
+    }
+}
+
+impl std::error::Error for TelemetryServiceError {}
+
+/// Resource-backed telemetry Service controller.
+#[derive(Debug, Default)]
+pub struct TelemetryServiceController {
+    phase: TelemetryServicePhase,
+}
+
+impl Default for TelemetryServicePhase {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+impl TelemetryServiceController {
+    /// Construct a Service controller in the pending phase.
+    pub fn new() -> Self {
+        Self {
+            phase: TelemetryServicePhase::Pending,
+        }
+    }
+
+    /// Return the current Service phase.
+    pub const fn phase(&self) -> TelemetryServicePhase {
+        self.phase
+    }
+
+    /// Reconcile one Service without opening or mutating a transport.
+    pub fn reconcile(
+        &mut self,
+        service_ref: &ResourceRef,
+        provider_ref: &ResourceRef,
+        role: TelemetryServiceRole,
+        ingest_endpoint_refs: &[ResourceRef],
+        authority_unique: bool,
+        ingest_ready: bool,
+    ) -> Result<TelemetryServiceStatus, TelemetryServiceError> {
+        if service_ref.resource_type().as_str() != TELEMETRY_SERVICE_RESOURCE_TYPE
+            || provider_ref.to_canonical_string() != TELEMETRY_PROVIDER_REF
+        {
+            return Err(TelemetryServiceError::InvalidReference);
+        }
+        if self.phase == TelemetryServicePhase::Deleted {
+            return Err(TelemetryServiceError::Finalized);
+        }
+        if matches!(role, TelemetryServiceRole::Authority)
+            && !(1..=8).contains(&ingest_endpoint_refs.len())
+        {
+            self.phase = TelemetryServicePhase::Degraded;
+            return Err(TelemetryServiceError::InvalidAuthority);
+        }
+        let endpoint_count = u8::try_from(ingest_endpoint_refs.len()).unwrap_or(u8::MAX);
+        self.phase = if !authority_unique {
+            TelemetryServicePhase::Degraded
+        } else if ingest_ready || matches!(role, TelemetryServiceRole::Projection) {
+            TelemetryServicePhase::Ready
+        } else {
+            TelemetryServicePhase::Pending
+        };
+        Ok(TelemetryServiceStatus {
+            phase: self.phase,
+            endpoint_count,
+            authority_unique,
+        })
+    }
+
+    /// Finalize the Service without touching an independently owned backend.
+    pub fn finalize(&mut self) {
+        self.phase = TelemetryServicePhase::Deleted;
+    }
+}
+
+/// Closed telemetry signal carried by a ComponentSession stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryStreamSignal {
+    /// Metrics frames.
+    Metrics,
+    /// Trace frames.
+    Traces,
+    /// Log frames.
+    Logs,
+}
+
+/// A typed stream request. It carries semantic identity, never a locator or
+/// resource mutation payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryStreamRequest {
+    /// Service capability selected by the producer.
+    pub service_ref: ResourceRef,
+    /// Binding that owns producer intent.
+    pub binding_ref: ResourceRef,
+    /// Signal carried by this stream.
+    pub signal: TelemetryStreamSignal,
+}
+
+/// A stream-only ComponentSession admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryStreamAdmission {
+    request: TelemetryStreamRequest,
+}
+
+impl TelemetryStreamAdmission {
+    /// Borrow the admitted semantic stream request.
+    pub const fn request(&self) -> &TelemetryStreamRequest {
+        &self.request
+    }
+}
+
+/// Stream-only ComponentSession adapter for telemetry producers.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TelemetryComponentSession;
+
+impl TelemetryComponentSession {
+    /// Admit one stream and reject all resource-service-shaped references.
+    pub fn open_stream(
+        &self,
+        request: TelemetryStreamRequest,
+    ) -> Result<TelemetryStreamAdmission, TelemetryControllerError> {
+        if request.service_ref.resource_type().as_str() != TELEMETRY_SERVICE_RESOURCE_TYPE
+            || request.binding_ref.resource_type().as_str() != TELEMETRY_BINDING_RESOURCE_TYPE
+        {
+            return Err(TelemetryControllerError::Admission);
+        }
+        Ok(TelemetryStreamAdmission { request })
+    }
+
+    /// Resource mutation is deliberately outside the ComponentSession seam.
+    pub const fn resource_mutation_forbidden() -> TelemetryControllerError {
+        TelemetryControllerError::StreamOnly
+    }
+}
 
 const TELEMETRY_ZONE_BINDING_CHILD_REQUESTS: [BindingChildRequest; 2] = [
     BindingChildRequest::process(
@@ -95,6 +285,8 @@ pub enum TelemetryControllerError {
     Admission,
     /// Reconciliation was attempted after finalization.
     Finalized,
+    /// A resource mutation was attempted through a stream-only session.
+    StreamOnly,
 }
 
 impl core::fmt::Display for TelemetryControllerError {
@@ -102,6 +294,7 @@ impl core::fmt::Display for TelemetryControllerError {
         formatter.write_str(match self {
             Self::Admission => "telemetry-controller-admission-failed",
             Self::Finalized => "telemetry-controller-finalized",
+            Self::StreamOnly => "telemetry-session-resource-mutation-forbidden",
         })
     }
 }

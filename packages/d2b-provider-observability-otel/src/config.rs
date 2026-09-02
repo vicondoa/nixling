@@ -17,6 +17,54 @@ impl core::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Rejectable ambient credential-chain environment variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbientCredentialError {
+    /// A process environment variable would let the exporter acquire an
+    /// unbound credential outside the Resource/ComponentSession contract.
+    ChainDetected,
+}
+
+impl core::fmt::Display for AmbientCredentialError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("observability-ambient-credential-chain")
+    }
+}
+
+impl std::error::Error for AmbientCredentialError {}
+
+const FORBIDDEN_AMBIENT_KEYS: &[&str] = &[
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AZURE_CLIENT_CERTIFICATE_PATH",
+    "AZURE_CLIENT_SECRET",
+    "AZURE_FEDERATED_TOKEN_FILE",
+    "AZURE_TENANT_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "OTEL_EXPORTER_OTLP_AUTH",
+    "OTEL_EXPORTER_OTLP_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+];
+
+/// Refuse exporter credential discovery from the ambient process environment.
+///
+/// Values are never inspected or copied, so this check cannot retain a
+/// credential byte in diagnostics or status.
+pub fn reject_ambient_credential_chain(
+    keys: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<(), AmbientCredentialError> {
+    if keys
+        .into_iter()
+        .any(|key| FORBIDDEN_AMBIENT_KEYS.contains(&key.as_ref()))
+    {
+        return Err(AmbientCredentialError::ChainDetected);
+    }
+    Ok(())
+}
+
 /// The only installation-wide setting accepted by the Provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderConfig {
@@ -106,6 +154,18 @@ mod tests {
                 "selfMetrics": {"enable": "yes"}
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn ambient_exporter_credential_chains_are_rejected_without_reading_values() {
+        assert_eq!(
+            reject_ambient_credential_chain(["OTEL_EXPORTER_OTLP_HEADERS"]),
+            Err(AmbientCredentialError::ChainDetected)
+        );
+        assert_eq!(
+            reject_ambient_credential_chain(["RUST_LOG", "PATH"]),
+            Ok(())
         );
     }
 }

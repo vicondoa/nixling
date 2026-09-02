@@ -38,12 +38,13 @@ parallel policy.
 ## Controllers / services / workers / binaries
 
 The source contains the session-bound Provider agent, the
-`TelemetryBindingController`, bounded emitter socket, structural metric
-ingress gate, strict configuration parser, and closed self-metric descriptors.
-An authored telemetry Binding declares its collector and forwarder
-`Process`/`Endpoint` children; Core owns resource reconciliation and the
-generic Process Provider owns launch. Exporter, journald, ComponentSession
-transport, and projection/share remain outside this crate.
+`TelemetryServiceController` and `TelemetryBindingController`, bounded emitter
+socket, structural metric ingress gate, strict configuration parser, and
+closed self-metric descriptors. Resource-backed Service/Binding mutation stays
+on the daemon's authenticated `ResourceService` path; ComponentSession is
+stream-only for telemetry frames. An authored telemetry Binding declares its
+collector and forwarder `Process`/`Endpoint` children; Core owns resource
+reconciliation and the generic Process Provider owns launch.
 
 ## Placement and dependencies
 
@@ -76,8 +77,9 @@ credential, secret, token, password, and path-shaped messages.
 
 Emitter, ingress, quarantine, and diagnostic audit state is bounded and
 in-memory. Export loss degrades telemetry only; it never blocks resource
-mutation or audit durability. This crate does not claim production OTLP,
-vsock, ComponentSession, journald, projection, or cross-Zone share support.
+mutation or audit durability. This crate does not claim production OTLP, vsock, journald, projection, or
+cross-Zone share support; its ComponentSession surface is limited to typed
+telemetry streams.
 
 ## Build and test
 

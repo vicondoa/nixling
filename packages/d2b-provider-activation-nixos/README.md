@@ -35,6 +35,8 @@ mode, and optional prior-generation reference.
 keep host-generation handoff checks with this owner, and `ActivationRunner` is
 the typed target-local helper boundary. The existing activation helper accepts
 bounded JSON and refuses raw command or path fallbacks.
+The daemon attaches this controller to the shared Core `Runner`; it does not
+open a separate scheduler or Guest ResourceService session.
 
 ## Placement and dependencies
 
@@ -51,7 +53,11 @@ runner request is emitted.
 ## Security posture
 
 The Provider never sees a store path or broker DTO. Refusal and helper failure
-preserve the prior generation, and audit outcomes are closed codes.
+preserve the prior generation, and audit outcomes are closed codes. Activation
+verification fails closed on trust epoch, revocation reference, deny state,
+publisher root, signature ID, Ed25519, artifact digest, and the activation-time
+artifact-catalog digest. Core alone publishes `managedBy` and
+`configurationGeneration`.
 
 ## State and telemetry
 

@@ -16752,16 +16752,6 @@ async fn open_resource_plane(
             return Err(error);
         }
         if let Err(error) = runtime
-            .reconcile_activation_resources(Arc::new(state.clone()))
-            .await
-        {
-            tracing::warn!(
-                zone = %runtime.zone().as_str(),
-                error = ?error,
-                "activation reconciliation degraded during startup",
-            );
-        }
-        if let Err(error) = runtime
             .reconcile_audio_resources(Arc::new(state.clone()))
             .await
         {
@@ -16776,6 +16766,16 @@ async fn open_resource_plane(
                 zone = %runtime.zone().as_str(),
                 error = ?error,
                 "semantic binding reconciliation degraded during startup",
+            );
+        }
+        if let Err(error) = runtime
+            .start_u12_controller_runners(Arc::new(state.clone()))
+            .await
+        {
+            tracing::warn!(
+                zone = %runtime.zone().as_str(),
+                error = ?error,
+                "observability and activation controller runners degraded during startup",
             );
         }
         let _ = runtime.audio_binding_statuses();

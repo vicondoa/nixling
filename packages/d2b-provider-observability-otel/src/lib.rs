@@ -17,10 +17,15 @@ pub const PROVIDER_API_MAJOR: u16 = 1;
 pub use agent::{
     ProviderAgentAuditEvent, ProviderAgentAuditOutcome, ProviderAgentError, ProviderAgentProcess,
 };
-pub use config::{ConfigError, ProviderConfig};
+pub use config::{
+    AmbientCredentialError, ConfigError, ProviderConfig, reject_ambient_credential_chain,
+};
 pub use controller::{
     TelemetryBindingController, TelemetryBindingPhase, TelemetryBindingStatus,
-    TelemetryControllerError, TelemetryReconcileResult,
+    TelemetryComponentSession, TelemetryControllerError, TelemetryReconcileResult,
+    TelemetryServiceController, TelemetryServiceError, TelemetryServicePhase, TelemetryServiceRole,
+    TelemetryServiceStatus, TelemetryStreamAdmission, TelemetryStreamRequest,
+    TelemetryStreamSignal,
 };
 pub use emitter_socket::{EmitterSocket, ReceiverReadiness};
 pub use ingress_policy::{

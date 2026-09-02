@@ -1,9 +1,12 @@
 use d2b_contracts_resource::v3::ActivationOutcomeCode;
 use d2b_contracts_resource::v3::{ActivationMode, NixosGenerationSpec, ResourcePhase, ResourceRef};
 use d2b_provider_activation_nixos::{
-    ActivationCaller, ActivationController, CallerRole, GenerationObservation, GenerationPhase,
-    activation_runner_name, activation_runner_ref,
+    ActivationCaller, ActivationController, ActivationTrust, ActivationTrustExpectation,
+    CallerRole, GenerationObservation, GenerationPhase, TrustStatus, activation_runner_name,
+    activation_runner_ref,
 };
+use ring::signature::{Ed25519KeyPair, KeyPair};
+use sha2::{Digest, Sha256};
 
 fn spec() -> NixosGenerationSpec {
     NixosGenerationSpec::new(
@@ -275,4 +278,150 @@ fn retention_prunes_only_old_terminal_generations_without_ttl() {
     let plan = controller.retention_plan(&observations);
     assert_eq!(plan.delete_names(), &["gen-1".to_owned()]);
     assert!(!plan.uses_ttl());
+}
+
+fn trust_fixture() -> (ActivationTrust, ActivationTrustExpectation, Vec<u8>, String) {
+    let rng = ring::rand::SystemRandom::new();
+    let key_pair = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let key_pair = Ed25519KeyPair::from_pkcs8(key_pair.as_ref()).unwrap();
+    let payload = b"activation-envelope".to_vec();
+    let artifact = b"verified-system".to_vec();
+    let signature = key_pair.sign(&payload);
+    let artifact_digest = format!("sha256:{:x}", Sha256::digest(&artifact));
+    let catalog_digest = format!("sha256:{}", "1".repeat(64));
+    let trust = ActivationTrust::new(
+        7,
+        Some("revocation/7".to_owned()),
+        TrustStatus::Clear,
+        TrustStatus::Clear,
+        "publisher-root",
+        "signing-key-7",
+        key_pair.public_key().as_ref().to_vec(),
+        signature.as_ref().to_vec(),
+    );
+    let expected = ActivationTrustExpectation::new(
+        7,
+        Some("revocation/7".to_owned()),
+        "publisher-root",
+        "signing-key-7",
+        artifact_digest,
+        catalog_digest.clone(),
+        payload,
+    );
+    (trust, expected, artifact, catalog_digest)
+}
+
+#[test]
+fn activation_verification_requires_all_trust_and_digest_fences() {
+    let (trust, expected, artifact, catalog_digest) = trust_fixture();
+    ActivationController::new(3)
+        .verify_application(&trust, &expected, &artifact, &catalog_digest)
+        .expect("trusted activation verifies");
+
+    let mut cases = Vec::new();
+    cases.push(ActivationTrust::new(
+        8,
+        Some("revocation/7".to_owned()),
+        TrustStatus::Clear,
+        TrustStatus::Clear,
+        "publisher-root",
+        "signing-key-7",
+        vec![0; 32],
+        vec![0; 64],
+    ));
+    cases.push(ActivationTrust::new(
+        7,
+        Some("revocation/8".to_owned()),
+        TrustStatus::Clear,
+        TrustStatus::Clear,
+        "publisher-root",
+        "signing-key-7",
+        vec![0; 32],
+        vec![0; 64],
+    ));
+    cases.push(ActivationTrust::new(
+        7,
+        Some("revocation/7".to_owned()),
+        TrustStatus::Denied,
+        TrustStatus::Clear,
+        "publisher-root",
+        "signing-key-7",
+        vec![0; 32],
+        vec![0; 64],
+    ));
+    cases.push(ActivationTrust::new(
+        7,
+        Some("revocation/7".to_owned()),
+        TrustStatus::Unknown,
+        TrustStatus::Clear,
+        "publisher-root",
+        "signing-key-7",
+        vec![0; 32],
+        vec![0; 64],
+    ));
+    cases.push(ActivationTrust::new(
+        7,
+        Some("revocation/7".to_owned()),
+        TrustStatus::Clear,
+        TrustStatus::Clear,
+        "other-root",
+        "signing-key-7",
+        vec![0; 32],
+        vec![0; 64],
+    ));
+    cases.push(ActivationTrust::new(
+        7,
+        Some("revocation/7".to_owned()),
+        TrustStatus::Clear,
+        TrustStatus::Clear,
+        "publisher-root",
+        "other-key",
+        vec![0; 32],
+        vec![0; 64],
+    ));
+
+    for (trust, expected_error) in cases.into_iter().zip([
+        d2b_provider_activation_nixos::ActivationVerificationError::TrustEpochMismatch,
+        d2b_provider_activation_nixos::ActivationVerificationError::RevocationRefMismatch,
+        d2b_provider_activation_nixos::ActivationVerificationError::TrustDenied,
+        d2b_provider_activation_nixos::ActivationVerificationError::TrustDenied,
+        d2b_provider_activation_nixos::ActivationVerificationError::PublisherRootMismatch,
+        d2b_provider_activation_nixos::ActivationVerificationError::SignatureIdMismatch,
+    ]) {
+        assert_eq!(
+            trust.verify(&expected, &artifact, &catalog_digest),
+            Err(expected_error)
+        );
+    }
+}
+
+#[test]
+fn activation_verification_rejects_digest_catalog_and_signature_changes() {
+    let (trust, expected, artifact, catalog_digest) = trust_fixture();
+    assert_eq!(
+        trust.verify(&expected, b"changed", &catalog_digest),
+        Err(d2b_provider_activation_nixos::ActivationVerificationError::ArtifactDigestMismatch)
+    );
+    assert_eq!(
+        trust.verify(
+            &expected,
+            &artifact,
+            &("sha256:".to_owned() + &"2".repeat(64))
+        ),
+        Err(d2b_provider_activation_nixos::ActivationVerificationError::ArtifactCatalogDigestMismatch)
+    );
+    let payload = b"changed-envelope".to_vec();
+    let changed = ActivationTrustExpectation::new(
+        7,
+        Some("revocation/7".to_owned()),
+        "publisher-root",
+        "signing-key-7",
+        format!("sha256:{:x}", Sha256::digest(&artifact)),
+        catalog_digest.clone(),
+        payload,
+    );
+    assert_eq!(
+        trust.verify(&changed, &artifact, &catalog_digest),
+        Err(d2b_provider_activation_nixos::ActivationVerificationError::SignatureInvalid)
+    );
 }
