@@ -406,8 +406,11 @@ impl ResourceReconciler for ProcessReconciler {
     fn validate_spec(
         &self,
         _context: &ReconcileContext,
-        _resource: &ResourceSnapshot,
+        resource: &ResourceSnapshot,
     ) -> impl std::future::Future<Output = Result<ValidationResult, Self::Error>> + Send {
+        if self.measure_handler_start {
+            self.metrics.record_handler_start(resource.key());
+        }
         std::future::ready(Ok(ValidationResult::Valid))
     }
 
@@ -429,9 +432,6 @@ impl ResourceReconciler for ProcessReconciler {
         _dependencies: &[DependencySnapshot],
         _plan: &ReconcilePlan,
     ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
-        if self.measure_handler_start {
-            self.metrics.record_handler_start(resource.key());
-        }
         std::future::ready(Ok(ReconcileResult::converged(
             resource.revision(),
             resource.generation(),
