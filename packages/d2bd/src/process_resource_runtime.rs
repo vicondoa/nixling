@@ -505,7 +505,7 @@ impl ProcessResourceRuntime {
             record.provider_assignment_generation = provider_assignment_generation;
             self.restart_counts
                 .entry(record.resource.resource_ref.clone())
-                .or_insert_with(|| status_restart_count(&record.resource));
+                .or_insert_with(|| persisted_restart_count(&record.resource, &record.process));
         }
         let desired_keys = desired.keys().cloned().collect::<BTreeSet<_>>();
         let removed = self
@@ -1715,6 +1715,8 @@ impl ResourceReconciler for ProcessResourceReconciler {
             };
             let mut runtime = self.runtime.for_pass();
             runtime.without_status_client();
+            // A persisted Ready identity is checked by the declared
+            // adoption-backed repair probe before any replacement launch.
             let observe_only = status_phase(&record.resource) == Some(ResourcePhase::Ready)
                 && status_observed_generation(&record.resource) == Some(record.resource.generation)
                 && status_has_started_at(&record.resource);
@@ -1732,10 +1734,11 @@ impl ResourceReconciler for ProcessResourceReconciler {
                             "identity-ambiguous",
                             "provider identity could not be verified safely",
                         ),
-                        status_restart_count(&record.resource),
+                        persisted_restart_count(&record.resource, &record.process),
                     ),
                     ExistingProcessState::Exited => {
-                        let restart_count = status_restart_count(&record.resource);
+                        let restart_count =
+                            persisted_restart_count(&record.resource, &record.process);
                         match &record.process {
                             DesiredProcess::Ephemeral(_) => (
                                 ResourcePhase::Succeeded,
@@ -1799,7 +1802,9 @@ impl ResourceReconciler for ProcessResourceReconciler {
                     .restart_counts
                     .get(&record.resource.resource_ref)
                     .copied()
-                    .unwrap_or_else(|| status_restart_count(&record.resource));
+                    .unwrap_or_else(|| {
+                        persisted_restart_count(&record.resource, &record.process)
+                    });
                 let (phase, outcome) = match &record.process {
                     DesiredProcess::Process(spec)
                         if spec.desired_lifecycle()
@@ -2181,6 +2186,33 @@ fn status_restart_count(resource: &StoredResource) -> u32 {
     match value.get("restartCount") {
         Some(CanonicalJsonValue::Integer(count)) => u32::try_from(*count).unwrap_or(0),
         _ => 0,
+    }
+}
+
+fn restart_count_reset_due(resource: &StoredResource, process: &DesiredProcess) -> bool {
+    let DesiredProcess::Process(spec) = process else {
+        return false;
+    };
+    let Some(CanonicalJsonValue::String(started_at)) = status_value(resource, "startedAt") else {
+        return false;
+    };
+    let Some(started_at) = timestamp_millis(&started_at) else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    started_at
+        .checked_add(u128::from(spec.restart_policy().reset_after().as_millis()))
+        .is_none_or(|reset_at| reset_at <= now)
+}
+
+fn persisted_restart_count(resource: &StoredResource, process: &DesiredProcess) -> u32 {
+    if restart_count_reset_due(resource, process) {
+        0
+    } else {
+        status_restart_count(resource)
     }
 }
 
