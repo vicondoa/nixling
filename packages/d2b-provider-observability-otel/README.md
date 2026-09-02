@@ -68,7 +68,9 @@ caller's resource permissions.
 
 Ingress validation is structural and occurs before capacity admission. Errors
 use closed classes and do not echo rejected labels, values, paths, or
-identities. The metric policy rejects identity keys, identity suffixes, and
+identities. Production startup rejects OTEL and cloud SDK ambient credential
+chains by environment-variable name only; values are never read into
+diagnostics. The metric policy rejects identity keys, identity suffixes, and
 trusted resource-identity canaries. OTEL telemetry never reads or writes the
 authoritative audit sink, and journald filtering is opt-in and redacts
 credential, secret, token, password, and path-shaped messages.

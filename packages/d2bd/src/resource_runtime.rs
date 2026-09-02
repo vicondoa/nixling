@@ -14,7 +14,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -189,6 +189,33 @@ struct CoreAssignmentAuthority {
     controller_role: ResourceRef,
     target: ResourceRef,
     epoch: u64,
+}
+
+async fn abort_u12_runner_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+    for task in tasks.drain(..) {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+fn u12_provider_missing_with_resources(resources_present: bool) -> bool {
+    resources_present
+}
+
+fn validate_observability_environment() -> Result<(), ResourceRuntimeError> {
+    d2b_provider_observability_otel::reject_process_environment_credential_chain()
+        .map_err(|_| ResourceRuntimeError::ProviderPathUnavailable)
+}
+
+fn validate_observability_environment_keys(
+    keys: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<(), ResourceRuntimeError> {
+    d2b_provider_observability_otel::reject_ambient_credential_chain(keys)
+        .map_err(|_| ResourceRuntimeError::ProviderPathUnavailable)
+}
+
+fn u12_runner_readiness(required: bool, task_count: usize, any_finished: bool) -> bool {
+    !required || (task_count != 0 && !any_finished)
 }
 
 #[derive(Clone)]
@@ -2127,6 +2154,8 @@ pub struct ZoneResourceRuntime {
     core_runner_lock: Arc<tokio::sync::Mutex<()>>,
     u12_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     u12_runner_lock: Arc<tokio::sync::Mutex<()>>,
+    u12_state: Mutex<Option<Arc<crate::ServerState>>>,
+    u12_required: AtomicBool,
     #[cfg(test)]
     core_runner_events: Arc<Mutex<Vec<&'static str>>>,
     core: Mutex<CoreProcess>,
@@ -2890,6 +2919,8 @@ impl ZoneResourceRuntime {
             core_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
             u12_runner_tasks: Mutex::new(Vec::new()),
             u12_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
+            u12_state: Mutex::new(None),
+            u12_required: AtomicBool::new(false),
             #[cfg(test)]
             core_runner_events: Arc::new(Mutex::new(Vec::new())),
             core: Mutex::new(core),
@@ -3583,8 +3614,14 @@ impl ZoneResourceRuntime {
         } else {
             None
         };
+        let _u12_runner_guard = if rebind_core {
+            Some(self.u12_runner_lock.lock().await)
+        } else {
+            None
+        };
         if rebind_core {
             self.stop_core_controller_runners_locked().await?;
+            self.stop_u12_controller_runners_locked().await?;
         }
         self.authorizer
             .replace_policy(policy.clone(), &state)
@@ -3620,6 +3657,14 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)? = true;
         if rebind_core {
             self.start_core_controller_runners_locked(true).await?;
+            let state = self
+                .u12_state
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .clone();
+            if let Some(state) = state {
+                self.start_u12_controller_runners_locked(state).await?;
+            }
         }
         Ok(())
     }
@@ -4304,6 +4349,21 @@ impl ZoneResourceRuntime {
         Ok(())
     }
 
+    async fn stop_u12_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        let tasks = {
+            let mut tasks = self
+                .u12_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        Ok(())
+    }
+
     /// Attach the observability and activation handlers to the same Core
     /// source/Runner path used by every resource owner.
     pub(crate) async fn start_u12_controller_runners(
@@ -4311,6 +4371,25 @@ impl ZoneResourceRuntime {
         state: Arc<crate::ServerState>,
     ) -> Result<(), ResourceRuntimeError> {
         let _runner_guard = self.u12_runner_lock.lock().await;
+        let result = self
+            .start_u12_controller_runners_locked(Arc::clone(&state))
+            .await;
+        if result.is_ok() {
+            match self.u12_state.lock() {
+                Ok(mut current) => *current = Some(state),
+                Err(_) => {
+                    self.stop_u12_controller_runners_locked().await?;
+                    return Err(ResourceRuntimeError::AuthenticationUnavailable);
+                }
+            }
+        }
+        result
+    }
+
+    async fn start_u12_controller_runners_locked(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
         if !self.readiness.resource_api_ready {
             return Ok(());
         }
@@ -4374,7 +4453,9 @@ impl ZoneResourceRuntime {
             ),
         ];
 
-        for (provider_name, controller_ref, kind) in providers {
+        let build_result: Result<bool, ResourceRuntimeError> = async {
+            let mut required = false;
+            for (provider_name, controller_ref, kind) in providers {
             let provider_ref =
                 ResourceRef::parse(&format!("Provider/{provider_name}"))
                     .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
@@ -4396,14 +4477,37 @@ impl ZoneResourceRuntime {
                 .await
             {
                 Ok(provider) => provider,
-                Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => continue,
+                Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                    let resource_types = match kind {
+                        U12ControllerKind::Telemetry => {
+                            ["telemetry.d2bus.org.TelemetryService", "telemetry.d2bus.org.TelemetryBinding"]
+                        }
+                        U12ControllerKind::Activation => {
+                            ["activation-nixos.d2bus.org.NixosGeneration", ""]
+                        }
+                    };
+                    let resource_types = resource_types
+                        .into_iter()
+                        .filter(|resource_type| !resource_type.is_empty())
+                        .collect::<Vec<_>>();
+                    if u12_provider_missing_with_resources(
+                        self.u12_resources_present(&resource_types).await?,
+                    ) {
+                        return Err(ResourceRuntimeError::ProviderPathUnavailable);
+                    }
+                    continue;
+                }
                 Err(_) => return Err(ResourceRuntimeError::StoreReadFailed),
             };
+            required = true;
             if provider.zone != self.zone
                 || provider.resource_ref != provider_ref
                 || provider.generation.get() == 0
             {
                 return Err(ResourceRuntimeError::HandlerNotReady);
+            }
+            if provider_name == "observability-otel" {
+                validate_observability_environment()?;
             }
             let identity = ControllerIdentity::new(
                 self.zone.clone(),
@@ -4546,13 +4650,61 @@ impl ZoneResourceRuntime {
                     let _ = runner.run().await;
                 })
             };
-            new_tasks.push(task);
+                new_tasks.push(task);
+            }
+            Ok(required)
         }
-        self.u12_runner_tasks
-            .lock()
-            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
-            .extend(new_tasks);
+        .await;
+        let required = match build_result {
+            Ok(required) => required,
+            Err(error) => {
+                abort_u12_runner_tasks(&mut new_tasks).await;
+                return Err(error);
+            }
+        };
+        match self.u12_runner_tasks.lock() {
+            Ok(mut tasks) => tasks.extend(new_tasks),
+            Err(_) => {
+                abort_u12_runner_tasks(&mut new_tasks).await;
+                return Err(ResourceRuntimeError::WatchUnavailable);
+            }
+        }
+        self.u12_required.store(required, Ordering::Release);
         Ok(())
+    }
+
+    async fn u12_resources_present(
+        &self,
+        resource_types: &[&str],
+    ) -> Result<bool, ResourceRuntimeError> {
+        let resource_types = resource_types
+            .iter()
+            .map(|resource_type| {
+                ResourceTypeName::parse((*resource_type).to_owned())
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let page = self
+            .store
+            .list(StoreListRequest {
+                operation: StoreOperationContext {
+                    operation_id: "u12-provider-presence".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "u12-provider-presence".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                resource_types,
+                resource_names: Vec::new(),
+                filters: Vec::new(),
+                page_size: 1,
+                cursor: None,
+                projection: StoreProjection::MetadataOnly,
+            })
+            .await
+            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        Ok(!page.resources.is_empty())
     }
 
     async fn u12_controller_assignments(
@@ -7933,6 +8085,23 @@ impl ZoneResourceRuntime {
         if !self.readiness.provider_path_ready {
             return Some(ResourceRuntimeError::ProviderPathUnavailable);
         }
+        let u12_ready = if self.u12_required.load(Ordering::Acquire) {
+            self.u12_runner_tasks
+                .try_lock()
+                .map(|tasks| {
+                    u12_runner_readiness(
+                        true,
+                        tasks.len(),
+                        tasks.iter().any(|task| task.is_finished()),
+                    )
+                })
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        if !u12_ready {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
         if !matches!(self.core_stage().ok(), Some(StartupStage::Ready)) {
             return Some(ResourceRuntimeError::HandlerNotReady);
         }
@@ -11306,6 +11475,54 @@ mod tests {
     use d2b_resource_store::mutation_seal::mutation_seal_pair;
     use d2b_resource_store_redb::write_provisioning_marker;
     use d2b_session_unix::{CreditPool, CreditScopeSet, OutboundPacket, prearmed_seqpacket_pair};
+
+    #[test]
+    fn accepted_u12_resources_cannot_run_without_their_provider() {
+        assert!(u12_provider_missing_with_resources(true));
+        assert!(!u12_provider_missing_with_resources(false));
+        assert!(!u12_runner_readiness(true, 0, false));
+        assert!(!u12_runner_readiness(true, 1, true));
+        assert!(u12_runner_readiness(true, 2, false));
+        assert!(u12_runner_readiness(false, 0, true));
+        assert_eq!(
+            validate_observability_environment_keys(["OTEL_EXPORTER_OTLP_HEADERS"]),
+            Err(ResourceRuntimeError::ProviderPathUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn u12_runner_start_rollback_aborts_every_spawned_task() {
+        let mut tasks = vec![
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+        ];
+        abort_u12_runner_tasks(&mut tasks).await;
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn u12_rebind_stop_clears_every_tracked_runner() {
+        let fixture = PublicationStoreFixture::new().await;
+        let bundle = publication_bundle(&fixture.zone, fixture.identity.zone_uid(), "u12-stop");
+        let runtime = fixture.open(&bundle).await;
+        runtime
+            .u12_runner_tasks
+            .lock()
+            .unwrap()
+            .push(tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }));
+        runtime
+            .stop_u12_controller_runners_locked()
+            .await
+            .expect("U12 runner stop");
+        assert!(runtime.u12_runner_tasks.lock().unwrap().is_empty());
+        runtime.shutdown().await.unwrap();
+    }
 
     #[test]
     fn cloud_hypervisor_process_update_applies_requested_lifecycle() {

@@ -19,6 +19,7 @@ pub use agent::{
 };
 pub use config::{
     AmbientCredentialError, ConfigError, ProviderConfig, reject_ambient_credential_chain,
+    reject_process_environment_credential_chain,
 };
 pub use controller::{
     TelemetryBindingController, TelemetryBindingPhase, TelemetryBindingStatus,

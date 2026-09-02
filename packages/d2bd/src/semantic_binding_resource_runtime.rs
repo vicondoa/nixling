@@ -18,7 +18,8 @@ use d2b_contracts_resource::v3::{
 use d2b_core_controller::{
     ControllerDescriptor, ControllerExecutionPolicy, ControllerIdentity, ControllerSelector,
     ControllerVerb, DependencySnapshot, DrainResult, FinalizeResult, HandlerFailure,
-    ObservationResult, ReconcileContext, ReconcilePlan, ReconcileReason, ReconcileResult,
+    ObservationResult, ReconcileContext, ReconcileDisposition, ReconcilePlan, ReconcileReason,
+    ReconcileResult,
     ResourceReconciler, ResourceRegistration, ResourceSnapshot, ResyncPolicy, SelectorField,
     UpdateAssessment, UpdateAssessmentState, UpgradePlan, UpgradeStage, ValidationResult,
 };
@@ -179,12 +180,16 @@ impl TelemetryResourceReconciler {
         }
     }
 
-    async fn reconcile_snapshot(&self) -> Result<(), SemanticBindingRuntimeError> {
+    async fn reconcile_snapshot(
+        &self,
+        target: &ResourceRef,
+    ) -> Result<(), SemanticBindingRuntimeError> {
         let _guard = self.reconcile_lock.lock().await;
         reconcile_telemetry_binding_resources(
             &self.store,
             &self.client,
             &self.store.identity().zone(),
+            Some(target),
         )
         .await
     }
@@ -194,6 +199,30 @@ impl TelemetryResourceReconciler {
             target.key().resource_ref().resource_type().as_str(),
             TELEMETRY_BINDING_RESOURCE_TYPE | "telemetry.d2bus.org.TelemetryService"
         )
+    }
+
+    fn first_finalizer_batch(
+        resource: &ResourceSnapshot,
+    ) -> Result<Option<d2b_core_controller::ResourceMutationBatch>, SemanticBindingRuntimeError>
+    {
+        if resource.key().resource_ref().resource_type().as_str()
+            != TELEMETRY_BINDING_RESOURCE_TYPE
+            || resource.deleting()
+            || binding_has_finalizer(resource)
+        {
+            return Ok(None);
+        }
+        let mutation = d2b_core_controller::MutationIntent::new(
+            resource.key().resource_ref().clone(),
+            Some(resource.key().uid().clone()),
+            Some(resource.revision()),
+            d2b_core_controller::MutationIntentKind::UpdateFinalizers,
+            Some(finalizer_payload(resource)?),
+        )
+        .map_err(|_| SemanticBindingRuntimeError::InvalidResource)?;
+        d2b_core_controller::ResourceMutationBatch::new(vec![mutation])
+            .map(Some)
+            .map_err(|_| SemanticBindingRuntimeError::InvalidResource)
     }
 }
 
@@ -249,26 +278,44 @@ impl ResourceReconciler for TelemetryResourceReconciler {
     fn reconcile(
         &self,
         context: &ReconcileContext,
-        _resource: &ResourceSnapshot,
+        resource: &ResourceSnapshot,
         _dependencies: &[DependencySnapshot],
         _plan: &ReconcilePlan,
     ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
         let result = context
             .authorize_effect()
-            .map(|_| ReconcileResult::converged(context.revision(), context.generation()))
-            .map_err(|_| SemanticBindingRuntimeError::InvalidResource);
+            .map_err(|_| SemanticBindingRuntimeError::InvalidResource)
+            .and_then(|_| {
+                if let Some(batch) = Self::first_finalizer_batch(resource)? {
+                    return ReconcileResult::new(
+                        context.revision(),
+                        context.generation(),
+                        Some(batch),
+                        None,
+                        ReconcileDisposition::Pending,
+                        None,
+                        None,
+                        d2b_core_controller::StatusPersistence::NotRequested,
+                    )
+                    .map_err(|_| SemanticBindingRuntimeError::InvalidResource);
+                }
+                Ok(ReconcileResult::converged(
+                    context.revision(),
+                    context.generation(),
+                ))
+            });
         std::future::ready(result)
     }
 
     fn execute_effect(
         &self,
-        _context: &ReconcileContext,
+        context: &ReconcileContext,
         _resource: &ResourceSnapshot,
         _dependencies: &[DependencySnapshot],
         _plan: &ReconcilePlan,
     ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
         let future = async move {
-            self.reconcile_snapshot().await?;
+            self.reconcile_snapshot(context.target().resource_ref()).await?;
             Ok(ReconcileResult::converged(
                 _resource.revision(),
                 _resource.generation(),
@@ -301,11 +348,11 @@ impl ResourceReconciler for TelemetryResourceReconciler {
 
     fn execute_finalize(
         &self,
-        _context: &ReconcileContext,
+        context: &ReconcileContext,
         resource: &ResourceSnapshot,
     ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
         let future = async move {
-            self.reconcile_snapshot().await?;
+            self.reconcile_snapshot(context.target().resource_ref()).await?;
             Ok(ReconcileResult::converged(
                 resource.revision(),
                 resource.generation(),
@@ -534,7 +581,7 @@ pub(crate) async fn reconcile_semantic_binding_resources(
     client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
     zone: &ZoneId,
 ) -> Result<(), SemanticBindingRuntimeError> {
-    reconcile_binding_owner_set(store, client, zone, &SEMANTIC_BINDINGS).await
+    reconcile_binding_owner_set(store, client, zone, &SEMANTIC_BINDINGS, None).await
 }
 
 /// Relist and reconcile telemetry Service/Binding children through the
@@ -543,15 +590,17 @@ pub(crate) async fn reconcile_telemetry_binding_resources(
     store: &RedbResourceStore,
     client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
     zone: &ZoneId,
+    target: Option<&ResourceRef>,
 ) -> Result<(), SemanticBindingRuntimeError> {
-    reconcile_telemetry_services(store, client, zone).await?;
-    reconcile_binding_owner_set(store, client, zone, &[TELEMETRY_BINDING]).await
+    reconcile_telemetry_services(store, client, zone, target).await?;
+    reconcile_binding_owner_set(store, client, zone, &[TELEMETRY_BINDING], target).await
 }
 
 async fn reconcile_telemetry_services(
     store: &RedbResourceStore,
     client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
     zone: &ZoneId,
+    target: Option<&ResourceRef>,
 ) -> Result<(), SemanticBindingRuntimeError> {
     let services = list_resources(
         store,
@@ -568,6 +617,12 @@ async fn reconcile_telemetry_services(
     )
     .await?;
     for service in services {
+        if !selected_target(target, &service.resource_ref) {
+            continue;
+        }
+        if deletion_requested(&service) {
+            continue;
+        }
         let (phase, projection) = telemetry_service_status(&service, &endpoints);
         let resource = sanitized_status_resource(&service)?;
         crate::resource_runtime::persist_resource_status_with_projection(
@@ -655,8 +710,15 @@ async fn reconcile_binding_owner_set(
     client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
     zone: &ZoneId,
     descriptors: &[SemanticBindingDescriptor],
+    target: Option<&ResourceRef>,
 ) -> Result<(), SemanticBindingRuntimeError> {
     let owners = list_binding_owners_for(store, zone, descriptors).await?;
+    let owners = owners
+        .into_iter()
+        .filter(|owner| {
+            target.is_none_or(|target| target == &owner.resource.resource_ref)
+        })
+        .collect::<Vec<_>>();
     for owner in &owners {
         if owner.desired.is_some() && !owner.fenced {
             update_binding_child_finalizer(client, &owner.resource, true)
@@ -670,6 +732,15 @@ async fn reconcile_binding_owner_set(
     let children = list_binding_children(store, zone)
         .await
         .map_err(|_| SemanticBindingRuntimeError::Reconcile)?;
+    if target.is_some()
+        && owners
+            .iter()
+            .any(|owner| {
+                !owner.fenced && !converged.contains(&owner.resource.resource_ref)
+            })
+    {
+        return Ok(());
+    }
 
     // Finalizer removal is deliberately a second phase: all owned children
     // must be absent after their own finalizers have drained.
@@ -683,11 +754,18 @@ async fn reconcile_binding_owner_set(
                 .await
                 .map_err(|_| SemanticBindingRuntimeError::Reconcile)?;
         }
+
     }
 
     // Finalizer updates advance the parent revision, so relist before writing
     // the layered Binding status with an exact UID/revision precondition.
-    let refreshed = list_binding_owners_for(store, zone, descriptors).await?;
+    let refreshed = list_binding_owners_for(store, zone, descriptors)
+        .await?
+        .into_iter()
+        .filter(|owner| {
+            target.is_none_or(|target| target == &owner.resource.resource_ref)
+        })
+        .collect::<Vec<_>>();
     for owner in &refreshed {
         if owner.fenced {
             if let Err(error) = persist_fenced_binding_status(client, owner).await {
@@ -707,6 +785,10 @@ async fn reconcile_binding_owner_set(
         persist_semantic_binding_status(client, owner, desired, converged, ready).await?;
     }
     Ok(())
+}
+
+fn selected_target(target: Option<&ResourceRef>, candidate: &ResourceRef) -> bool {
+    target.is_none_or(|target| target == candidate)
 }
 
 async fn persist_fenced_binding_status(
@@ -1004,6 +1086,48 @@ fn deletion_requested(resource: &StoredResource) -> bool {
         .and_then(|value| value.get("metadata").cloned())
         .and_then(|metadata| metadata.get("deletionRequestedAt").cloned())
         .is_some_and(|value| !value.is_null())
+}
+
+fn binding_has_finalizer(resource: &ResourceSnapshot) -> bool {
+    serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .ok()
+        .and_then(|value| value.pointer("/metadata/finalizers").cloned())
+        .and_then(|value| value.as_array().cloned())
+        .is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| {
+                    value.as_str()
+                        == Some(crate::binding_child_resource_runtime::BINDING_CHILD_FINALIZER)
+                })
+        })
+}
+
+fn finalizer_payload(
+    resource: &ResourceSnapshot,
+) -> Result<Vec<u8>, SemanticBindingRuntimeError> {
+    let value = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .map_err(|_| SemanticBindingRuntimeError::InvalidResource)?;
+    let mut finalizers = value
+        .pointer("/metadata/finalizers")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let finalizer = crate::binding_child_resource_runtime::BINDING_CHILD_FINALIZER;
+    if !finalizers
+        .iter()
+        .any(|value| value.as_str() == Some(finalizer))
+    {
+        finalizers.push(serde_json::Value::String(finalizer.to_owned()));
+    }
+    CanonicalJsonValue::parse(
+        &serde_json::to_vec(&serde_json::json!({
+            "metadata": {"finalizers": finalizers}
+        }))
+        .map_err(|_| SemanticBindingRuntimeError::InvalidResource)?,
+    )
+    .map(|value| value.to_canonical_bytes())
+    .map_err(|_| SemanticBindingRuntimeError::InvalidResource)
 }
 
 async fn list_resources(
@@ -1338,5 +1462,46 @@ mod tests {
         assert_eq!(phase, "Pending");
         assert_eq!(projection["serviceRole"], "authority");
         assert_eq!(projection["serviceReadiness"], "Pending");
+    }
+
+    #[test]
+    fn telemetry_first_pass_returns_only_one_exact_finalizer_mutation() {
+        let target = ResourceRef::parse(
+            "telemetry.d2bus.org.TelemetryBinding/metrics",
+        )
+        .unwrap();
+        let snapshot = ResourceSnapshot::new(
+            d2b_core_controller::ResourceKey::new(
+                ZoneId::parse("dev").unwrap(),
+                target.clone(),
+                ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            ),
+            ZoneRevision::new(7),
+            ResourceGeneration::new(1).unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": {"finalizers": []}
+            }))
+            .unwrap(),
+            false,
+        );
+        let batch = TelemetryResourceReconciler::first_finalizer_batch(&snapshot)
+            .unwrap()
+            .expect("first pass enrolls the exact finalizer");
+        assert_eq!(batch.mutations().len(), 1);
+        assert_eq!(batch.mutations()[0].target(), &target);
+        assert_eq!(
+            batch.mutations()[0].kind(),
+            d2b_core_controller::MutationIntentKind::UpdateFinalizers
+        );
+    }
+
+    #[test]
+    fn telemetry_effect_selection_never_mutates_a_sibling() {
+        let target =
+            ResourceRef::parse("telemetry.d2bus.org.TelemetryBinding/target").unwrap();
+        let sibling =
+            ResourceRef::parse("telemetry.d2bus.org.TelemetryBinding/sibling").unwrap();
+        assert!(selected_target(Some(&target), &target));
+        assert!(!selected_target(Some(&target), &sibling));
     }
 }

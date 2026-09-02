@@ -155,6 +155,114 @@ pub struct RunnerRequest {
     pub start_root: bool,
 }
 
+/// Production activation/application verification hook.
+pub trait ActivationApplicationVerifier: Send + Sync {
+    /// Verify trust, signature, artifact, and catalog identity before an
+    /// activation effect or runner resource is created.
+    fn verify_application(
+        &self,
+        controller: &ActivationController,
+        request: &RunnerRequest,
+    ) -> Result<(), ActivationVerificationError>;
+}
+
+/// Default fail-closed verifier used until trusted material is supplied by
+/// the artifact/application adapter.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FailClosedActivationVerifier;
+
+impl ActivationApplicationVerifier for FailClosedActivationVerifier {
+    fn verify_application(
+        &self,
+        controller: &ActivationController,
+        _request: &RunnerRequest,
+    ) -> Result<(), ActivationVerificationError> {
+        let trust = ActivationTrust::new(
+            0,
+            None,
+            TrustStatus::Unknown,
+            TrustStatus::Unknown,
+            "",
+            "",
+            Vec::new(),
+            Vec::new(),
+        );
+        let expected = ActivationTrustExpectation::new(
+            0,
+            None,
+            "",
+            "",
+            "",
+            "",
+            Vec::new(),
+        );
+        controller.verify_application(&trust, &expected, &[], "")
+    }
+}
+
+/// Verification material supplied by the trusted artifact/application
+/// adapter. The bytes are retained only in memory for one verification call.
+pub struct SignedActivationApplicationVerifier {
+    request: RunnerRequest,
+    trust: ActivationTrust,
+    expected: ActivationTrustExpectation,
+    artifact_bytes: Vec<u8>,
+    activation_catalog_digest: String,
+}
+
+impl core::fmt::Debug for SignedActivationApplicationVerifier {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("SignedActivationApplicationVerifier")
+            .field("request", &self.request)
+            .field("trust", &self.trust)
+            .field("expected", &self.expected)
+            .field("artifact_bytes", &self.artifact_bytes.len())
+            .field(
+                "activation_catalog_digest_bytes",
+                &self.activation_catalog_digest.len(),
+            )
+            .finish()
+    }
+}
+
+impl SignedActivationApplicationVerifier {
+    /// Bind verification material to one exact runner request.
+    pub fn new(
+        request: RunnerRequest,
+        trust: ActivationTrust,
+        expected: ActivationTrustExpectation,
+        artifact_bytes: impl Into<Vec<u8>>,
+        activation_catalog_digest: impl Into<String>,
+    ) -> Self {
+        Self {
+            request,
+            trust,
+            expected,
+            artifact_bytes: artifact_bytes.into(),
+            activation_catalog_digest: activation_catalog_digest.into(),
+        }
+    }
+}
+
+impl ActivationApplicationVerifier for SignedActivationApplicationVerifier {
+    fn verify_application(
+        &self,
+        controller: &ActivationController,
+        request: &RunnerRequest,
+    ) -> Result<(), ActivationVerificationError> {
+        if request != &self.request {
+            return Err(ActivationVerificationError::InvalidEvidence);
+        }
+        controller.verify_application(
+            &self.trust,
+            &self.expected,
+            &self.artifact_bytes,
+            &self.activation_catalog_digest,
+        )
+    }
+}
+
 /// Return the deterministic target-local child name for one generation.
 ///
 /// The name is derived from the qualified generation reference rather than

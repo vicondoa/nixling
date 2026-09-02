@@ -16772,11 +16772,17 @@ async fn open_resource_plane(
             .start_u12_controller_runners(Arc::new(state.clone()))
             .await
         {
-            tracing::warn!(
+            tracing::error!(
                 zone = %runtime.zone().as_str(),
                 error = ?error,
-                "observability and activation controller runners degraded during startup",
+                "observability and activation controller runners refused during startup",
             );
+            let _ = runtime.shutdown().await;
+            let _ = plane.shutdown().await;
+            while let Some((_, runtime, _)) = remaining.next() {
+                let _ = runtime.shutdown().await;
+            }
+            return Err(error);
         }
         let _ = runtime.audio_binding_statuses();
         if let Err(error) = runtime.require_ready() {
@@ -17066,6 +17072,17 @@ mod zone_publication_order_tests {
         assert!(barrier < durable_commit);
         assert!(durable_commit < activation);
         assert!(activation < process_reconcile);
+    }
+
+    #[test]
+    fn u12_attach_failure_is_not_downgraded_to_a_startup_warning() {
+        let source = include_str!("composition.rs");
+        let start = source
+            .find("start_u12_controller_runners")
+            .expect("U12 runner attach");
+        let tail = &source[start..];
+        assert!(tail.contains("return Err(error);"));
+        assert!(tail.contains("observability and activation controller runners refused during startup"));
     }
 }
 

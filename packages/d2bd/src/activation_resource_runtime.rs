@@ -33,7 +33,8 @@ use d2b_core_controller::{
     ValidationResult,
 };
 use d2b_provider_activation_nixos::{
-    ActivationCaller, ActivationController, CallerRole, GenerationObservation, GenerationPhase,
+    ActivationApplicationVerifier, ActivationCaller, ActivationController, CallerRole,
+    FailClosedActivationVerifier, GenerationObservation, GenerationPhase,
     activation_runner_ref, activation_runner_spec,
 };
 use d2b_resource_api::{RedbBackend, ResourceApiClient, service::UnavailableUpgradeDispatcher};
@@ -188,8 +189,25 @@ impl ActivationResourceReconciler {
         state: Arc<ServerState>,
         identity: ControllerIdentity,
     ) -> Self {
+        Self::with_verifier(
+            store,
+            client,
+            state,
+            identity,
+            Arc::new(FailClosedActivationVerifier),
+        )
+    }
+
+    pub(crate) fn with_verifier(
+        store: Arc<RedbResourceStore>,
+        client: Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+        state: Arc<ServerState>,
+        identity: ControllerIdentity,
+        verifier: Arc<dyn ActivationApplicationVerifier>,
+    ) -> Self {
         let mut runtime = ActivationResourceRuntime::new(store.identity().zone().clone());
         runtime.set_status_client(Arc::clone(&client));
+        runtime.set_verifier(verifier);
         Self {
             store,
             client,
@@ -199,7 +217,10 @@ impl ActivationResourceReconciler {
         }
     }
 
-    async fn reconcile_snapshot(&self) -> Result<(), ActivationResourceRuntimeError> {
+    async fn reconcile_snapshot(
+        &self,
+        target: &ResourceRef,
+    ) -> Result<(), ActivationResourceRuntimeError> {
         let snapshot = list_activation_snapshot(&self.store, self.store.identity().zone()).await?;
         let process_snapshot = crate::process_resource_runtime::list_process_snapshot(
             &self.store,
@@ -210,7 +231,12 @@ impl ActivationResourceReconciler {
         let mut runtime = self.runtime.lock().await;
         runtime.set_status_client(Arc::clone(&self.client));
         runtime
-            .reconcile(Arc::clone(&self.state), snapshot, process_snapshot)
+            .reconcile(
+                Arc::clone(&self.state),
+                snapshot,
+                process_snapshot,
+                Some(target),
+            )
             .await
     }
 }
@@ -273,7 +299,7 @@ impl ResourceReconciler for ActivationResourceReconciler {
                     Some(resource.key().uid().clone()),
                     Some(resource.revision()),
                     d2b_core_controller::MutationIntentKind::UpdateFinalizers,
-                    None,
+                    Some(finalizer_payload(resource)?),
                 )
                 .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
                 let batch = d2b_core_controller::ResourceMutationBatch::new(vec![mutation])
@@ -300,13 +326,13 @@ impl ResourceReconciler for ActivationResourceReconciler {
 
     fn execute_effect(
         &self,
-        _context: &ReconcileContext,
+        context: &ReconcileContext,
         resource: &ResourceSnapshot,
         _dependencies: &[DependencySnapshot],
         _plan: &ReconcilePlan,
     ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
         let future = async move {
-            self.reconcile_snapshot().await?;
+            self.reconcile_snapshot(context.target().resource_ref()).await?;
             Ok(ReconcileResult::converged(
                 resource.revision(),
                 resource.generation(),
@@ -339,11 +365,11 @@ impl ResourceReconciler for ActivationResourceReconciler {
 
     fn execute_finalize(
         &self,
-        _context: &ReconcileContext,
+        context: &ReconcileContext,
         resource: &ResourceSnapshot,
     ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
         let future = async move {
-            self.reconcile_snapshot().await?;
+            self.reconcile_snapshot(context.target().resource_ref()).await?;
             Ok(ReconcileResult::converged(
                 resource.revision(),
                 resource.generation(),
@@ -421,6 +447,29 @@ fn resource_has_finalizer(resource: &ResourceSnapshot) -> bool {
         })
 }
 
+fn finalizer_payload(
+    resource: &ResourceSnapshot,
+) -> Result<Vec<u8>, ActivationResourceRuntimeError> {
+    let value = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
+    let mut finalizers = value
+        .pointer("/metadata/finalizers")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !finalizers.iter().any(|value| value.as_str() == Some(ACTIVATION_FINALIZER)) {
+        finalizers.push(serde_json::Value::String(ACTIVATION_FINALIZER.to_owned()));
+    }
+    CanonicalJsonValue::parse(
+        &serde_json::to_vec(&serde_json::json!({
+            "metadata": {"finalizers": finalizers}
+        }))
+        .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?,
+    )
+    .map(|value| value.to_canonical_bytes())
+    .map_err(|_| ActivationResourceRuntimeError::InvalidResource)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DesiredRecord {
     resource: StoredResource,
@@ -472,6 +521,7 @@ pub(crate) struct ActivationResourceRuntime {
     controller: ActivationController,
     records: BTreeMap<ResourceRef, DesiredRecord>,
     status_client: Option<Arc<dyn ActivationResourceClient>>,
+    verifier: Arc<dyn ActivationApplicationVerifier>,
 }
 
 impl core::fmt::Debug for ActivationResourceRuntime {
@@ -492,6 +542,7 @@ impl ActivationResourceRuntime {
             controller: ActivationController::new(RETAINED_GENERATIONS),
             records: BTreeMap::new(),
             status_client: None,
+            verifier: Arc::new(FailClosedActivationVerifier),
         }
     }
 
@@ -500,6 +551,23 @@ impl ActivationResourceRuntime {
         C: ActivationResourceClient + 'static,
     {
         self.status_client = Some(status_client);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_verifier(
+        &mut self,
+        verifier: Arc<dyn ActivationApplicationVerifier>,
+    ) {
+        self.verifier = verifier;
+    }
+
+    fn application_is_verified(
+        &self,
+        request: &d2b_provider_activation_nixos::RunnerRequest,
+    ) -> bool {
+        self.verifier
+            .verify_application(&self.controller, request)
+            .is_ok()
     }
 
     fn runner_client(
@@ -515,6 +583,7 @@ impl ActivationResourceRuntime {
         state: Arc<ServerState>,
         snapshot: Vec<StoredResource>,
         process_snapshot: Vec<StoredResource>,
+        target: Option<&ResourceRef>,
     ) -> Result<(), ActivationResourceRuntimeError> {
         let desired = decode_snapshot(&self.zone, snapshot)?;
         let desired_keys = desired.keys().cloned().collect::<BTreeSet<_>>();
@@ -537,6 +606,10 @@ impl ActivationResourceRuntime {
         );
 
         for (key, mut record) in desired {
+            if !selected_target(target, &key) {
+                self.records.insert(key, record);
+                continue;
+            }
             let replace = self
                 .records
                 .get(&key)
@@ -656,6 +729,31 @@ impl ActivationResourceRuntime {
                 self.records.insert(key, record);
                 return Ok(());
             }
+            if !self.application_is_verified(&request) {
+                let applied = self
+                    .controller
+                    .apply_runner_result(
+                        &record.spec,
+                        ActivationOutcomeCode::HelperRefused,
+                        observed,
+                    )
+                    .map_err(|_| ActivationResourceRuntimeError::Policy)?;
+                let detail = activation_detail(
+                    record.spec.activation_mode(),
+                    ActivationOutcomeCode::HelperRefused,
+                    applied.phase(),
+                );
+                record = self
+                    .publish_status(
+                        &record,
+                        applied.phase(),
+                        detail,
+                        applied.audit_codes().first().copied(),
+                    )
+                    .await?;
+                self.records.insert(key, record);
+                return Ok(());
+            }
             let runner = find_runner_observation(&record, &process_snapshot);
             if runner.is_none() {
                 self.create_runner(&record, &request).await?;
@@ -711,7 +809,9 @@ impl ActivationResourceRuntime {
             return Ok(());
         }
 
-        self.apply_retention().await?;
+        if target.is_none() {
+            self.apply_retention().await?;
+        }
         Ok(())
     }
 
@@ -728,6 +828,9 @@ impl ActivationResourceRuntime {
             || request.target_generation != record.ordinal
         {
             return ActivationOutcomeCode::TargetMismatch;
+        }
+        if !self.application_is_verified(request) {
+            return ActivationOutcomeCode::HelperRefused;
         }
         match request.execution_ref.resource_type().as_str() {
             "Host" => self
@@ -977,6 +1080,10 @@ impl ActivationResourceRuntime {
     ) -> Result<(), ActivationResourceRuntimeError> {
         delete_stored_resource(client, resource).await
     }
+}
+
+fn selected_target(target: Option<&ResourceRef>, candidate: &ResourceRef) -> bool {
+    target.is_none_or(|target| target == candidate)
 }
 
 fn host_handoff_outcome(response: &ApplyHostGenerationHandoffResponse) -> ActivationOutcomeCode {
@@ -1785,5 +1892,66 @@ mod tests {
             status.get("phase"),
             Some(&CanonicalJsonValue::String("Pending".to_owned()))
         );
+    }
+
+    #[test]
+    fn production_activation_path_invokes_the_verification_gate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingVerifier {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ActivationApplicationVerifier for CountingVerifier {
+            fn verify_application(
+                &self,
+                _controller: &ActivationController,
+                _request: &d2b_provider_activation_nixos::RunnerRequest,
+            ) -> Result<(), d2b_provider_activation_nixos::ActivationVerificationError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ActivationResourceRuntime::new(ZoneId::parse("dev").unwrap());
+        runtime.set_verifier(Arc::new(CountingVerifier {
+            calls: Arc::clone(&calls),
+        }));
+        let request = d2b_provider_activation_nixos::RunnerRequest {
+            runner_name: d2b_contracts_resource::v3::ResourceName::parse("runner").unwrap(),
+            execution_ref: ResourceRef::parse("Host/host-system").unwrap(),
+            system_artifact_id: d2b_contracts_resource::v3::ArtifactId::parse("system").unwrap(),
+            activation_mode: ActivationMode::Switch,
+            target_generation: 1,
+            start_root: true,
+        };
+        assert!(runtime.application_is_verified(&request));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn missing_activation_verification_fails_closed() {
+        let runtime = ActivationResourceRuntime::new(ZoneId::parse("dev").unwrap());
+        let request = d2b_provider_activation_nixos::RunnerRequest {
+            runner_name: d2b_contracts_resource::v3::ResourceName::parse("runner").unwrap(),
+            execution_ref: ResourceRef::parse("Host/host-system").unwrap(),
+            system_artifact_id: d2b_contracts_resource::v3::ArtifactId::parse("system").unwrap(),
+            activation_mode: ActivationMode::Switch,
+            target_generation: 1,
+            start_root: true,
+        };
+        assert!(!runtime.application_is_verified(&request));
+    }
+
+    #[test]
+    fn activation_pass_selects_only_the_hinted_resource_identity() {
+        let target =
+            ResourceRef::parse("activation-nixos.d2bus.org.NixosGeneration/target").unwrap();
+        let sibling =
+            ResourceRef::parse("activation-nixos.d2bus.org.NixosGeneration/sibling").unwrap();
+        assert!(selected_target(Some(&target), &target));
+        assert!(!selected_target(Some(&target), &sibling));
+        assert!(selected_target(None, &sibling));
     }
 }

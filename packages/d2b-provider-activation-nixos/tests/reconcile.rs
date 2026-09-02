@@ -2,8 +2,8 @@ use d2b_contracts_resource::v3::ActivationOutcomeCode;
 use d2b_contracts_resource::v3::{ActivationMode, NixosGenerationSpec, ResourcePhase, ResourceRef};
 use d2b_provider_activation_nixos::{
     ActivationCaller, ActivationController, ActivationTrust, ActivationTrustExpectation,
-    CallerRole, GenerationObservation, GenerationPhase, TrustStatus, activation_runner_name,
-    activation_runner_ref,
+    ActivationApplicationVerifier, CallerRole, GenerationObservation, GenerationPhase,
+    SignedActivationApplicationVerifier, TrustStatus, activation_runner_name, activation_runner_ref,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use sha2::{Digest, Sha256};
@@ -423,5 +423,34 @@ fn activation_verification_rejects_digest_catalog_and_signature_changes() {
     assert_eq!(
         trust.verify(&changed, &artifact, &catalog_digest),
         Err(d2b_provider_activation_nixos::ActivationVerificationError::SignatureInvalid)
+    );
+}
+
+#[test]
+fn signed_activation_verifier_binds_verification_to_the_exact_runner_request() {
+    let (trust, expected, artifact, catalog_digest) = trust_fixture();
+    let request = d2b_provider_activation_nixos::RunnerRequest {
+        runner_name: d2b_contracts_resource::v3::ResourceName::parse("runner").unwrap(),
+        execution_ref: ResourceRef::parse("Host/host-system").unwrap(),
+        system_artifact_id: d2b_contracts_resource::v3::ArtifactId::parse("system").unwrap(),
+        activation_mode: ActivationMode::Switch,
+        target_generation: 1,
+        start_root: true,
+    };
+    let verifier = SignedActivationApplicationVerifier::new(
+        request.clone(),
+        trust,
+        expected,
+        artifact,
+        catalog_digest,
+    );
+    verifier
+        .verify_application(&ActivationController::new(3), &request)
+        .expect("exact request verifies");
+    let mut changed = request;
+    changed.target_generation = 2;
+    assert_eq!(
+        verifier.verify_application(&ActivationController::new(3), &changed),
+        Err(d2b_provider_activation_nixos::ActivationVerificationError::InvalidEvidence)
     );
 }
