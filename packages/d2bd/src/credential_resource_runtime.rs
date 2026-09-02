@@ -2310,6 +2310,32 @@ mod tests {
         assert_ne!(request.session_generation, rejoined.session_generation);
     }
 
+    #[tokio::test]
+    async fn provider_route_generation_mismatch_is_uncertain() {
+        let provider_ref =
+            ResourceRef::parse("Provider/credential-managed-identity").unwrap();
+        let driver = Arc::new(FakeCredentialDriver::new(9));
+        let route = d2b_session::AuthenticatedSessionRouteBinding::for_test(
+            Some(provider_ref.clone()),
+            CREDENTIAL_SERVICE_NAME,
+            9,
+            Some(1),
+            Some(1),
+        );
+        let session = ComponentCredentialSession::new(route, driver).unwrap();
+        let request = CredentialRevocationRequest::new(
+            &resource(),
+            &provider_ref,
+            &identity_for_provider("Provider/credential-managed-identity"),
+            ReconnectGeneration::new(8).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            session.revoke_credential(&request).await.unwrap(),
+            CredentialRevocationOutcome::Uncertain
+        );
+    }
+
     #[test]
     fn revocation_request_rejects_cross_provider_or_zero_session_identity() {
         let target = resource();
@@ -2483,7 +2509,7 @@ mod tests {
             tokio::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
             tokio::sync::Notify,
         )>,
-        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, String, u64)>>>,
     }
 
     impl FakeCredentialDriver {
@@ -2520,9 +2546,16 @@ mod tests {
                     d2b_contracts_zone_session::v3::component_session::SessionErrorCode::RecordMalformed,
                 )
             })?;
+            let session_generation = request
+                .metadata
+                .iter()
+                .find(|value| value.key == "d2b.credential.session-generation")
+                .and_then(|value| value.value.parse::<u64>().ok())
+                .expect("provider route session generation");
             self.requests.lock().unwrap().push((
                 typed.operation_id().to_owned(),
                 typed.idempotency_key().to_owned(),
+                session_generation,
             ));
             let metadata = MetadataResponse {
                 metadata: d2b_contracts_provider::v3::credential::CredentialMetadata {
@@ -3183,9 +3216,59 @@ mod tests {
             driver.requests.lock().unwrap()[0],
             (
                 expected_revoke.operation_id.clone(),
-                expected_revoke.idempotency_key.clone()
+                expected_revoke.idempotency_key.clone(),
+                9,
             )
         );
+
+        let rejoined_driver = Arc::new(FakeCredentialDriver::new(10));
+        let rejoined_route = d2b_session::AuthenticatedSessionRouteBinding::for_test(
+            Some(provider_ref.clone()),
+            CREDENTIAL_SERVICE_NAME,
+            10,
+            Some(1),
+            Some(1),
+        );
+        let rejoined_session = Arc::new(
+            ComponentCredentialSession::new(rejoined_route, rejoined_driver.clone()).unwrap(),
+        );
+        registry
+            .register(
+                provider_ref.clone(),
+                ReconnectGeneration::new(10).unwrap(),
+                rejoined_session,
+            )
+            .unwrap();
+        let rejoined_source = Arc::new(TestRunnerSource::new(
+            Some(active.clone()),
+            Vec::new(),
+        ));
+        let rejoined = Arc::new(CredentialResourceReconciler::new(
+            Arc::new(TestCredentialStore::default()),
+            Arc::clone(&client),
+            identity_for_provider("Provider/credential-managed-identity"),
+            provider_ref.clone(),
+            registry.for_provider(provider_ref.clone()),
+        )
+        .unwrap());
+        Runner::new(rejoined, rejoined_source.clone(), runner_config())
+            .run()
+            .await
+            .expect("composed provider rejoin runner");
+        assert!(String::from_utf8(
+            rejoined_source.commits()[0]
+                .status_candidate
+                .clone()
+                .unwrap(),
+        )
+        .unwrap()
+        .contains("\"outcome\":\"revoked\""));
+        assert_eq!(rejoined_driver.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            rejoined_driver.requests.lock().unwrap()[0].0,
+            expected_revoke.operation_id
+        );
+        assert_eq!(rejoined_driver.requests.lock().unwrap()[0].2, 10);
 
         let revoked = deleting_resource("Revoked");
         let delete_source = Arc::new(TestRunnerSource::new(Some(revoked.clone()), Vec::new()));

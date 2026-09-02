@@ -43,6 +43,12 @@ const PROVIDER_BOOTSTRAP_FD: i32 = 10;
 pub const PROVIDER_BOOTSTRAP_STREAM_ID: u16 = 0x0102;
 /// Initial bounded credit for the Provider route bootstrap stream.
 pub const PROVIDER_BOOTSTRAP_STREAM_CREDIT: u32 = 64 * 1024;
+/// Named stream carrying the post-admission Provider readiness receipt.
+pub const PROVIDER_READY_STREAM_ID: u16 = 0x0103;
+/// Initial bounded credit for the Provider readiness stream.
+pub const PROVIDER_READY_STREAM_CREDIT: u32 = 256;
+/// Protected readiness receipt sent only after the typed service is live.
+pub const PROVIDER_READY_MARKER: &[u8] = b"d2b-provider-ready-v1";
 const PROVIDER_BOOTSTRAP_MAX_BYTES: usize = 64 * 1024;
 const PROVIDER_BOOTSTRAP_PROTOCOL: &str = "d2b-provider-session-bootstrap-v1";
 
@@ -453,13 +459,39 @@ where
     P: CredentialProvider + 'static,
     A: crate::CredentialAuthorizationSource,
 {
-    entrypoint.publish_authenticated_ready(&registration, session_admission, &route)?;
-    let result = d2b_session::serve_ttrpc_services(
+    let services = credential_service(provider, authorizer, route.clone());
+    let serving = tokio::spawn(d2b_session::serve_ttrpc_services(
         Arc::clone(&driver),
-        credential_service(provider, authorizer, route),
-    )
-    .await
-    .map_err(|_| ProviderRuntimeError::SessionLoopFailed);
+        services,
+    ));
+    tokio::task::yield_now().await;
+    if serving.is_finished() {
+        let _ = serving.await;
+        return Err(ProviderRuntimeError::SessionLoopFailed);
+    }
+    entrypoint.publish_authenticated_ready(&registration, session_admission, &route)?;
+    let stream = StreamId::new(PROVIDER_READY_STREAM_ID)
+        .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
+    driver
+        .open_named_stream(
+            stream,
+            PROVIDER_READY_STREAM_CREDIT,
+            PROVIDER_READY_STREAM_CREDIT,
+        )
+        .await
+        .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
+    driver
+        .send_named_stream(stream, PROVIDER_READY_MARKER.to_vec())
+        .await
+        .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
+    driver
+        .close_named_stream(stream)
+        .await
+        .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
+    let result = serving
+        .await
+        .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?
+        .map_err(|_| ProviderRuntimeError::SessionLoopFailed);
     let _ = driver.close(
         d2b_contracts_zone_session::v3::component_session::CloseReason::Normal,
         d2b_contracts_zone_session::v3::component_session::Remediation::None,

@@ -87,7 +87,8 @@ pub use d2b_session::{
 pub use dispatch::{DispatchLimiter, DispatchPermit, MAX_DISPATCH_IN_FLIGHT};
 #[cfg(feature = "unix-transport")]
 pub use fd10::{
-    PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID, ProviderFd10Spec,
+    PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID, PROVIDER_READY_MARKER,
+    PROVIDER_READY_STREAM_CREDIT, PROVIDER_READY_STREAM_ID, ProviderFd10Spec,
     ProviderSessionMetadata, run_from_fd10,
 };
 pub use error::ProviderToolkitError;

@@ -125,7 +125,8 @@ use d2b_provider_network_local::{
 use d2b_provider_device_gpu::GpuLifecycleEffectPort;
 use d2b_provider_notification_desktop::{Category, GuestSourceConfig, NotificationProviderConfig};
 use d2b_provider_toolkit::{
-    PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID, ProviderSessionMetadata,
+    PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID, PROVIDER_READY_MARKER,
+    PROVIDER_READY_STREAM_CREDIT, PROVIDER_READY_STREAM_ID, ProviderSessionMetadata,
 };
 use d2b_provider_runtime_cloud_hypervisor::{
     AuthenticatedResourceApiAdapter, AuthenticatedResourceSession, BootstrapGraph, ChildRole,
@@ -161,7 +162,7 @@ use d2b_resource_store_redb::{
 };
 use d2b_session::{
     ComponentSessionDriver, HandshakeCredentials, SessionDriverHandle, SessionEngine,
-    SessionServerError, StreamId, TransportEvidence,
+    SessionServerError, StreamEvent, StreamId, TransportEvidence,
 };
 use d2b_session_unix::{
     AncillaryCapacity, CONTROLLER_BOOTSTRAP_TIMEOUT, PeerCredentials, SeqpacketSocket,
@@ -16702,6 +16703,19 @@ impl ControllerSessionCoordinator {
                 .close_named_stream(stream)
                 .await
                 .map_err(|_| authentication_error("provider-session-bootstrap-close"))?;
+            let ready_stream = StreamId::new(PROVIDER_READY_STREAM_ID)
+                .map_err(|_| authentication_error("provider-session-ready-stream"))?;
+            driver
+                .open_named_stream(
+                    ready_stream,
+                    PROVIDER_READY_STREAM_CREDIT,
+                    PROVIDER_READY_STREAM_CREDIT,
+                )
+                .await
+                .map_err(|_| authentication_error("provider-session-ready-open"))?;
+            receive_provider_ready(&driver)
+                .await
+                .map_err(|_| authentication_error("provider-session-ready"))?;
             let monitor = driver.clone();
             (
                 None,
@@ -18577,6 +18591,51 @@ async fn receive_controller_bootstrap(
         return Err(ResourceRuntimeError::AuthenticationUnavailable);
     }
     Ok((resource_socket, credentials))
+}
+
+async fn receive_provider_ready(
+    driver: &SessionDriverHandle,
+) -> Result<(), ResourceRuntimeError> {
+    let stream = StreamId::new(PROVIDER_READY_STREAM_ID)
+        .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
+    let mut received = Vec::new();
+    loop {
+        match driver
+            .receive_named_stream_for(stream)
+            .await
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+        {
+            StreamEvent::Data {
+                stream: received_stream,
+                bytes,
+            } if received_stream == stream => {
+                received.extend_from_slice(&bytes);
+                if received.len() > PROVIDER_READY_MARKER.len() {
+                    return Err(ResourceRuntimeError::AuthenticationUnavailable);
+                }
+                driver
+                    .grant_named_stream_credit(
+                        stream,
+                        u32::try_from(bytes.len())
+                            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?,
+                    )
+                    .await
+                    .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
+            }
+            StreamEvent::RemoteClosed {
+                stream: closed_stream,
+            } if closed_stream == stream => {
+                if received == PROVIDER_READY_MARKER {
+                    return Ok(());
+                }
+                return Err(ResourceRuntimeError::AuthenticationUnavailable);
+            }
+            StreamEvent::Reset { .. } => {
+                return Err(ResourceRuntimeError::AuthenticationUnavailable);
+            }
+            _ => return Err(ResourceRuntimeError::AuthenticationUnavailable),
+        }
+    }
 }
 
 async fn committed_resource(

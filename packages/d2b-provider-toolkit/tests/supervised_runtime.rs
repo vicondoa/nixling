@@ -17,10 +17,11 @@ use d2b_contracts_zone_session::v3::component_session::{
     Locality as ComponentLocality, PurposeClass, TransportClass,
 };
 use d2b_provider_toolkit::{
-    PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID, ProviderSessionMetadata,
+    PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID, PROVIDER_READY_MARKER,
+    PROVIDER_READY_STREAM_CREDIT, PROVIDER_READY_STREAM_ID, ProviderSessionMetadata,
 };
 use d2b_session::{
-    ComponentSessionDriver, HandshakeCredentials, SessionEngine, StreamId,
+    ComponentSessionDriver, HandshakeCredentials, SessionEngine, StreamEvent, StreamId,
 };
 use d2b_session_unix::{
     AncillaryCapacity, CreditPool, CreditScopeSet, DescriptorPolicyResolver,
@@ -175,6 +176,36 @@ fn run_supervised_binary(path: &str, provider: &str) {
             .close_named_stream(stream)
             .await
             .expect("close bootstrap stream");
+        let ready_stream = StreamId::new(PROVIDER_READY_STREAM_ID).expect("ready stream");
+        driver
+            .open_named_stream(
+                ready_stream,
+                PROVIDER_READY_STREAM_CREDIT,
+                PROVIDER_READY_STREAM_CREDIT,
+            )
+            .await
+            .expect("open ready stream");
+        let mut ready = Vec::new();
+        loop {
+            match driver
+                .receive_named_stream_for(ready_stream)
+                .await
+                .expect("receive readiness") {
+                StreamEvent::Data { bytes, .. } => {
+                    ready.extend_from_slice(&bytes);
+                    driver
+                        .grant_named_stream_credit(
+                            ready_stream,
+                            u32::try_from(bytes.len()).expect("readiness size"),
+                        )
+                        .await
+                        .expect("grant readiness credit");
+                }
+                StreamEvent::RemoteClosed { .. } => break,
+                StreamEvent::Reset { .. } => panic!("provider reset readiness stream"),
+            }
+        }
+        assert_eq!(ready, PROVIDER_READY_MARKER);
         tokio::task::yield_now().await;
         driver
     });
