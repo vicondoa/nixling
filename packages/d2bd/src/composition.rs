@@ -17223,6 +17223,9 @@ mod zone_publication_order_tests {
         let source = include_str!("resource_runtime.rs");
         assert!(source.contains("credential_provider_endpoint_policy()"));
         assert!(source.contains("if credential_session"));
+        assert!(source.contains("ProviderSessionMetadata::from_route"));
+        assert!(source.contains("receive_provider_ready(&driver)"));
+        assert!(!source.contains("std::future::pending::<Result<(), SessionServerError>>()"));
         assert!(source.contains("ComponentCredentialSession::new(route.clone()"));
     }
 }

@@ -13,8 +13,8 @@ use d2b_contracts_resource::v3::{
     },
 };
 use d2b_contracts_zone_session::v3::component_session::{
-    EndpointRole, EndpointRole as ComponentEndpointRole,
-    Locality as ComponentLocality, PurposeClass, TransportClass,
+    EndpointRole, EndpointRole as ComponentEndpointRole, Locality as ComponentLocality,
+    PurposeClass, TransportClass,
 };
 use d2b_provider_toolkit::{
     PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID, PROVIDER_READY_MARKER,
@@ -24,8 +24,8 @@ use d2b_session::{
     ComponentSessionDriver, HandshakeCredentials, SessionEngine, StreamEvent, StreamId,
 };
 use d2b_session_unix::{
-    AncillaryCapacity, CreditPool, CreditScopeSet, DescriptorPolicyResolver,
-    PeerIdentityPolicy, SeqpacketSocket, UnixSeqpacketTransport, UnixSessionError,
+    AncillaryCapacity, CreditPool, CreditScopeSet, DescriptorPolicyResolver, PeerIdentityPolicy,
+    SeqpacketSocket, UnixSeqpacketTransport, UnixSessionError,
     controller_bootstrap_attachment_policy, controller_credit_scopes,
     credential_provider_endpoint_policy, duplicate_to_inherited_fd, prearmed_seqpacket_pair,
 };
@@ -143,8 +143,9 @@ fn run_supervised_binary(path: &str, provider: &str) {
         .expect("test runtime");
     let driver = runtime.block_on(async {
         let bootstrap = SeqpacketSocket::from_parent_prearmed(bootstrap_fd).expect("bootstrap");
-        let (resource_socket, credentials) =
-            receive_bootstrap(&bootstrap).await.expect("bootstrap receive");
+        let (resource_socket, credentials) = receive_bootstrap(&bootstrap)
+            .await
+            .expect("bootstrap receive");
         let policy = credential_provider_endpoint_policy();
         let responder = SessionEngine::establish_responder(
             provider_transport(resource_socket, credentials),
@@ -190,7 +191,8 @@ fn run_supervised_binary(path: &str, provider: &str) {
             match driver
                 .receive_named_stream_for(ready_stream)
                 .await
-                .expect("receive readiness") {
+                .expect("receive readiness")
+            {
                 StreamEvent::Data { bytes, .. } => {
                     ready.extend_from_slice(&bytes);
                     driver

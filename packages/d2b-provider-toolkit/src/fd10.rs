@@ -241,9 +241,7 @@ pub fn run_from_fd10<P, A, F>(spec: ProviderFd10Spec, factory: F) -> i32
 where
     P: CredentialProvider + 'static,
     A: crate::CredentialAuthorizationSource,
-    F: FnOnce(
-            &AuthenticatedSessionRouteBinding,
-        ) -> Result<(Arc<P>, Arc<A>), ProviderRuntimeError>
+    F: FnOnce(&AuthenticatedSessionRouteBinding) -> Result<(Arc<P>, Arc<A>), ProviderRuntimeError>
         + Send
         + 'static,
 {
@@ -270,9 +268,7 @@ async fn run_from_fd10_async<P, A, F>(
 where
     P: CredentialProvider + 'static,
     A: crate::CredentialAuthorizationSource,
-    F: FnOnce(
-            &AuthenticatedSessionRouteBinding,
-        ) -> Result<(Arc<P>, Arc<A>), ProviderRuntimeError>
+    F: FnOnce(&AuthenticatedSessionRouteBinding) -> Result<(Arc<P>, Arc<A>), ProviderRuntimeError>
         + Send
         + 'static,
 {
@@ -281,8 +277,8 @@ where
     let expected_peer = bootstrap
         .acceptor_peer_credentials()
         .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
-    let (daemon_endpoint, controller_endpoint) = prearmed_seqpacket_pair()
-        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let (daemon_endpoint, controller_endpoint) =
+        prearmed_seqpacket_pair().map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
     let controller_socket = SeqpacketSocket::from_parent_prearmed(controller_endpoint)
         .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
     send_controller_bootstrap(&bootstrap, daemon_endpoint).await?;
@@ -329,11 +325,8 @@ where
         .admit(metadata.allocator_binding()?)
         .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
 
-    let mut entrypoint = ProviderEntrypoint::with_provider(
-        spec.name,
-        spec.provider_ref,
-        spec.service,
-    )?;
+    let mut entrypoint =
+        ProviderEntrypoint::with_provider(spec.name, spec.provider_ref, spec.service)?;
     if let Some(execution_ref) = route.context().execution_ref().cloned() {
         entrypoint = entrypoint.with_execution_target(execution_ref)?;
     }
@@ -425,15 +418,20 @@ async fn receive_route_metadata(
             .await
             .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?
         {
-            StreamEvent::Data { stream: received, bytes: chunk } if received == stream => {
+            StreamEvent::Data {
+                stream: received,
+                bytes: chunk,
+            } if received == stream => {
                 bytes.extend_from_slice(&chunk);
                 if bytes.len() > PROVIDER_BOOTSTRAP_MAX_BYTES {
                     return Err(ProviderRuntimeError::SessionUnauthenticated);
                 }
                 driver
-                    .grant_named_stream_credit(stream, u32::try_from(chunk.len()).map_err(|_| {
-                        ProviderRuntimeError::SessionUnauthenticated
-                    })?)
+                    .grant_named_stream_credit(
+                        stream,
+                        u32::try_from(chunk.len())
+                            .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?,
+                    )
                     .await
                     .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
             }
@@ -469,33 +467,50 @@ where
         let _ = serving.await;
         return Err(ProviderRuntimeError::SessionLoopFailed);
     }
-    entrypoint.publish_authenticated_ready(&registration, session_admission, &route)?;
-    let stream = StreamId::new(PROVIDER_READY_STREAM_ID)
-        .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
-    driver
-        .open_named_stream(
-            stream,
-            PROVIDER_READY_STREAM_CREDIT,
-            PROVIDER_READY_STREAM_CREDIT,
-        )
-        .await
-        .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
-    driver
-        .send_named_stream(stream, PROVIDER_READY_MARKER.to_vec())
-        .await
-        .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
-    driver
-        .close_named_stream(stream)
-        .await
-        .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
+    if entrypoint
+        .publish_authenticated_ready(&registration, session_admission, &route)
+        .is_err()
+    {
+        serving.abort();
+        let _ = serving.await;
+        return Err(ProviderRuntimeError::SessionLoopFailed);
+    }
+    let ready_result = async {
+        let stream = StreamId::new(PROVIDER_READY_STREAM_ID)
+            .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
+        driver
+            .open_named_stream(
+                stream,
+                PROVIDER_READY_STREAM_CREDIT,
+                PROVIDER_READY_STREAM_CREDIT,
+            )
+            .await
+            .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
+        driver
+            .send_named_stream(stream, PROVIDER_READY_MARKER.to_vec())
+            .await
+            .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
+        driver
+            .close_named_stream(stream)
+            .await
+            .map_err(|_| ProviderRuntimeError::SessionLoopFailed)
+    }
+    .await;
+    if let Err(error) = ready_result {
+        serving.abort();
+        let _ = serving.await;
+        return Err(error);
+    }
     let result = serving
         .await
         .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?
         .map_err(|_| ProviderRuntimeError::SessionLoopFailed);
-    let _ = driver.close(
-        d2b_contracts_zone_session::v3::component_session::CloseReason::Normal,
-        d2b_contracts_zone_session::v3::component_session::Remediation::None,
-    ).await;
+    let _ = driver
+        .close(
+            d2b_contracts_zone_session::v3::component_session::CloseReason::Normal,
+            d2b_contracts_zone_session::v3::component_session::Remediation::None,
+        )
+        .await;
     drop(registration);
     if !entrypoint.drain(Duration::from_secs(5)) {
         return Err(ProviderRuntimeError::SessionLoopFailed);
