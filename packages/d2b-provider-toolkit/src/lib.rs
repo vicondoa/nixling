@@ -112,5 +112,7 @@ pub use values::{
 /// Audited Unix attachment types used by Provider-specific transport adapters.
 #[cfg(feature = "unix-transport")]
 pub mod unix {
-    pub use d2b_session_unix::{AcceptedAttachment, CreditBundle, VerifiedPacket};
+    pub use d2b_session_unix::{
+        AcceptedAttachment, CreditBundle, VerifiedPacket, credential_provider_endpoint_policy,
+    };
 }
