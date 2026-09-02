@@ -67,6 +67,9 @@ d2b-provider-runtime-azure-virtual-machine = { path = "../d2b-provider-runtime-a
 # src/realm_stubs.rs wire this trait surface; they are compile-only
 # and NOT called from the running daemon (zero behavior change).
 d2b-provider-runtime-azure-container-apps = { path = "../d2b-provider-runtime-azure-container-apps", version = "0.0.0-bootstrap" }
+d2b-provider-credential-secret-service = { path = "../d2b-provider-credential-secret-service", version = "0.0.0-bootstrap" }
+d2b-provider-credential-entra = { path = "../d2b-provider-credential-entra", version = "0.0.0-bootstrap" }
+d2b-provider-credential-managed-identity = { path = "../d2b-provider-credential-managed-identity", version = "0.0.0-bootstrap" }
 d2b-provider-transport-azure-relay = { path = "../d2b-provider-transport-azure-relay", version = "0.0.0-bootstrap" }
 protobuf = "3.7.2"
 serde.workspace = true

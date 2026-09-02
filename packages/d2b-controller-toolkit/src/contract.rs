@@ -242,6 +242,11 @@ impl ControllerIdentity {
     pub const fn provider_generation(&self) -> ResourceGeneration {
         self.provider_generation
     }
+
+    /// Borrow the Provider reference bound to this controller session.
+    pub const fn provider_ref(&self) -> &ResourceRef {
+        &self.provider_ref
+    }
 }
 
 impl core::fmt::Debug for ControllerIdentity {

@@ -422,6 +422,7 @@ mod audio_dispatch;
 mod audio_host_controller;
 mod audio_resource_runtime;
 mod binding_child_resource_runtime;
+mod credential_resource_runtime;
 pub mod interaction_composition;
 pub mod network_effect_port;
 pub mod process_provider_runtime;
@@ -16742,6 +16743,19 @@ async fn open_resource_plane(
                 "semantic binding reconciliation degraded during startup",
             );
         }
+        if let Err(error) = runtime.start_u10_controller_runners().await {
+            tracing::error!(
+                zone = %runtime.zone().as_str(),
+                error = ?error,
+                "Credential controller runners refused during startup",
+            );
+            let _ = runtime.shutdown().await;
+            let _ = plane.shutdown().await;
+            while let Some((_, runtime, _)) = remaining.next() {
+                let _ = runtime.shutdown().await;
+            }
+            return Err(error);
+        }
         if let Err(error) = runtime
             .start_u12_controller_runners(Arc::new(state.clone()))
             .await
@@ -17147,6 +17161,29 @@ mod zone_publication_order_tests {
             .map(|(source, _)| source)
             .expect("serve source span");
         assert!(!serve_source.contains(".start_u9_controller_runners("));
+    }
+
+    #[test]
+    fn credential_runner_attach_is_fail_closed_before_readiness() {
+        let source = include_str!("composition.rs");
+        let credential_attach = source
+            .find("if let Err(error) = runtime.start_u10_controller_runners().await")
+            .expect("Credential runner attach");
+        let u12_attach = source
+            .find("runtime\n            .start_u12_controller_runners")
+            .expect("U12 runner attach");
+        let readiness = source
+            .find("if let Err(error) = runtime.require_ready()")
+            .expect("startup readiness check");
+        assert!(credential_attach < u12_attach);
+        assert!(u12_attach < readiness);
+        let arm_end = source[credential_attach..]
+            .find("        if let Err(error) = runtime\n            .start_u12_controller_runners")
+            .map(|offset| credential_attach + offset)
+            .expect("Credential attach arm end");
+        let arm = &source[credential_attach..arm_end];
+        assert!(arm.contains("return Err(error);"));
+        assert!(!arm.contains("tracing::warn!"));
     }
 }
 

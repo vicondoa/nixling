@@ -35,6 +35,10 @@ use crate::binding_child_resource_runtime::{
     OneOwnedChildProgress, OwnedChildOwner,
     reconcile_one_guest_child,
 };
+use crate::binding_child_resource_runtime::reconcile_binding_children;
+use crate::credential_resource_runtime::{
+    CredentialResourceReconciler, credential_controller_descriptor,
+};
 use crate::process_resource_runtime::{
     ProcessResourceReconciler, ProcessResourceRuntime, ProcessResourceRuntimeError,
     controller_provider_refs, list_process_snapshot, process_controller_descriptor,
@@ -8168,7 +8172,7 @@ struct CoreAssignmentAuthority {
     epoch: u64,
 }
 
-async fn abort_u12_runner_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+async fn abort_controller_runner_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
     for task in tasks.drain(..) {
         task.abort();
         let _ = task.await;
@@ -10244,6 +10248,9 @@ pub struct ZoneResourceRuntime {
     u9_runner_lock: Arc<tokio::sync::Mutex<()>>,
     u9_state: Mutex<Option<Arc<crate::ServerState>>>,
     u9_required: AtomicBool,
+    u10_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    u10_runner_lock: Arc<tokio::sync::Mutex<()>>,
+    u10_required: AtomicBool,
     #[cfg(test)]
     core_runner_events: Arc<Mutex<Vec<&'static str>>>,
     core: Mutex<CoreProcess>,
@@ -11036,6 +11043,9 @@ impl ZoneResourceRuntime {
             u9_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
             u9_state: Mutex::new(None),
             u9_required: AtomicBool::new(false),
+            u10_runner_tasks: Mutex::new(Vec::new()),
+            u10_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
+            u10_required: AtomicBool::new(false),
             #[cfg(test)]
             core_runner_events: Arc::new(Mutex::new(Vec::new())),
             core: Mutex::new(core),
@@ -11754,12 +11764,18 @@ impl ZoneResourceRuntime {
         } else {
             None
         };
+        let _u10_runner_guard = if rebind_core {
+            Some(self.u10_runner_lock.lock().await)
+        } else {
+            None
+        };
         if rebind_core {
             self.stop_core_controller_runners_locked().await?;
             self.stop_u12_controller_runners_locked().await?;
             self.stop_u7_controller_runners_locked().await?;
             self.stop_u6_controller_runners_locked().await?;
             self.stop_u9_controller_runners_locked().await?;
+            self.stop_u10_controller_runners_locked().await?;
         }
         self.authorizer
             .replace_policy(policy.clone(), &state)
@@ -11834,6 +11850,7 @@ impl ZoneResourceRuntime {
             if let Some(state) = state {
                 self.start_u9_controller_runners_locked(state).await?;
             }
+            self.start_u10_controller_runners_locked().await?;
         }
         Ok(())
     }
@@ -12148,6 +12165,26 @@ impl ZoneResourceRuntime {
             .lock()
             .ok()
             .and_then(|client| client.clone())
+    }
+
+    /// Gate a Guest-local typed Credential session through this Zone's
+    /// authenticated ResourceService before it can read a lease.
+    #[allow(dead_code)]
+    pub(crate) fn scoped_credential_client(
+        &self,
+        delegate: Arc<dyn d2b_provider_transport_azure_relay::ScopedCredentialClient>,
+    ) -> Result<
+        Arc<crate::credential_resource_runtime::SameZoneScopedCredentialClient>,
+        ResourceRuntimeError,
+    > {
+        let resource = self.status_client()?;
+        Ok(Arc::new(
+            crate::credential_resource_runtime::SameZoneScopedCredentialClient::new(
+                self.zone.clone(),
+                resource,
+                delegate,
+            ),
+        ))
     }
 
     fn status_client(
@@ -12743,6 +12780,338 @@ impl ZoneResourceRuntime {
             }
         }
         Ok(())
+    }
+
+    async fn stop_u10_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        let tasks = {
+            let mut tasks = self
+                .u10_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        self.u10_required.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Attach Credential Provider controllers to the shared Core source and
+    /// Runner path. A controller is registered only when its Provider owns at
+    /// least one Credential row, avoiding zero-resource registrations.
+    pub(crate) async fn start_u10_controller_runners(
+        &self,
+    ) -> Result<(), ResourceRuntimeError> {
+        let _runner_guard = self.u10_runner_lock.lock().await;
+        self.start_u10_controller_runners_locked().await
+    }
+
+    async fn start_u10_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        if !self.readiness.resource_api_ready {
+            return Ok(());
+        }
+        {
+            let tasks = self
+                .u10_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            if tasks.iter().any(|task| !task.is_finished()) {
+                return Ok(());
+            }
+        }
+        let stale = {
+            let mut tasks = self
+                .u10_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in stale {
+            let _ = task.await;
+        }
+
+        let subject_context = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let authorization_state = self
+            .authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let controller_generation = self
+            .store_metadata
+            .policy_snapshot
+            .controller_generation
+            .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+        let session_generation = subject_context.reconnect_generation();
+        let status_client = self.status_client()?;
+        let providers = [
+            (
+                "credential-secret-service",
+                ResourceRef::parse("Process/credential-secret-service-controller")
+                    .expect("Credential controller ref"),
+                d2b_contracts_provider::v3::credential_controller::CredentialProviderKind::SecretService,
+                d2b_provider_credential_secret_service::PROVIDER_REF,
+            ),
+            (
+                "credential-entra",
+                ResourceRef::parse("Process/credential-entra-controller")
+                    .expect("Credential controller ref"),
+                d2b_contracts_provider::v3::credential_controller::CredentialProviderKind::Entra,
+                d2b_provider_credential_entra::PROVIDER_REF,
+            ),
+            (
+                "credential-managed-identity",
+                ResourceRef::parse("Process/credential-managed-identity-controller")
+                    .expect("Credential controller ref"),
+                d2b_contracts_provider::v3::credential_controller::CredentialProviderKind::ManagedIdentity,
+                d2b_provider_credential_managed_identity::PROVIDER_REF,
+            ),
+        ];
+        let mut new_tasks = Vec::new();
+        let build_result: Result<(), ResourceRuntimeError> = async {
+            for (provider_name, controller_ref, provider_kind, provider_ref_text) in providers {
+            let provider_ref =
+                ResourceRef::parse(provider_ref_text).map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            if !self.credential_resources_present(&provider_ref).await? {
+                continue;
+            }
+            let provider = match self
+                .store
+                .get(StoreGetRequest {
+                    operation: StoreOperationContext {
+                        operation_id: format!("u10-provider-{provider_name}"),
+                        idempotency_key: None,
+                        correlation_id: format!("u10-provider-{provider_name}"),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: self.zone.clone(),
+                    target: provider_ref.clone(),
+                    expected_uid: None,
+                    projection: StoreProjection::MetadataOnly,
+                })
+                .await
+            {
+                Ok(provider) => provider,
+                Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                    return Err(ResourceRuntimeError::ProviderPathUnavailable);
+                }
+                Err(_) => return Err(ResourceRuntimeError::StoreReadFailed),
+            };
+            if provider.zone != self.zone
+                || provider.resource_ref != provider_ref
+                || provider.generation.get() == 0
+            {
+                return Err(ResourceRuntimeError::HandlerNotReady);
+            }
+            let identity = ControllerIdentity::new(
+                self.zone.clone(),
+                controller_ref.clone(),
+                controller_generation,
+                provider_ref.clone(),
+                provider.generation,
+                controller_ref.clone(),
+                ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                None,
+            )
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let descriptor = credential_controller_descriptor(identity.clone())
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let (assignments, authority) = self
+                .u12_controller_assignments(
+                    &descriptor,
+                    controller_ref.clone(),
+                    provider.generation,
+                    controller_generation,
+                    session_generation,
+                )
+                .await?;
+            let subject = self
+                .authorizer
+                .issue_authenticated_subject(subject_context.clone(), authorization_state.clone())
+                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+            let api = self
+                .api
+                .registered_controller_api(
+                    subject,
+                    authorization_state.clone(),
+                    assignments,
+                )
+                .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
+            let allowed_types = descriptor.resource_types().cloned().collect::<BTreeSet<_>>();
+            let resolver_store = Arc::clone(&self.store);
+            let resolver_zone = self.zone.clone();
+            let resolver_authority = Arc::clone(&authority);
+            let resolver: AssignmentFenceResolver = Arc::new(move |target, uid, revision| {
+                let store = Arc::clone(&resolver_store);
+                let zone = resolver_zone.clone();
+                let authority = Arc::clone(&resolver_authority);
+                let allowed_types = allowed_types.clone();
+                Box::pin(async move {
+                    if !allowed_types.contains(target.resource_type()) {
+                        return Err(SourceError::Integrity);
+                    }
+                    if let Some(stored) = store
+                        .assignment_fence(zone.clone(), target.clone())
+                        .await
+                        .map_err(|error| match error.kind() {
+                            StoreErrorKind::Backpressure
+                            | StoreErrorKind::StoreBackpressure => SourceError::Backpressure,
+                            StoreErrorKind::Timeout => SourceError::Timeout,
+                            _ => SourceError::Unavailable,
+                        })?
+                    {
+                        if stored.resource_uid != uid
+                            || stored.epoch > authority.epoch
+                            || (stored.epoch == authority.epoch
+                                && (stored.provider_generation != authority.provider_generation
+                                    || stored.controller_generation
+                                        != authority.controller_generation
+                                    || stored.controller_role != authority.controller_role
+                                    || stored.target != authority.target
+                                    || stored.session_generation != authority.session_generation))
+                        {
+                            return Err(SourceError::Integrity);
+                        }
+                        if stored.epoch == authority.epoch
+                            && stored.resource_revision != revision
+                        {
+                            return Err(SourceError::Conflict(stored.resource_revision));
+                        }
+                    }
+                    Ok(ResourceAssignmentFence {
+                        resource_uid: uid,
+                        resource_revision: revision,
+                        provider_generation: authority.provider_generation,
+                        controller_generation: authority.controller_generation,
+                        controller_role: authority.controller_role.clone(),
+                        target: authority.target.clone(),
+                        session_generation: authority.session_generation,
+                        epoch: authority.epoch,
+                        scope: ResourceAssignmentScope::Primary,
+                    })
+                })
+            });
+            let api = api.with_assignment_fence_resolver(resolver);
+            let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+            let reconciler = Arc::new(
+                CredentialResourceReconciler::new(
+                    Arc::clone(&self.store),
+                    Arc::clone(&status_client),
+                    identity,
+                    provider_ref,
+                )
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+            );
+            let runner = Runner::new(
+                reconciler,
+                source,
+                RunnerConfig {
+                    policy_revision: authorization_state.snapshot.policy_revision,
+                    api_revision: authorization_state.snapshot.api_catalog_revision,
+                    configuration_revision: authorization_state
+                        .snapshot
+                        .active_configuration_revision,
+                    deadline_tick: 5_000,
+                    max_attempts: 3,
+                },
+            );
+            new_tasks.push(tokio::spawn(async move {
+                match runner.run().await {
+                    Ok(report) => {
+                        tracing::debug!(
+                            provider = provider_kind.as_str(),
+                            dispatched = report.dispatched,
+                            relists = report.relists,
+                            "Credential resource runner stopped",
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            provider = provider_kind.as_str(),
+                            error = %error,
+                            "Credential resource runner isolated failure",
+                        );
+                    }
+                }
+            }));
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = build_result {
+            abort_controller_runner_tasks(&mut new_tasks).await;
+            self.u10_required.store(false, Ordering::Release);
+            return Err(error);
+        }
+        let required = !new_tasks.is_empty();
+        match self.u10_runner_tasks.lock() {
+            Ok(mut tasks) => tasks.extend(new_tasks),
+            Err(_) => {
+                abort_controller_runner_tasks(&mut new_tasks).await;
+                self.u10_required.store(false, Ordering::Release);
+                return Err(ResourceRuntimeError::WatchUnavailable);
+            }
+        }
+        self.u10_required.store(required, Ordering::Release);
+        Ok(())
+    }
+
+    async fn credential_resources_present(
+        &self,
+        provider_ref: &ResourceRef,
+    ) -> Result<bool, ResourceRuntimeError> {
+        let mut cursor = None;
+        loop {
+            let page = self
+                .store
+                .list(StoreListRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "u10-credential-presence".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "u10-credential-presence".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: self.zone.clone(),
+                    resource_types: vec![
+                        ResourceTypeName::parse("Credential")
+                            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                    ],
+                    resource_names: Vec::new(),
+                    filters: Vec::new(),
+                    page_size: 256,
+                    cursor,
+                    projection: StoreProjection::Full,
+                })
+                .await
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+            if page.resources.iter().any(|resource| {
+                serde_json::from_slice::<Value>(&resource.canonical_json)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .pointer("/spec/providerRef")
+                            .and_then(Value::as_str)
+                            .and_then(|value| ResourceRef::parse(value).ok())
+                    })
+                    .is_some_and(|selected| selected == *provider_ref)
+            }) {
+                return Ok(true);
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                return Ok(false);
+            }
+        }
     }
 
     async fn stop_u12_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
@@ -13450,14 +13819,14 @@ impl ZoneResourceRuntime {
         let required = match build_result {
             Ok(required) => required,
             Err(error) => {
-                abort_u12_runner_tasks(&mut new_tasks).await;
+                abort_controller_runner_tasks(&mut new_tasks).await;
                 return Err(error);
             }
         };
         match self.u12_runner_tasks.lock() {
             Ok(mut tasks) => tasks.extend(new_tasks),
             Err(_) => {
-                abort_u12_runner_tasks(&mut new_tasks).await;
+                abort_controller_runner_tasks(&mut new_tasks).await;
                 return Err(ResourceRuntimeError::WatchUnavailable);
             }
         }
@@ -16768,6 +17137,23 @@ impl ZoneResourceRuntime {
         if !u9_ready {
             return Some(ResourceRuntimeError::HandlerNotReady);
         }
+        let u10_ready = if self.u10_required.load(Ordering::Acquire) {
+            self.u10_runner_tasks
+                .try_lock()
+                .map(|tasks| {
+                    u12_runner_readiness(
+                        true,
+                        tasks.len(),
+                        tasks.iter().any(|task| task.is_finished()),
+                    )
+                })
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        if !u10_ready {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
         if !matches!(self.core_stage().ok(), Some(StartupStage::Ready)) {
             return Some(ResourceRuntimeError::HandlerNotReady);
         }
@@ -17380,6 +17766,8 @@ impl ZoneResourceRuntime {
             u7_runner_tasks,
             u6_runner_tasks,
             u9_runner_tasks,
+            u10_runner_tasks,
+            audio_watch_task,
             audio_runtime,
             device_binding_watch_task,
             process_runner_task,
@@ -17428,6 +17816,20 @@ impl ZoneResourceRuntime {
             .into_inner()
             .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
         for task in u9_runner_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        let u10_runner_tasks = u10_runner_tasks
+            .into_inner()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        for task in u10_runner_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = audio_watch_task
+            .into_inner()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
+        {
             task.abort();
             let _ = task.await;
         }
@@ -21324,7 +21726,7 @@ mod tests {
                 std::future::pending::<()>().await;
             }),
         ];
-        abort_u12_runner_tasks(&mut tasks).await;
+        abort_controller_runner_tasks(&mut tasks).await;
         assert!(tasks.is_empty());
     }
 

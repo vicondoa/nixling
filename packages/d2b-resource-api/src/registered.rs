@@ -770,6 +770,13 @@ impl RedbRegisteredControllerApi {
             Ok(resource) => resource,
             Err(_) => return Ok(None),
         };
+        if !descriptor
+            .watch_selectors()
+            .iter()
+            .any(|selector| selector_matches(selector, &resource))
+        {
+            return Ok(None);
+        }
         let current = finalizer_set(&resource.canonical_json)?;
         let missing = finalizers.difference(&current).cloned().collect::<Vec<_>>();
         if missing.is_empty() {
@@ -1602,6 +1609,18 @@ fn selector_matches(
     let Some(expected) = selector.exact_value() else {
         return true;
     };
+    if resource.resource_ref.resource_type().as_str() == "Credential" {
+        return serde_json::from_slice::<Value>(&resource.canonical_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/spec/providerRef")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some(expected);
+    }
     match selector.field() {
         ChangeField::Metadata => resource.resource_ref.name().as_str() == expected,
         ChangeField::Spec
@@ -1799,6 +1818,27 @@ fn selector_matches_event(
 ) -> bool {
     if selector.resource_type() != entry.resource_type() {
         return false;
+    }
+    if entry.resource_type().as_str() == "Credential"
+        && let Some(expected) = selector.exact_value()
+    {
+        return entry
+            .canonical_resource()
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .and_then(|value| {
+                value
+                    .pointer("/spec/providerRef")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            .map_or(
+                matches!(
+                    entry.event(),
+                    ChangeEvent::DeletionRequested | ChangeEvent::Deleted
+                ),
+                |provider| provider == expected,
+            );
     }
     if matches!(
         entry.event(),
@@ -2183,6 +2223,33 @@ mod tests {
             );
         }
         value.to_canonical_bytes()
+    }
+
+    #[test]
+    fn credential_watch_selectors_filter_by_provider_ref_before_dispatch() {
+        let credential_type = ResourceTypeName::parse("Credential").unwrap();
+        let selector = WatchSelector::new(
+            credential_type.clone(),
+            ChangeField::Spec,
+            Some("Provider/credential-entra".to_owned()),
+        )
+        .unwrap();
+        let resource = StoredResource {
+            resource_ref: ResourceRef::parse("Credential/work").unwrap(),
+            zone: ZoneId::parse("work").unwrap(),
+            uid: ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            generation: ResourceGeneration::new(1).unwrap(),
+            revision: ZoneRevision::new(1),
+            canonical_json: br#"{"spec":{"providerRef":"Provider/credential-entra"}}"#.to_vec(),
+            payload_digest: format!("sha256:{}", "a".repeat(64)),
+        };
+        assert!(selector_matches(&selector, &resource));
+        let wrong = StoredResource {
+            canonical_json: br#"{"spec":{"providerRef":"Provider/credential-secret-service"}}"#
+                .to_vec(),
+            ..resource
+        };
+        assert!(!selector_matches(&selector, &wrong));
     }
 
     fn verified_create(
