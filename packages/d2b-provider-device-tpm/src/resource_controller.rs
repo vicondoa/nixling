@@ -4,6 +4,59 @@ use d2b_contracts_resource::v3::{ResourceRef, ResourceUid};
 use serde::Serialize;
 
 use crate::resource_effect::{TpmResourceEffectError, TpmResourceEffectPort};
+use crate::status::{TpmMarkerStatus, TpmStatusReport};
+
+/// Default descriptor repair interval.
+pub const TPM_REPAIR_INTERVAL_SECS: u64 = 30;
+/// Maximum descriptor repair interval.
+pub const TPM_MAX_REPAIR_INTERVAL_SECS: u64 = 60;
+/// The cutover contract for the TPM Device owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TpmRunnerContract {
+    resource_type: &'static str,
+    finalizer: &'static str,
+    repair_interval_secs: u64,
+    legacy_scheduler_disabled: bool,
+    watched_configuration_is_dependency: bool,
+}
+
+impl TpmRunnerContract {
+    /// Return the owned ResourceType.
+    pub const fn resource_type(self) -> &'static str {
+        self.resource_type
+    }
+
+    /// Return the exact Device finalizer.
+    pub const fn finalizer(self) -> &'static str {
+        self.finalizer
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Whether the legacy TPM scheduler is disabled.
+    pub const fn legacy_scheduler_disabled(self) -> bool {
+        self.legacy_scheduler_disabled
+    }
+
+    /// Whether watched configuration is treated as a dependency.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+}
+
+/// Return the one shared-Runner registration for the TPM Device owner.
+pub const fn tpm_runner_contract() -> TpmRunnerContract {
+    TpmRunnerContract {
+        resource_type: "Device",
+        finalizer: crate::DEVICE_TPM_FINALIZER,
+        repair_interval_secs: TPM_REPAIR_INTERVAL_SECS,
+        legacy_scheduler_disabled: true,
+        watched_configuration_is_dependency: true,
+    }
+}
 
 /// Lifecycle phase of the resource-backed TPM controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -78,6 +131,8 @@ pub struct TpmResourceController {
     process_ref: Option<ResourceRef>,
     flush_ref: Option<ResourceRef>,
     endpoint_ref: Option<ResourceRef>,
+    marker_status: TpmMarkerStatus,
+    last_error: Option<TpmResourceEffectError>,
 }
 
 impl TpmResourceController {
@@ -106,6 +161,8 @@ impl TpmResourceController {
             process_ref: None,
             flush_ref: None,
             endpoint_ref: None,
+            marker_status: TpmMarkerStatus::NeverProvisioned,
+            last_error: None,
         })
     }
 
@@ -124,6 +181,19 @@ impl TpmResourceController {
         self.endpoint_ref.as_ref()
     }
 
+    /// Return the durable, redacted status projection retained for restart.
+    pub fn status(&self) -> TpmStatusReport {
+        TpmStatusReport {
+            phase: self.phase,
+            state_volume_ref: self.volume_ref.clone(),
+            swtpm_process_ref: self.process_ref.clone(),
+            last_flush_ref: self.flush_ref.clone(),
+            tpm_endpoint_ref: self.endpoint_ref.clone(),
+            marker_status: self.marker_status,
+            condition: self.last_error.map(TpmResourceEffectError::code),
+        }
+    }
+
     /// Reconciliation creates the Volume, completes the mandatory pre-start
     /// flush, starts and observes the long-lived Process, and then exposes
     /// the Endpoint.
@@ -134,36 +204,56 @@ impl TpmResourceController {
         if self.phase == TpmResourcePhase::Finalized {
             return Err(TpmResourceControllerError::InvalidState);
         }
+        if self.phase == TpmResourcePhase::Failed {
+            return Err(TpmResourceControllerError::Effect(
+                self.last_error
+                    .unwrap_or(TpmResourceEffectError::StateIntegrity),
+            ));
+        }
         self.phase = TpmResourcePhase::Reconciling;
-        let volume = match port
-            .ensure_state_volume(&self.device_uid, &self.device_ref, &self.execution_ref)
-            .await
-        {
-            Ok(value) => value,
-            Err(error) => return self.effect_failed(error),
+        let volume = if let Some(volume) = self.volume_ref.clone() {
+            volume
+        } else {
+            let volume = match port
+                .ensure_state_volume(&self.device_uid, &self.device_ref, &self.execution_ref)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => return self.effect_failed(error),
+            };
+            self.marker_status = TpmMarkerStatus::Verified;
+            self.volume_ref = Some(volume.clone());
+            volume
         };
-        self.volume_ref = Some(volume.clone());
-        let flush = match port
-            .request_flush_process(&self.device_uid, &self.execution_ref)
-            .await
-        {
-            Ok(value) => value,
-            Err(error) => return self.effect_failed(error),
+        if self.flush_ref.is_none() {
+            let flush = match port
+                .request_flush_process(&self.device_uid, &self.execution_ref)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => return self.effect_failed(error),
+            };
+            self.flush_ref = Some(flush);
+        }
+        let process = if let Some(process) = self.process_ref.clone() {
+            process
+        } else {
+            let process = match port
+                .request_swtpm_process(&self.device_uid, &volume, &self.execution_ref)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => return self.effect_failed(error),
+            };
+            self.process_ref = Some(process.clone());
+            process
         };
-        self.flush_ref = Some(flush);
-        let process = match port
-            .request_swtpm_process(&self.device_uid, &volume, &self.execution_ref)
-            .await
-        {
-            Ok(value) => value,
-            Err(error) => return self.effect_failed(error),
-        };
-        self.process_ref = Some(process.clone());
         let endpoint = match port.watch_tpm_endpoint(&process).await {
             Ok(value) => value,
             Err(error) => return self.effect_failed(error),
         };
         self.endpoint_ref = Some(endpoint);
+        self.last_error = None;
         self.phase = TpmResourcePhase::Ready;
         Ok(TpmResourceOutcome::Ready)
     }
@@ -198,6 +288,7 @@ impl TpmResourceController {
             return Err(TpmResourceControllerError::Effect(error));
         }
         self.endpoint_ref = None;
+        self.last_error = None;
         self.phase = TpmResourcePhase::Finalized;
         Ok(TpmResourceOutcome::VolumeRetained)
     }
@@ -206,6 +297,10 @@ impl TpmResourceController {
         &mut self,
         error: TpmResourceEffectError,
     ) -> Result<T, TpmResourceControllerError> {
+        self.last_error = Some(error);
+        if error == TpmResourceEffectError::StateIntegrity {
+            self.marker_status = TpmMarkerStatus::Tampered;
+        }
         self.phase = if error == TpmResourceEffectError::Transient {
             TpmResourcePhase::Degraded
         } else {

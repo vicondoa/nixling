@@ -23,7 +23,9 @@ pub use controller::{
 };
 pub use migration::LegacyMigrationOutcome;
 pub use resource_controller::{
-    TpmResourceController, TpmResourceControllerError, TpmResourceOutcome, TpmResourcePhase,
+    TPM_MAX_REPAIR_INTERVAL_SECS, TPM_REPAIR_INTERVAL_SECS, TpmResourceController,
+    TpmResourceControllerError, TpmResourceOutcome, TpmResourcePhase, TpmRunnerContract,
+    tpm_runner_contract,
 };
 pub use resource_effect::{TpmResourceEffectError, TpmResourceEffectPort};
 pub use resources::{

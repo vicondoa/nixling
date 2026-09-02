@@ -30,6 +30,10 @@ pub struct TpmStatusReport {
     pub phase: TpmResourcePhase,
     /// The retained Device-owned state Volume.
     pub state_volume_ref: Option<ResourceRef>,
+    /// The Device-owned swtpm Process.
+    pub swtpm_process_ref: Option<ResourceRef>,
+    /// The most recent pre-start flush Process.
+    pub last_flush_ref: Option<ResourceRef>,
     /// The Device-owned TPM Endpoint.
     pub tpm_endpoint_ref: Option<ResourceRef>,
     /// Marker posture.
@@ -44,6 +48,8 @@ impl TpmStatusReport {
         Self {
             phase: TpmResourcePhase::Pending,
             state_volume_ref: None,
+            swtpm_process_ref: None,
+            last_flush_ref: None,
             tpm_endpoint_ref: None,
             marker_status: TpmMarkerStatus::NeverProvisioned,
             condition: None,
