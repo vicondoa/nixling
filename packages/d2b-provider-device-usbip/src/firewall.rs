@@ -291,6 +291,8 @@ pub enum UsbipEffectError {
     WrongZone,
     /// The dependency was not Ready.
     NetworkNotReady,
+    /// The dependency assignment no longer matches this controller.
+    StaleAssignment,
     /// A second owner attempted to create the Network relay authority.
     RelayAuthorityConflict,
     /// Effect may be retried with all authority retained.
@@ -311,6 +313,7 @@ impl UsbipEffectError {
         match self {
             Self::WrongZone => "wrong-zone",
             Self::NetworkNotReady => "network-not-ready",
+            Self::StaleAssignment => "usbip-assignment-stale",
             Self::RelayAuthorityConflict => "usbip-network-relay-authority-conflict",
             Self::Transient => "transient",
             Self::FirewallGenerationMismatch => "firewall-generation-mismatch",

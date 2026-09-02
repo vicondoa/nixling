@@ -23,9 +23,11 @@ mod workers;
 pub use arbitration::{UsbipArbitrator, UsbipClaim, UsbipClaimError};
 pub use busid::{BusId, FirewallOwnershipMarker, MAX_BUS_ID_BYTES, PhysicalUsbBackingToken};
 pub use controller::{
-    NetworkDependency, ScopedResourceUid, UsbipBindingController, UsbipBindingControllerError,
-    UsbipBindingPhase, UsbipBindingReconcileResult, UsbipController, UsbipControllerError,
-    UsbipMetricLabels, UsbipOperation, UsbipOutcome, UsbipServicePhase,
+    NetworkDependency, ScopedResourceUid, USBIP_BINDING_FINALIZER, USBIP_MAX_REPAIR_INTERVAL_SECS,
+    USBIP_REPAIR_INTERVAL_SECS, USBIP_SERVICE_FINALIZER, UsbipBindingAdmission,
+    UsbipBindingController, UsbipBindingControllerError, UsbipBindingPhase,
+    UsbipBindingReconcileResult, UsbipController, UsbipControllerError, UsbipMetricLabels,
+    UsbipOperation, UsbipOutcome, UsbipRunnerContract, UsbipServicePhase, usbip_runner_contract,
 };
 pub use d2b_contracts::usbip::validate_bus_id;
 pub use firewall::{

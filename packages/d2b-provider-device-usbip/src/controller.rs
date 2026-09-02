@@ -10,6 +10,63 @@ use crate::firewall::{
     UsbipEffectPort,
 };
 
+/// Default descriptor repair interval.
+pub const USBIP_REPAIR_INTERVAL_SECS: u64 = 30;
+/// Maximum descriptor repair interval.
+pub const USBIP_MAX_REPAIR_INTERVAL_SECS: u64 = 60;
+/// Service finalizer owned by the USBIP Provider.
+pub const USBIP_SERVICE_FINALIZER: &str = "device-usbip.d2bus.org/service-finalizer";
+/// Binding finalizer owned by the USBIP Provider.
+pub const USBIP_BINDING_FINALIZER: &str = "device-usbip.d2bus.org/binding-finalizer";
+
+/// The cutover contract for the USB Service and Binding owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsbipRunnerContract {
+    service_resource_type: &'static str,
+    binding_resource_type: &'static str,
+    repair_interval_secs: u64,
+    legacy_scheduler_disabled: bool,
+    watched_configuration_is_dependency: bool,
+}
+
+impl UsbipRunnerContract {
+    /// Return the provider-neutral Service ResourceType.
+    pub const fn service_resource_type(self) -> &'static str {
+        self.service_resource_type
+    }
+
+    /// Return the provider-neutral Binding ResourceType.
+    pub const fn binding_resource_type(self) -> &'static str {
+        self.binding_resource_type
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Whether legacy USBIP scheduling is disabled.
+    pub const fn legacy_scheduler_disabled(self) -> bool {
+        self.legacy_scheduler_disabled
+    }
+
+    /// Whether watched configuration is treated as a dependency.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+}
+
+/// Return the one shared-Runner registration for USBIP.
+pub const fn usbip_runner_contract() -> UsbipRunnerContract {
+    UsbipRunnerContract {
+        service_resource_type: crate::USB_SERVICE_RESOURCE_TYPE,
+        binding_resource_type: crate::USB_BINDING_RESOURCE_TYPE,
+        repair_interval_secs: USBIP_REPAIR_INTERVAL_SECS,
+        legacy_scheduler_disabled: true,
+        watched_configuration_is_dependency: true,
+    }
+}
+
 /// Closed USB Binding lifecycle phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsbipBindingPhase {
@@ -21,6 +78,72 @@ pub enum UsbipBindingPhase {
     Degraded,
     /// Child resources are draining.
     Deleted,
+}
+
+/// Exact Core admission for one USB Binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbipBindingAdmission {
+    zone_uid: ResourceUid,
+    binding_uid: ResourceUid,
+    service_uid: ResourceUid,
+    guest_uid: ResourceUid,
+    service_generation: ResourceGeneration,
+    assignment_epoch: u64,
+}
+
+impl UsbipBindingAdmission {
+    /// Construct an admission bound to one Zone, Service, Guest, and
+    /// assignment generation.
+    pub fn new(
+        zone_uid: ResourceUid,
+        binding_uid: ResourceUid,
+        service_uid: ResourceUid,
+        guest_uid: ResourceUid,
+        service_generation: ResourceGeneration,
+        assignment_epoch: u64,
+    ) -> Result<Self, UsbipBindingControllerError> {
+        if assignment_epoch == 0 {
+            return Err(UsbipBindingControllerError::InvalidAdmission);
+        }
+        Ok(Self {
+            zone_uid,
+            binding_uid,
+            service_uid,
+            guest_uid,
+            service_generation,
+            assignment_epoch,
+        })
+    }
+
+    /// Borrow the admitted Zone identity.
+    pub const fn zone_uid(&self) -> &ResourceUid {
+        &self.zone_uid
+    }
+
+    /// Borrow the Binding UID.
+    pub const fn binding_uid(&self) -> &ResourceUid {
+        &self.binding_uid
+    }
+
+    /// Borrow the Service UID.
+    pub const fn service_uid(&self) -> &ResourceUid {
+        &self.service_uid
+    }
+
+    /// Borrow the Guest UID.
+    pub const fn guest_uid(&self) -> &ResourceUid {
+        &self.guest_uid
+    }
+
+    /// Return the admitted Service generation.
+    pub const fn service_generation(&self) -> ResourceGeneration {
+        self.service_generation
+    }
+
+    /// Return the exact assignment epoch.
+    pub const fn assignment_epoch(&self) -> u64 {
+        self.assignment_epoch
+    }
 }
 
 /// USB Binding reconcile output.
@@ -37,6 +160,10 @@ pub struct UsbipBindingReconcileResult {
 pub enum UsbipBindingControllerError {
     /// Binding, Service, target, or Provider references were not admitted.
     Admission,
+    /// The Core assignment admission was malformed.
+    InvalidAdmission,
+    /// A newer assignment must be read before this Binding can continue.
+    StaleAssignment,
     /// Reconciliation was requested after finalization.
     Finalized,
 }
@@ -45,6 +172,8 @@ impl core::fmt::Display for UsbipBindingControllerError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str(match self {
             Self::Admission => "usbip-binding-controller-admission-failed",
+            Self::InvalidAdmission => "usbip-binding-controller-admission-invalid",
+            Self::StaleAssignment => "usbip-binding-controller-assignment-stale",
             Self::Finalized => "usbip-binding-controller-finalized",
         })
     }
@@ -58,8 +187,12 @@ impl std::error::Error for UsbipBindingControllerError {}
 /// attachment launch, adoption, signalling, and reap stay behind the generic
 /// resource runtime and the typed lifecycle port.
 pub struct UsbipBindingController {
+    binding_ref: ResourceRef,
+    service_ref: ResourceRef,
+    target_ref: ResourceRef,
     children: BindingChildSet,
     phase: UsbipBindingPhase,
+    admission: Option<UsbipBindingAdmission>,
 }
 
 impl core::fmt::Debug for UsbipBindingController {
@@ -67,7 +200,11 @@ impl core::fmt::Debug for UsbipBindingController {
         formatter
             .debug_struct("UsbipBindingController")
             .field("phase", &self.phase)
+            .field("binding_ref", &self.binding_ref)
+            .field("service_ref", &self.service_ref)
+            .field("target_ref", &self.target_ref)
             .field("children", &self.children)
+            .field("has_admission", &self.admission.is_some())
             .finish()
     }
 }
@@ -79,12 +216,35 @@ impl UsbipBindingController {
         service_ref: &ResourceRef,
         target_ref: &ResourceRef,
     ) -> Result<Self, UsbipBindingControllerError> {
+        if binding_ref.resource_type().as_str() != crate::USB_BINDING_RESOURCE_TYPE
+            || service_ref.resource_type().as_str() != crate::USB_SERVICE_RESOURCE_TYPE
+            || target_ref.resource_type().as_str() != "Guest"
+        {
+            return Err(UsbipBindingControllerError::Admission);
+        }
         let children = binding_child_resources(binding_ref, service_ref, target_ref)
             .map_err(|_| UsbipBindingControllerError::Admission)?;
         Ok(Self {
+            binding_ref: binding_ref.clone(),
+            service_ref: service_ref.clone(),
+            target_ref: target_ref.clone(),
             children,
             phase: UsbipBindingPhase::Pending,
+            admission: None,
         })
+    }
+
+    /// Construct a Binding controller from exact Core assignment evidence.
+    pub fn new_admitted(
+        binding_ref: &ResourceRef,
+        service_ref: &ResourceRef,
+        target_ref: &ResourceRef,
+        admission: UsbipBindingAdmission,
+    ) -> Result<Self, UsbipBindingControllerError> {
+        let mut controller = Self::new(binding_ref, service_ref, target_ref)?;
+        controller.validate_admission(&admission)?;
+        controller.admission = Some(admission);
+        Ok(controller)
     }
 
     /// Return the current Binding lifecycle phase.
@@ -95,6 +255,20 @@ impl UsbipBindingController {
     /// Borrow the current child intents.
     pub const fn children(&self) -> &BindingChildSet {
         &self.children
+    }
+
+    /// Borrow the exact Core assignment admission, when one was supplied.
+    pub const fn admission(&self) -> Option<&UsbipBindingAdmission> {
+        self.admission.as_ref()
+    }
+
+    /// Whether a ResourceRef is one of this Binding's Process/Endpoint
+    /// children. Volume ownership is never admitted by this controller.
+    pub fn owns_child(&self, resource_ref: &ResourceRef) -> bool {
+        matches!(
+            resource_ref.resource_type().as_str(),
+            "Process" | "Endpoint"
+        ) && self.children.resource_refs().any(|current| current == resource_ref)
     }
 
     /// Observe Core-managed child readiness without spawning a feature
@@ -117,9 +291,55 @@ impl UsbipBindingController {
         })
     }
 
+    /// Observe children after rechecking the exact assignment fence.
+    pub fn observe_children_with_admission(
+        &mut self,
+        admission: UsbipBindingAdmission,
+        ready: bool,
+    ) -> Result<UsbipBindingReconcileResult, UsbipBindingControllerError> {
+        self.validate_admission(&admission)?;
+        if self.admission.is_none() {
+            self.admission = Some(admission);
+        }
+        self.observe_children(ready)
+    }
+
     /// Mark the Binding deleted after Endpoint, then Process children drain.
     pub fn finalize(&mut self) {
         self.phase = UsbipBindingPhase::Deleted;
+    }
+
+    /// Mark the Binding deleted after validating its current assignment.
+    pub fn finalize_with_admission(
+        &mut self,
+        admission: UsbipBindingAdmission,
+    ) -> Result<(), UsbipBindingControllerError> {
+        self.validate_admission(&admission)?;
+        self.finalize();
+        Ok(())
+    }
+
+    fn validate_admission(
+        &self,
+        admission: &UsbipBindingAdmission,
+    ) -> Result<(), UsbipBindingControllerError> {
+        if admission.assignment_epoch() == 0 {
+            return Err(UsbipBindingControllerError::InvalidAdmission);
+        }
+        if let Some(current) = self.admission.as_ref() {
+            if current.zone_uid() != admission.zone_uid()
+                || current.binding_uid() != admission.binding_uid()
+                || current.service_uid() != admission.service_uid()
+                || current.guest_uid() != admission.guest_uid()
+                || current.service_generation() != admission.service_generation()
+            {
+                return Err(UsbipBindingControllerError::Admission);
+            }
+            if current.assignment_epoch() != admission.assignment_epoch() {
+                return Err(UsbipBindingControllerError::StaleAssignment);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -162,6 +382,7 @@ pub struct NetworkDependency {
     identity: ScopedResourceUid,
     generation: ResourceGeneration,
     ready: bool,
+    assignment_epoch: Option<u64>,
 }
 
 impl NetworkDependency {
@@ -175,6 +396,7 @@ impl NetworkDependency {
             identity,
             generation,
             ready,
+            assignment_epoch: None,
         }
     }
 
@@ -191,6 +413,23 @@ impl NetworkDependency {
     /// Whether the Network is Ready for the relay dependency.
     pub const fn ready(&self) -> bool {
         self.ready
+    }
+
+    /// Bind the dependency to an exact Core assignment epoch.
+    pub fn with_assignment_epoch(
+        mut self,
+        assignment_epoch: u64,
+    ) -> Result<Self, UsbipEffectError> {
+        if assignment_epoch == 0 {
+            return Err(UsbipEffectError::StaleAssignment);
+        }
+        self.assignment_epoch = Some(assignment_epoch);
+        Ok(self)
+    }
+
+    /// Return the assignment epoch, when Core supplied one.
+    pub const fn assignment_epoch(&self) -> Option<u64> {
+        self.assignment_epoch
     }
 }
 
@@ -327,6 +566,7 @@ pub struct UsbipController {
     relay: Option<RelayAuthorityLease>,
     firewall: Option<FirewallLease>,
     last_error: Option<UsbipEffectError>,
+    network_assignment_epoch: Option<u64>,
 }
 
 impl UsbipController {
@@ -345,6 +585,7 @@ impl UsbipController {
             relay: None,
             firewall: None,
             last_error: None,
+            network_assignment_epoch: None,
         }
     }
 
@@ -378,6 +619,7 @@ impl UsbipController {
         self.validate_network(&network)?;
         self.phase = UsbipServicePhase::Applying;
         self.network = Some(network.clone());
+        self.network_assignment_epoch = network.assignment_epoch();
         if self.relay.is_none() {
             match port.acquire_relay(network.identity().resource_uid()) {
                 Ok(lease) => self.relay = Some(lease),
@@ -482,6 +724,7 @@ impl UsbipController {
             return self.effect_failed(error);
         }
         self.network = None;
+        self.network_assignment_epoch = None;
         self.last_error = None;
         self.phase = UsbipServicePhase::WaitingForNetwork;
         Ok(())
@@ -497,13 +740,23 @@ impl UsbipController {
         if !network.ready() {
             return self.effect_failed(UsbipEffectError::NetworkNotReady);
         }
+        if network.assignment_epoch() == Some(0)
+            || self
+                .network_assignment_epoch
+                .zip(network.assignment_epoch())
+                .is_some_and(|(current, next)| next < current)
+        {
+            return self.effect_failed(UsbipEffectError::StaleAssignment);
+        }
         Ok(())
     }
 
     fn effect_failed<T>(&mut self, error: UsbipEffectError) -> Result<T, UsbipControllerError> {
         self.last_error = Some(error);
         self.phase = match error {
-            UsbipEffectError::Transient | UsbipEffectError::FirewallGenerationMismatch => {
+            UsbipEffectError::Transient
+            | UsbipEffectError::FirewallGenerationMismatch
+            | UsbipEffectError::StaleAssignment => {
                 if self.firewall.is_some() {
                     UsbipServicePhase::Releasing
                 } else {
