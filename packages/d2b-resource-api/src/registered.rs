@@ -969,7 +969,7 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
                             .any(|resource_type| {
                                 resource.resource_ref.resource_type() == resource_type
                             })
-                            && initial_resource_matches(&descriptor, &resource)
+                            && initial_resource_matches(&descriptor, resource)
                     })
                     .map(|resource| {
                         InitialResource::new(
@@ -1637,13 +1637,13 @@ fn initial_resource_matches(
     descriptor: &ControllerDescriptor,
     resource: &StoredResource,
 ) -> bool {
-    let selectors = descriptor
+    let exact_spec_selectors = descriptor
         .watch_selectors()
         .iter()
         .filter(|selector| {
             selector.field() == ChangeField::Spec && selector.exact_value().is_some()
-        })
-        .collect::<Vec<_>>();
+        });
+    let selectors = exact_spec_selectors.collect::<Vec<_>>();
     selectors.is_empty()
         || selectors
             .into_iter()
