@@ -944,17 +944,19 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
             if self.descriptor()?.as_ref() != &descriptor {
                 return Err(SourceError::Integrity);
             }
+            let projection = if descriptor.watch_selectors().iter().any(|selector| {
+                selector.field() == ChangeField::Spec
+                    && selector.exact_value().is_some()
+            }) {
+                StoreProjection::BaseOnly
+            } else {
+                StoreProjection::MetadataOnly
+            };
             let (resources, snapshot_revision) = self
                 .list_all(
                     self.store.identity().zone(),
                     descriptor.resource_types().cloned().collect(),
-                    if descriptor.watch_selectors().iter().any(|selector| {
-                        selector.field() == ChangeField::Spec && selector.exact_value().is_some()
-                    }) {
-                        StoreProjection::BaseOnly
-                    } else {
-                        StoreProjection::MetadataOnly
-                    },
+                    projection,
                     "initial",
                 )
                 .await?;
