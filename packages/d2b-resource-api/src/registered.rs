@@ -733,6 +733,11 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
             Ok(InitialList {
                 resources: resources
                     .into_iter()
+                    .filter(|resource| {
+                        descriptor
+                            .resource_types()
+                            .any(|resource_type| resource.resource_ref.resource_type() == resource_type)
+                    })
                     .map(|resource| {
                         InitialResource::new(
                             ResourceKey::new(resource.zone, resource.resource_ref, resource.uid),

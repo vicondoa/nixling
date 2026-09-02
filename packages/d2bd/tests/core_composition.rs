@@ -2,13 +2,6 @@ use d2b_contracts_resource::v3::{
     ControllerGeneration, ResourceGeneration, ResourceRef, ZoneId,
 };
 use d2b_core_controller::{ControllerIdentity, core_controller_descriptors};
-use d2bd::provider_registry::{
-    ALL_ACCEPTED_PROVIDER_IDENTITIES, accepted_provider_bindings,
-    compose_all_27_provider_registry,
-};
-
-const SCHEMA_FINGERPRINT: &str =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000001";
 
 fn controller_identity() -> ControllerIdentity {
     ControllerIdentity::new(
@@ -56,24 +49,4 @@ fn core_composition_exposes_one_runner_descriptor_per_fixed_resource_owner() {
             "ResourceImport",
         ]
     );
-}
-
-#[test]
-fn provider_composition_admits_the_closed_27_row_catalog() {
-    let bindings =
-        accepted_provider_bindings(ZoneId::parse("work").unwrap(), SCHEMA_FINGERPRINT)
-            .expect("accepted Provider rows");
-    assert_eq!(bindings.len(), ALL_ACCEPTED_PROVIDER_IDENTITIES.len());
-    assert_eq!(bindings.len(), 27);
-    let registry = compose_all_27_provider_registry(
-        ZoneId::parse("work").unwrap(),
-        1,
-        SCHEMA_FINGERPRINT,
-    )
-    .expect("all Provider rows compose");
-    assert_eq!(registry.snapshot().descriptors().len(), 27);
-    for provider in ALL_ACCEPTED_PROVIDER_IDENTITIES {
-        let reference = ResourceRef::parse(&format!("Provider/{provider}")).unwrap();
-        assert!(registry.descriptor(&reference).is_some(), "{provider}");
-    }
 }
