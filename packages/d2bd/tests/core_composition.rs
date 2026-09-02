@@ -6,7 +6,8 @@ use d2b_contracts_resource::v3::{
 use d2b_core_controller::{ControllerIdentity, core_controller_descriptors};
 use d2bd::resource_runtime::{
     U7_SHARED_PROVIDER_RUNNERS, compose_shared_volume_runner_descriptors,
-    U8_SHARED_PROVIDER_RUNNERS, compose_shared_provider_runner_descriptors,
+    U8_SHARED_PROVIDER_RUNNERS, U6_SHARED_PROVIDER_RUNNERS,
+    compose_shared_guest_runner_descriptors, compose_shared_provider_runner_descriptors,
 };
 
 fn controller_identity() -> ControllerIdentity {
@@ -122,6 +123,61 @@ fn volume_composition_refuses_to_spawn_when_a_provider_identity_is_missing() {
         ),
         Err(d2bd::resource_runtime::ResourceRuntimeError::HandlerNotReady)
     );
+}
+
+#[test]
+fn guest_composition_builds_one_filtered_runner_per_runtime_provider() {
+    let generations = U6_SHARED_PROVIDER_RUNNERS
+        .iter()
+        .map(|registration| {
+            (
+                ResourceRef::parse(registration.provider_ref).unwrap(),
+                ResourceGeneration::new(7).unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let descriptors = compose_shared_guest_runner_descriptors(
+        U6_SHARED_PROVIDER_RUNNERS,
+        ZoneId::parse("work").unwrap(),
+        ControllerGeneration::new(3).unwrap(),
+        &generations,
+        ReconnectGeneration::new(5).unwrap(),
+    )
+    .expect("U6 descriptors");
+
+    assert_eq!(descriptors.len(), 4);
+    let controllers = descriptors
+        .iter()
+        .map(|(_, descriptor)| descriptor.identity().controller_ref().clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(controllers.len(), 4);
+    for (registration, descriptor) in descriptors {
+        assert_eq!(descriptor.resource_types().next().unwrap().as_str(), "Guest");
+        assert_eq!(
+            descriptor
+                .watch_selectors()
+                .iter()
+                .find(|selector| {
+                    selector.field() == d2b_core_controller::SelectorField::Spec
+                })
+                .and_then(|selector| selector.exact_value()),
+            Some(registration.provider_ref)
+        );
+        assert!(
+            descriptor
+                .dependency_selectors()
+                .iter()
+                .any(|selector| selector.resource_type().as_str() == "Process")
+        );
+        assert_eq!(
+            descriptor.execution().resync().observe_interval_ticks(),
+            Some(registration.repair_interval_ticks)
+        );
+        assert_eq!(
+            descriptor.execution().resync().resync_interval_ticks(),
+            registration.repair_interval_ticks
+        );
+    }
 }
 
 #[test]
