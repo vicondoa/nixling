@@ -384,11 +384,11 @@ impl SecurityKeyController {
         target_ref: &ResourceRef,
         outcome: SecurityKeyReconcileOutcome,
     ) -> Result<SecurityKeyReconcileResultWithChildren, SecurityKeyControllerError> {
+        let children = Self::child_resources(binding_ref, service_ref, target_ref)?;
         self.phase = match outcome {
             SecurityKeyReconcileOutcome::Active => SecurityKeyPhase::Active,
             SecurityKeyReconcileOutcome::Completed => SecurityKeyPhase::Completed,
         };
-        let children = Self::child_resources(binding_ref, service_ref, target_ref)?;
         Ok(SecurityKeyReconcileResultWithChildren { outcome, children })
     }
 
@@ -401,12 +401,12 @@ impl SecurityKeyController {
         user_ref: &ResourceRef,
         outcome: SecurityKeyReconcileOutcome,
     ) -> Result<SecurityKeyReconcileResultWithChildren, SecurityKeyControllerError> {
+        let children =
+            Self::child_resources_for_user(binding_ref, service_ref, target_ref, user_ref)?;
         self.phase = match outcome {
             SecurityKeyReconcileOutcome::Active => SecurityKeyPhase::Active,
             SecurityKeyReconcileOutcome::Completed => SecurityKeyPhase::Completed,
         };
-        let children =
-            Self::child_resources_for_user(binding_ref, service_ref, target_ref, user_ref)?;
         Ok(SecurityKeyReconcileResultWithChildren { outcome, children })
     }
 
