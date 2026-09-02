@@ -70,6 +70,7 @@ d2b-provider-runtime-azure-container-apps = { path = "../d2b-provider-runtime-az
 d2b-provider-credential-secret-service = { path = "../d2b-provider-credential-secret-service", version = "0.0.0-bootstrap" }
 d2b-provider-credential-entra = { path = "../d2b-provider-credential-entra", version = "0.0.0-bootstrap" }
 d2b-provider-credential-managed-identity = { path = "../d2b-provider-credential-managed-identity", version = "0.0.0-bootstrap" }
+d2b-provider-toolkit = { path = "../d2b-provider-toolkit", version = "0.0.0-bootstrap" }
 d2b-provider-transport-azure-relay = { path = "../d2b-provider-transport-azure-relay", version = "0.0.0-bootstrap" }
 protobuf = "3.7.2"
 serde.workspace = true

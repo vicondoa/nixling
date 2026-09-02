@@ -121,6 +121,28 @@ pub struct ProviderSessionAdmission {
     route: AuthenticatedSessionRouteBinding,
 }
 
+/// A route source that has already crossed the authenticated session boundary.
+///
+/// Both the full session candidate and the provider-side route metadata
+/// snapshot implement this trait. It exposes no driver or authorization
+/// capability.
+pub trait AuthenticatedRoute {
+    /// Snapshot the authenticated routing metadata.
+    fn route_binding(&self) -> AuthenticatedSessionRouteBinding;
+}
+
+impl<C> AuthenticatedRoute for AuthenticatedComponentSession<C> {
+    fn route_binding(&self) -> AuthenticatedSessionRouteBinding {
+        AuthenticatedComponentSession::route_binding(self)
+    }
+}
+
+impl AuthenticatedRoute for AuthenticatedSessionRouteBinding {
+    fn route_binding(&self) -> AuthenticatedSessionRouteBinding {
+        self.clone()
+    }
+}
+
 impl ProviderSessionAdmission {
     /// Borrow the authenticated routing metadata.
     pub const fn route(&self) -> &AuthenticatedSessionRouteBinding {
@@ -379,10 +401,13 @@ impl ProviderEntrypoint {
     }
 
     /// Derive a route-bound session admission from an authenticated session.
-    pub fn admit_authenticated<C>(
+    pub fn admit_authenticated<R>(
         &self,
-        session: &AuthenticatedComponentSession<C>,
-    ) -> Result<ProviderSessionAdmission, ProviderRuntimeError> {
+        session: &R,
+    ) -> Result<ProviderSessionAdmission, ProviderRuntimeError>
+    where
+        R: AuthenticatedRoute,
+    {
         if self.lifecycle() != ProviderLifecycle::Starting {
             return Err(ProviderRuntimeError::NotAccepting);
         }
@@ -438,12 +463,15 @@ impl ProviderEntrypoint {
 
     /// Publish readiness only after both local registration and authenticated
     /// ComponentSession route admission have succeeded.
-    pub fn publish_authenticated_ready<C>(
+    pub fn publish_authenticated_ready<R>(
         &self,
         registration: &ProviderAdmission,
         session: ProviderSessionAdmission,
-        live_session: &AuthenticatedComponentSession<C>,
-    ) -> Result<(), ProviderRuntimeError> {
+        live_session: &R,
+    ) -> Result<(), ProviderRuntimeError>
+    where
+        R: AuthenticatedRoute,
+    {
         let live_route = live_session.route_binding();
         self.validate_authenticated_ready(registration, &session, &live_route)?;
         let route = session.route.clone();

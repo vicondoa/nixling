@@ -31,10 +31,8 @@ use d2b_contracts_provider::v3::credential::{
 use d2b_contracts_resource::v3::ResourceRef;
 use d2b_contracts_resource::v3::identity::{AuthenticatedSubjectContext, Locality};
 use d2b_provider_toolkit::{
-    AllocatorSessionBinding, AuthenticatedComponentSession, Cancellation,
-    CredentialAuthorizationSource, ProviderAdmission, ProviderAgentBootstrap, ProviderEntrypoint,
-    ProviderLifecycle, ProviderRuntimeError,
-    run_authenticated_credential_provider,
+    AuthenticatedSessionRouteBinding, ProviderFd10Spec, ProviderRuntimeError,
+    RouteCredentialAuthorization, run_from_fd10 as run_provider_from_fd10,
 };
 
 pub use agent::ManagedIdentityAgent;
@@ -82,67 +80,115 @@ pub fn reject_process_environment_credential_chain(
     )
 }
 
-/// Return the fail-closed status used when the controller is not registered by
-/// `d2bd`.
-pub fn controller_binary_entrypoint() -> i32 {
-    standalone_entrypoint(CONTROLLER_BINARY)
-}
-
-/// Return the fail-closed status used when the agent is not registered by
-/// `d2bd`.
-pub fn agent_binary_entrypoint() -> i32 {
-    standalone_entrypoint(AGENT_BINARY)
-}
-
-fn standalone_entrypoint(name: &'static str) -> i32 {
+/// Enter a supervised Provider runtime through the inherited fd 10 handoff.
+pub fn run_from_fd10(name: &'static str) -> i32 {
     if reject_process_environment_credential_chain().is_err() {
         return 1;
     }
     let Ok(provider_ref) = ResourceRef::parse(PROVIDER_REF) else {
         return 1;
     };
-    let Ok(entrypoint) =
-        ProviderEntrypoint::with_provider(name, provider_ref, CREDENTIAL_SERVICE_NAME)
+    let Ok(purpose) =
+        d2b_contracts_resource::v3::identity::SessionPurpose::parse("provider-control")
     else {
         return 1;
     };
-    if entrypoint.lifecycle() != ProviderLifecycle::Starting || entrypoint.admit().is_err() {
-        return 1;
-    }
-    // A standalone Provider has no allocator-issued authenticated session.
-    // Refuse readiness instead of serving an unauthenticated or ambient path.
-    1
+    run_provider_from_fd10::<ManagedIdentityAgent, RouteCredentialAuthorization, _>(
+        ProviderFd10Spec::new(name, provider_ref, CREDENTIAL_SERVICE_NAME, purpose),
+        runtime_provider,
+    )
 }
 
-/// Serve the managed-identity Agent after the daemon has admitted the
-/// allocator-issued ComponentSession.
-pub async fn run_authenticated_agent<A>(
-    bootstrap: ProviderAgentBootstrap,
-    binding: AllocatorSessionBinding,
-    entrypoint: ProviderEntrypoint,
-    registration: ProviderAdmission,
-    session: AuthenticatedComponentSession<()>,
-    agent: Arc<ManagedIdentityAgent>,
-    authorizer: Arc<A>,
-    cancellation: Cancellation,
-) -> Result<(), ProviderRuntimeError>
-where
-    A: CredentialAuthorizationSource,
-{
-    bootstrap
-        .admit(binding)
-        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
-    let session_admission = entrypoint.admit_authenticated(&session)?;
-    run_authenticated_credential_provider(
-        entrypoint,
-        registration,
-        session_admission,
-        session,
-        agent,
-        authorizer,
-        cancellation,
+/// Return the supervised controller process status.
+pub fn controller_binary_entrypoint() -> i32 {
+    run_from_fd10(CONTROLLER_BINARY)
+}
+
+/// Return the supervised agent process status.
+pub fn agent_binary_entrypoint() -> i32 {
+    run_from_fd10(AGENT_BINARY)
+}
+
+fn runtime_provider(
+    route: &AuthenticatedSessionRouteBinding,
+) -> Result<
+    (
+        Arc<ManagedIdentityAgent>,
+        Arc<RouteCredentialAuthorization>,
+    ),
+    ProviderRuntimeError,
+> {
+    let provider_ref = route
+        .provider_ref()
+        .cloned()
+        .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
+    let zone_ref = route.context().zone_ref().clone();
+    let execution_ref = route
+        .context()
+        .execution_ref()
+        .filter(|reference| reference.resource_type().as_str() == "Guest")
+        .cloned()
+        .unwrap_or_else(|| ResourceRef::parse("Guest/credential-agent").expect("fixed Guest"));
+    let placement = ManagedIdentityPlacement::new(
+        PlacementBinding::GuestAgent,
+        execution_ref,
+        zone_ref,
     )
-    .await
+    .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let config = ManagedIdentityClientConfig::new(
+        "allocator-issued-client",
+        "azure-imds",
+        MAX_LOCAL_LEASES,
+    )
+    .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let provider = ManagedIdentityCredentialProviderFactory::new(
+        config,
+        placement,
+        provider_ref,
+        Arc::new(UnavailableManagedIdentityClient),
+    )
+    .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?
+    .construct();
+    Ok((
+        Arc::new(ManagedIdentityAgent::new(provider)),
+        Arc::new(RouteCredentialAuthorization),
+    ))
+}
+
+struct UnavailableManagedIdentityClient;
+
+impl ManagedIdentityCredentialClient for UnavailableManagedIdentityClient {
+    fn state(&self) -> ManagedIdentityFuture<'_, ManagedIdentityClientState> {
+        Box::pin(async { Ok(ManagedIdentityClientState::Unavailable) })
+    }
+
+    fn issue_lease(
+        &self,
+        _request: &ManagedIdentityLeaseRequest,
+    ) -> ManagedIdentityFuture<'_, ManagedIdentityLeaseGrant> {
+        Box::pin(async { Err(ManagedIdentityClientError::Unavailable) })
+    }
+
+    fn inspect_lease(
+        &self,
+        _lease: &ManagedIdentityLeaseRef,
+    ) -> ManagedIdentityFuture<'_, ManagedIdentityLeaseInspection> {
+        Box::pin(async { Err(ManagedIdentityClientError::Unavailable) })
+    }
+
+    fn refresh_lease(
+        &self,
+        _lease: &ManagedIdentityLeaseRef,
+    ) -> ManagedIdentityFuture<'_, ManagedIdentityLeaseRenewal> {
+        Box::pin(async { Err(ManagedIdentityClientError::Unavailable) })
+    }
+
+    fn revoke_lease(
+        &self,
+        _lease: &ManagedIdentityLeaseRef,
+    ) -> ManagedIdentityFuture<'_, ManagedIdentityLeaseRevocation> {
+        Box::pin(async { Err(ManagedIdentityClientError::Unavailable) })
+    }
 }
 
 /// Boxed asynchronous result returned by the injected IMDS client.
@@ -677,6 +723,21 @@ impl ManagedIdentityCredentialProvider {
             && subject.provider_generation().is_some()
     }
 
+    fn context_matches_controller(&self, subject: &AuthenticatedSubjectContext) -> bool {
+        subject.transport_binding().locality() == Locality::Local
+            && subject.subject_ref().to_canonical_string() == crate::PROVIDER_REF
+            && subject
+                .provider_ref()
+                .is_some_and(|provider| provider.to_canonical_string() == crate::PROVIDER_REF)
+            && subject.zone_ref() == self.placement.zone_ref()
+            && subject.service().as_str() == CREDENTIAL_SERVICE_NAME
+            && subject.session_purpose().as_str() == "provider-control"
+            && subject.provider_generation().is_some()
+            && subject
+                .process_ref()
+                .is_some_and(|process| process.resource_type().as_str() == "Process")
+    }
+
     /// Validate the authenticated ComponentSession binding for one method.
     pub(crate) fn validate_authenticated_session<'a>(
         &self,
@@ -695,7 +756,11 @@ impl ManagedIdentityCredentialProvider {
         }
 
         let subject = session.authenticated_subject();
-        if !self.context_matches_provider(subject) {
+        let controller_session = matches!(
+            method,
+            CredentialMethod::RevokeToken | CredentialMethod::InspectMetadata
+        ) && self.context_matches_controller(subject);
+        if !self.context_matches_provider(subject) && !controller_session {
             return Err(CredentialServiceError::new(
                 CredentialServiceErrorCode::OperationDenied,
             ));
@@ -707,6 +772,10 @@ impl ManagedIdentityCredentialProvider {
             return Err(CredentialServiceError::new(
                 CredentialServiceErrorCode::OperationDenied,
             ));
+        }
+
+        if controller_session {
+            return Ok(session);
         }
 
         if method.requires_delivery() {

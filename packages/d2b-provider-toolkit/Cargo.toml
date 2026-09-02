@@ -21,12 +21,14 @@ d2b-provider = { path = "../d2b-provider", version = "0.0.0-bootstrap" }
 d2b-session = { path = "../d2b-session", version = "0.0.0-bootstrap" }
 d2b-session-unix = { path = "../d2b-session-unix", version = "0.0.0-bootstrap", default-features = false, optional = true }
 schemars.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 ttrpc = { version = "0.9.0", default-features = false, features = ["async", "sync"] }
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 d2b-session = { path = "../d2b-session", version = "0.0.0-bootstrap", features = ["test-support"] }
+d2b-session-unix = { path = "../d2b-session-unix", version = "0.0.0-bootstrap", features = ["test-support"] }
 sha2.workspace = true
 
 [[bin]]

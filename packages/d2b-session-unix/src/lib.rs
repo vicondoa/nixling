@@ -183,6 +183,8 @@ pub use socket::{
     AncillaryCapacity, OutboundPacket, PacketBurst, SendBurst, SentPacket, SeqpacketSocket,
     StreamRead, StreamSocket, prearmed_seqpacket_pair,
 };
+#[cfg(feature = "test-support")]
+pub use socket::duplicate_to_inherited_fd;
 #[cfg(feature = "host-socket")]
 pub use subject::VerifiedUnixPeer;
 #[cfg(feature = "host-socket")]

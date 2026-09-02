@@ -21,7 +21,20 @@ impl CredentialProvider for SecretServiceCredentialProvider {
         authorization: &CredentialAuthorization,
     ) -> Result<CredentialResponse, CredentialServiceError> {
         let _lifecycle = self.mutation_guard()?;
-        let session_key = self.authorize_session_locked(authorization)?;
+        let session_key = self
+            .authorize_session_locked(authorization)
+            .or_else(|_| {
+                matches!(
+                    method,
+                    CredentialMethod::RevokeToken | CredentialMethod::InspectMetadata
+                )
+                .then(|| self.authorize_controller_session_locked(authorization))
+                .unwrap_or_else(|| {
+                    Err(CredentialServiceError::new(
+                        CredentialServiceErrorCode::OperationDenied,
+                    ))
+                })
+            })?;
         match method {
             CredentialMethod::AcquireToken => self.acquire(request, authorization, session_key),
             CredentialMethod::RefreshToken => self.refresh(request, authorization, session_key),

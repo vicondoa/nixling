@@ -12,6 +12,7 @@ native-vsock = [
     "dep:tokio",
     "dep:tokio-vsock",
 ]
+test-support = []
 
 [dependencies]
 d2b-contracts-zone-session = { path = "../d2b-contracts-zone-session", version = "0.0.0-bootstrap" }

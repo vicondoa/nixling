@@ -2238,6 +2238,21 @@ impl ZoneRegistrar {
         verified_peer: &VerifiedUnixPeer,
         committed: CommittedControllerProcessSubjectInput,
     ) -> d2b_session::Result<()> {
+        self.install_committed_controller_process_subject_for_service(
+            verified_peer,
+            committed,
+            ServicePackage::ResourceV3,
+        )
+    }
+
+    /// Install an external Provider controller Process subject for one exact
+    /// authenticated service package.
+    pub fn install_committed_controller_process_subject_for_service(
+        &self,
+        verified_peer: &VerifiedUnixPeer,
+        committed: CommittedControllerProcessSubjectInput,
+        service: ServicePackage,
+    ) -> d2b_session::Result<()> {
         let CommittedControllerProcessSubjectInput {
             provider_ref,
             provider_uid,
@@ -2258,7 +2273,7 @@ impl ZoneRegistrar {
         .with_process_ref(process_ref)?
         .with_controller_generation(controller_generation)
         .with_execution_ref(execution_ref)?
-        .for_service(ServicePackage::ResourceV3);
+        .for_service(service);
         self.unix_subjects.install(subject, &self.core.zone)
     }
 

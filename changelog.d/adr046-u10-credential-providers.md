@@ -36,3 +36,7 @@
 - Credential Provider controller sessions now use the dedicated typed
   `d2b.credential.v3` endpoint, and the service runtime drains registrations
   before reporting shutdown.
+- Credential Provider Process children now use the inherited fd 10 supervisor
+  handoff, authenticated route bootstrap, typed serving loop, readiness gate,
+  and shutdown drain; revocation metadata is selected from the live Provider
+  session route and rebinds safely across reconnect generations.

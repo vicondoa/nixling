@@ -1274,6 +1274,62 @@ impl AuthenticatedSessionRouteBinding {
         .map_err(SessionError::from)
     }
 
+    /// Construct route metadata received over an already authenticated peer
+    /// session. The caller must have verified the protected bootstrap frame;
+    /// this value carries routing metadata only and never mints authority.
+    pub fn from_authenticated_peer(
+        context: AuthenticatedSubjectContext,
+        endpoint_locality: ComponentLocality,
+        purpose_class: PurposeClass,
+        initiator_role: EndpointRole,
+        responder_role: EndpointRole,
+        transport_class: TransportClass,
+    ) -> Result<Self> {
+        if context.zone_ref().resource_type().as_str() != "Zone"
+            || context.provider_ref().is_none()
+            || context.provider_generation().is_none()
+            || context.controller_generation().is_none()
+            || context.reconnect_generation().get() == 0
+            || context.transport_binding().locality() != Locality::Local
+        {
+            return Err(SessionError::new(SessionErrorCode::SubjectMismatch));
+        }
+        let zone = ZoneId::parse(context.zone_ref().name().as_str())
+            .map_err(|_| SessionError::new(SessionErrorCode::SubjectMismatch))?;
+        let subject_ref = context.subject_ref().clone();
+        let subject_uid = context.subject_uid().clone();
+        let evidence_class = context.evidence_class();
+        let locality = context.transport_binding().locality();
+        let transport_binding = context.transport_binding().clone();
+        let service = context.service().clone();
+        let schema = context.schema_fingerprint().clone();
+        let reconnect_generation = context.reconnect_generation();
+        let provider_ref = context.provider_ref().cloned();
+        let provider_generation = context.provider_generation();
+        let controller_generation = context.controller_generation();
+        Ok(Self {
+            context,
+            zone,
+            subject_ref,
+            subject_uid,
+            evidence_class,
+            locality,
+            endpoint_locality,
+            purpose_class,
+            initiator_role,
+            responder_role,
+            transport_class,
+            transport_binding,
+            liveness: SessionLiveness::new(),
+            service,
+            schema,
+            reconnect_generation,
+            provider_ref,
+            provider_generation,
+            controller_generation,
+        })
+    }
+
     /// Build redacted route metadata for toolkit unit tests.
     #[cfg(feature = "test-support")]
     pub fn for_test(

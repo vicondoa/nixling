@@ -59,19 +59,23 @@ impl EntraCredentialProvider {
         if session.authenticated_subject() != subject {
             return Err(denied());
         }
-        if subject.transport_binding().locality() != Locality::Local
-            || subject.subject_ref() != self.consumer_ref()
-            || subject.execution_ref() != Some(self.placement.execution_ref())
-            || subject
+        let controller_session = matches!(
+            method,
+            CredentialMethod::RevokeToken | CredentialMethod::InspectMetadata
+        ) && self.is_controller_session(subject);
+        let consumer_session = subject.transport_binding().locality() == Locality::Local
+            && subject.subject_ref() == self.consumer_ref()
+            && subject.execution_ref() == Some(self.placement.execution_ref())
+            && subject
                 .execution_ref()
-                .is_none_or(|execution| execution.resource_type().as_str() != "Guest")
-            || subject
+                .is_some_and(|execution| execution.resource_type().as_str() == "Guest")
+            && subject
                 .provider_ref()
-                .is_none_or(|provider| provider.to_canonical_string() != crate::PROVIDER_REF)
-            || subject.provider_generation().is_none()
-            || subject.service().as_str() != CREDENTIAL_SERVICE_NAME
-            || subject.session_purpose().as_str() != CREDENTIAL_SESSION_PURPOSE
-        {
+                .is_some_and(|provider| provider.to_canonical_string() == crate::PROVIDER_REF)
+            && subject.provider_generation().is_some()
+            && subject.service().as_str() == CREDENTIAL_SERVICE_NAME
+            && subject.session_purpose().as_str() == CREDENTIAL_SESSION_PURPOSE;
+        if !controller_session && !consumer_session {
             return Err(denied());
         }
         self.placement
@@ -130,6 +134,26 @@ impl EntraCredentialProvider {
             return Err(invariant());
         }
         Ok(())
+    }
+
+    fn is_controller_session(
+        &self,
+        subject: &d2b_contracts_resource::v3::identity::AuthenticatedSubjectContext,
+    ) -> bool {
+        subject.transport_binding().locality() == Locality::Local
+            && subject.subject_ref().to_canonical_string() == crate::PROVIDER_REF
+            && subject
+                .provider_ref()
+                .is_some_and(|provider| provider.to_canonical_string() == crate::PROVIDER_REF)
+            && subject.service().as_str() == CREDENTIAL_SERVICE_NAME
+            && subject.session_purpose().as_str() == "provider-control"
+            && subject
+                .provider_generation()
+                .is_some_and(|generation| generation.get() == self.placement.endpoint_generation())
+            && subject
+                .process_ref()
+                .is_some_and(|process| process.resource_type().as_str() == "Process")
+            && self.placement.validate_zone(subject.zone_ref()).is_ok()
     }
 
     fn acquire(

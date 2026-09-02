@@ -1489,10 +1489,11 @@ dependencies = [
  "d2b-session",
  "d2b-session-unix",
  "schemars",
+ "serde",
  "serde_json",
  "sha2",
- "ttrpc",
  "tokio",
+ "ttrpc",
 ]
 
 [[package]]
@@ -1787,6 +1788,7 @@ dependencies = [
  "d2b-provider-system-core",
  "d2b-provider-system-minijail",
  "d2b-provider-system-systemd",
+ "d2b-provider-toolkit",
  "d2b-provider-transport-azure-relay",
  "d2b-provider-volume-local",
  "d2b-provider-volume-virtiofs",

@@ -48,6 +48,8 @@ mod bootstrap;
 mod credential;
 mod dispatch;
 mod error;
+#[cfg(feature = "unix-transport")]
+mod fd10;
 mod fixture;
 mod redaction;
 mod registration;
@@ -83,6 +85,11 @@ pub use d2b_session::{
     ComponentSessionDriver, StreamEvent, StreamId,
 };
 pub use dispatch::{DispatchLimiter, DispatchPermit, MAX_DISPATCH_IN_FLIGHT};
+#[cfg(feature = "unix-transport")]
+pub use fd10::{
+    PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID, ProviderFd10Spec,
+    ProviderSessionMetadata, run_from_fd10,
+};
 pub use error::ProviderToolkitError;
 pub use fixture::{
     DeterministicClock, FakeProvider, Fixture, SampleLeaseRequest, sample_lease_request,
@@ -92,8 +99,8 @@ pub use registration::{
     ExactRegistration, ToolkitError, register_exact_instances, validate_manifest_registration,
 };
 pub use runtime::{
-    ProviderAdmission, ProviderEntrypoint, ProviderLifecycle, ProviderRuntimeError,
-    ProviderSessionAdmission,
+    AuthenticatedRoute, ProviderAdmission, ProviderEntrypoint, ProviderLifecycle,
+    ProviderRuntimeError, ProviderSessionAdmission,
 };
 pub use server::{
     GeneratedProviderServiceServer, GeneratedServiceDescriptor, MAX_SERVER_IN_FLIGHT, ServerError,

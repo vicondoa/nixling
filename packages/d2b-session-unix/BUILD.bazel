@@ -35,6 +35,7 @@ rust_library(
     crate_features = [
         "host-socket",
         "native-vsock",
+        "test-support",
     ],
     crate_name = "d2b_session_unix",
     proc_macro_deps = [

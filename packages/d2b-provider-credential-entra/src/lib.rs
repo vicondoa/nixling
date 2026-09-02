@@ -26,10 +26,8 @@ use d2b_contracts_provider::v3::credential::{
 };
 use d2b_contracts_resource::v3::ResourceRef;
 use d2b_provider_toolkit::{
-    AllocatorSessionBinding, AuthenticatedComponentSession, Cancellation,
-    CredentialAuthorizationSource, ProviderAdmission, ProviderAgentBootstrap, ProviderEntrypoint,
-    ProviderLifecycle, ProviderRuntimeError,
-    run_authenticated_credential_provider,
+    AuthenticatedSessionRouteBinding, ProviderFd10Spec, ProviderRuntimeError,
+    RouteCredentialAuthorization, run_from_fd10 as run_provider_from_fd10,
 };
 
 pub use controller::{
@@ -65,57 +63,107 @@ pub fn reject_process_environment_credential_chain(
     )
 }
 
-/// Return the fail-closed status used when the controller is not registered by
-/// `d2bd`.
-pub fn controller_binary_entrypoint() -> i32 {
+/// Enter the supervised Provider runtime through the inherited fd 10 handoff.
+pub fn run_from_fd10() -> i32 {
     if reject_process_environment_credential_chain().is_err() {
         return 1;
     }
     let Ok(provider_ref) = ResourceRef::parse(PROVIDER_REF) else {
         return 1;
     };
-    let Ok(entrypoint) = ProviderEntrypoint::with_provider(
-        "d2b-provider-credential-entra",
-        provider_ref,
-        CREDENTIAL_SERVICE_NAME,
-    ) else {
+    let Ok(purpose) =
+        d2b_contracts_resource::v3::identity::SessionPurpose::parse("provider-control")
+    else {
         return 1;
     };
-    if entrypoint.lifecycle() != ProviderLifecycle::Starting || entrypoint.admit().is_err() {
-        return 1;
-    }
-    1
+    run_provider_from_fd10::<EntraCredentialProvider, RouteCredentialAuthorization, _>(
+        ProviderFd10Spec::new(
+            "d2b-provider-credential-entra",
+            provider_ref,
+            CREDENTIAL_SERVICE_NAME,
+            purpose,
+        ),
+        runtime_provider,
+    )
 }
 
-/// Serve the typed Credential service after the daemon has admitted the
-/// allocator-issued ComponentSession.
-pub async fn run_authenticated_credential_service<A>(
-    bootstrap: ProviderAgentBootstrap,
-    binding: AllocatorSessionBinding,
-    entrypoint: ProviderEntrypoint,
-    registration: ProviderAdmission,
-    session: AuthenticatedComponentSession<()>,
-    provider: Arc<EntraCredentialProvider>,
-    authorizer: Arc<A>,
-    cancellation: Cancellation,
-) -> Result<(), ProviderRuntimeError>
-where
-    A: CredentialAuthorizationSource,
-{
-    bootstrap
-        .admit(binding)
-        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
-    let session_admission = entrypoint.admit_authenticated(&session)?;
-    run_authenticated_credential_provider(
-        entrypoint,
-        registration,
-        session_admission,
-        session,
-        provider,
-        authorizer,
-        cancellation,
+/// Return the supervised controller process status.
+pub fn controller_binary_entrypoint() -> i32 {
+    run_from_fd10()
+}
+
+fn runtime_provider(
+    route: &AuthenticatedSessionRouteBinding,
+) -> Result<
+    (
+        Arc<EntraCredentialProvider>,
+        Arc<RouteCredentialAuthorization>,
+    ),
+    ProviderRuntimeError,
+> {
+    let provider_ref = route
+        .provider_ref()
+        .cloned()
+        .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
+    let zone_ref = route.context().zone_ref().clone();
+    let execution_ref = route
+        .context()
+        .execution_ref()
+        .filter(|reference| reference.resource_type().as_str() == "Guest")
+        .cloned()
+        .unwrap_or_else(|| ResourceRef::parse("Guest/credential-identity").expect("fixed Guest"));
+    let identity_guest_ref =
+        ResourceRef::parse("Guest/credential-identity").expect("fixed identity Guest");
+    let login_endpoint_ref =
+        ResourceRef::parse("Endpoint/credential-entra-login").expect("fixed Endpoint");
+    let endpoint_generation = route
+        .provider_generation()
+        .ok_or(ProviderRuntimeError::SessionUnauthenticated)?
+        .get();
+    let placement = EntraPlacement::new_in_zone(
+        zone_ref,
+        PlacementBinding::GuestAgent,
+        execution_ref,
+        identity_guest_ref,
+        login_endpoint_ref,
+        endpoint_generation,
     )
-    .await
+    .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let config = EntraConfig::new("allocator-issued-tenant", MAX_LOCAL_LEASES)
+        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let provider = EntraCredentialProviderFactory::new(
+        config,
+        placement,
+        provider_ref,
+        Arc::new(UnavailableEntraClient),
+    )
+    .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?
+    .construct();
+    Ok((Arc::new(provider), Arc::new(RouteCredentialAuthorization)))
+}
+
+struct UnavailableEntraClient;
+
+impl EntraCredentialClient for UnavailableEntraClient {
+    fn state(&self) -> EntraFuture<'_, EntraClientState> {
+        Box::pin(async { Ok(EntraClientState::InteractionRequired) })
+    }
+
+    fn issue_lease(&self, _request: &EntraLeaseRequest) -> EntraFuture<'_, EntraLeaseGrant> {
+        Box::pin(async { Err(EntraClientError::Unavailable) })
+    }
+
+    fn inspect_lease(&self, _lease: &EntraLeaseRef) -> EntraFuture<'_, EntraLeaseInspection> {
+        Box::pin(async { Err(EntraClientError::Unavailable) })
+    }
+
+    fn refresh_lease(&self, _lease: &EntraLeaseRef) -> EntraFuture<'_, EntraLeaseRenewal> {
+        Box::pin(async { Err(EntraClientError::Unavailable) })
+    }
+
+    fn revoke_lease(&self, _lease: &EntraLeaseRef) -> EntraFuture<'_, EntraLeaseRevocation> {
+        Box::pin(async { Err(EntraClientError::Unavailable) })
+    }
 }
 
 /// Boxed asynchronous result returned by the injected identity-Guest client.

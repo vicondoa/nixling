@@ -27,10 +27,8 @@ use d2b_contracts_provider::v3::credential::{
 };
 use d2b_contracts_resource::v3::{ResourceGeneration, ResourceRef, ZoneId};
 use d2b_provider_toolkit::{
-    AllocatorSessionBinding, AuthenticatedComponentSession, Cancellation,
-    CredentialAuthorizationSource, ProviderAdmission, ProviderAgentBootstrap, ProviderEntrypoint,
-    ProviderLifecycle, ProviderRuntimeError,
-    run_authenticated_credential_provider,
+    AuthenticatedSessionRouteBinding, ProviderFd10Spec, ProviderRuntimeError,
+    RouteCredentialAuthorization, run_from_fd10 as run_provider_from_fd10,
 };
 
 pub use controller::{
@@ -62,57 +60,119 @@ pub fn reject_process_environment_credential_chain(
     )
 }
 
-/// Return the fail-closed status used when the controller is not registered by
-/// `d2bd`.
-pub fn controller_binary_entrypoint() -> i32 {
+/// Enter the supervised Provider runtime through the inherited fd 10 handoff.
+pub fn run_from_fd10() -> i32 {
     if reject_process_environment_credential_chain().is_err() {
         return 1;
     }
     let Ok(provider_ref) = ResourceRef::parse(PROVIDER_REF) else {
         return 1;
     };
-    let Ok(entrypoint) = ProviderEntrypoint::with_provider(
-        "d2b-provider-credential-secret-service",
-        provider_ref,
-        CREDENTIAL_SERVICE_NAME,
-    ) else {
+    let Ok(purpose) =
+        d2b_contracts_resource::v3::identity::SessionPurpose::parse("provider-control")
+    else {
         return 1;
     };
-    if entrypoint.lifecycle() != ProviderLifecycle::Starting || entrypoint.admit().is_err() {
-        return 1;
-    }
-    1
+    run_provider_from_fd10::<SecretServiceCredentialProvider, RouteCredentialAuthorization, _>(
+        ProviderFd10Spec::new(
+            "d2b-provider-credential-secret-service",
+            provider_ref,
+            CREDENTIAL_SERVICE_NAME,
+            purpose,
+        ),
+        runtime_provider,
+    )
 }
 
-/// Serve the typed Credential service after the daemon has admitted the
-/// allocator-issued ComponentSession.
-pub async fn run_authenticated_credential_service<A>(
-    bootstrap: ProviderAgentBootstrap,
-    binding: AllocatorSessionBinding,
-    entrypoint: ProviderEntrypoint,
-    registration: ProviderAdmission,
-    session: AuthenticatedComponentSession<()>,
-    provider: Arc<SecretServiceCredentialProvider>,
-    authorizer: Arc<A>,
-    cancellation: Cancellation,
-) -> Result<(), ProviderRuntimeError>
-where
-    A: CredentialAuthorizationSource,
-{
-    bootstrap
-        .admit(binding)
+/// Return the supervised controller process status.
+pub fn controller_binary_entrypoint() -> i32 {
+    run_from_fd10()
+}
+
+fn runtime_provider(
+    route: &AuthenticatedSessionRouteBinding,
+) -> Result<
+    (
+        Arc<SecretServiceCredentialProvider>,
+        Arc<RouteCredentialAuthorization>,
+    ),
+    ProviderRuntimeError,
+> {
+    let provider_ref = route
+        .provider_ref()
+        .cloned()
+        .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
+    let execution_ref = route
+        .context()
+        .execution_ref()
+        .cloned()
+        .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
+    let user_ref = ResourceRef::parse("User/provider-controller")
         .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
-    let session_admission = entrypoint.admit_authenticated(&session)?;
-    run_authenticated_credential_provider(
-        entrypoint,
-        registration,
-        session_admission,
-        session,
-        provider,
-        authorizer,
-        cancellation,
+    let placement = SecretServicePlacement::new(
+        route.zone().clone(),
+        PlacementBinding::UserAgent,
+        execution_ref,
+        user_ref,
     )
-    .await
+    .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let config = SecretServiceConfig::new(
+        "allocator-issued-collection",
+        MAX_LOCAL_LEASES,
+        LockPolicy::FailClosed,
+    )
+    .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let provider = SecretServiceCredentialProviderFactory::new(
+        config,
+        placement,
+        Some(provider_ref),
+        Arc::new(UnavailableSecretServicePort),
+    )
+    .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?
+    .with_generation(
+        route
+            .provider_generation()
+            .ok_or(ProviderRuntimeError::SessionUnauthenticated)?,
+    )
+    .construct()
+    .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    Ok((Arc::new(provider), Arc::new(RouteCredentialAuthorization)))
+}
+
+struct UnavailableSecretServicePort;
+
+impl Oo7SecretServicePort for UnavailableSecretServicePort {
+    fn state(&self) -> SecretServiceFuture<'_, SecretServiceState> {
+        Box::pin(async { Ok(SecretServiceState::Locked) })
+    }
+
+    fn issue_lease(
+        &self,
+        _request: &SecretServiceLeaseRequest,
+    ) -> SecretServiceFuture<'_, SecretServiceLeaseGrant> {
+        Box::pin(async { Err(SecretServicePortError::Unavailable) })
+    }
+
+    fn inspect_lease(
+        &self,
+        _lease: &SecretServiceLeaseRef,
+    ) -> SecretServiceFuture<'_, SecretServiceLeaseInspection> {
+        Box::pin(async { Err(SecretServicePortError::Unavailable) })
+    }
+
+    fn refresh_lease(
+        &self,
+        _lease: &SecretServiceLeaseRef,
+    ) -> SecretServiceFuture<'_, SecretServiceLeaseRenewal> {
+        Box::pin(async { Err(SecretServicePortError::Unavailable) })
+    }
+
+    fn revoke_lease(
+        &self,
+        _lease: &SecretServiceLeaseRef,
+    ) -> SecretServiceFuture<'_, SecretServiceLeaseRevocation> {
+        Box::pin(async { Err(SecretServicePortError::Unavailable) })
+    }
 }
 
 /// A boxed asynchronous result returned by the injected port.
@@ -901,6 +961,52 @@ impl SecretServiceCredentialProvider {
         })?;
         sessions.insert(key, ());
         Ok(key)
+    }
+
+    pub(crate) fn authorize_controller_session_locked(
+        &self,
+        authorization: &CredentialAuthorization,
+    ) -> Result<SessionKey, CredentialServiceError> {
+        if self.finalized.load(Ordering::Acquire) || !self.authorizes_controller_session(authorization)
+        {
+            return Err(CredentialServiceError::new(
+                CredentialServiceErrorCode::OperationDenied,
+            ));
+        }
+        let key = SessionKey {
+            authority: self.authority.identity,
+            capability_id: 0,
+            presentation: 0,
+        };
+        self.sessions
+            .lock()
+            .map_err(|_| CredentialServiceError::new(CredentialServiceErrorCode::InvariantFailure))?
+            .insert(key, ());
+        Ok(key)
+    }
+
+    fn authorizes_controller_session(
+        &self,
+        authorization: &CredentialAuthorization,
+    ) -> bool {
+        let Some(session) = authorization.authenticated_session() else {
+            return false;
+        };
+        let subject = session.authenticated_subject();
+        authorization.authenticated_subject_context() == Some(subject)
+            && subject.subject_ref().to_canonical_string() == PROVIDER_REF
+            && subject
+                .provider_ref()
+                .is_some_and(|provider| provider.to_canonical_string() == PROVIDER_REF)
+            && subject.zone_ref().name().as_str() == self.placement.zone().as_str()
+            && subject.transport_binding().locality()
+                == d2b_contracts_resource::v3::identity::Locality::Local
+            && subject.service().as_str() == CREDENTIAL_SERVICE_NAME
+            && subject.session_purpose().as_str() == "provider-control"
+            && subject.provider_generation() == Some(self.generation)
+            && subject
+                .process_ref()
+                .is_some_and(|process| process.resource_type().as_str() == "Process")
     }
 
     pub(crate) fn session_capability<'a>(

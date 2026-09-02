@@ -124,6 +124,9 @@ use d2b_provider_network_local::{
 };
 use d2b_provider_device_gpu::GpuLifecycleEffectPort;
 use d2b_provider_notification_desktop::{Category, GuestSourceConfig, NotificationProviderConfig};
+use d2b_provider_toolkit::{
+    PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID, ProviderSessionMetadata,
+};
 use d2b_provider_runtime_cloud_hypervisor::{
     AuthenticatedResourceApiAdapter, AuthenticatedResourceSession, BootstrapGraph, ChildRole,
     CloudHypervisorConfig, CloudHypervisorController, CloudHypervisorResourceApiError,
@@ -16612,22 +16615,30 @@ impl ControllerSessionCoordinator {
         }
         let zone_ref = ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
             .map_err(|_| authentication_error("zone-reference"))?;
-        registrar
-            .install_committed_controller_process_subject(
-                &verified_peer,
-                CommittedControllerProcessSubjectInput {
-                    provider_ref: context.provider_owner_ref().clone(),
-                    provider_uid,
-                    process_ref: context.process_ref().clone(),
-                    zone_ref,
-                    execution_ref: context.execution_ref().clone(),
-                    provider_generation,
-                    controller_generation: context.controller_generation(),
-                },
-            )
-            .map_err(|_| authentication_error("controller-subject-install"))?;
-
         let credential_session = is_credential_provider_ref(context.provider_owner_ref());
+        let committed_subject = CommittedControllerProcessSubjectInput {
+            provider_ref: context.provider_owner_ref().clone(),
+            provider_uid,
+            process_ref: context.process_ref().clone(),
+            zone_ref,
+            execution_ref: context.execution_ref().clone(),
+            provider_generation,
+            controller_generation: context.controller_generation(),
+        };
+        if credential_session {
+            registrar
+                .install_committed_controller_process_subject_for_service(
+                    &verified_peer,
+                    committed_subject,
+                    d2b_contracts_zone_session::v3::component_session::ServicePackage::CredentialV3,
+                )
+        } else {
+            registrar.install_committed_controller_process_subject(
+                &verified_peer,
+                committed_subject,
+            )
+        }
+        .map_err(|_| authentication_error("controller-subject-install"))?;
         let policy = if credential_session {
             credential_provider_endpoint_policy()
         } else {
@@ -16670,10 +16681,37 @@ impl ControllerSessionCoordinator {
             .await
             .map_err(|_| authentication_error("service-registration"))?;
         let (resource_client, service_task) = if credential_session {
+            let metadata = ProviderSessionMetadata::from_route(&route)
+                .and_then(|metadata| metadata.encode())
+                .map_err(|_| authentication_error("provider-session-bootstrap"))?;
+            let stream = StreamId::new(PROVIDER_BOOTSTRAP_STREAM_ID)
+                .map_err(|_| authentication_error("provider-session-stream"))?;
+            driver
+                .open_named_stream(
+                    stream,
+                    PROVIDER_BOOTSTRAP_STREAM_CREDIT,
+                    PROVIDER_BOOTSTRAP_STREAM_CREDIT,
+                )
+                .await
+                .map_err(|_| authentication_error("provider-session-stream-open"))?;
+            driver
+                .send_named_stream(stream, metadata)
+                .await
+                .map_err(|_| authentication_error("provider-session-bootstrap-send"))?;
+            driver
+                .close_named_stream(stream)
+                .await
+                .map_err(|_| authentication_error("provider-session-bootstrap-close"))?;
+            let monitor = driver.clone();
             (
                 None,
-                tokio::spawn(async {
-                    std::future::pending::<Result<(), SessionServerError>>().await
+                tokio::spawn(async move {
+                    loop {
+                        match monitor.receive_control().await {
+                            Ok(d2b_session::SessionEvent::Close(_)) | Err(_) => return Ok(()),
+                            Ok(_) => {}
+                        }
+                    }
                 }),
             )
         } else {
