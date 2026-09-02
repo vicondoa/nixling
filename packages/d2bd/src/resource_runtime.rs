@@ -13035,7 +13035,6 @@ impl ZoneResourceRuntime {
                         Arc::clone(&status_client),
                         identity,
                         provider_ref.clone(),
-                        session_generation,
                         self.credential_sessions
                             .for_provider(provider_ref.clone()),
                     )

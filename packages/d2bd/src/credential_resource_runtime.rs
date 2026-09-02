@@ -241,6 +241,8 @@ impl core::fmt::Debug for CredentialRevocationEvidence {
 /// Typed Credential session used by the resource controller's cleanup effect.
 #[async_trait]
 pub(crate) trait CredentialSession: Send + Sync {
+    fn session_generation(&self) -> Option<ReconnectGeneration>;
+
     async fn revoke_credential(
         &self,
         request: &CredentialRevocationRequest,
@@ -284,6 +286,13 @@ impl ComponentCredentialSession {
 
 #[async_trait]
 impl CredentialSession for ComponentCredentialSession {
+    fn session_generation(&self) -> Option<ReconnectGeneration> {
+        self.route
+            .liveness()
+            .is_live()
+            .then_some(self.route.reconnect_generation())
+    }
+
     async fn revoke_credential(
         &self,
         request: &CredentialRevocationRequest,
@@ -296,9 +305,11 @@ impl CredentialSession for ComponentCredentialSession {
             || &request.provider_ref != provider_ref
             || self.route.provider_generation() != Some(request.provider_generation)
             || self.route.controller_generation() != Some(request.controller_generation)
-            || request.session_generation != self.route.reconnect_generation()
         {
             return Err(CredentialResourceRuntimeError::InvalidResource);
+        }
+        if request.session_generation != self.route.reconnect_generation() {
+            return Ok(CredentialRevocationOutcome::Uncertain);
         }
         let _gate = self.gate.lock().await;
         if !self.route.liveness().is_live()
@@ -463,6 +474,13 @@ struct RegistryCredentialSession {
 
 #[async_trait]
 impl CredentialSession for RegistryCredentialSession {
+    fn session_generation(&self) -> Option<ReconnectGeneration> {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(&self.provider_ref).map(|(generation, _)| *generation))
+    }
+
     async fn revoke_credential(
         &self,
         request: &CredentialRevocationRequest,
@@ -470,15 +488,17 @@ impl CredentialSession for RegistryCredentialSession {
         if request.provider_ref != self.provider_ref {
             return Err(CredentialResourceRuntimeError::InvalidResource);
         }
-        let session = self
+        let current = self
             .sessions
             .lock()
             .map_err(|_| CredentialResourceRuntimeError::Revocation)?
             .get(&self.provider_ref)
-            .map(|(_, session)| Arc::clone(session));
-        match session {
-            Some(session) => session.revoke_credential(request).await,
-            None => Ok(CredentialRevocationOutcome::Uncertain),
+            .map(|(generation, session)| (*generation, Arc::clone(session)));
+        match current {
+            Some((generation, session)) if generation == request.session_generation => {
+                session.revoke_credential(request).await
+            }
+            Some(_) | None => Ok(CredentialRevocationOutcome::Uncertain),
         }
     }
 }
@@ -566,7 +586,6 @@ pub(crate) struct CredentialResourceReconciler<
     identity: ControllerIdentity,
     provider_ref: ResourceRef,
     provider_kind: CredentialProviderKind,
-    session_generation: ReconnectGeneration,
     credential_session: Arc<dyn CredentialSession>,
 }
 
@@ -580,7 +599,6 @@ where
         client: Arc<C>,
         identity: ControllerIdentity,
         provider_ref: ResourceRef,
-        session_generation: ReconnectGeneration,
         credential_session: Arc<dyn CredentialSession>,
     ) -> Result<Self, CredentialResourceRuntimeError> {
         let provider_kind =
@@ -591,7 +609,6 @@ where
             identity,
             provider_ref,
             provider_kind,
-            session_generation,
             credential_session,
         })
     }
@@ -1059,11 +1076,31 @@ where
                 .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?;
             let lease_state = lease_state(resource);
             if matches!(lease_state.as_deref(), Some("Active" | "Unknown")) {
+                let Some(session_generation) = self.credential_session.session_generation() else {
+                    let status = credential_status_candidate(
+                        resource,
+                        ResourcePhase::Degraded,
+                        "credential-revocation-uncertain",
+                        false,
+                        None,
+                    )?;
+                    return ReconcileResult::new(
+                        resource.revision(),
+                        resource.generation(),
+                        None,
+                        Some(status),
+                        ReconcileDisposition::Degraded,
+                        None,
+                        None,
+                        d2b_core_controller::StatusPersistence::Pending,
+                    )
+                    .map_err(|_| CredentialResourceRuntimeError::InvalidResource);
+                };
                 let request = CredentialRevocationRequest::new(
                     resource,
                     &self.provider_ref,
                     &self.identity,
-                    self.session_generation,
+                    session_generation,
                 )?;
                 let outcome = self.credential_session.revoke_credential(&request).await?;
                 let evidence = CredentialRevocationEvidence::confirmed(&request, outcome);
@@ -2199,6 +2236,10 @@ mod tests {
 
     #[async_trait]
     impl CredentialSession for RecordingCredentialSession {
+        fn session_generation(&self) -> Option<ReconnectGeneration> {
+            Some(ReconnectGeneration::new(7).expect("recording session generation"))
+        }
+
         async fn revoke_credential(
             &self,
             request: &CredentialRevocationRequest,
@@ -2224,6 +2265,10 @@ mod tests {
 
     #[async_trait]
     impl CredentialSession for UncertainCredentialSession {
+        fn session_generation(&self) -> Option<ReconnectGeneration> {
+            None
+        }
+
         async fn revoke_credential(
             &self,
             _request: &CredentialRevocationRequest,
@@ -2919,7 +2964,6 @@ mod tests {
             client,
             identity_for_provider(provider),
             provider_ref,
-            ReconnectGeneration::new(7).unwrap(),
             session,
         )
         .unwrap()
@@ -3015,7 +3059,6 @@ mod tests {
                 Arc::clone(&client),
                 identity_for_provider("Provider/credential-managed-identity"),
                 provider_ref,
-                ReconnectGeneration::new(7).unwrap(),
                 Arc::new(UncertainCredentialSession),
             )
             .unwrap(),
@@ -3088,11 +3131,11 @@ mod tests {
     async fn composed_runner_revokes_then_cleans_the_managed_identity_child() {
         let provider_ref =
             ResourceRef::parse("Provider/credential-managed-identity").unwrap();
-        let driver = Arc::new(FakeCredentialDriver::new(7));
+        let driver = Arc::new(FakeCredentialDriver::new(9));
         let route = d2b_session::AuthenticatedSessionRouteBinding::for_test(
             Some(provider_ref.clone()),
             CREDENTIAL_SERVICE_NAME,
-            7,
+            9,
             Some(1),
             Some(1),
         );
@@ -3103,7 +3146,7 @@ mod tests {
         registry
             .register(
                 provider_ref.clone(),
-                ReconnectGeneration::new(7).unwrap(),
+                ReconnectGeneration::new(9).unwrap(),
                 session,
             )
             .unwrap();
@@ -3114,7 +3157,7 @@ mod tests {
             &active,
             &provider_ref,
             &identity_for_provider("Provider/credential-managed-identity"),
-            ReconnectGeneration::new(7).unwrap(),
+            ReconnectGeneration::new(9).unwrap(),
         )
         .unwrap();
         let revoke_source = Arc::new(TestRunnerSource::new(Some(active.clone()), Vec::new()));
@@ -3123,7 +3166,6 @@ mod tests {
             Arc::clone(&client),
             identity_for_provider("Provider/credential-managed-identity"),
             provider_ref.clone(),
-            ReconnectGeneration::new(7).unwrap(),
             registry.for_provider(provider_ref.clone()),
         )
         .unwrap());
@@ -3155,7 +3197,6 @@ mod tests {
             Arc::clone(&client),
             identity_for_provider("Provider/credential-managed-identity"),
             provider_ref.clone(),
-            ReconnectGeneration::new(7).unwrap(),
             registry.for_provider(provider_ref.clone()),
         )
         .unwrap());
@@ -3175,7 +3216,6 @@ mod tests {
             Arc::clone(&client),
             identity_for_provider("Provider/credential-managed-identity"),
             provider_ref.clone(),
-            ReconnectGeneration::new(7).unwrap(),
             registry.for_provider(provider_ref.clone()),
         )
         .unwrap());
@@ -3191,7 +3231,6 @@ mod tests {
             Arc::clone(&client),
             identity_for_provider("Provider/credential-managed-identity"),
             provider_ref,
-            ReconnectGeneration::new(7).unwrap(),
             registry.for_provider(
                 ResourceRef::parse("Provider/credential-managed-identity").unwrap(),
             ),
@@ -3219,7 +3258,6 @@ mod tests {
                     Arc::new(TestCredentialClient::default()),
                     identity_for_provider(provider),
                     provider_ref,
-                    ReconnectGeneration::new(7).unwrap(),
                     Arc::new(RecordingCredentialSession::default()),
                 )
                 .unwrap(),
