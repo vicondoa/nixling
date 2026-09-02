@@ -15,10 +15,11 @@ use d2b_controller_toolkit::{
     ControllerIdentity, ControllerSelector, ControllerSource, ControllerVerb, DependencySnapshot,
     DescriptorError, DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot, HandlerFailure,
     InitialList, ObservationResult, OperationContext, ReconcileContext, ReconcilePlan,
-    ReconcileProjection, ReconcileReason, ReconcileResult, ResourceKey, ResourceRegistration,
-    ResourceReconciler, ResourceSnapshot, ResyncPolicy, SelectorField, SourceError,
-    StatusPersistence, UpdateAssessment, UpdateAssessmentState, UpgradePlan, ValidationResult,
-    WatchEvent, WatchFailure,
+    ReconcileDisposition, ReconcileProjection, ReconcileReason, ReconcileResult, ResourceKey,
+    ResourceRegistration, ResourceReconciler, ResourceSnapshot, ResyncPolicy, SelectorField,
+    SourceError, StatusPersistence, UpdateAssessment, UpdateAssessmentState, UpgradePlan,
+    ValidationResult, WatchEvent, WatchFailure, MutationIntent, MutationIntentKind,
+    ResourceMutationBatch,
 };
 
 use crate::{
@@ -609,9 +610,33 @@ fn resource_has_finalizer(
     Ok(value
         .pointer("/metadata/finalizers")
         .and_then(serde_json::Value::as_array)
-        .ok_or(CoreReconcileError)?
-        .iter()
-        .any(|value| value.as_str() == Some(expected)))
+        .is_some_and(|finalizers| {
+            finalizers
+                .iter()
+                .any(|value| value.as_str() == Some(expected))
+        }))
+}
+
+fn finalizer_removal_payload(
+    resource: &ResourceSnapshot,
+    expected: &str,
+) -> Result<Option<Vec<u8>>, CoreReconcileError> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .map_err(|_| CoreReconcileError)?;
+    let Some(finalizers) = value
+        .pointer_mut("/metadata/finalizers")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(None);
+    };
+    let original_len = finalizers.len();
+    finalizers.retain(|value| value.as_str() != Some(expected));
+    if finalizers.len() == original_len {
+        return Ok(None);
+    }
+    serde_json::to_vec(&value)
+        .map(Some)
+        .map_err(|_| CoreReconcileError)
 }
 
 fn status_candidate(resource: &ResourceSnapshot) -> Result<Vec<u8>, CoreReconcileError> {
@@ -759,6 +784,63 @@ impl ResourceReconciler for CoreResourceReconciler {
             resource.revision(),
             resource.generation(),
         ))))
+    }
+
+    fn prepare_finalize(
+        &self,
+        context: &ReconcileContext,
+        deleting_resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let result = (|| {
+            context
+                .authorize_effect()
+                .map_err(|_| CoreReconcileError)?;
+            let Some(finalizer) = self.descriptor.finalizers().first() else {
+                return Ok(ReconcileResult::converged(
+                    deleting_resource.revision(),
+                    deleting_resource.generation(),
+                ));
+            };
+            let Some(desired) = finalizer_removal_payload(deleting_resource, finalizer)? else {
+                return Ok(ReconcileResult::converged(
+                    deleting_resource.revision(),
+                    deleting_resource.generation(),
+                ));
+            };
+            let mutation = MutationIntent::new(
+                deleting_resource.key().resource_ref().clone(),
+                Some(deleting_resource.key().uid().clone()),
+                Some(deleting_resource.revision()),
+                MutationIntentKind::UpdateFinalizers,
+                Some(desired),
+            )
+            .map_err(|_| CoreReconcileError)?;
+            let batch =
+                ResourceMutationBatch::new(vec![mutation]).map_err(|_| CoreReconcileError)?;
+            ReconcileResult::new(
+                deleting_resource.revision(),
+                deleting_resource.generation(),
+                Some(batch),
+                None,
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::NotRequested,
+            )
+            .map_err(|_| CoreReconcileError)
+        })();
+        std::future::ready(result)
+    }
+
+    fn execute_finalize(
+        &self,
+        _context: &ReconcileContext,
+        deleting_resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        std::future::ready(Ok(ReconcileResult::converged(
+            deleting_resource.revision(),
+            deleting_resource.generation(),
+        )))
     }
 
     fn health(&self) -> impl Future<Output = Result<ControllerHealth, Self::Error>> + Send {
@@ -1387,6 +1469,62 @@ mod tests {
                 "core.zone-link-drain",
             ]
         );
+    }
+
+    #[test]
+    fn core_finalizer_removal_keeps_foreign_finalizers_for_every_owner() {
+        let key = key("deleting", 7);
+        for registration in CORE_RESOURCE_CONTROLLER_REGISTRATIONS {
+            let Some(finalizer) = registration.finalizer() else {
+                continue;
+            };
+            let resource = ResourceSnapshot::new(
+                key.clone(),
+                ZoneRevision::new(4),
+                ResourceGeneration::new(2).unwrap(),
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata": {
+                        "finalizers": [finalizer, "foreign.finalizer"]
+                    }
+                }))
+                .unwrap(),
+                true,
+            );
+            let payload = finalizer_removal_payload(&resource, finalizer)
+                .unwrap()
+                .expect("owned finalizer is present");
+            let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            let finalizers = value
+                .pointer("/metadata/finalizers")
+                .and_then(serde_json::Value::as_array)
+                .unwrap();
+            assert_eq!(
+                finalizers,
+                &[serde_json::Value::String("foreign.finalizer".to_owned())]
+            );
+        }
+    }
+
+    #[test]
+    fn absent_or_empty_core_finalizer_is_already_cleared() {
+        let key = key("already-cleared", 8);
+        for finalizers in [Vec::<&str>::new(), vec!["foreign.finalizer"]] {
+            let resource = ResourceSnapshot::new(
+                key.clone(),
+                ZoneRevision::new(4),
+                ResourceGeneration::new(2).unwrap(),
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata": {"finalizers": finalizers}
+                }))
+                .unwrap(),
+                true,
+            );
+            assert!(
+                finalizer_removal_payload(&resource, "core.finalizer")
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
 }
