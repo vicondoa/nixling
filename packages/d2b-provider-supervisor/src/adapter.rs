@@ -359,21 +359,25 @@ impl<B: ProcessEffectBackend> ProviderSupervisor<B> {
         let state = Arc::clone(&self.inner.state);
         let result = self
             .blocking(self.inner.default_timeout, move |backend| {
-                backend.finalize(finalize_handle.as_ref())?;
-                let mut state = state.lock().map_err(|_| ProcessEffectError::StopFailed)?;
-                if state
-                    .handles
-                    .get(&finalize_identity)
-                    .is_some_and(|retained| Arc::ptr_eq(retained, &finalize_handle))
-                {
-                    state.handles.remove(&finalize_identity);
-                    state.quarantined_identities.remove(&finalize_identity);
+                let result = backend.finalize(finalize_handle.as_ref());
+                if result.is_ok() || result == Err(ProcessEffectError::Vanished) {
+                    let mut state = state.lock().map_err(|_| ProcessEffectError::StopFailed)?;
+                    if state
+                        .handles
+                        .get(&finalize_identity)
+                        .is_some_and(|retained| Arc::ptr_eq(retained, &finalize_handle))
+                    {
+                        state.handles.remove(&finalize_identity);
+                        state.quarantined_identities.remove(&finalize_identity);
+                    }
                 }
-
-                Ok(())
+                result
             })
             .await;
-        result.map_err(map_error)
+        match result {
+            Ok(()) | Err(ProcessEffectError::Vanished) => Ok(()),
+            Err(error) => Err(map_error(error)),
+        }
     }
 
     /// Take the Provider-controller bootstrap endpoint retained with one handle.

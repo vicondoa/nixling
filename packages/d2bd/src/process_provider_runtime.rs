@@ -1295,7 +1295,7 @@ impl ProductionProcessProviders {
             )
         .await?;
         if liveness == ProviderLiveness::Exited {
-            self.forget_resource_for_context(&context, spec.execution().execution_ref());
+                self.finalize_resource(context.clone()).await?;
         }
         Ok(liveness)
     }
@@ -1318,7 +1318,7 @@ impl ProductionProcessProviders {
             )
         .await?;
         if liveness == ProviderLiveness::Exited {
-            self.forget_resource_for_context(&context, spec.execution().execution_ref());
+                self.finalize_resource(context.clone()).await?;
         }
         Ok(liveness)
     }
@@ -1808,7 +1808,7 @@ impl ProductionProcessProviders {
         let controller_bootstrap = ticket.inherited_fd_table().count() == 1;
         match outcome {
             AdoptionOutcome::Absent => {
-                self.forget_resource_for_context(&context, execution.execution_ref());
+                self.finalize_resource(context.clone()).await?;
                 Ok(ProviderAdoption::Absent)
             }
             AdoptionOutcome::Adopted(report) => {
