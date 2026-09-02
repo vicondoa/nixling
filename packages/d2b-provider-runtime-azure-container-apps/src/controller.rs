@@ -43,6 +43,59 @@ pub enum AcaPhase {
     Finalized,
 }
 
+/// Default descriptor repair interval.
+pub const ACA_REPAIR_INTERVAL_SECS: u64 = 30;
+/// Exact Guest finalizer owned by the ACA runtime Provider.
+pub const ACA_GUEST_FINALIZER: &str = "runtime-azure-container-apps.d2bus.org/guest-cleanup";
+
+/// The shared-Runner contract for the Azure Container Apps Guest owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AzureContainerAppsRunnerContract {
+    resource_type: &'static str,
+    finalizer: &'static str,
+    repair_interval_secs: u64,
+    legacy_scheduler_disabled: bool,
+    watched_configuration_is_dependency: bool,
+}
+
+impl AzureContainerAppsRunnerContract {
+    /// Return the owned ResourceType.
+    pub const fn resource_type(self) -> &'static str {
+        self.resource_type
+    }
+
+    /// Return the exact Guest finalizer.
+    pub const fn finalizer(self) -> &'static str {
+        self.finalizer
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Whether the legacy Guest scheduler is disabled.
+    pub const fn legacy_scheduler_disabled(self) -> bool {
+        self.legacy_scheduler_disabled
+    }
+
+    /// Whether watched configuration is treated as a dependency.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+}
+
+/// Return the shared-Runner contract for Azure Container Apps Guests.
+pub const fn azure_container_apps_runner_contract() -> AzureContainerAppsRunnerContract {
+    AzureContainerAppsRunnerContract {
+        resource_type: "Guest",
+        finalizer: ACA_GUEST_FINALIZER,
+        repair_interval_secs: ACA_REPAIR_INTERVAL_SECS,
+        legacy_scheduler_disabled: true,
+        watched_configuration_is_dependency: true,
+    }
+}
+
 /// Result of one non-blocking reconcile pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcaReconcileOutcome {

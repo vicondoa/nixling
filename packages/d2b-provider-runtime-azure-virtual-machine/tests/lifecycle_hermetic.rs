@@ -10,6 +10,20 @@ use d2b_provider_runtime_azure_virtual_machine::{
     PskExtensionPayload, TagDigest,
 };
 
+#[test]
+fn azure_vm_publishes_the_shared_runner_contract() {
+    let contract =
+        d2b_provider_runtime_azure_virtual_machine::azure_virtual_machine_runner_contract();
+    assert_eq!(contract.resource_type(), "Guest");
+    assert_eq!(
+        contract.finalizer(),
+        d2b_provider_runtime_azure_virtual_machine::FINALIZER
+    );
+    assert_eq!(contract.repair_interval_secs(), 30);
+    assert!(contract.legacy_scheduler_disabled());
+    assert!(contract.watched_configuration_is_dependency());
+}
+
 struct FakeState {
     state: AzureVmState,
     handle: Option<AzureVmHandle>,

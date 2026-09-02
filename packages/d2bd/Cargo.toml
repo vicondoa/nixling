@@ -61,6 +61,8 @@ d2b-provider-notification-desktop = { path = "../d2b-provider-notification-deskt
 d2b-provider-audio-pipewire = { path = "../d2b-provider-audio-pipewire", version = "0.0.0-bootstrap" }
 d2b-provider-network-local = { path = "../d2b-provider-network-local", version = "0.0.0-bootstrap" }
 d2b-provider-runtime-cloud-hypervisor = { path = "../d2b-provider-runtime-cloud-hypervisor", version = "0.0.0-bootstrap" }
+d2b-provider-runtime-qemu-media = { path = "../d2b-provider-runtime-qemu-media", version = "0.0.0-bootstrap" }
+d2b-provider-runtime-azure-virtual-machine = { path = "../d2b-provider-runtime-azure-virtual-machine", version = "0.0.0-bootstrap" }
 # v2 constellation contract crates (ADR 0032). The peer-module skeletons in
 # src/realm_stubs.rs wire this trait surface; they are compile-only
 # and NOT called from the running daemon (zero behavior change).

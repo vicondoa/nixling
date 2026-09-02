@@ -193,9 +193,14 @@ use sha2::{Digest, Sha256};
 
 mod volume_effect_adapter;
 mod volume_provider_runtime;
+mod guest_provider_runtime;
 pub use volume_provider_runtime::{
     compose_shared_volume_runner_descriptors, SharedVolumeRunnerRegistration,
     U7_SHARED_PROVIDER_RUNNERS,
+};
+pub use guest_provider_runtime::{
+    compose_shared_guest_runner_descriptors, SharedGuestRunnerRegistration,
+    U6_SHARED_PROVIDER_RUNNERS,
 };
 pub use volume_effect_adapter::{
     AnchoredVolumeEffectAdapter, FdRootResolver, ResolvedVolumeRoot, VolumeRootResolver,
@@ -363,6 +368,10 @@ pub(crate) enum SharedProviderResourceKind {
     SecurityKeyService,
     SecurityKeyBinding,
     GpuDevice,
+    CloudHypervisorGuest,
+    QemuMediaGuest,
+    AzureContainerAppsGuest,
+    AzureVirtualMachineGuest,
 }
 
 impl SharedProviderResourceKind {
@@ -409,6 +418,26 @@ impl SharedProviderResourceKind {
             ("Provider/device-gpu", "Device", "Process/device-gpu-controller") => {
                 Ok(Self::GpuDevice)
             }
+            (
+                "Provider/runtime-cloud-hypervisor",
+                "Guest",
+                "Process/cloud-hypervisor-controller",
+            ) => Ok(Self::CloudHypervisorGuest),
+            (
+                "Provider/runtime-qemu-media",
+                "Guest",
+                "Process/runtime-qemu-media-controller",
+            ) => Ok(Self::QemuMediaGuest),
+            (
+                "Provider/runtime-azure-container-apps",
+                "Guest",
+                "Process/aca-controller",
+            ) => Ok(Self::AzureContainerAppsGuest),
+            (
+                "Provider/runtime-azure-virtual-machine",
+                "Guest",
+                "Process/azure-vm-controller-process",
+            ) => Ok(Self::AzureVirtualMachineGuest),
             _ => Err(ResourceRuntimeError::HandlerNotReady),
         }
     }
@@ -424,6 +453,10 @@ impl SharedProviderResourceKind {
             Self::SecurityKeyService => "device-security-key-service",
             Self::SecurityKeyBinding => "device-security-key-binding",
             Self::GpuDevice => "device-gpu",
+            Self::CloudHypervisorGuest => "runtime-cloud-hypervisor-guest",
+            Self::QemuMediaGuest => "runtime-qemu-media-guest",
+            Self::AzureContainerAppsGuest => "runtime-azure-container-apps-guest",
+            Self::AzureVirtualMachineGuest => "runtime-azure-virtual-machine-guest",
         }
     }
 
@@ -438,6 +471,10 @@ impl SharedProviderResourceKind {
             | Self::SecurityKeyService
             | Self::SecurityKeyBinding => "Provider/device-security-key",
             Self::GpuDevice => "Provider/device-gpu",
+            Self::CloudHypervisorGuest => "Provider/runtime-cloud-hypervisor",
+            Self::QemuMediaGuest => "Provider/runtime-qemu-media",
+            Self::AzureContainerAppsGuest => "Provider/runtime-azure-container-apps",
+            Self::AzureVirtualMachineGuest => "Provider/runtime-azure-virtual-machine",
         }
     }
 
@@ -456,6 +493,10 @@ impl SharedProviderResourceKind {
             Self::SecurityKeyBinding => {
                 d2b_provider_device_security_key::SECURITY_KEY_BINDING_RESOURCE_TYPE
             }
+            Self::CloudHypervisorGuest
+            | Self::QemuMediaGuest
+            | Self::AzureContainerAppsGuest
+            | Self::AzureVirtualMachineGuest => "Guest",
         }
     }
 
@@ -590,6 +631,18 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
         Err(SharedProviderEffectError::Unavailable)
     }
 
+    /// Reconcile one Guest through its selected runtime Provider.
+    async fn reconcile_guest(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let _ = (kind, context, resource, dependencies);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
     /// Dispatch the closed Provider kind to its typed effect port.
     async fn reconcile(
         &self,
@@ -629,6 +682,12 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
             SharedProviderResourceKind::GpuDevice => {
                 self.reconcile_gpu(context, resource, dependencies).await
             }
+            SharedProviderResourceKind::CloudHypervisorGuest
+            | SharedProviderResourceKind::QemuMediaGuest
+            | SharedProviderResourceKind::AzureContainerAppsGuest
+            | SharedProviderResourceKind::AzureVirtualMachineGuest => self
+                .reconcile_guest(kind, context, resource, dependencies)
+                .await,
         }
     }
 
@@ -644,6 +703,26 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
 
     /// Run provider cleanup before the owner finalizer is removed.
     async fn finalize(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<(), SharedProviderEffectError> {
+        if matches!(
+            kind,
+            SharedProviderResourceKind::CloudHypervisorGuest
+                | SharedProviderResourceKind::QemuMediaGuest
+                | SharedProviderResourceKind::AzureContainerAppsGuest
+                | SharedProviderResourceKind::AzureVirtualMachineGuest
+        ) {
+            return self.finalize_guest(kind, context, resource).await;
+        }
+        let _ = (kind, context, resource);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Finalize one Guest through its selected runtime Provider.
+    async fn finalize_guest(
         &self,
         kind: SharedProviderResourceKind,
         context: &SharedProviderEffectContext,
@@ -1364,6 +1443,255 @@ impl DaemonSharedProviderEffects {
             .lock()
             .map_err(|_| SharedProviderEffectError::Unavailable)?
             .insert(device_uid.clone(), opened_devices);
+        Ok(())
+    }
+
+    async fn guest_provider_resource(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<Value, SharedProviderEffectError> {
+        let value = self.validate(kind, context, resource)?;
+        if resource.key().resource_ref().resource_type().as_str() != "Guest"
+            || resource.key().uid().as_str().is_empty()
+            || resource.generation().get() == 0
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        Ok(value)
+    }
+
+    fn guest_phase(value: &Value) -> SharedProviderEffectPhase {
+        if value.pointer("/status/phase").and_then(Value::as_str) == Some("Ready")
+            && value
+                .pointer("/status/observedGeneration")
+                .and_then(Value::as_u64)
+                == value.pointer("/metadata/generation").and_then(Value::as_u64)
+        {
+            SharedProviderEffectPhase::Ready
+        } else {
+            SharedProviderEffectPhase::Pending
+        }
+    }
+
+    fn related_guest_dependency(
+        guest: &Value,
+        dependency: &DependencySnapshot,
+    ) -> Result<bool, SharedProviderEffectError> {
+        let dependency_value = serde_json::from_slice::<Value>(dependency.resource().canonical_json())
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let dependency_ref = dependency.resource().key().resource_ref();
+        let provider_ref = guest
+            .pointer("/spec/providerRef")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceRef::parse(value).ok());
+        let attachment = guest
+            .pointer("/spec/networkAttachments")
+            .and_then(Value::as_array)
+            .is_some_and(|attachments| {
+                attachments.iter().any(|attachment| {
+                    attachment
+                        .get("networkRef")
+                        .and_then(Value::as_str)
+                        == Some(dependency_ref.to_canonical_string().as_str())
+                })
+            })
+            || guest
+                .pointer("/spec/deviceAttachments")
+                .and_then(Value::as_array)
+                .is_some_and(|attachments| {
+                    attachments.iter().any(|attachment| {
+                        attachment
+                            .get("deviceRef")
+                            .and_then(Value::as_str)
+                            == Some(dependency_ref.to_canonical_string().as_str())
+                    })
+                });
+        let is_provider = provider_ref.as_ref() == Some(dependency_ref);
+        if is_provider || attachment {
+            Ok(dependency_value.pointer("/status/phase").and_then(Value::as_str) == Some("Ready"))
+        } else {
+            Ok(true)
+        }
+    }
+
+    fn validate_qemu_guest(value: &Value) -> Result<(), SharedProviderEffectError> {
+        let settings = value
+            .pointer("/spec/provider/settings")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        serde_json::from_value::<d2b_provider_runtime_qemu_media::GuestProviderSpecSettings>(
+            settings,
+        )
+        .map(|_| ())
+        .map_err(|_| SharedProviderEffectError::InvalidResource)
+    }
+
+    fn validate_azure_vm_guest(value: &Value) -> Result<(), SharedProviderEffectError> {
+        let settings = value
+            .pointer("/spec/provider/settings")
+            .cloned()
+            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        serde_json::from_value::<d2b_provider_runtime_azure_virtual_machine::AzureVmGuestSettings>(
+            settings,
+        )
+        .map(|_| ())
+        .map_err(|_| SharedProviderEffectError::InvalidResource)
+    }
+
+    async fn validate_gateway_custody(
+        &self,
+        provider_ref: &ResourceRef,
+        credential_fields: &[&str],
+        context: &SharedProviderEffectContext,
+    ) -> Result<(), SharedProviderEffectError> {
+        let runtime = self.runtime()?;
+        let provider = runtime
+            .committed_resource_value(provider_ref, &context.operation_id)
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let config = provider
+            .pointer("/spec/config")
+            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        let gateway = config
+            .get("gatewayExecutionRef")
+            .or_else(|| config.get("controllerExecutionRef"))
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceRef::parse(value).ok())
+            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        if gateway.resource_type().as_str() != "Guest" {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        for field in credential_fields {
+            let Some(credential_ref) = config
+                .get(*field)
+                .and_then(Value::as_str)
+                .and_then(|value| ResourceRef::parse(value).ok())
+            else {
+                continue;
+            };
+            if credential_ref.resource_type().as_str() != "Credential" {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+            let credential = runtime
+                .committed_resource_value(&credential_ref, &context.operation_id)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let scope = credential
+                .pointer("/spec/scope/executionRef")
+                .and_then(Value::as_str)
+                .and_then(|value| ResourceRef::parse(value).ok())
+                .ok_or(SharedProviderEffectError::InvalidResource)?;
+            if scope != gateway {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+        }
+        Ok(())
+    }
+
+    async fn reconcile_guest_runtime(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let value = self.guest_provider_resource(kind, context, resource).await?;
+        for dependency in dependencies {
+            if !Self::related_guest_dependency(&value, dependency)? {
+                return Ok(SharedProviderEffectPhase::Pending);
+            }
+        }
+        match kind {
+            SharedProviderResourceKind::CloudHypervisorGuest => {
+                let runtime = self.runtime()?;
+                runtime
+                    .reconcile_cloud_hypervisor_guest(
+                        Arc::clone(&self.state),
+                        resource.key().resource_ref(),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let fresh = runtime
+                    .committed_resource_value(
+                        resource.key().resource_ref(),
+                        &context.operation_id,
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(Self::guest_phase(&fresh))
+            }
+            SharedProviderResourceKind::QemuMediaGuest => {
+                Self::validate_qemu_guest(&value)?;
+                Ok(Self::guest_phase(&value))
+            }
+            SharedProviderResourceKind::AzureContainerAppsGuest => {
+                self.validate_gateway_custody(
+                    &ResourceRef::parse("Provider/runtime-azure-container-apps")
+                        .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+                    &["controlCredentialRef", "pullCredentialRef"],
+                    context,
+                )
+                .await?;
+                Ok(Self::guest_phase(&value))
+            }
+            SharedProviderResourceKind::AzureVirtualMachineGuest => {
+                Self::validate_azure_vm_guest(&value)?;
+                self.validate_gateway_custody(
+                    &ResourceRef::parse("Provider/runtime-azure-virtual-machine")
+                        .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+                    &["armCredentialRef"],
+                    context,
+                )
+                .await?;
+                Ok(Self::guest_phase(&value))
+            }
+            _ => Err(SharedProviderEffectError::InvalidResource),
+        }
+    }
+
+    async fn finalize_guest_runtime(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<(), SharedProviderEffectError> {
+        let value = self.guest_provider_resource(kind, context, resource).await?;
+        if kind == SharedProviderResourceKind::CloudHypervisorGuest {
+            self.runtime()?
+                .reconcile_cloud_hypervisor_guest(
+                    Arc::clone(&self.state),
+                    resource.key().resource_ref(),
+                )
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            return Ok(());
+        }
+        let runtime = self.runtime()?;
+        for resource_type in ["Process", "Endpoint", "Volume"] {
+            if runtime
+                .committed_resources_of_type(resource_type)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .into_iter()
+                .any(|child| {
+                    child
+                        .pointer("/metadata/ownerRef")
+                        .and_then(Value::as_str)
+                        == Some(
+                            resource
+                                .key()
+                                .resource_ref()
+                                .to_canonical_string()
+                                .as_str(),
+                        )
+                })
+            {
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+        }
+        let _ = value;
         Ok(())
     }
 }
@@ -2685,6 +3013,26 @@ type SharedRunnerUsbipPort<'a> = d2b_provider_device_usbip::ProductionPort<
 
 #[async_trait]
 impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
+    async fn reconcile_guest(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        self.reconcile_guest_runtime(kind, context, resource, dependencies)
+            .await
+    }
+
+    async fn finalize_guest(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<(), SharedProviderEffectError> {
+        self.finalize_guest_runtime(kind, context, resource).await
+    }
+
     async fn reconcile_network(
         &self,
         context: &SharedProviderEffectContext,
@@ -4102,15 +4450,18 @@ impl SharedProviderResourceReconciler {
         serde_json::to_vec(status).map_err(|_| SharedProviderReconcileError::InvalidResource)
     }
 
-    fn finalizer_removal(
+    fn finalizer_mutation(
         resource: &ResourceSnapshot,
+        finalizer: &str,
+        add: bool,
     ) -> Result<ResourceMutationBatch, SharedProviderReconcileError> {
+        let canonical = finalizer_candidate(resource.canonical_json(), finalizer, add)?;
         let mutation = d2b_core_controller::MutationIntent::new(
             resource.key().resource_ref().clone(),
             Some(resource.key().uid().clone()),
             Some(resource.revision()),
             d2b_core_controller::MutationIntentKind::UpdateFinalizers,
-            None,
+            Some(canonical),
         )
         .map_err(|_| SharedProviderReconcileError::InvalidResource)?;
         ResourceMutationBatch::new(vec![mutation])
@@ -4122,7 +4473,12 @@ impl SharedProviderResourceReconciler {
         &self,
         resource: &ResourceSnapshot,
     ) -> Result<ReconcileResult, SharedProviderReconcileError> {
-        if self.has_finalizer(resource)? {
+        let finalizer = self
+            .descriptor
+            .finalizers()
+            .first()
+            .ok_or(SharedProviderReconcileError::InvalidResource)?;
+        if resource.deleting() || self.has_finalizer(resource)? {
             return Ok(ReconcileResult::converged(
                 resource.revision(),
                 resource.generation(),
@@ -4131,15 +4487,12 @@ impl SharedProviderResourceReconciler {
         ReconcileResult::new(
             resource.revision(),
             resource.generation(),
+            Some(Self::finalizer_mutation(resource, finalizer, true)?),
             None,
-            Some(Self::status_candidate(
-                resource,
-                Some(SharedProviderEffectPhase::Pending),
-            )?),
             ReconcileDisposition::Pending,
             None,
             None,
-            StatusPersistence::Pending,
+            StatusPersistence::NotRequested,
         )
         .map_err(|_| SharedProviderReconcileError::InvalidResource)
     }
@@ -4179,7 +4532,14 @@ impl SharedProviderResourceReconciler {
             ReconcileResult::new(
                 resource.revision(),
                 resource.generation(),
-                Some(Self::finalizer_removal(resource)?),
+                Some(Self::finalizer_mutation(
+                    resource,
+                    self.descriptor
+                        .finalizers()
+                        .first()
+                        .ok_or(SharedProviderReconcileError::InvalidResource)?,
+                    false,
+                )?),
                 None,
                 ReconcileDisposition::Pending,
                 None,
@@ -4189,6 +4549,37 @@ impl SharedProviderResourceReconciler {
             .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
         )
     }
+}
+
+fn finalizer_candidate(
+    canonical_json: &[u8],
+    finalizer: &str,
+    add: bool,
+) -> Result<Vec<u8>, SharedProviderReconcileError> {
+    let mut value = CanonicalJsonValue::parse(canonical_json)
+        .map_err(|_| SharedProviderReconcileError::InvalidResource)?;
+    let CanonicalJsonValue::Object(root) = &mut value else {
+        return Err(SharedProviderReconcileError::InvalidResource);
+    };
+    let Some(CanonicalJsonValue::Object(metadata)) = root.get_mut("metadata") else {
+        return Err(SharedProviderReconcileError::InvalidResource);
+    };
+    let Some(CanonicalJsonValue::Array(finalizers)) = metadata.get_mut("finalizers") else {
+        return Err(SharedProviderReconcileError::InvalidResource);
+    };
+    if add {
+        if !finalizers
+            .iter()
+            .any(|value| matches!(value, CanonicalJsonValue::String(value) if value == finalizer))
+        {
+            finalizers.push(CanonicalJsonValue::String(finalizer.to_owned()));
+        }
+    } else {
+        finalizers.retain(
+            |value| !matches!(value, CanonicalJsonValue::String(value) if value == finalizer),
+        );
+    }
+    Ok(value.to_canonical_bytes())
 }
 
 type SharedCoreControllerSource =
@@ -4347,6 +4738,24 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
                 .map_err(|_| SharedProviderReconcileError::Effect(
                     SharedProviderEffectError::Unavailable,
                 ))?;
+            let finalizer = self
+                .descriptor
+                .finalizers()
+                .first()
+                .ok_or(SharedProviderReconcileError::InvalidResource)?;
+            if !resource.deleting() && !self.has_finalizer(resource)? {
+                return Ok(ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    Some(Self::finalizer_mutation(resource, finalizer, true)?),
+                    None,
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    StatusPersistence::NotRequested,
+                )
+                .map_err(|_| SharedProviderReconcileError::InvalidResource)?);
+            }
             if !self.has_finalizer(resource)? {
                 return ReconcileResult::new(
                     resource.revision(),
@@ -4509,11 +4918,20 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             )
             .await
             .map_err(SharedProviderReconcileError::Effect)?;
+        let finalizer = self
+            .descriptor
+            .finalizers()
+            .first()
+            .ok_or(SharedProviderReconcileError::InvalidResource)?;
         Ok(
             ReconcileResult::new(
                 deleting_resource.revision(),
                 deleting_resource.generation(),
-                Some(Self::finalizer_removal(deleting_resource)?),
+                Some(Self::finalizer_mutation(
+                    deleting_resource,
+                    finalizer,
+                    false,
+                )?),
                 None,
                 ReconcileDisposition::Pending,
                 None,
@@ -4703,6 +5121,31 @@ pub fn compose_shared_provider_runner_descriptors(
                         .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
                 );
             }
+            let dependency_selectors = if registration.resource_type == "Guest" {
+                [
+                    "Provider",
+                    "Process",
+                    "EphemeralProcess",
+                    "Endpoint",
+                    "Volume",
+                    "Network",
+                    "Device",
+                    "Credential",
+                ]
+                .into_iter()
+                .map(|resource_type| {
+                    ControllerSelector::new(
+                        ResourceTypeName::parse(resource_type.to_owned())
+                            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                        SelectorField::Metadata,
+                        None,
+                    )
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            };
             let execution = ControllerExecutionPolicy::new(
                 8,
                 4,
@@ -4729,7 +5172,7 @@ pub fn compose_shared_provider_runner_descriptors(
                     ControllerVerb::RemoveFinalizer,
                 ],
                 selectors,
-                Vec::new(),
+                dependency_selectors,
                 true,
                 vec![registration.finalizer.to_owned()],
                 vec!["d2b.resource.v3".to_owned()],
@@ -5331,6 +5774,7 @@ struct CloudHypervisorResourceSession {
     controller_generation: ControllerGeneration,
     session_target: Option<crate::CommittedGuestSessionTarget>,
     session_evidence: Option<GuestSessionEvidence>,
+    suppress_finalizer_clear: bool,
 }
 
 pub(crate) struct CatalogDescriptorVerifier {
@@ -6539,6 +6983,9 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 if !finalizer_present {
                     return Ok(CloudHypervisorResourceResponse::LifecycleApplied);
                 }
+                if self.suppress_finalizer_clear {
+                    return Ok(CloudHypervisorResourceResponse::LifecycleApplied);
+                }
                 let mut request = wire::UpdateFinalizersRequest::new();
                 request.meta = MessageField::some(public_request_meta(&format!(
                     "cloud-hypervisor-clear-finalizer-{}-{}",
@@ -6722,6 +7169,10 @@ pub struct ZoneResourceRuntime {
     u7_runner_lock: Arc<tokio::sync::Mutex<()>>,
     u7_state: Mutex<Option<Arc<crate::ServerState>>>,
     u7_required: AtomicBool,
+    u6_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    u6_runner_lock: Arc<tokio::sync::Mutex<()>>,
+    u6_state: Mutex<Option<Arc<crate::ServerState>>>,
+    u6_required: AtomicBool,
     #[cfg(test)]
     core_runner_events: Arc<Mutex<Vec<&'static str>>>,
     core: Mutex<CoreProcess>,
@@ -7507,6 +7958,10 @@ impl ZoneResourceRuntime {
             u7_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
             u7_state: Mutex::new(None),
             u7_required: AtomicBool::new(false),
+            u6_runner_tasks: Mutex::new(Vec::new()),
+            u6_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
+            u6_state: Mutex::new(None),
+            u6_required: AtomicBool::new(false),
             #[cfg(test)]
             core_runner_events: Arc::new(Mutex::new(Vec::new())),
             core: Mutex::new(core),
@@ -8216,10 +8671,16 @@ impl ZoneResourceRuntime {
         } else {
             None
         };
+        let _u6_runner_guard = if rebind_core {
+            Some(self.u6_runner_lock.lock().await)
+        } else {
+            None
+        };
         if rebind_core {
             self.stop_core_controller_runners_locked().await?;
             self.stop_u12_controller_runners_locked().await?;
             self.stop_u7_controller_runners_locked().await?;
+            self.stop_u6_controller_runners_locked().await?;
         }
         self.authorizer
             .replace_policy(policy.clone(), &state)
@@ -8277,6 +8738,14 @@ impl ZoneResourceRuntime {
                 .clone();
             if let Some(state) = state {
                 self.start_u7_controller_runners_locked(state).await?;
+            }
+            let state = self
+                .u6_state
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .clone();
+            if let Some(state) = state {
+                self.start_u6_controller_runners_locked(state).await?;
             }
         }
         Ok(())
@@ -9272,6 +9741,76 @@ impl ZoneResourceRuntime {
         Ok(())
     }
 
+    async fn stop_u6_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        let tasks = {
+            let mut tasks = self
+                .u6_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        self.u6_required.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Attach the selected Guest runtime Providers to the production shared
+    /// Runner. Provider selection remains an exact `Guest.spec.providerRef`
+    /// admission rule.
+    pub(crate) async fn start_u6_controller_runners(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        let _runner_guard = self.u6_runner_lock.lock().await;
+        let result = self
+            .start_u6_controller_runners_locked(Arc::clone(&state))
+            .await;
+        if result.is_ok() {
+            match self.u6_state.lock() {
+                Ok(mut current) => *current = Some(state),
+                Err(_) => {
+                    self.stop_u6_controller_runners_locked().await?;
+                    return Err(ResourceRuntimeError::AuthenticationUnavailable);
+                }
+            }
+        }
+        result
+    }
+
+    async fn start_u6_controller_runners_locked(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        if !self.readiness.resource_api_ready {
+            return Ok(());
+        }
+        {
+            let tasks = self
+                .u6_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            if tasks.iter().any(|task| !task.is_finished()) {
+                return Ok(());
+            }
+        }
+        let stale = {
+            let mut tasks = self
+                .u6_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in stale {
+            let _ = task.await;
+        }
+        let required = guest_provider_runtime::start(self, state).await?;
+        self.u6_required.store(required, Ordering::Release);
+        Ok(())
+    }
+
     /// Attach the observability and activation handlers to the same Core
     /// source/Runner path used by every resource owner.
     pub(crate) async fn start_u12_controller_runners(
@@ -10174,6 +10713,27 @@ impl ZoneResourceRuntime {
         &self,
         state: Arc<crate::ServerState>,
     ) -> Result<(), ResourceRuntimeError> {
+        self.reconcile_cloud_hypervisor_guests_inner(state, None).await
+    }
+
+    /// Reconcile one Cloud Hypervisor Guest selected by the shared Runner.
+    ///
+    /// The legacy relist helper remains available to explicit lifecycle
+    /// commands, but the shared Runner always supplies one exact Guest key.
+    pub(crate) async fn reconcile_cloud_hypervisor_guest(
+        &self,
+        state: Arc<crate::ServerState>,
+        guest_ref: &ResourceRef,
+    ) -> Result<(), ResourceRuntimeError> {
+        self.reconcile_cloud_hypervisor_guests_inner(state, Some(guest_ref))
+            .await
+    }
+
+    async fn reconcile_cloud_hypervisor_guests_inner(
+        &self,
+        state: Arc<crate::ServerState>,
+        selected_guest: Option<&ResourceRef>,
+    ) -> Result<(), ResourceRuntimeError> {
         if !self.readiness.resource_api_ready {
             return Ok(());
         }
@@ -10186,6 +10746,9 @@ impl ZoneResourceRuntime {
             .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         for guest_ref in guests {
+            if selected_guest.is_some_and(|selected| selected != &guest_ref) {
+                continue;
+            }
             let Some(descriptor_bytes) =
                 self.guest_setup_descriptors.get(guest_ref.name().as_str())
             else {
@@ -10262,34 +10825,10 @@ impl ZoneResourceRuntime {
                 crate::resolve_committed_guest_session_target(self, &guest_ref)
                     .await
                     .ok();
-            let guest_deleting = self
-                .committed_resource_value(&guest_ref, "cloud-hypervisor-delete-session")
-                .await
-                .ok()
-                .and_then(|value| {
-                    value
-                        .pointer("/metadata/deletionRequestedAt")
-                        .map(|value| !value.is_null())
-                })
-                .unwrap_or(false);
-            if guest_deleting && let Some(target) = guest_session_target.as_ref() {
-                let session_closed = self
-                    .closed_guest_sessions
-                    .lock()
-                    .await
-                    .contains(&target.key());
-                if !session_closed
-                    && let Err(error) =
-                        crate::connect_guest_component_session_for_guest(&state, target).await
-                {
-                    tracing::warn!(
-                        zone = %self.zone.as_str(),
-                        guest = %guest_ref.name().as_str(),
-                        error = %error,
-                        "Cloud Hypervisor deletion session reconnect failed",
-                    );
-                }
-            }
+            // Deletion may reuse the already authenticated live session below,
+            // but it never creates a new session solely to clear a finalizer.
+            // A durable Closed marker therefore remains terminal for session
+            // custody during finalization.
             let guest_session = match guest_session_target.as_ref() {
                 Some(target) => state
                     .guest_component_sessions
@@ -10334,6 +10873,7 @@ impl ZoneResourceRuntime {
                     .unwrap_or_else(|| ControllerGeneration::new(1).expect("generation one")),
                 session_target: guest_session_target,
                 session_evidence,
+                    suppress_finalizer_clear: selected_guest.is_some(),
             };
             let adapter = AuthenticatedResourceApiAdapter::new(Arc::new(session));
             let mut controller = CloudHypervisorController::from_verified_descriptor(
@@ -12966,6 +13506,19 @@ impl ZoneResourceRuntime {
         if !u7_ready {
             return Some(ResourceRuntimeError::HandlerNotReady);
         }
+        let u6_ready = if self.u6_required.load(Ordering::Acquire) {
+            self.u6_runner_tasks
+                .try_lock()
+                .map(|tasks| {
+                    !tasks.is_empty() && !tasks.iter().any(|task| task.is_finished())
+                })
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        if !u6_ready {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
         if !matches!(self.core_stage().ok(), Some(StartupStage::Ready)) {
             return Some(ResourceRuntimeError::HandlerNotReady);
         }
@@ -13576,6 +14129,7 @@ impl ZoneResourceRuntime {
             core_runner_tasks,
             u12_runner_tasks,
             u7_runner_tasks,
+            u6_runner_tasks,
             audio_watch_task,
             audio_runtime,
             device_binding_watch_task,
@@ -13611,6 +14165,13 @@ impl ZoneResourceRuntime {
             .into_inner()
             .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
         for task in u7_runner_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        let u6_runner_tasks = u6_runner_tasks
+            .into_inner()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        for task in u6_runner_tasks {
             task.abort();
             let _ = task.await;
         }
@@ -16977,7 +17538,17 @@ mod tests {
             .first_pass_for_test(&shared_provider_test_resource(&[], false))
             .unwrap();
         assert_eq!(first.disposition(), ReconcileDisposition::Pending);
-        assert!(first.status_candidate().is_some());
+        assert!(first.mutation_batch().is_some());
+        assert_eq!(
+            first
+                .mutation_batch()
+                .unwrap()
+                .mutations()
+                .first()
+                .unwrap()
+                .kind(),
+            d2b_core_controller::MutationIntentKind::UpdateFinalizers
+        );
         assert_eq!(effects.reconciles.load(Ordering::SeqCst), 0);
 
         let current = shared_provider_test_resource(&[registration.finalizer], false);
@@ -17007,6 +17578,49 @@ mod tests {
             d2b_core_controller::MutationIntentKind::UpdateFinalizers
         );
         assert_eq!(effects.finalizes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn every_u6_guest_runtime_descriptor_is_provider_ref_scoped() {
+        for registration in U6_SHARED_PROVIDER_RUNNERS {
+            let (_, descriptor) = shared_provider_test_descriptor_for(registration);
+            assert_eq!(
+                descriptor
+                    .resource_types()
+                    .map(|resource_type| resource_type.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["Guest"]
+            );
+            assert!(descriptor
+                .watch_selectors()
+                .iter()
+                .any(|selector| selector.exact_value() == Some(registration.provider_ref)));
+            assert!(descriptor.dependency_selectors().iter().any(|selector| {
+                selector.resource_type().as_str() == "Process"
+            }));
+            assert!(registration.legacy_scheduler_disabled);
+            assert!(registration.watched_configuration_is_dependency);
+        }
+    }
+
+    #[test]
+    fn u6_guest_runtime_kinds_are_closed_to_the_four_provider_rows() {
+        assert_eq!(
+            SharedProviderResourceKind::from_registration(U6_SHARED_PROVIDER_RUNNERS[0]).unwrap(),
+            SharedProviderResourceKind::CloudHypervisorGuest
+        );
+        assert_eq!(
+            SharedProviderResourceKind::from_registration(U6_SHARED_PROVIDER_RUNNERS[1]).unwrap(),
+            SharedProviderResourceKind::QemuMediaGuest
+        );
+        assert_eq!(
+            SharedProviderResourceKind::from_registration(U6_SHARED_PROVIDER_RUNNERS[2]).unwrap(),
+            SharedProviderResourceKind::AzureContainerAppsGuest
+        );
+        assert_eq!(
+            SharedProviderResourceKind::from_registration(U6_SHARED_PROVIDER_RUNNERS[3]).unwrap(),
+            SharedProviderResourceKind::AzureVirtualMachineGuest
+        );
     }
 
     #[tokio::test]

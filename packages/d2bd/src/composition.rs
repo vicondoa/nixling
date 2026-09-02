@@ -3799,143 +3799,6 @@ pub async fn serve(options: ServeOptions) -> Result<(), TypedError> {
                                 detail: "resource-plane state lock unavailable".to_owned(),
                             });
                         }
-                        let convergence_state = Arc::new(state.clone());
-                        let convergence_plane = Arc::clone(&plane);
-                        tokio::spawn(async move {
-                            for zone in convergence_plane.zone_ids() {
-                                let Some(runtime) = convergence_plane.zone(&zone).ok() else {
-                                    continue;
-                                };
-                                let mut logged_list_error = false;
-                                let mut logged_reconcile_error = false;
-                                let mut logged_target_error = false;
-                                let mut logged_guests = false;
-                                let mut logged_target = false;
-                                loop {
-                                    if let Err(error) = runtime
-                                        .reconcile_cloud_hypervisor_guests(Arc::clone(
-                                            &convergence_state,
-                                        ))
-                                        .await
-                                        && !logged_reconcile_error
-                                    {
-                                        tracing::warn!(
-                                            zone = %zone,
-                                            error = ?error,
-                                            "post-publication Guest reconciliation degraded",
-                                        );
-                                        logged_reconcile_error = true;
-                                    }
-                                    let guests = match runtime.list_cloud_hypervisor_guests().await
-                                    {
-                                        Ok(guests) => guests,
-                                        Err(error) => {
-                                            if !logged_list_error {
-                                                tracing::warn!(
-                                                    zone = %zone,
-                                                    error = ?error,
-                                                    "post-publication Guest session relist failed",
-                                                );
-                                                logged_list_error = true;
-                                            }
-                                            tokio::time::sleep(Duration::from_millis(250)).await;
-                                            continue;
-                                        }
-                                    };
-                                    if guests.is_empty() {
-                                        break;
-                                    }
-                                    if !logged_guests {
-                                        tracing::info!(
-                                            zone = %zone,
-                                            guest_count = guests.len(),
-                                            "post-publication Guest session convergence discovered Guests",
-                                        );
-                                        logged_guests = true;
-                                    }
-                                    let mut pending = false;
-                                    for guest_ref in guests {
-                                        let target = match resolve_committed_guest_session_target(
-                                            &runtime, &guest_ref,
-                                        )
-                                        .await
-                                        {
-                                            Ok(target) => target,
-                                            Err(error) => {
-                                                if !logged_target_error {
-                                                    tracing::warn!(
-                                                        zone = %zone,
-                                                        guest = %guest_ref.name().as_str(),
-                                                        error = %error,
-                                                        "post-publication Guest session target is not ready",
-                                                    );
-                                                    logged_target_error = true;
-                                                }
-                                                pending = true;
-                                                continue;
-                                            }
-                                        };
-                                        if !logged_target {
-                                            tracing::info!(
-                                                zone = %zone,
-                                                guest = %guest_ref.name().as_str(),
-                                                "post-publication Guest session target resolved",
-                                            );
-                                            logged_target = true;
-                                        }
-                                        match connect_guest_component_session_for_guest(
-                                            &convergence_state,
-                                            &target,
-                                        )
-                                        .await
-                                        {
-                                            Ok(_) => {
-                                                tracing::info!(
-                                                    zone = %zone,
-                                                    guest = %guest_ref.name().as_str(),
-                                                    "post-publication Guest session connected",
-                                                );
-                                                break;
-                                            }
-                                            Err(error)
-                                                if matches!(
-                                                    error.as_str(),
-                                                    "session-material-unavailable"
-                                                        | "session-unavailable"
-                                                        | "session-timeout"
-                                                ) =>
-                                            {
-                                                pending = true;
-                                            }
-                                            Err(error) => {
-                                                tracing::warn!(
-                                                    zone = %zone,
-                                                    guest = %guest_ref.name().as_str(),
-                                                    error = %error,
-                                                    "post-publication Guest session connection failed",
-                                                );
-                                            }
-                                        }
-                                    }
-                                    if !pending {
-                                        break;
-                                    }
-                                    tokio::time::sleep(Duration::from_millis(250)).await;
-                                }
-                                if let Err(error) = runtime
-                                    .reconcile_cloud_hypervisor_guests(Arc::clone(
-                                        &convergence_state,
-                                    ))
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        zone = %zone,
-                                        error = ?error,
-                                        "post-publication Guest completion reconcile degraded",
-                                    );
-                                }
-                            }
-                        });
                         let mut runtimes = InteractionRuntime::new();
                         let mut listener_set: Option<
                             interaction_composition::InteractionListenerSet,
@@ -16896,6 +16759,22 @@ async fn open_resource_plane(
                 zone = %runtime.zone().as_str(),
                 error = ?error,
                 "storage Provider runners refused during startup",
+            );
+            let _ = runtime.shutdown().await;
+            let _ = plane.shutdown().await;
+            while let Some((_, runtime, _)) = remaining.next() {
+                let _ = runtime.shutdown().await;
+            }
+            return Err(error);
+        }
+        if let Err(error) = runtime
+            .start_u6_controller_runners(Arc::new(state.clone()))
+            .await
+        {
+            tracing::error!(
+                zone = %runtime.zone(),
+                error = ?error,
+                "Guest runtime Provider runners refused during startup",
             );
             let _ = runtime.shutdown().await;
             let _ = plane.shutdown().await;

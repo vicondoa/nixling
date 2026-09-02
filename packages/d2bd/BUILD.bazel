@@ -50,6 +50,8 @@ d2bd_shared_deps = [
     "//packages/d2b-provider-notification-desktop:d2b_provider_notification_desktop",
     "//packages/d2b-provider-runtime-azure-container-apps:d2b_provider_runtime_azure_container_apps",
     "//packages/d2b-provider-runtime-cloud-hypervisor:d2b_provider_runtime_cloud_hypervisor",
+    "//packages/d2b-provider-runtime-qemu-media:d2b_provider_runtime_qemu_media",
+    "//packages/d2b-provider-runtime-azure-virtual-machine:d2b_provider_runtime_azure_virtual_machine",
     "//packages/d2b-provider-supervisor:d2b_provider_supervisor",
     "//packages/d2b-provider-system-core:d2b_provider_system_core",
     "//packages/d2b-provider-system-minijail:d2b_provider_system_minijail",

@@ -20,7 +20,9 @@ pub use config::{
 };
 pub use controller::{
     AzureVmClock, AzureVmController, AzureVmPhase, AzureVmReconcileOutcome, AzureVmRecoveryState,
-    AzureVmStatus, AzureVmUpdate, SystemAzureVmClock,
+    AzureVmStatus, AzureVmUpdate, AzureVirtualMachineRunnerContract, SystemAzureVmClock,
+    AZURE_VM_GUEST_FINALIZER, AZURE_VM_REPAIR_INTERVAL_SECS,
+    azure_virtual_machine_runner_contract,
 };
 pub use effect::{
     AzureAccessToken, AzureCredentialPort, AzureEffectPort, AzureOperationHandle, AzureVmHandle,
@@ -32,3 +34,5 @@ pub use error::AzureVmError;
 pub const AZURE_VM_IMPLEMENTATION_ID: &str = "azure-vm";
 /// Stable Provider resource reference.
 pub const PROVIDER_REF: &str = "Provider/runtime-azure-virtual-machine";
+/// Stable Guest finalizer.
+pub const FINALIZER: &str = AZURE_VM_GUEST_FINALIZER;

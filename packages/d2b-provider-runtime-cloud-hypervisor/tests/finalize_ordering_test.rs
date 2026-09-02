@@ -190,8 +190,83 @@ fn dead_session_needs_process_and_volume_absence_proof() {
     .unwrap();
     assert_eq!(
         plan_finalization(pending_child).unwrap().disposition(),
-        FinalizationDisposition::Progressing
+        FinalizationDisposition::Blocked(FinalizationBlockReason::TransitiveDescendant)
     );
+}
+
+#[test]
+fn child_cleanup_finalizer_does_not_block_the_first_delete_request() {
+    let pending = child(ChildRole::ChApiEndpoint, "gateway-ch-api", 1)
+        .with_finalizers_pending(true);
+    let input = GuestFinalizationInput::new(
+        ResourceUid::parse(GUEST_UID).unwrap(),
+        SessionState::Closed,
+        true,
+        ProcessState::Stopped,
+        vec![pending],
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    let plan = plan_finalization(input).unwrap();
+    assert!(matches!(
+        plan.steps(),
+        [FinalizationStep::DeleteChild(child)] if child.role() == ChildRole::ChApiEndpoint
+    ));
+}
+
+#[test]
+fn already_requested_child_with_cleared_finalizers_is_left_for_platform_removal() {
+    let requested = child(ChildRole::ChApiEndpoint, "gateway-ch-api", 1)
+        .with_deletion_requested(true);
+    let input = GuestFinalizationInput::new(
+        ResourceUid::parse(GUEST_UID).unwrap(),
+        SessionState::Closed,
+        true,
+        ProcessState::Stopped,
+        vec![requested],
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    let plan = plan_finalization(input).unwrap();
+    assert_eq!(
+        plan.disposition(),
+        FinalizationDisposition::Blocked(FinalizationBlockReason::TransitiveDescendant)
+    );
+    assert!(matches!(
+        plan.steps(),
+        [FinalizationStep::WaitForDescendants]
+    ));
+}
+
+#[test]
+fn already_requested_child_with_a_cleanup_finalizer_only_waits_for_platform_removal() {
+    let requested = child(ChildRole::ChApiEndpoint, "gateway-ch-api", 1)
+        .with_deletion_requested(true)
+        .with_finalizers_pending(true);
+    let input = GuestFinalizationInput::new(
+        ResourceUid::parse(GUEST_UID).unwrap(),
+        SessionState::Closed,
+        true,
+        ProcessState::Stopped,
+        vec![requested],
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    let plan = plan_finalization(input).unwrap();
+    assert_eq!(
+        plan.disposition(),
+        FinalizationDisposition::Blocked(FinalizationBlockReason::ChildFinalizer)
+    );
+    assert!(!plan
+        .steps()
+        .iter()
+        .any(|step| matches!(step, FinalizationStep::DeleteChild(_))));
 }
 
 #[test]

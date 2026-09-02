@@ -561,6 +561,20 @@ impl AcaProviderConfig {
         Ok(())
     }
 
+    /// Require every ACA controller effect to execute in the configured
+    /// Gateway Guest. Host placement is never a valid fallback.
+    pub fn validate_gateway_execution(
+        &self,
+        execution_ref: &ResourceRef,
+    ) -> Result<(), AcaTypeError> {
+        if self.gateway_execution_ref.resource_type().as_str() != "Guest"
+            || execution_ref != &self.gateway_execution_ref
+        {
+            return Err(AcaTypeError::InvalidExecutionBoundary);
+        }
+        Ok(())
+    }
+
     /// Revalidate a Provider configuration at the admission boundary.
     pub fn validate(&self) -> Result<(), AcaTypeError> {
         Self::new(
@@ -1059,7 +1073,10 @@ pub type BoxAcaFuture<'a, T> =
 
 #[cfg(test)]
 mod tests {
-    use super::AcaRuntimeConfig;
+    use super::{
+        AcaConfiguredDiskId, AcaCpuMillis, AcaDiskImageSource, AcaMemoryMib, AcaProfileId,
+        AcaProviderConfig, AcaReadinessPolicy, AcaRuntimeConfig, AcaSandboxProfile, ResourceRef,
+    };
 
     #[test]
     fn runtime_config_deserialization_revalidates_constructor_bounds() {
@@ -1081,5 +1098,46 @@ mod tests {
 
         let invalid = valid.replace("\"cpu\": 500", "\"cpu\": 251");
         assert!(serde_json::from_str::<AcaRuntimeConfig>(&invalid).is_err());
+    }
+
+    #[test]
+    fn gateway_execution_validation_has_no_host_fallback() {
+        let profile = AcaSandboxProfile::new(
+            AcaProfileId::parse("default").unwrap(),
+            AcaDiskImageSource::ConfiguredDisk {
+                binding_id: AcaConfiguredDiskId::parse("image-1").unwrap(),
+            },
+            AcaCpuMillis::new(500).unwrap(),
+            AcaMemoryMib::new(2_048).unwrap(),
+            300,
+            None,
+        )
+        .unwrap();
+        let config = AcaProviderConfig::new(
+            ResourceRef::parse("Guest/gateway").unwrap(),
+            super::OpaqueAzureRef::parse("tenant").unwrap(),
+            super::OpaqueAzureRef::parse("client").unwrap(),
+            super::OpaqueAzureRef::parse("subscription").unwrap(),
+            ResourceRef::parse("Credential/control").unwrap(),
+            None,
+            super::AcaConfiguredImageId::parse("environment").unwrap(),
+            super::AcaConfiguredImageId::parse("resource-group").unwrap(),
+            None,
+            AcaProfileId::parse("relay").unwrap(),
+            AcaRuntimeConfig::new(
+                profile,
+                AcaReadinessPolicy::new(1, 1).unwrap(),
+                1,
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(config
+            .validate_gateway_execution(&ResourceRef::parse("Guest/gateway").unwrap())
+            .is_ok());
+        assert!(config
+            .validate_gateway_execution(&ResourceRef::parse("Host/host-system").unwrap())
+            .is_err());
     }
 }

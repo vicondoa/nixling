@@ -69,6 +69,10 @@ const WAYLAND_SESSION_TYPE: &str = "display-wayland.d2bus.org.WaylandSession";
 #[allow(dead_code)]
 const WAYLAND_SESSION_FINALIZER: &str = "display-wayland.d2bus.org/proxy-stopped";
 pub(crate) const PROCESS_RESTART_ANNOTATION: &str = "d2b.d2bus.org/restart-generation";
+const GUEST_RUNTIME_PROCESS_TEMPLATES: &[(&str, &str)] = &[
+    ("cloud-hypervisor-runner", "-vmm"),
+    ("qemu-media-runner", "-qemu"),
+];
 
 /// Stable failures for the daemon-owned generic process path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,15 +317,26 @@ fn scoped_target_ref(
         _ => match (&record.process, owner) {
             (DesiredProcess::Process(spec), Some(owner))
                 if owner.resource_type().as_str() == "Guest"
-                    && spec.execution().template().as_str() == "cloud-hypervisor-runner"
-                    && record.resource.resource_ref.name().as_str()
-                        == format!("{}-vmm", owner.name().as_str()) =>
+                    && guest_runtime_process_matches(
+                        spec.execution().template().as_str(),
+                        record.resource.resource_ref.name().as_str(),
+                        owner.name().as_str(),
+                    ) =>
             {
                 Some(owner)
             }
             _ => None,
         },
     }
+}
+
+fn guest_runtime_process_matches(template: &str, process_name: &str, guest_name: &str) -> bool {
+    GUEST_RUNTIME_PROCESS_TEMPLATES
+        .iter()
+        .any(|(expected_template, suffix)| {
+            template == *expected_template
+                && process_name == format!("{guest_name}{suffix}")
+        })
 }
 
 impl ProcessResourceRuntime {
@@ -5126,6 +5141,17 @@ mod tests {
             ResourceRef::parse("Process/acceptance-guest-vmm").expect("VMM ref");
         vmm_record.process = DesiredProcess::Process(vmm);
         assert_eq!(scoped_target_ref(&vmm_record, None, None), Some(vmm_owner));
+
+        let qemu = serde_json::from_str::<ProcessSpec>(
+            r#"{"executionRef":"Host/host-system","processClass":"worker","template":"qemu-media-runner"}"#,
+        )
+        .expect("QEMU media VMM process");
+        let qemu_owner = ResourceRef::parse("Guest/media-vm").expect("QEMU Guest owner");
+        let mut qemu_record = make_record(qemu_owner.to_canonical_string().as_str());
+        qemu_record.resource.resource_ref =
+            ResourceRef::parse("Process/media-vm-qemu").expect("QEMU VMM ref");
+        qemu_record.process = DesiredProcess::Process(qemu);
+        assert_eq!(scoped_target_ref(&qemu_record, None, None), Some(qemu_owner));
     }
 
     fn identity_record(revision: u64) -> DesiredRecord {

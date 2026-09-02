@@ -48,6 +48,9 @@ pub use types::{
     GuestRuntimeStatus, GuestSpec, GuestSpecError, GuestStatus, MachineType, NetworkAttachment,
     ProviderPhase, RemovableVolumeRef, RtcBase, build_guest_resource_spec,
 };
+pub use controller::reconcile::{
+    QEMU_MEDIA_REPAIR_INTERVAL_SECS, qemu_media_runner_contract,
+};
 
 /// Stable Provider implementation identifier.
 pub const QEMU_MEDIA_IMPLEMENTATION_ID: &str = "qemu-media";
