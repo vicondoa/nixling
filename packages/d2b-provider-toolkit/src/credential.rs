@@ -11,9 +11,7 @@ use d2b_contracts_provider::v3::credential::{
     CredentialSessionBinding, DeliveryResponse, MetadataResponse, decode_outer,
     dispatch_authorized_provider, encode_outer,
 };
-use d2b_session::{
-    AuthenticatedComponentSession, AuthenticatedSessionRouteBinding, Cancellation,
-};
+use d2b_session::{AuthenticatedComponentSession, AuthenticatedSessionRouteBinding, Cancellation};
 
 use crate::{
     ProviderAdmission, ProviderEntrypoint, ProviderRuntimeError, ProviderSessionAdmission,
@@ -52,10 +50,8 @@ impl CredentialAuthorizationSource for RouteCredentialAuthorization {
                 CredentialServiceErrorCode::OperationDenied,
             ));
         }
-        let session = CredentialSessionBinding::new(
-            route.context().clone(),
-            request.deadline_unix_ms(),
-        )?;
+        let session =
+            CredentialSessionBinding::new(route.context().clone(), request.deadline_unix_ms())?;
         CredentialAuthorization::new_for_subject(method, None, route.context().clone())?
             .with_authenticated_session(session)
     }
@@ -99,10 +95,9 @@ where
         let payload = match response {
             CredentialResponse::AcquireToken(response)
             | CredentialResponse::RefreshToken(response)
-            | CredentialResponse::SignChallenge(response) => encode_outer::<DeliveryResponse>(
-                &response,
-            )
-            .map_err(rpc_error)?,
+            | CredentialResponse::SignChallenge(response) => {
+                encode_outer::<DeliveryResponse>(&response).map_err(rpc_error)?
+            }
             CredentialResponse::RevokeToken(response)
             | CredentialResponse::InspectMetadata(response) => {
                 encode_outer::<MetadataResponse>(&response).map_err(rpc_error)?
@@ -172,10 +167,8 @@ where
         .map_err(|_| ProviderRuntimeError::NotAccepting)?;
     let route = session.route_binding();
     let driver = Arc::new(session.into_authenticated_driver());
-    let serving = d2b_session::serve_ttrpc_services(
-        driver,
-        credential_service(provider, authorizer, route),
-    );
+    let serving =
+        d2b_session::serve_ttrpc_services(driver, credential_service(provider, authorizer, route));
     let result = tokio::select! {
         result = serving => result.map_err(|_| ProviderRuntimeError::SessionLoopFailed),
         _ = cancellation.cancelled() => Ok(()),
@@ -207,8 +200,8 @@ fn rpc_error(error: CredentialServiceError) -> ttrpc::Error {
 mod tests {
     use super::*;
     use d2b_contracts_provider::v3::credential::{
-        CredentialLeaseHandle, CredentialLeaseState, CredentialMetadata,
-        CredentialOutcomeCode, CredentialSourceVersion,
+        CredentialLeaseHandle, CredentialLeaseState, CredentialMetadata, CredentialOutcomeCode,
+        CredentialSourceVersion,
     };
     use d2b_contracts_resource::v3::ResourceRef;
 
@@ -285,10 +278,7 @@ mod tests {
             .methods
             .get("RevokeToken")
             .unwrap();
-        let response = method
-            .handler(test_context(), request())
-            .await
-            .unwrap();
+        let response = method.handler(test_context(), request()).await.unwrap();
         let metadata: MetadataResponse = decode_outer(&response.payload).unwrap();
         assert_eq!(metadata.metadata.state, CredentialLeaseState::Revoked);
         assert_eq!(metadata.metadata.outcome, CredentialOutcomeCode::Revoked);
@@ -307,10 +297,7 @@ mod tests {
             .methods
             .get("RevokeToken")
             .unwrap();
-        assert!(method
-            .handler(test_context(), request())
-            .await
-            .is_err());
+        assert!(method.handler(test_context(), request()).await.is_err());
     }
 
     fn test_context() -> ttrpc::r#async::TtrpcContext {
