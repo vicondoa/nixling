@@ -2266,7 +2266,7 @@ mod tests {
     #[async_trait]
     impl CredentialSession for UncertainCredentialSession {
         fn session_generation(&self) -> Option<ReconnectGeneration> {
-            None
+            Some(ReconnectGeneration::new(7).expect("uncertain session generation"))
         }
 
         async fn revoke_credential(
