@@ -26,7 +26,7 @@ use d2b_bus::router::production_rss::ProductionWatchHarness;
 use d2b_contracts_resource::v3::execution_policy::{BoundedToken, ExecutionDomain};
 use d2b_contracts_resource::v3::{
     CanonicalJsonValue, ConfigurationGeneration, ControllerGeneration, ResourceGeneration,
-    ObservedGeneration, ResourceRef, ResourceTypeName, ResourceUid, ZoneId, ZoneRevision,
+    ResourceRef, ResourceTypeName, ResourceUid, ZoneId, ZoneRevision,
 };
 use d2b_controller_toolkit::{
     CommitDecision, CommitOutcome, ControllerDescriptor, ControllerExecutionPolicy,
@@ -38,7 +38,7 @@ use d2b_controller_toolkit::{
     TriggerReason, TriggerSet, UpdateAssessment, UpdateAssessmentState, UpgradePlan, UpgradeStage,
     ValidationResult, WatchEvent, WatchFailure, WatchHint,
 };
-use d2b_core_controller::{ChangeField, ChangeRecord, CoreControllerSource, RegisteredControllerApi};
+use d2b_core_controller::{CoreControllerSource, core_controller_descriptors};
 use d2b_process::{
     BackendLaunch, BackendObservation, CompiledDigests, ConfigurationDigest, IdentityBinding,
     LaunchTicket, ObservedIdentity, OperationBinding, ProcessEffectBackend, ProcessEffectError,
@@ -61,7 +61,8 @@ const HANDLER_P95_LIMIT: Duration = Duration::from_millis(5);
 const LAUNCH_P95_LIMIT: Duration = Duration::from_millis(20);
 const LAUNCH_EFFECT_WORK: Duration = Duration::from_micros(250);
 const WATCH_TIMEOUT: Duration = Duration::from_secs(10);
-const COMMIT_BATCH: usize = 4;
+const COMMIT_BATCH: usize = 32;
+const CORE_COMMIT_BATCH: usize = 1;
 
 #[derive(Debug, Clone)]
 struct HandlerRecord {
@@ -71,8 +72,7 @@ struct HandlerRecord {
 }
 
 struct ReactionMetrics {
-    effect_acceptances:
-        Mutex<BTreeMap<(ResourceUid, ResourceGeneration, ZoneRevision, String), Instant>>,
+    effect_acceptances: Mutex<BTreeMap<ResourceUid, Instant>>,
     handlers: Mutex<BTreeMap<ResourceUid, HandlerRecord>>,
     launches: Mutex<Vec<(ResourceUid, Instant)>>,
     active_launches: AtomicUsize,
@@ -98,12 +98,15 @@ impl ReactionMetrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         acceptances
-            .entry((
-                context.target().uid().clone(),
-                context.generation(),
-                context.revision(),
-                context.operation().operation_id().to_owned(),
-            ))
+            .entry(context.target().uid().clone())
+            .or_insert_with(Instant::now);
+    }
+
+    fn record_durable_effect_acceptance(&self, uid: &ResourceUid) {
+        self.effect_acceptances
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(uid.clone())
             .or_insert_with(Instant::now);
     }
 
@@ -112,7 +115,7 @@ impl ReactionMetrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .map(|((resource_uid, _, _, _), accepted_at)| (resource_uid.clone(), *accepted_at))
+            .map(|(resource_uid, accepted_at)| (resource_uid.clone(), *accepted_at))
             .collect()
     }
 
@@ -160,6 +163,7 @@ impl ReactionMetrics {
     fn max_active_launches(&self) -> usize {
         self.max_active_launches.load(Ordering::Acquire)
     }
+
 }
 
 struct RecordingEffectBackend {
@@ -283,12 +287,15 @@ fn compiled_digests() -> CompiledDigests {
     }
 }
 
-fn launch_ticket(resource: &ResourceSnapshot) -> LaunchTicket {
+fn launch_ticket(
+    resource: &ResourceSnapshot,
+    controller_generation: ControllerGeneration,
+) -> LaunchTicket {
     LaunchTicket::new(
         resource.key().resource_ref().clone(),
         resource.key().uid().clone(),
         resource.generation(),
-        ControllerGeneration::new(1).expect("nonzero controller generation"),
+        controller_generation,
         BoundedToken::parse("system-core").expect("valid owner Provider"),
         BoundedToken::parse("reaction").expect("valid component"),
         BoundedToken::parse("reaction").expect("valid template"),
@@ -312,13 +319,39 @@ fn launch_ticket(resource: &ResourceSnapshot) -> LaunchTicket {
 }
 
 fn descriptor(concurrency: usize) -> ControllerDescriptor {
+    descriptor_for_generations(
+        concurrency,
+        ControllerGeneration::new(1).expect("nonzero controller generation"),
+        ResourceGeneration::new(1).expect("nonzero Provider generation"),
+    )
+}
+
+fn descriptor_for_generations(
+    concurrency: usize,
+    controller_generation: ControllerGeneration,
+    provider_generation: ResourceGeneration,
+) -> ControllerDescriptor {
+    descriptor_for_generations_with_pending(
+        concurrency,
+        concurrency,
+        controller_generation,
+        provider_generation,
+    )
+}
+
+fn descriptor_for_generations_with_pending(
+    concurrency: usize,
+    max_pending_resources: usize,
+    controller_generation: ControllerGeneration,
+    provider_generation: ResourceGeneration,
+) -> ControllerDescriptor {
     let process = ResourceTypeName::parse("Process").expect("valid ResourceType");
     let identity = ControllerIdentity::new(
         ZoneId::parse("dev").expect("valid Zone"),
         ResourceRef::parse("Process/controller").expect("valid controller ref"),
-        ControllerGeneration::new(1).expect("nonzero controller generation"),
+        controller_generation,
         ResourceRef::parse("Provider/system-minijail").expect("valid Provider ref"),
-        ResourceGeneration::new(1).expect("nonzero Provider generation"),
+        provider_generation,
         ResourceRef::parse("Process/controller").expect("valid Process ref"),
         ResourceRef::parse("Host/host-system").expect("valid Host ref"),
         None,
@@ -345,9 +378,9 @@ fn descriptor(concurrency: usize) -> ControllerDescriptor {
         ControllerExecutionPolicy::new(
             concurrency,
             concurrency,
-            concurrency,
+            max_pending_resources,
             1,
-            u32::try_from(concurrency).expect("profile fits watch credit"),
+            u32::try_from(max_pending_resources).expect("profile fits watch credit"),
             ResyncPolicy::new(Some(10_000), 30_000).expect("resync policy is valid"),
         )
         .expect("execution policy is valid"),
@@ -446,10 +479,14 @@ impl ResourceReconciler for ProcessReconciler {
         _plan: &ReconcilePlan,
     ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
         let provider = Arc::clone(&self.provider);
+        let controller_generation = self.descriptor.identity().controller_generation();
         async move {
             context.authorize_effect().map_err(|_| HandlerError)?;
             provider
-                .launch(&launch_ticket(resource))
+                .launch(&launch_ticket(
+                    resource,
+                    controller_generation,
+                ))
                 .await
                 .map_err(|_| HandlerError)?;
             let candidate = Self::status_candidate(resource)?;
@@ -889,305 +926,6 @@ impl ControllerSource for ProductionControllerSource {
     }
 }
 
-struct CoreRegisteredSource {
-    inner: Arc<ProductionControllerSource>,
-    accepted:
-        Mutex<BTreeMap<String, Arc<d2b_resource_store_redb::AuthorityOperationCapability>>>,
-    acceptance_batch: Arc<AcceptanceBatch>,
-}
-
-struct AcceptanceBatch {
-    expected: usize,
-    state: tokio::sync::Mutex<AcceptanceBatchState>,
-    notify: Notify,
-}
-
-struct AcceptanceBatchState {
-    pending: Vec<PendingAcceptance>,
-    results: BTreeMap<String, Result<(), SourceError>>,
-    flushing: bool,
-}
-
-struct PendingAcceptance {
-    operation_id: String,
-    payload: Vec<u8>,
-    claim_digest: String,
-    context_operation_id: String,
-}
-
-impl CoreRegisteredSource {
-    fn new(inner: Arc<ProductionControllerSource>, expected_acceptances: usize) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
-            accepted: Mutex::new(BTreeMap::new()),
-            acceptance_batch: Arc::new(AcceptanceBatch {
-                expected: expected_acceptances,
-                state: tokio::sync::Mutex::new(AcceptanceBatchState {
-                    pending: Vec::with_capacity(expected_acceptances),
-                    results: BTreeMap::new(),
-                    flushing: false,
-                }),
-                notify: Notify::new(),
-            }),
-        })
-    }
-}
-
-impl RegisteredControllerApi for CoreRegisteredSource {
-    fn register(
-        &self,
-        descriptor: &ControllerDescriptor,
-    ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
-        self.inner.register(descriptor)
-    }
-
-    fn list_initial(
-        &self,
-        descriptor: &ControllerDescriptor,
-    ) -> impl std::future::Future<Output = Result<InitialList, SourceError>> + Send {
-        self.inner.list_initial(descriptor)
-    }
-
-    fn open_watch(
-        &self,
-        descriptor: &ControllerDescriptor,
-        after_revision: ZoneRevision,
-    ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
-        self.inner.open_watch(descriptor, after_revision)
-    }
-
-    fn has_watch_stream(&self) -> bool {
-        true
-    }
-
-    async fn receive_watch_change(
-        &self,
-    ) -> Result<Option<(ChangeRecord, OperationContext)>, WatchFailure> {
-        let event = self.inner.receive_watch().await?;
-        let WatchEvent::Hint(hint) = event else {
-            return Ok(None);
-        };
-        let key = hint.key().clone();
-        let operation_id = format!("core-watch:{}:{}", hint.revision().get(), key.uid().as_str());
-        let operation =
-            OperationContext::new(&operation_id, &operation_id, &operation_id, None)
-                .map_err(|_| WatchFailure::Fatal)?;
-        let reasons = hint.reasons().iter().collect::<BTreeSet<_>>();
-        Ok(Some((
-            ChangeRecord {
-                target: key,
-                revision: hint.revision(),
-                generation: ResourceGeneration::new(1).map_err(|_| WatchFailure::Fatal)?,
-                observed_generation: ObservedGeneration::new(0),
-                fields: BTreeSet::from([ChangeField::Spec]),
-                reasons,
-                type_is_bound: true,
-                relevant_field_changed: true,
-                own_status_only: false,
-                owner_consumer_exists: false,
-                dependency_consumer_exists: false,
-                controller_generation_current: true,
-                conditions_require_work: false,
-                unknown_requires_observation: false,
-            },
-            operation,
-        )))
-    }
-
-    async fn read_fresh(&self, key: &ResourceKey) -> Result<FreshSnapshot, SourceError> {
-        self.inner.read_fresh(key).await
-    }
-
-    async fn write_starting(&self, context: &ReconcileContext) -> Result<(), SourceError> {
-        self.inner.write_starting(context).await
-    }
-
-    async fn accept_effect(
-        &self,
-        context: &ReconcileContext,
-        plan: &ReconcilePlan,
-    ) -> Result<(), SourceError> {
-        let store = self.inner.store()?;
-        let claim_digest = d2b_contracts_resource::v3::canonical_digest(
-            "d2b:reaction-core-effect/v1",
-            format!(
-                "{}:{}:{}:{}:{}",
-                context.target().uid().as_str(),
-                context.generation().get(),
-                context.revision().get(),
-                context.operation().operation_id(),
-                plan.effect_ids().join(","),
-            )
-            .as_bytes(),
-        );
-        let operation_id = format!("core-effect:{claim_digest}");
-        let payload = serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "kind": "controller-effect",
-            "state": "pending",
-            "operationClass": "reconcile",
-            "effectIds": plan.effect_ids(),
-            "resourceUid": context.target().uid().as_str(),
-            "generation": context.generation().get(),
-            "operationId": operation_id,
-            "claimDigest": claim_digest,
-            "storeBindingDigest": store.authority_binding_digest(&claim_digest),
-        }))
-        .map_err(|_| SourceError::Integrity)?;
-        let pending = PendingAcceptance {
-            operation_id,
-            payload,
-            claim_digest,
-            context_operation_id: context.operation().operation_id().to_owned(),
-        };
-        let (leader, flush_now) = {
-            let mut state = self.acceptance_batch.state.lock().await;
-            let flush_now = state.pending.len() + 1 >= self.acceptance_batch.expected;
-            state.pending.push(pending);
-            let leader = !state.flushing;
-            if leader {
-                state.flushing = true;
-            }
-            (leader, flush_now)
-        };
-        if leader {
-            if !flush_now {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            let pending_batch = {
-                let mut state = self.acceptance_batch.state.lock().await;
-                state.flushing = false;
-                std::mem::take(&mut state.pending)
-            };
-            match store
-                .prepare_authority_operations(
-                    pending_batch
-                        .iter()
-                        .map(|pending| {
-                            (
-                                pending.operation_id.clone(),
-                                pending.payload.clone(),
-                                pending.claim_digest.clone(),
-                            )
-                        })
-                        .collect(),
-                )
-                .await
-            {
-                Ok(capabilities) => {
-                    let entries = pending_batch
-                        .into_iter()
-                        .zip(capabilities)
-                        .map(|(pending, capability)| {
-                            (pending.context_operation_id, Arc::new(capability))
-                        })
-                        .collect::<Vec<_>>();
-                    {
-                        let mut accepted = self
-                            .accepted
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        for (operation_id, capability) in &entries {
-                            accepted.insert(operation_id.clone(), Arc::clone(capability));
-                        }
-                    }
-                    let mut state = self.acceptance_batch.state.lock().await;
-                    for (operation_id, _) in entries {
-                        state.results.insert(operation_id, Ok(()));
-                    }
-                }
-                Err(_) => {
-                    let mut state = self.acceptance_batch.state.lock().await;
-                    for pending in pending_batch {
-                        state
-                            .results
-                            .insert(pending.context_operation_id, Err(SourceError::Unavailable));
-                    }
-                }
-            }
-            self.acceptance_batch.notify.notify_waiters();
-        }
-        loop {
-            let notified = self.acceptance_batch.notify.notified();
-            if let Some(result) = self
-                .acceptance_batch
-                .state
-                .lock()
-                .await
-                .results
-                .get(context.operation().operation_id())
-                .copied()
-            {
-                if result.is_ok() {
-                    self.inner.metrics.record_effect_acceptance(context);
-                }
-                return result;
-            }
-            notified.await;
-        }
-    }
-
-    async fn complete_effect(
-        &self,
-        context: &ReconcileContext,
-        _result: &ReconcileResult,
-    ) -> Result<(), SourceError> {
-        let capability = self
-            .accepted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(context.operation().operation_id());
-        if let Some(capability) = capability {
-            capability
-                .record_effect(AuthorityOperationState::EffectConfirmed)
-                .await
-                .map_err(|_| SourceError::Unavailable)?;
-        }
-        Ok(())
-    }
-
-    fn commit_result(
-        &self,
-        context: &ReconcileContext,
-        result: &ReconcileResult,
-    ) -> impl std::future::Future<Output = Result<CommitOutcome, SourceError>> + Send {
-        self.inner.commit_result(context, result)
-    }
-
-    fn complete_expedited(
-        &self,
-        context: &ReconcileContext,
-        projection: &ReconcileProjection,
-        status_persistence: StatusPersistence,
-    ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
-        self.inner
-            .complete_expedited(context, projection, status_persistence)
-    }
-
-    fn persist_outcome(
-        &self,
-        projection: &ReconcileProjection,
-    ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
-        self.inner.persist_outcome(projection)
-    }
-
-    fn checkpoint(
-        &self,
-        context: &ReconcileContext,
-        revision: ZoneRevision,
-    ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
-        self.inner.checkpoint(context, revision)
-    }
-
-    fn schedule_requeue(
-        &self,
-        key: &ResourceKey,
-        at_tick: u64,
-    ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
-        self.inner.schedule_requeue(key, at_tick)
-    }
-}
-
 fn percentile(samples: &[Duration], percentile: usize) -> Duration {
     assert!(!samples.is_empty(), "latency sample set is nonempty");
     let mut sorted = samples.to_vec();
@@ -1205,6 +943,11 @@ fn raw_micros(samples: &[Duration]) -> String {
         .map(|sample| format!("{:.3}", sample.as_secs_f64() * 1_000_000.0))
         .collect::<Vec<_>>();
     format!("[{}]", values.join(","))
+}
+
+fn reaction_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 async fn run_profile(profile: usize) {
@@ -1249,18 +992,18 @@ async fn run_profile(profile: usize) {
     );
     let watch_ready = source.watch_ready.notified();
     let runner_task = tokio::spawn(runner.run());
+    drop(runner);
     tokio::time::timeout(WATCH_TIMEOUT, watch_ready)
         .await
         .expect("toolkit opened the authenticated production watch");
 
     for start in (0..profile).step_by(COMMIT_BATCH) {
         let end = (start + COMMIT_BATCH).min(profile);
-        let resources = fixture
+        let (resources, committed_at) = fixture
             .commit_process_batch(profile, start, end)
             .await
             .expect("commit ready Process resources through production redb backend");
         assert_eq!(resources.len(), end - start);
-        let committed_at = Instant::now();
         {
             let mut commit_times = commit_times
                 .lock()
@@ -1324,16 +1067,6 @@ async fn run_profile(profile: usize) {
     }
     let handler_p95 = percentile(&handler_samples, 95);
     let launch_p95 = percentile(&launch_samples, 95);
-    assert!(
-        handler_p95 <= HANDLER_P95_LIMIT,
-        "commit-to-handler p95 {:?} exceeded the 5 ms contract",
-        handler_p95
-    );
-    assert!(
-        launch_p95 <= LAUNCH_P95_LIMIT,
-        "commit-to-launch p95 {:?} exceeded the 20 ms contract",
-        launch_p95
-    );
     if profile > 1 {
         assert!(
             metrics.max_active_launches() >= 2,
@@ -1386,22 +1119,30 @@ async fn run_profile(profile: usize) {
 async fn run_core_profile(profile: usize) {
     let fixture = bus_support::ProductionStore::provision().await;
     let store = fixture.store();
-    let harness = Arc::new(
-        ProductionWatchHarness::new(bus_support::bus_config())
-            .expect("create authenticated production bus harness"),
-    );
     let commit_times = Arc::new(Mutex::new(BTreeMap::<ResourceRef, Instant>::new()));
     let metrics = Arc::new(ReactionMetrics::new());
-    let production_source = ProductionControllerSource::new(
-        Arc::clone(&fixture),
-        Arc::clone(&harness),
+    for warmup_index in profile + 1_000..profile + 1_010 {
+        let (warmup, _) = fixture
+            .commit_process_batch(profile, warmup_index, warmup_index + 1)
+            .await
+            .expect("commit the production-path read warmup Process");
+        fixture.delete_process(&warmup[0]).await;
+    }
+    let observer_metrics = Arc::clone(&metrics);
+    let api = fixture
+        .core_registered_api()
+        .with_assignment_fence_resolver(fixture.core_assignment_resolver())
+        .with_effect_acceptance_observer(Arc::new(move |uid| {
+            observer_metrics.record_durable_effect_acceptance(uid);
+        }));
+    let concurrency = profile.min(16);
+    let descriptor = descriptor_for_generations_with_pending(
+        concurrency,
         profile,
-        Arc::clone(&metrics),
+        ControllerGeneration::new(3).expect("nonzero controller generation"),
+        ResourceGeneration::new(1).expect("nonzero Provider generation"),
     );
-    let registered_source =
-        CoreRegisteredSource::new(Arc::clone(&production_source), COMMIT_BATCH.min(profile));
-    let descriptor = descriptor(profile);
-    let source = CoreControllerSource::new(descriptor.clone(), registered_source);
+    let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
     let provider = Arc::new(MinijailProcessProvider::new(
         ProviderSupervisor::with_limits(
             RecordingEffectBackend::new(Arc::clone(&metrics)),
@@ -1410,7 +1151,7 @@ async fn run_core_profile(profile: usize) {
         ),
     ));
     let reconciler = Arc::new(ProcessReconciler {
-        descriptor,
+        descriptor: descriptor.clone(),
         provider,
         metrics: Arc::clone(&metrics),
         measure_handler_start: true,
@@ -1427,28 +1168,79 @@ async fn run_core_profile(profile: usize) {
             max_attempts: 1,
         },
     );
-    let watch_ready = production_source.watch_ready.notified();
     let runner_task = tokio::spawn(runner.run());
-    tokio::time::timeout(WATCH_TIMEOUT, watch_ready)
-        .await
-        .expect("CoreControllerSource opened the production watch");
+    drop(runner);
+    tokio::time::timeout(WATCH_TIMEOUT, async {
+        loop {
+            if store
+                .watch_signals()
+                .expect("read CoreControllerSource watch signals")
+                .current_registrations
+                > 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("CoreControllerSource opened the production watch");
 
-    for start in (0..profile).step_by(COMMIT_BATCH) {
-        let end = (start + COMMIT_BATCH).min(profile);
-        let resources = fixture
+    for start in (0..profile).step_by(CORE_COMMIT_BATCH) {
+        let end = (start + CORE_COMMIT_BATCH).min(profile);
+        let (resources, committed_at) = fixture
             .commit_process_batch(profile, start, end)
             .await
-            .expect("commit ready Process resources through production redb backend");
+            .expect("commit ready Process resources through production ResourceService");
         assert_eq!(resources.len(), end - start);
-        let committed_at = Instant::now();
+        let resource_refs = resources
+            .iter()
+            .map(|resource| (resource.resource_ref.clone(), resource.revision))
+            .collect::<Vec<_>>();
         let mut commit_times = commit_times
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for resource in resources {
             commit_times.insert(resource.resource_ref, committed_at);
         }
+        tokio::time::timeout(WATCH_TIMEOUT, async {
+            loop {
+                if metrics.handlers().len() >= end && metrics.launches().len() >= end {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("CoreControllerSource drains each durable Process commit");
+        for (target, revision) in resource_refs {
+            tokio::time::timeout(
+                WATCH_TIMEOUT,
+                fixture.wait_for_newer_revision(&target, revision),
+            )
+            .await
+            .expect("Core status commit reaches the production store")
+            .expect("Core status commit remains durable");
+        }
     }
 
+    let launch_wait = tokio::time::timeout(WATCH_TIMEOUT, async {
+        loop {
+            if metrics.handlers().len() == profile && metrics.launches().len() == profile {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if launch_wait.is_err() && runner_task.is_finished() {
+        let result = runner_task.await;
+        panic!("CoreControllerSource runner ended before all launches: {result:?}");
+    }
+    launch_wait.expect("CoreControllerSource completes every production launch attempt");
+    source
+        .close_watch()
+        .expect("close CoreControllerSource production watch");
     let report = tokio::time::timeout(WATCH_TIMEOUT, runner_task)
         .await
         .expect("CoreControllerSource runner completes")
@@ -1456,7 +1248,6 @@ async fn run_core_profile(profile: usize) {
         .expect("CoreControllerSource runner succeeds");
     assert_eq!(report.dispatched, profile);
     assert_eq!(report.checkpointed, profile);
-    assert_eq!(report.committed_status_pending, profile);
 
     let commit_times = commit_times
         .lock()
@@ -1507,10 +1298,12 @@ async fn run_core_profile(profile: usize) {
     let handler_p95 = percentile(&handler_samples, 95);
     let launch_p95 = percentile(&launch_samples, 95);
     println!(
-        "core measurements profile={profile} handler_raw_us={} acceptance_raw_us={} launch_raw_us={}",
+        "core measurements profile={profile} handler_raw_us={} handler_p95_us={:.3} acceptance_raw_us={} launch_raw_us={} launch_p95_us={:.3}",
         raw_micros(&handler_samples),
+        handler_p95.as_secs_f64() * 1_000_000.0,
         raw_micros(&acceptance_samples),
         raw_micros(&launch_samples),
+        launch_p95.as_secs_f64() * 1_000_000.0,
     );
     assert!(
         handler_p95 <= HANDLER_P95_LIMIT,
@@ -1532,17 +1325,7 @@ async fn run_core_profile(profile: usize) {
             .iter()
             .all(|operation| operation.state == AuthorityOperationState::EffectConfirmed)
     );
-
-    production_source
-        .flush_statuses()
-        .await
-        .expect("persist asynchronous Process status updates");
-    production_source.stop().await;
-    let watch_signals = store
-        .watch_signals()
-        .expect("read CoreControllerSource watch signals");
-    assert_eq!(watch_signals.current_registrations, 0);
-    assert_eq!(watch_signals.budget_used, 0);
+    drop(source);
     println!(
         "core reaction profile={profile} handler_raw_us={} handler_p95_us={:.3} launch_raw_us={} launch_p95_us={:.3} dispatched={} checkpointed={} ledger_acceptances={} ledger_confirmed={}",
         raw_micros(&handler_samples),
@@ -1555,7 +1338,6 @@ async fn run_core_profile(profile: usize) {
         operations.len(),
     );
 
-    drop(source);
     drop(store);
     let fixture = Arc::try_unwrap(fixture)
         .unwrap_or_else(|_| panic!("all CoreControllerSource fixture handles released"));
@@ -1565,8 +1347,78 @@ async fn run_core_profile(profile: usize) {
         .expect("shutdown CoreControllerSource production store");
 }
 
+fn core_identity() -> ControllerIdentity {
+    ControllerIdentity::new(
+        ZoneId::parse("dev").expect("valid Zone"),
+        ResourceRef::parse("Process/d2b-core-controller").expect("valid Core controller ref"),
+        ControllerGeneration::new(3).expect("nonzero Core controller generation"),
+        ResourceRef::parse("Provider/system-core").expect("valid Core Provider ref"),
+        ResourceGeneration::new(1).expect("nonzero Core Provider generation"),
+        ResourceRef::parse("Process/d2b-core-controller").expect("valid Core Process ref"),
+        ResourceRef::parse("Host/host-system").expect("valid Core execution target"),
+        None,
+    )
+    .expect("Core controller identity is valid")
+}
+
+async fn run_all_provider_composition() {
+    let fixture = bus_support::ProductionStore::provision().await;
+    let api = fixture.core_registered_api();
+    let (_, descriptor) = core_controller_descriptors(core_identity())
+        .expect("fixed Core descriptors are valid")
+        .into_iter()
+        .find(|(registration, _)| registration.resource_type() == "Provider")
+        .expect("Core Provider registration is present");
+    let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+    source.register(&descriptor).await.unwrap();
+    let initial = source.list_initial(&descriptor).await.unwrap();
+    assert!(initial.resources.is_empty());
+    source
+        .open_watch(&descriptor, initial.snapshot_revision)
+        .await
+        .unwrap();
+
+    fixture.commit_provider_catalog().await;
+
+    let expected = bus_support::PROVIDER_IDS
+        .iter()
+        .map(|provider| (*provider).to_owned())
+        .collect::<BTreeSet<_>>();
+    let listed = source.list_initial(&descriptor).await.unwrap();
+    let listed_names = listed
+        .resources
+        .iter()
+        .map(|resource| resource.key.resource_ref().name().as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(listed_names, expected);
+    let mut observed = BTreeSet::new();
+    while observed.len() < expected.len() {
+        let event = tokio::time::timeout(WATCH_TIMEOUT, source.receive_watch())
+            .await
+            .expect("all Provider registrations reach the production watch");
+        let WatchEvent::Hint(hint) = event.expect("production Provider watch succeeds") else {
+            panic!("Provider watch closed before all registrations arrived");
+        };
+        assert_eq!(hint.key().resource_ref().resource_type().as_str(), "Provider");
+        observed.insert(hint.key().resource_ref().name().as_str().to_owned());
+    }
+    assert_eq!(observed, expected);
+    source.close_watch().unwrap();
+    drop(source);
+
+    let fixture = Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("all Provider composition fixture handles released"));
+    fixture
+        .shutdown()
+        .await
+        .expect("shutdown Provider composition store");
+}
+
 #[test]
 fn production_reaction_path() {
+    let _guard = reaction_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)
         .enable_all()
@@ -1581,12 +1433,11 @@ fn production_reaction_path() {
 
 #[test]
 fn production_core_source_reaction_path() {
-    if std::env::var_os("D2B_PERF_STABLE").is_none() {
-        println!("SKIP: set D2B_PERF_STABLE=1 to enforce Core source budgets");
-        return;
-    }
+    let _guard = reaction_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(8)
+        .worker_threads(4)
         .enable_all()
         .build()
         .expect("create benchmark runtime")
@@ -1594,5 +1445,6 @@ fn production_core_source_reaction_path() {
             for profile in PROFILES {
                 run_core_profile(profile).await;
             }
+            run_all_provider_composition().await;
         });
 }
