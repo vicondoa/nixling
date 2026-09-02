@@ -194,7 +194,12 @@ impl TpmResourceController {
         controller.flush_ref = status.last_flush_ref.clone();
         controller.endpoint_ref = status.tpm_endpoint_ref.clone();
         controller.marker_status = status.marker_status;
-        controller.last_error = if status.marker_status == TpmMarkerStatus::Tampered {
+        controller.last_error = if matches!(
+            status.marker_status,
+            TpmMarkerStatus::Missing
+                | TpmMarkerStatus::Replaced
+                | TpmMarkerStatus::Tampered
+        ) {
             Some(TpmResourceEffectError::StateIntegrity)
         } else if status.phase == TpmResourcePhase::Failed {
             Some(TpmResourceEffectError::EffectRejected)
