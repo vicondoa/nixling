@@ -166,6 +166,44 @@ impl TpmResourceController {
         })
     }
 
+    /// Rehydrate a controller from its bounded persisted status evidence.
+    pub fn from_status(
+        device_uid: ResourceUid,
+        device_ref: ResourceRef,
+        execution_ref: ResourceRef,
+        status: &TpmStatusReport,
+    ) -> Result<Self, TpmResourceControllerError> {
+        let mut controller = Self::new(device_uid, device_ref, execution_ref)?;
+        for (reference, expected_type) in [
+            (status.state_volume_ref.as_ref(), "Volume"),
+            (status.swtpm_process_ref.as_ref(), "Process"),
+            (status.last_flush_ref.as_ref(), "EphemeralProcess"),
+            (status.tpm_endpoint_ref.as_ref(), "Endpoint"),
+        ] {
+            if reference
+                .is_some_and(|reference| reference.resource_type().as_str() != expected_type)
+            {
+                return Err(TpmResourceControllerError::Effect(
+                    TpmResourceEffectError::StateIntegrity,
+                ));
+            }
+        }
+        controller.phase = status.phase;
+        controller.volume_ref = status.state_volume_ref.clone();
+        controller.process_ref = status.swtpm_process_ref.clone();
+        controller.flush_ref = status.last_flush_ref.clone();
+        controller.endpoint_ref = status.tpm_endpoint_ref.clone();
+        controller.marker_status = status.marker_status;
+        controller.last_error = if status.marker_status == TpmMarkerStatus::Tampered {
+            Some(TpmResourceEffectError::StateIntegrity)
+        } else if status.phase == TpmResourcePhase::Failed {
+            Some(TpmResourceEffectError::EffectRejected)
+        } else {
+            None
+        };
+        Ok(controller)
+    }
+
     /// Return the current lifecycle phase.
     pub const fn phase(&self) -> TpmResourcePhase {
         self.phase

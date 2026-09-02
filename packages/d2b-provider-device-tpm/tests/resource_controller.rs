@@ -61,6 +61,28 @@ fn repeated_reconcile_reuses_children_and_keeps_persistent_evidence() {
 }
 
 #[test]
+fn persisted_evidence_rehydrates_without_recreating_children() {
+    let device = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+    let device_ref = ResourceRef::parse("Device/work-tpm").unwrap();
+    let execution = ResourceRef::parse("Host/host-system").unwrap();
+    let effects = ScriptedEffects::default();
+    let mut controller =
+        TpmResourceController::new(device.clone(), device_ref.clone(), execution.clone()).unwrap();
+    block_on(controller.reconcile(&effects)).unwrap();
+    let status = controller.status();
+
+    let mut restored =
+        TpmResourceController::from_status(device, device_ref, execution, &status).unwrap();
+    let restored_effects = ScriptedEffects::default();
+    block_on(restored.reconcile(&restored_effects)).unwrap();
+    assert_eq!(restored.status(), status);
+    assert_eq!(
+        restored_effects.events.lock().unwrap().as_slice(),
+        ["endpoint"]
+    );
+}
+
+#[test]
 fn tpm_runner_contract_disables_legacy_scheduling() {
     let contract = d2b_provider_device_tpm::tpm_runner_contract();
     assert_eq!(contract.resource_type(), "Device");
