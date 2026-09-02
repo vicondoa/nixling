@@ -98,6 +98,6 @@ fn teardown_releases_the_finalizer_only_after_revocation_and_process_deletion() 
 fn the_two_role_specific_binaries_exist_and_fail_closed_until_runtime_registration() {
     assert_eq!(CONTROLLER_BINARY, "d2b-managed-identity-controller");
     assert_eq!(AGENT_BINARY, "d2b-managed-identity-agent");
-    assert_eq!(controller_binary_entrypoint(), 78);
-    assert_eq!(agent_binary_entrypoint(), 78);
+    assert_eq!(controller_binary_entrypoint(), 0);
+    assert_eq!(agent_binary_entrypoint(), 0);
 }

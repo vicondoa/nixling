@@ -13,6 +13,8 @@ use d2b_contracts_resource::v3::ResourceRef;
 use d2b_contracts_resource::v3::identity::Locality;
 use d2b_provider_credential_managed_identity::{
     ManagedIdentityCredentialProvider, ManagedIdentityCredentialProviderFactory,
+    PROVIDER_KIND, PROVIDER_REVOKE_FINALIZER, ManagedIdentityController,
+    ManagedIdentityTeardownPlan,
 };
 
 use common::{
@@ -139,6 +141,7 @@ fn lease_operations_bind_to_authenticated_zone_workload_subject_and_session() {
             CredentialServiceErrorCode::OperationDenied
         );
     }
+
     assert_eq!(
         client
             .refresh_calls
@@ -1166,4 +1169,51 @@ fn finalization_revokes_only_the_callers_owned_handles() {
         .unwrap(),
         CredentialResponse::RefreshToken(_)
     ));
+}
+
+#[test]
+fn controller_cleanup_keeps_the_finalizer_until_agent_deletion_is_observed() {
+    assert_eq!(
+        ManagedIdentityController::teardown_plan(true, false, false),
+        ManagedIdentityTeardownPlan {
+            stop_agent: true,
+            delete_agent: false,
+            clear_provider_revoke: false,
+        }
+    );
+    assert_eq!(
+        ManagedIdentityController::teardown_plan(false, true, false),
+        ManagedIdentityTeardownPlan {
+            stop_agent: false,
+            delete_agent: true,
+            clear_provider_revoke: false,
+        }
+    );
+    assert_eq!(
+        ManagedIdentityController::teardown_plan(false, true, true),
+        ManagedIdentityTeardownPlan {
+            stop_agent: false,
+            delete_agent: false,
+            clear_provider_revoke: true,
+        }
+    );
+    assert_eq!(PROVIDER_KIND.as_str(), "credential-managed-identity");
+    assert_eq!(
+        PROVIDER_REVOKE_FINALIZER,
+        "credential.d2bus.org/provider-revoke"
+    );
+}
+
+#[test]
+fn ambient_sdk_chain_names_are_rejected_before_imds_use() {
+    assert!(
+        d2b_provider_credential_managed_identity::reject_ambient_credential_chain(["PATH"])
+            .is_ok()
+    );
+    assert!(
+        d2b_provider_credential_managed_identity::reject_ambient_credential_chain(
+            ["AZURE_FEDERATED_TOKEN_FILE"]
+        )
+        .is_err()
+    );
 }

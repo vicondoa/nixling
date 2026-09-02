@@ -28,7 +28,8 @@ use d2b_contracts_provider::v3::credential::{
 use d2b_contracts_resource::v3::{ResourceGeneration, ResourceRef, ZoneId};
 
 pub use controller::{
-    SecretServiceController, SecretServiceControllerHealth, SecretServiceStatusProjection,
+    PROVIDER_KIND, PROVIDER_REVOKE_FINALIZER, SecretServiceController,
+    SecretServiceControllerHealth, SecretServiceStatusProjection,
 };
 
 /// Canonical Provider reference.
@@ -38,6 +39,22 @@ pub const MAX_LOCAL_LEASES: u32 = 256;
 /// Maximum bytes in a Secret Service collection alias.
 pub const MAX_COLLECTION_ALIAS_BYTES: usize = 128;
 const ABSOLUTE_UNIX_MS_THRESHOLD: u64 = 1_000_000_000_000;
+
+/// Reject ambient SDK credential-chain environment names.
+pub fn reject_ambient_credential_chain(
+    keys: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<(), SecretServiceProviderError> {
+    d2b_contracts_provider::v3::credential_controller::reject_ambient_credential_chain(keys)
+        .map_err(|_| SecretServiceProviderError::InvalidConfig)
+}
+
+/// Reject ambient SDK credential-chain variables in this process.
+pub fn reject_process_environment_credential_chain(
+) -> Result<(), SecretServiceProviderError> {
+    reject_ambient_credential_chain(
+        std::env::vars_os().filter_map(|(key, _value)| key.into_string().ok()),
+    )
+}
 
 /// A boxed asynchronous result returned by the injected port.
 pub type SecretServiceFuture<'a, T> =
@@ -1494,5 +1511,11 @@ mod tests {
             deadline,
         );
         assert!(matches!(result, Err(SecretServicePollError::Deadline)));
+    }
+
+    #[test]
+    fn ambient_sdk_chain_names_are_rejected_without_reading_values() {
+        assert!(reject_ambient_credential_chain(["PATH", "RUST_LOG"]).is_ok());
+        assert!(reject_ambient_credential_chain(["AZURE_CLIENT_SECRET"]).is_err());
     }
 }

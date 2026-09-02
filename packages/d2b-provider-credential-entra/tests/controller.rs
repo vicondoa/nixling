@@ -1,10 +1,17 @@
 mod common;
 
-use d2b_contracts_provider::v3::credential::CredentialServiceErrorCode;
+use d2b_contracts_provider::v3::credential::{
+    CredentialResourceVerb, CredentialServiceErrorCode, CredentialLeaseState, OperationClass,
+    RolePermission, RevocationAction,
+};
+use d2b_contracts_provider::v3::credential_controller::{
+    CredentialControllerHandlers, CredentialRevocationInput,
+};
 use d2b_contracts_resource::v3::ResourceRef;
 use d2b_contracts_resource::v3::identity::Locality;
 use d2b_provider_credential_entra::{
     EntraClientState, EntraController, EntraEndpointPolicy, EntraPlacement, EntraResourceHealth,
+    PROVIDER_KIND, PROVIDER_REVOKE_FINALIZER,
 };
 
 use common::{subject_context, subject_context_for, subject_context_with_bindings};
@@ -153,5 +160,44 @@ fn status_projection_rejects_retry_counts_above_the_provider_ceiling() {
             .unwrap_err()
             .code(),
         CredentialServiceErrorCode::InvariantFailure
+    );
+}
+
+#[test]
+fn shared_controller_finalization_requires_the_exact_revoke_subresource() {
+    let (controller, _) = controller();
+    let input = CredentialRevocationInput::new(
+        d2b_contracts_resource::v3::ResourceUid::parse(
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .unwrap(),
+        Some(CredentialLeaseState::Active),
+        1,
+        RevocationAction::Immediate,
+        20_000,
+        [OperationClass::RevokeToken],
+        RolePermission::new(CredentialResourceVerb::UseCredential, "revoke-token"),
+        10,
+        20,
+    )
+    .unwrap();
+    let decision = controller.finalize(&input).unwrap();
+    let call = decision.call.expect("finalizer must revoke before release");
+    assert_eq!(call.subresource(), "revoke-token");
+    assert_eq!(PROVIDER_KIND.as_str(), "credential-entra");
+    assert_eq!(
+        PROVIDER_REVOKE_FINALIZER,
+        "credential.d2bus.org/provider-revoke"
+    );
+}
+
+#[test]
+fn ambient_sdk_chain_names_are_rejected_before_provider_use() {
+    assert!(
+        d2b_provider_credential_entra::reject_ambient_credential_chain(["PATH"]).is_ok()
+    );
+    assert!(
+        d2b_provider_credential_entra::reject_ambient_credential_chain(["AZURE_TENANT_ID"])
+            .is_err()
     );
 }

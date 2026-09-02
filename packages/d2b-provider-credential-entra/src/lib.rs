@@ -26,7 +26,10 @@ use d2b_contracts_provider::v3::credential::{
 };
 use d2b_contracts_resource::v3::ResourceRef;
 
-pub use controller::{EntraController, EntraEndpointPolicy, EntraStatusProjection};
+pub use controller::{
+    EntraController, EntraEndpointPolicy, EntraStatusProjection, PROVIDER_KIND,
+    PROVIDER_REVOKE_FINALIZER,
+};
 
 /// Canonical Provider reference.
 pub const PROVIDER_REF: &str = "Provider/credential-entra";
@@ -39,6 +42,22 @@ pub const MAX_LOCAL_LEASES: u32 = 256;
 /// Maximum refresh failures retained for one Credential before retry stops.
 pub const MAX_REFRESH_ATTEMPTS: u16 = 3;
 const ABSOLUTE_UNIX_MILLIS_THRESHOLD: u64 = 1_000_000_000_000;
+
+/// Reject ambient SDK credential-chain environment names.
+pub fn reject_ambient_credential_chain(
+    keys: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<(), EntraProviderError> {
+    d2b_contracts_provider::v3::credential_controller::reject_ambient_credential_chain(keys)
+        .map_err(|_| EntraProviderError::InvalidConfig)
+}
+
+/// Reject ambient SDK credential-chain variables in this process.
+pub fn reject_process_environment_credential_chain(
+) -> Result<(), EntraProviderError> {
+    reject_ambient_credential_chain(
+        std::env::vars_os().filter_map(|(key, _value)| key.into_string().ok()),
+    )
+}
 
 /// Boxed asynchronous result returned by the injected identity-Guest client.
 pub type EntraFuture<'a, T> =

@@ -1,9 +1,9 @@
 mod common;
 
 use d2b_contracts_provider::v3::credential::{
-    CredentialAuthorization, CredentialMethod, CredentialProvider, CredentialRequest,
-    CredentialResponse, CredentialServiceError, CredentialServiceErrorCode, DeliverySessionParams,
-    SensitiveDeliveryRecord,
+    CREDENTIAL_DELIVERY_NOISE_PROFILE, CredentialAuthorization, CredentialMethod,
+    CredentialProvider, CredentialRequest, CredentialResponse, CredentialServiceError,
+    CredentialServiceErrorCode, DeliverySessionParams, SensitiveDeliveryRecord,
 };
 use d2b_provider_credential_secret_service::{
     SecretServiceCredentialProvider, SecretServiceSessionCapability,
@@ -13,6 +13,10 @@ use common::{Admission, ProviderHarness, SessionCapabilitySource, TestAdmission,
 
 #[test]
 fn response_uses_the_read_only_adapter_binding_and_record_zeroizes() {
+    assert_eq!(
+        CREDENTIAL_DELIVERY_NOISE_PROFILE,
+        "Noise_KK_25519_ChaChaPoly_SHA256"
+    );
     let (provider, _) = setup(64);
     let server = ProviderHarness::new(provider, Admission);
     let response = server
@@ -117,5 +121,28 @@ fn adapter_refuses_a_provider_response_with_a_different_binding() {
             .unwrap_err()
             .code(),
         CredentialServiceErrorCode::InvariantFailure
+    );
+}
+
+#[test]
+fn provider_refuses_an_incoming_delivery_binding_for_another_credential() {
+    let (provider, _) = common::setup(64);
+    let wrong_binding = common::delivery_for(
+        CredentialMethod::AcquireToken,
+        1,
+        d2b_contracts_resource::v3::ResourceRef::parse("Credential/other").unwrap(),
+    );
+    let server = ProviderHarness::new(
+        provider,
+        MismatchedAdmission {
+            authorized: wrong_binding,
+        },
+    );
+    assert_eq!(
+        server
+            .call(CredentialMethod::AcquireToken, request("wrong-credential"))
+            .unwrap_err()
+            .code(),
+        CredentialServiceErrorCode::OperationDenied
     );
 }

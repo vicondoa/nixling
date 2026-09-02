@@ -1,13 +1,18 @@
 mod common;
 
 use d2b_contracts_provider::v3::credential::{
-    CredentialAuthorization, CredentialMethod, CredentialProvider, CredentialServiceErrorCode,
-    PlacementBinding, dispatch_authorized_provider,
+    CredentialAuthorization, CredentialMethod, CredentialProvider, CredentialResourceVerb,
+    CredentialRotationPolicy, CredentialServiceErrorCode, OperationClass, PlacementBinding,
+    RolePermission, RotationPolicyClass, dispatch_authorized_provider,
+};
+use d2b_contracts_provider::v3::credential_controller::{
+    CredentialControllerHandlers, CredentialReconcileInput,
 };
 use d2b_contracts_resource::v3::{ResourceGeneration, ResourceRef, ZoneId};
 use d2b_provider_credential_secret_service::{
-    LockPolicy, SecretServiceConfig, SecretServiceCredentialProvider,
-    SecretServiceCredentialProviderFactory, SecretServicePlacement,
+    LockPolicy, PROVIDER_KIND, PROVIDER_REVOKE_FINALIZER, SecretServiceConfig,
+    SecretServiceController, SecretServiceCredentialProvider, SecretServiceCredentialProviderFactory,
+    SecretServicePlacement,
 };
 
 use common::{FakeOo7Port, delivery, request, setup};
@@ -59,14 +64,7 @@ fn one_session_capability_rejects_clone_replay_and_disconnects_owned_lease() {
     dispatch_authorized_provider(
         &provider,
         CredentialMethod::AcquireToken,
-        &d2b_contracts_provider::v3::credential::CredentialRequest::new(
-            ResourceRef::parse("Credential/other-keyring").unwrap(),
-            "operation-2",
-            "session-owned-2",
-            common::EXPIRY,
-            15_000,
-        )
-        .unwrap(),
+        &request("session-owned-2"),
         &authorization,
     )
     .unwrap();
@@ -75,7 +73,7 @@ fn one_session_capability_rejects_clone_replay_and_disconnects_owned_lease() {
     provider.disconnect(&authorization).unwrap();
     assert_eq!(
         port.revoke_calls.load(std::sync::atomic::Ordering::SeqCst),
-        2
+        1
     );
     assert_eq!(
         provider
@@ -141,7 +139,12 @@ fn absent_consumer_uses_only_the_canonical_provider_reference() {
     );
     let own_authorization = CredentialAuthorization::new(
         CredentialMethod::AcquireToken,
-        Some(delivery(CredentialMethod::AcquireToken, 1)),
+        Some(common::delivery_for_consumer(
+            CredentialMethod::AcquireToken,
+            1,
+            ResourceRef::parse("Credential/local-keyring").unwrap(),
+            ResourceRef::parse("Provider/credential-secret-service").unwrap(),
+        )),
     )
     .unwrap()
     .with_session_proof(
@@ -355,6 +358,40 @@ fn disconnect_revokes_only_the_owned_workload_leases() {
     assert_eq!(
         port.revoke_calls.load(std::sync::atomic::Ordering::SeqCst),
         2
+    );
+}
+
+#[test]
+fn shared_controller_admission_uses_the_exact_finalizer_and_operation_class() {
+    let controller = SecretServiceController::new(
+        SecretServiceConfig::new("login collection", 64, LockPolicy::FailClosed).unwrap(),
+    );
+    let input = CredentialReconcileInput::new(
+        d2b_contracts_resource::v3::ResourceUid::parse(
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .unwrap(),
+        CredentialRotationPolicy::new(RotationPolicyClass::OnExpiry, None, 1_000).unwrap(),
+        None,
+        1,
+        20_000,
+        [OperationClass::AcquireToken],
+        RolePermission::new(CredentialResourceVerb::UseCredential, "acquire-token"),
+        true,
+        0,
+        64,
+        10,
+        20,
+        None,
+    )
+    .unwrap();
+    let decision = controller.reconcile_handler(&input).unwrap();
+    let call = decision.call.expect("first pass must accept acquisition");
+    assert_eq!(call.subresource(), "acquire-token");
+    assert_eq!(PROVIDER_KIND.as_str(), "credential-secret-service");
+    assert_eq!(
+        PROVIDER_REVOKE_FINALIZER,
+        "credential.d2bus.org/provider-revoke"
     );
 }
 

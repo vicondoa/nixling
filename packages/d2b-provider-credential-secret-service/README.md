@@ -39,9 +39,10 @@ and deletion cleanup. It projects `CredentialReady`, `RotationDue`,
 
 ## Controllers / services / workers / binaries
 
-The `d2b-provider-credential-secret-service` binary hosts the user-domain
-`secret-service-controller` and `d2b.credential.v3` handler. The injected
-`Oo7SecretServicePort` is the only Secret Service boundary.
+The `d2bd` composition attaches the `secret-service-controller` to the shared
+Runner and ResourceService. The injected `Oo7SecretServicePort` remains the
+only Secret Service boundary; no standalone scheduler or ambient D-Bus path is
+used.
 
 ## Placement and dependencies
 

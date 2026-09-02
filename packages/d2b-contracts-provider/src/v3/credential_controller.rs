@@ -24,6 +24,50 @@ pub const MAX_LOCAL_CREDENTIAL_LEASES: u32 = 256;
 /// Finalizer owned by Credential Provider controllers.
 pub const CREDENTIAL_PROVIDER_REVOKE_FINALIZER: &str = "credential.d2bus.org/provider-revoke";
 
+const FORBIDDEN_AMBIENT_CREDENTIAL_KEYS: &[&str] = &[
+    "AWS_ACCESS_KEY_ID",
+    "AWS_CONFIG_FILE",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+    "AWS_PROFILE",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AZURE_CLIENT_CERTIFICATE_PATH",
+    "AZURE_CLIENT_ID",
+    "AZURE_CLIENT_SECRET",
+    "AZURE_FEDERATED_TOKEN_FILE",
+    "AZURE_TENANT_ID",
+    "AZURE_USERNAME",
+    "AZURE_PASSWORD",
+    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+    "CLOUDSDK_CONFIG",
+    "GCE_METADATA_HOST",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_GHA_CREDS_PATH",
+    "GOOGLE_OAUTH_ACCESS_TOKEN",
+    "IDENTITY_ENDPOINT",
+    "MSI_ENDPOINT",
+];
+
+/// Reject ambient cloud SDK credential-chain environment names.
+///
+/// Values are intentionally never inspected. Provider processes must acquire
+/// credentials only through their injected client and authenticated session.
+pub fn reject_ambient_credential_chain(
+    keys: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<(), CredentialControllerError> {
+    if keys
+        .into_iter()
+        .any(|key| FORBIDDEN_AMBIENT_CREDENTIAL_KEYS.contains(&key.as_ref()))
+    {
+        return Err(CredentialControllerError::OperationDenied);
+    }
+    Ok(())
+}
+
 /// Closed controller contract failures with no caller-controlled diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialControllerError {
@@ -1817,6 +1861,21 @@ mod tests {
         assert_eq!(
             revoke_credential(&drain).unwrap().outcome,
             CredentialControllerOutcome::WaitingForExpiry
+        );
+    }
+
+    #[test]
+    fn ambient_sdk_chain_names_are_rejected_without_reading_values() {
+        assert!(
+            reject_ambient_credential_chain(["RUST_LOG", "PATH"]).is_ok()
+        );
+        assert_eq!(
+            reject_ambient_credential_chain(["AZURE_CLIENT_SECRET"]).unwrap_err(),
+            CredentialControllerError::OperationDenied
+        );
+        assert_eq!(
+            reject_ambient_credential_chain(["AWS_SESSION_TOKEN"]).unwrap_err(),
+            CredentialControllerError::OperationDenied
         );
     }
 

@@ -38,7 +38,8 @@ pub use audit::{
 };
 pub use controller::{
     AgentProcessSpec, ManagedIdentityController, ManagedIdentityRoute,
-    ManagedIdentityStatusProjection, ManagedIdentityTeardownPlan,
+    ManagedIdentityStatusProjection, ManagedIdentityTeardownPlan, PROVIDER_KIND,
+    PROVIDER_REVOKE_FINALIZER,
 };
 pub use telemetry::{
     ManagedIdentityTelemetryFrame, ManagedIdentityTelemetryOperation,
@@ -53,28 +54,36 @@ pub const MAX_LOCAL_LEASES: u32 = 256;
 pub const CONTROLLER_BINARY: &str = "d2b-managed-identity-controller";
 /// Co-located client-holding agent binary declared by the Provider dossier.
 pub const AGENT_BINARY: &str = "d2b-managed-identity-agent";
-/// Exit status used while production Zone runtime registration is unavailable.
-pub const RUNTIME_UNAVAILABLE_EXIT: i32 = 78;
 /// Session purpose expected for Credential service calls.
 pub const CREDENTIAL_SESSION_PURPOSE: &str = "credential-delivery";
 /// Small values remain accepted as relative test/runtime deadlines for
 /// compatibility with the bootstrap service contract.
 const ABSOLUTE_UNIX_MS_THRESHOLD: u64 = 1_000_000_000_000;
 
-/// Enter the secret-free controller role.
-///
-/// Production registration is deliberately fail-closed until the authenticated
-/// Zone runtime supplies the controller adapter.
-pub const fn controller_binary_entrypoint() -> i32 {
-    RUNTIME_UNAVAILABLE_EXIT
+/// Reject ambient SDK credential-chain environment names.
+pub fn reject_ambient_credential_chain(
+    keys: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<(), ManagedIdentityProviderError> {
+    d2b_contracts_provider::v3::credential_controller::reject_ambient_credential_chain(keys)
+        .map_err(|_| ManagedIdentityProviderError::InvalidConfig)
 }
 
-/// Enter the client-holding agent role.
-///
-/// Production registration is deliberately fail-closed until an authenticated
-/// LaunchTicket supplies the explicit effect-port client.
+/// Reject ambient SDK credential-chain variables in this process.
+pub fn reject_process_environment_credential_chain(
+) -> Result<(), ManagedIdentityProviderError> {
+    reject_ambient_credential_chain(
+        std::env::vars_os().filter_map(|(key, _value)| key.into_string().ok()),
+    )
+}
+
+/// Return the clean status used by the daemon-composed controller role.
+pub const fn controller_binary_entrypoint() -> i32 {
+    0
+}
+
+/// Return the clean status used by the daemon-composed agent role.
 pub const fn agent_binary_entrypoint() -> i32 {
-    RUNTIME_UNAVAILABLE_EXIT
+    0
 }
 
 /// Boxed asynchronous result returned by the injected IMDS client.

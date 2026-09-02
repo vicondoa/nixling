@@ -204,11 +204,37 @@ pub fn request(idempotency: &str) -> CredentialRequest {
 }
 
 pub fn delivery(method: CredentialMethod, sequence: u64) -> DeliverySessionParams {
-    DeliverySessionParams::new(
+    delivery_for(
+        method,
+        sequence,
         ResourceRef::parse("Credential/local-keyring").unwrap(),
+    )
+}
+
+pub fn delivery_for(
+    method: CredentialMethod,
+    sequence: u64,
+    credential_ref: ResourceRef,
+) -> DeliverySessionParams {
+    delivery_for_consumer(
+        method,
+        sequence,
+        credential_ref,
+        ResourceRef::parse("Provider/shell-terminal").unwrap(),
+    )
+}
+
+pub fn delivery_for_consumer(
+    method: CredentialMethod,
+    sequence: u64,
+    credential_ref: ResourceRef,
+    consumer_ref: ResourceRef,
+) -> DeliverySessionParams {
+    DeliverySessionParams::new(
+        credential_ref,
         ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
         ResourceGeneration::new(1).unwrap(),
-        ResourceRef::parse("Provider/shell-terminal").unwrap(),
+        consumer_ref,
         ResourceGeneration::new(1).unwrap(),
         AudienceToken::parse("user-session").unwrap(),
         method.operation_class(),
@@ -236,15 +262,37 @@ impl TestAdmission for Admission {
     fn authorize(
         &self,
         method: CredentialMethod,
-        _request: &CredentialRequest,
+        request: &CredentialRequest,
     ) -> Result<CredentialAuthorization, CredentialServiceError> {
         let params = if method.requires_delivery() {
-            Some(delivery(method, 1))
+            Some(delivery_for_request(method, 1, request))
         } else {
             None
         };
         CredentialAuthorization::new(method, params)
     }
+}
+
+pub fn delivery_for_request(
+    method: CredentialMethod,
+    sequence: u64,
+    request: &CredentialRequest,
+) -> DeliverySessionParams {
+    DeliverySessionParams::new(
+        request.credential_ref().clone(),
+        ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+        ResourceGeneration::new(1).unwrap(),
+        ResourceRef::parse("Provider/shell-terminal").unwrap(),
+        ResourceGeneration::new(1).unwrap(),
+        AudienceToken::parse("user-session").unwrap(),
+        method.operation_class(),
+        request.requested_expiry_unix_ms(),
+        request.deadline_unix_ms(),
+        DeliveryRouteDigest::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
+        4_096,
+        sequence,
+    )
+    .unwrap()
 }
 
 pub trait SessionCapabilitySource {

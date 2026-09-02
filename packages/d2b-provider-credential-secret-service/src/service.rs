@@ -35,6 +35,25 @@ impl CredentialProvider for SecretServiceCredentialProvider {
 }
 
 impl SecretServiceCredentialProvider {
+    fn validate_delivery(
+        &self,
+        method: CredentialMethod,
+        request: &CredentialRequest,
+        delivery: &d2b_contracts_provider::v3::credential::DeliverySessionParams,
+    ) -> Result<(), CredentialServiceError> {
+        if delivery.credential_ref() != request.credential_ref()
+            || delivery.consumer_provider_ref() != &self.consumer_ref
+            || delivery.operation_class() != method.operation_class()
+            || delivery.deadline_unix_ms() > request.deadline_unix_ms()
+            || delivery.expiry_unix_ms() > request.requested_expiry_unix_ms()
+        {
+            return Err(CredentialServiceError::new(
+                CredentialServiceErrorCode::OperationDenied,
+            ));
+        }
+        Ok(())
+    }
+
     fn acquire(
         &self,
         request: &CredentialRequest,
@@ -45,6 +64,7 @@ impl SecretServiceCredentialProvider {
             .delivery_session_params()
             .cloned()
             .ok_or_else(invariant)?;
+        self.validate_delivery(CredentialMethod::AcquireToken, request, &delivery)?;
         let deadline = Self::operation_deadline(request.deadline_unix_ms())?;
         let key = request.credential_ref().to_canonical_string();
         self.ensure_unlocked(deadline)?;
@@ -138,6 +158,7 @@ impl SecretServiceCredentialProvider {
             .delivery_session_params()
             .cloned()
             .ok_or_else(invariant)?;
+        self.validate_delivery(CredentialMethod::RefreshToken, request, &delivery)?;
         let deadline = Self::operation_deadline(request.deadline_unix_ms())?;
         let key = request.credential_ref().to_canonical_string();
         self.ensure_unlocked(deadline)?;
