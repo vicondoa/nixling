@@ -1286,12 +1286,13 @@ impl ProductionProcessProviders {
     ) -> Result<ProviderLiveness, String> {
         let liveness = self
             .probe_resource_with_execution(
-            &context,
-            spec.execution(),
-            None,
-            &serde_json::to_vec(spec).map_err(|_| "provider-ticket:serialization".to_owned())?,
-            Some(spec.readiness().class()),
-        )
+                &context,
+                spec.execution(),
+                None,
+                &serde_json::to_vec(spec)
+                    .map_err(|_| "provider-ticket:serialization".to_owned())?,
+                Some(spec.readiness().class()),
+            )
         .await?;
         if liveness == ProviderLiveness::Exited {
             self.forget_resource_for_context(&context, spec.execution().execution_ref());
@@ -1308,12 +1309,13 @@ impl ProductionProcessProviders {
     ) -> Result<ProviderLiveness, String> {
         let liveness = self
             .probe_resource_with_execution(
-            &context,
-            spec.execution(),
-            spec.activation_input(),
-            &serde_json::to_vec(spec).map_err(|_| "provider-ticket:serialization".to_owned())?,
-            None,
-        )
+                &context,
+                spec.execution(),
+                spec.activation_input(),
+                &serde_json::to_vec(spec)
+                    .map_err(|_| "provider-ticket:serialization".to_owned())?,
+                None,
+            )
         .await?;
         if liveness == ProviderLiveness::Exited {
             self.forget_resource_for_context(&context, spec.execution().execution_ref());

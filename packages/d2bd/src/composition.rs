@@ -28880,6 +28880,31 @@ mod broker_dispatch_tests {
     }
 
     #[test]
+    fn provider_one_shot_waits_for_exact_exit_before_dag_successor() {
+        let source = include_str!("composition.rs");
+        let one_shot = source
+            .find("VmStartNodeMode::OneShot")
+            .expect("OneShot branch");
+        let provider = one_shot
+            + source[one_shot..]
+                .find("VmRunnerLaunch::Provider => {")
+                .expect("Provider OneShot branch");
+        let controller = provider
+            + source[provider..]
+                .find("VmRunnerLaunch::ControllerOwned")
+                .expect("next OneShot branch");
+        let provider_arm = &source[provider..controller];
+        assert!(
+            provider_arm.contains("providers.wait_node"),
+            "Provider-backed OneShot must wait for its exact child exit"
+        );
+        assert!(
+            !provider_arm.contains("asynchronous observation"),
+            "DAG readiness must not return before a Provider OneShot exits"
+        );
+    }
+
+    #[test]
     fn qemu_media_stale_dependency_cleanup_detects_proxy_without_primary() {
         let tracked_roles = vec!["wayland-proxy".to_owned(), "qemu-media".to_owned()];
         let entries = vec![PidfdRegistration {

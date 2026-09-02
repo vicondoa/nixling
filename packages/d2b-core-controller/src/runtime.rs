@@ -297,9 +297,6 @@ where
                 CoreDispatchOutcome::Coalesced
             }
         };
-        if self.watch_stream_enabled.load(Ordering::Acquire) {
-            return Ok(dispatch);
-        }
         match self.watch_signal_tx.try_send(()) {
             Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(())) => Ok(dispatch),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
@@ -407,17 +404,35 @@ where
                 return Ok(event);
             }
             if self.watch_stream_enabled.load(Ordering::Acquire) {
-                match self.api.receive_watch_change().await? {
-                    Some((change, operation)) => {
-                        match self.dispatch_change(self.controller.clone(), change, operation) {
-                            Ok(CoreDispatchOutcome::Suppressed(_))
-                            | Ok(CoreDispatchOutcome::Admitted)
-                            | Ok(CoreDispatchOutcome::Coalesced) => continue,
-                            Err(CoreSourceError::WatchClosed) => return Ok(WatchEvent::Closed),
-                            Err(_) => return Err(WatchFailure::Fatal),
+                let mut signal_rx = self.watch_signal_rx.lock().await;
+                tokio::select! {
+                    change = self.api.receive_watch_change() => {
+                        match change? {
+                            Some((change, operation)) => {
+                                match self.dispatch_change(self.controller.clone(), change, operation) {
+                                    Ok(CoreDispatchOutcome::Suppressed(_))
+                                    | Ok(CoreDispatchOutcome::Admitted)
+                                    | Ok(CoreDispatchOutcome::Coalesced) => continue,
+                                    Err(CoreSourceError::WatchClosed) => return Ok(WatchEvent::Closed),
+                                    Err(_) => return Err(WatchFailure::Fatal),
+                                }
+                            }
+                            None => {
+                                self.watch_stream_enabled.store(false, Ordering::Release);
+                                self.watch
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .closed = true;
+                                continue;
+                            }
                         }
                     }
-                    None => return Ok(WatchEvent::Closed),
+                    signal = signal_rx.recv() => {
+                        if signal.is_none() {
+                            return Ok(WatchEvent::Closed);
+                        }
+                        continue;
+                    }
                 }
             }
             if self.watch_signal_rx.lock().await.recv().await.is_none() {

@@ -1588,6 +1588,7 @@ impl ResourceStoreBackend for SessionBoundStore {
 mod tests {
     use super::*;
     use d2b_resource_store::mutation_seal::StoreSealIdentity;
+    use d2b_resource_store_redb::AuthorityOperationState;
     use protobuf::{EnumOrUnknown, MessageField};
 
     fn test_identity() -> GuestIdentity {
@@ -1647,6 +1648,91 @@ mod tests {
             .await
             .expect("reopened store list");
         assert!(listed.resources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn target_local_authority_operation_rejoins_without_duplicate_rows() {
+        let directory = tempfile::tempdir().expect("state directory");
+        let identity = test_identity();
+        let first = GuestResourceRuntime::new(identity.clone(), directory.path())
+            .await
+            .expect("initial target-local runtime");
+        let active_generation = first.active_generation();
+        *active_generation.lock().expect("active generation") = Some(1);
+        let bound = SessionBoundStore {
+            store: Arc::clone(&first.store),
+            active_generation,
+            generation: 1,
+        };
+        let claim_digest = d2b_contracts_resource::v3::canonical_digest(
+            "d2b:test-guest-effect",
+            b"resource:1:generation:1",
+        );
+        let store_binding_digest = bound
+            .authority_binding_digest(&claim_digest)
+            .expect("store binding digest");
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "kind": "controller-effect",
+            "state": "pending",
+            "resourceUid": identity.guest_uid().as_str(),
+            "generation": 1,
+            "operationId": "effect:test",
+            "claimDigest": claim_digest,
+            "storeBindingDigest": store_binding_digest,
+            "assignment": {
+                "sessionGeneration": 1,
+                "epoch": 1,
+            },
+        }))
+        .expect("authority payload");
+        let first_capability = bound
+            .prepare_authority_operation(
+                "effect:test".to_owned(),
+                payload.clone(),
+                &claim_digest,
+            )
+            .await
+            .expect("prepare authority operation");
+        let second_capability = bound
+            .prepare_authority_operation("effect:test".to_owned(), payload, &claim_digest)
+            .await
+            .expect("idempotent authority operation");
+        let rows = bound
+            .authority_operations()
+            .await
+            .expect("read authority rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, AuthorityOperationState::Pending);
+        drop(first_capability);
+        drop(second_capability);
+        drop(bound);
+        drop(first);
+
+        let second = GuestResourceRuntime::new(identity, directory.path())
+            .await
+            .expect("reopened target-local runtime");
+        let active_generation = second.active_generation();
+        *active_generation.lock().expect("active generation") = Some(2);
+        let rebound = SessionBoundStore {
+            store: Arc::clone(&second.store),
+            active_generation,
+            generation: 2,
+        };
+        let resumed = rebound
+            .resume_authority_operation("effect:test".to_owned(), &store_binding_digest)
+            .await
+            .expect("resume pending authority operation");
+        resumed
+            .record_effect(AuthorityOperationState::EffectConfirmed)
+            .await
+            .expect("confirm resumed authority operation");
+        let rows = rebound
+            .authority_operations()
+            .await
+            .expect("read resumed authority row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, AuthorityOperationState::EffectConfirmed);
     }
 
     #[test]

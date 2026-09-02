@@ -1716,7 +1716,8 @@ impl ResourceReconciler for ProcessResourceReconciler {
             let mut runtime = self.runtime.for_pass();
             runtime.without_status_client();
             let observe_only = status_phase(&record.resource) == Some(ResourcePhase::Ready)
-                && status_observed_generation(&record.resource) == Some(record.resource.generation);
+                && status_observed_generation(&record.resource) == Some(record.resource.generation)
+                && status_has_started_at(&record.resource);
             let (phase, outcome, restart_count) = if observe_only {
                 match runtime.observe_existing_record(&record).await? {
                     ExistingProcessState::Alive => {
@@ -2164,6 +2165,13 @@ fn status_observed_generation(resource: &StoredResource) -> Option<ResourceGener
     u64::try_from(*generation)
         .ok()
         .and_then(|generation| ResourceGeneration::new(generation).ok())
+}
+
+fn status_has_started_at(resource: &StoredResource) -> bool {
+    matches!(
+        status_value(resource, "startedAt"),
+        Some(CanonicalJsonValue::String(value)) if !value.is_empty()
+    )
 }
 
 fn status_restart_count(resource: &StoredResource) -> u32 {
@@ -4456,10 +4464,10 @@ fn watch_observed_generation(
 }
 
 fn resource_deleting(canonical_resource: &[u8]) -> bool {
-        serde_json::from_slice::<serde_json::Value>(canonical_resource)
-            .ok()
-            .and_then(|value| value.pointer("/metadata/deletionRequestedAt").cloned())
-            .is_some_and(|value| !value.is_null())
+    serde_json::from_slice::<serde_json::Value>(canonical_resource)
+        .ok()
+        .and_then(|value| value.pointer("/metadata/deletionRequestedAt").cloned())
+        .is_some_and(|value| !value.is_null())
 }
 
 fn response_to_commit(failed: bool, revision: u64) -> Result<CommitOutcome, SourceError> {
@@ -5111,6 +5119,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![EPHEMERAL_PROCESS_TYPE, PROCESS_TYPE]
         );
-        assert!(descriptor.finalizers().is_empty());
+        assert!(descriptor.finalizers().is_empty(        ));
+    }
+
+    #[test]
+    fn persisted_ephemeral_completed_at_falls_back_when_cleanup_deadline_is_missing() {
+        let mut record = identity_record(1);
+        record.resource.resource_ref =
+            ResourceRef::parse("EphemeralProcess/completed").expect("ephemeral ref");
+        record.resource.canonical_json =
+            br#"{"status":{"phase":"Succeeded","completedAt":"1970-01-01T00:00:00.000Z"}}"#
+                .to_vec();
+        record.process = DesiredProcess::Ephemeral(
+            serde_json::from_str(
+                r#"{"executionRef":"Host/host-system","processClass":"worker","template":"reaction","successfulTtl":"1s","incidentHold":false}"#,
+            )
+            .expect("ephemeral spec"),
+        );
+        assert!(ephemeral_status_ttl_elapsed(
+            &record.resource,
+            &record.process
+        ));
     }
 }
