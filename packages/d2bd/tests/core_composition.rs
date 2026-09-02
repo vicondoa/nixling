@@ -126,7 +126,7 @@ fn volume_composition_refuses_to_spawn_when_a_provider_identity_is_missing() {
 
 #[test]
 fn provider_composition_builds_real_runner_descriptors_with_exact_fences() {
-    let mut provider_generations = U8_SHARED_PROVIDER_RUNNERS
+    let provider_generations = U8_SHARED_PROVIDER_RUNNERS
         .iter()
         .map(|registration| {
             (
@@ -186,7 +186,7 @@ fn provider_composition_builds_real_runner_descriptors_with_exact_fences() {
 #[test]
 fn provider_composition_rejects_a_missing_accepted_provider_before_runner_spawn() {
     let missing = ResourceRef::parse("Provider/device-gpu").unwrap();
-    let provider_generations = U8_SHARED_PROVIDER_RUNNERS
+    let mut provider_generations = U8_SHARED_PROVIDER_RUNNERS
         .iter()
         .filter_map(|registration| {
             let provider_ref = ResourceRef::parse(registration.provider_ref).unwrap();
