@@ -316,6 +316,16 @@ impl GpuController {
         self.authority_lease.is_some()
     }
 
+    /// Borrow the Core admission bound to this controller.
+    pub const fn admission(&self) -> Option<&GpuAuthorityAdmission> {
+        self.admission.as_ref()
+    }
+
+    /// Borrow the opaque device grants bound to this controller.
+    pub const fn tokens(&self) -> &GpuEffectTokenSet {
+        &self.tokens
+    }
+
     /// Return the current GPU process identity, if started or adopted.
     pub const fn gpu_identity(&self) -> Option<&GpuProcessIdentity> {
         self.gpu_identity.as_ref()

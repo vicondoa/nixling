@@ -800,6 +800,108 @@ pub(crate) fn reconcile_device_tpm(
     crate::block_on_future(controller.reconcile(&resource_effect))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconcile_device_tpm_controller(
+    state: &crate::ServerState,
+    resolver: &BundleResolver,
+    vm_id: VmId,
+    migration_intent_ref: BundleOpId,
+    migration_decision: LegacyTpmMigrationDecision,
+    admitted_device: AdmittedTpmDevice,
+    state_intent: StateDirIntent,
+    settings: SwtpmSettings,
+    binary: SignedBinaryRef,
+    caller_role: BrokerCallerRole,
+    controller: &mut TpmResourceController,
+) -> Result<TpmResourceOutcome, d2b_provider_device_tpm::TpmResourceControllerError> {
+    let AdmittedTpmDevice {
+        device_uid,
+        device_ref,
+        zone,
+        execution_ref,
+        lifecycle_authorization,
+    } = admitted_device;
+    let executor = LiveTpmEffectExecutor::new(
+        state,
+        resolver,
+        vm_id.clone(),
+        caller_role,
+        device_uid.clone(),
+        lifecycle_authorization,
+        migration_decision.requires_migration(),
+    );
+    let effect = ProductionTpmEffectPort::new(
+        state,
+        vm_id,
+        migration_intent_ref,
+        migration_decision,
+        executor,
+    );
+    let resource_effect = LiveTpmResourceEffectPort {
+        effect: Mutex::new(effect),
+        device_uid,
+        device_ref,
+        zone,
+        execution_ref,
+        state_intent,
+        settings,
+        binary,
+        preparation: Mutex::new(None),
+    };
+    crate::block_on_future(controller.reconcile(&resource_effect))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_device_tpm_controller(
+    state: &crate::ServerState,
+    resolver: &BundleResolver,
+    vm_id: VmId,
+    migration_intent_ref: BundleOpId,
+    migration_decision: LegacyTpmMigrationDecision,
+    admitted_device: AdmittedTpmDevice,
+    state_intent: StateDirIntent,
+    settings: SwtpmSettings,
+    binary: SignedBinaryRef,
+    caller_role: BrokerCallerRole,
+    controller: &mut TpmResourceController,
+) -> Result<TpmResourceOutcome, d2b_provider_device_tpm::TpmResourceControllerError> {
+    let AdmittedTpmDevice {
+        device_uid,
+        device_ref,
+        zone,
+        execution_ref,
+        lifecycle_authorization,
+    } = admitted_device;
+    let executor = LiveTpmEffectExecutor::new(
+        state,
+        resolver,
+        vm_id.clone(),
+        caller_role,
+        device_uid.clone(),
+        lifecycle_authorization,
+        migration_decision.requires_migration(),
+    );
+    let effect = ProductionTpmEffectPort::new(
+        state,
+        vm_id,
+        migration_intent_ref,
+        migration_decision,
+        executor,
+    );
+    let resource_effect = LiveTpmResourceEffectPort {
+        effect: Mutex::new(effect),
+        device_uid,
+        device_ref,
+        zone,
+        execution_ref,
+        state_intent,
+        settings,
+        binary,
+        preparation: Mutex::new(None),
+    };
+    crate::block_on_future(controller.finalize(&resource_effect))
+}
+
 struct LiveTpmResourceEffectPort<'a, E> {
     effect: Mutex<ProductionTpmEffectPort<'a, E>>,
     device_uid: ResourceUid,

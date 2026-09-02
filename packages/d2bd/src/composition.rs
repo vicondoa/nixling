@@ -81,13 +81,13 @@ use d2b_contracts_resource::v3::{
     },
     process::ProcessSpec,
 };
-#[cfg(test)]
 use d2b_contracts_resource::v3::ResourceBundleGenerationId;
+use d2b_contracts_resource::v3::network::NetworkSpec;
+#[cfg(test)]
+use d2b_contracts_resource::v3::ResourceErrorKind;
 #[cfg(test)]
 use d2b_contracts_resource::v3::{
-    ResourceErrorKind,
     guest::GuestSpec,
-    network::NetworkSpec,
     volume::{VolumeAttachment, VolumeSpec},
 };
 use d2b_contracts_resource::v3::{ResourceName, activation_nixos::NIXOS_GENERATION_RESOURCE_TYPE};
@@ -105,12 +105,12 @@ use d2b_core::bundle_resolver::{
     intent_id_keys_rotate, intent_id_legacy_runner, intent_id_migrate_host,
     intent_id_nft_host, intent_id_nm_unmanaged_host, intent_id_rotate_known_host, intent_id_trust,
 };
-#[cfg(test)]
 use d2b_core::bundle_resolver::{
     intent_id_network_bridge_uids, intent_id_network_hosts_uids, intent_id_network_projection_uids,
-    intent_id_network_route_uids, intent_id_network_sysctl_uids, intent_id_usbip_bind,
-    intent_id_usbip_firewall,
+    intent_id_network_route_uids, intent_id_network_sysctl_uids,
 };
+#[cfg(test)]
+use d2b_core::bundle_resolver::{intent_id_usbip_bind, intent_id_usbip_firewall};
 use d2b_core::closures::ClosureMetadata;
 use d2b_core::error::BundleError;
 use d2b_core::host::{HostJson, QemuMediaSourceIntent};
@@ -118,6 +118,8 @@ use d2b_core::host_check;
 use d2b_core::manifest_v04::{ManifestV04, VmEntry as ManifestVmEntry};
 use d2b_core::processes::{ProcessNode, ProcessRole, ProcessesJson, ReadinessPredicate};
 use d2b_core_controller::coordinator::{CoordinatorError, ZoneCoordinator};
+#[cfg(test)]
+use d2b_core_controller::{ResourceKey, ResourceSnapshot};
 use d2b_core_controller::zone_links::{
     BootstrapPsk, SealedEnrollment, ZoneLinkEffect, ZoneLinkError, ZoneLinkEvent,
     ZoneLinkKeyPolicy, ZoneLinkLimits, ZoneLinkRecord, ZoneLinkRouteBinding,
@@ -127,16 +129,18 @@ use d2b_host::ssh_keygen;
 use d2b_process_conformance::{ConfigurationDigest, GuestExecutionBinding};
 use d2b_provider_network_local::broker::resolve_tap_identity;
 use d2b_provider_network_local::controller::NetworkAdmissionProof;
+use d2b_provider_network_local::{
+    broker::NetworkEffectContext,
+    ifname::derive_network_child_name,
+};
 #[cfg(test)]
 use d2b_provider_network_local::{
     artifact::{ArtifactCatalogEntry, ArtifactKind},
-    broker::NetworkEffectContext,
     controller::{
         CONFIG_VOLUME_MAX_BYTES, NetworkAdmissionIntent, NetworkAdmissionKey, NetworkConfigContent,
         NetworkEffectError, NetworkReconciler, NetworkResourcePort, ReconcileInput,
         ReconcileProgress,
     },
-    ifname::derive_network_child_name,
     observe::observe_host_network,
 };
 use d2b_provider_shell_terminal::{
@@ -234,9 +238,9 @@ pub use d2bd_runtime::runtime_process::{
     sd_notify_payload, sd_notify_ready, sd_notify_status, validate_lock_parent,
     write_daemon_version_file,
 };
-use d2bd_runtime::runtime_util::{block_on_future, duplicate_received_fd, hex_bytes};
-#[cfg(test)]
-use d2bd_runtime::runtime_util::projection_digest_bytes;
+use d2bd_runtime::runtime_util::{
+    block_on_future, duplicate_received_fd, hex_bytes, projection_digest_bytes,
+};
 #[cfg(test)]
 use d2bd_runtime::shell_backend::shell_poll_timeout;
 use d2bd_runtime::shell_backend::{
@@ -7501,9 +7505,7 @@ fn resolve_volume_storage_ref(
     Ok(BundleOpId::new(storage_id))
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-fn resolve_network_effect_context(
+pub(crate) fn resolve_network_effect_context(
     resource: &Value,
     resolver: &BundleResolver,
     admission: &NetworkAdmissionProof,
@@ -8177,8 +8179,6 @@ struct Wave6NetworkEffectRequest<'a> {
     ensure_host_base: bool,
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 fn parse_committed_network_spec(
     resource: &Value,
 ) -> Result<NetworkSpec, resource_runtime::ResourceRuntimeError> {
@@ -8350,7 +8350,7 @@ fn release_completed_network_admission(
 
 #[cfg(test)]
 #[allow(dead_code)]
-fn resolve_network_admission(
+pub(crate) fn resolve_network_admission(
     state: &ServerState,
     runtime: &resource_runtime::ZoneResourceRuntime,
     peer: &PeerIdentity,
@@ -26603,6 +26603,43 @@ mod detached_exec_routing_tests {
         PeerIdentity {
             role: PeerRole::Admin,
             uid: 4242,
+        }
+    }
+
+    #[tokio::test]
+    async fn production_u8_effects_fail_closed_without_authoritative_runtime() {
+        let state = test_state(exec_session::ExecSessionCaps::default());
+        let effects = resource_runtime::DaemonSharedProviderEffects::new(
+            Arc::new(state),
+            ZoneId::parse("work").unwrap(),
+        );
+        for registration in resource_runtime::U8_SHARED_PROVIDER_RUNNERS {
+            let resource_ref =
+                ResourceRef::parse(&format!("{}/u8-test", registration.resource_type)).unwrap();
+            let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+            let resource = ResourceSnapshot::new(
+                ResourceKey::new(
+                    ZoneId::parse("work").unwrap(),
+                    resource_ref,
+                    uid,
+                ),
+                ZoneRevision::new(1),
+                ResourceGeneration::new(1).unwrap(),
+                serde_json::to_vec(&serde_json::json!({
+                    "type": registration.resource_type,
+                    "metadata": {"uid": "123e4567-e89b-42d3-a456-426614174000"},
+                    "spec": {"providerRef": registration.provider_ref},
+                    "status": {"phase": "Pending"}
+                }))
+                .unwrap(),
+                false,
+            );
+            assert!(!matches!(
+                effects
+                    .test_reconcile_registration(registration, &resource)
+                    .await,
+                Ok(resource_runtime::SharedProviderEffectPhase::Ready)
+            ));
         }
     }
 

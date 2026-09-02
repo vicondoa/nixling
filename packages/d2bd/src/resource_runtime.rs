@@ -11,6 +11,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
+    os::fd::{AsRawFd, OwnedFd},
     path::Path,
     sync::{
         Arc, Mutex,
@@ -71,7 +72,7 @@ use d2b_contracts_resource::v3::{
 };
 use d2b_contracts_zone_session::v3::{ZoneStatusResource, resource_bundle::ResourceBundle};
 use d2b_core_controller::authority::{
-    AuthorityRequest, AuthorityReservation, ExternalNicClaimRequest, ExternalNicRecoveryInventory,
+    AuthorityLease, AuthorityRequest, AuthorityReservation, ExternalNicClaimRequest, ExternalNicRecoveryInventory,
     ExternalNicReservation, HostGlobalAuthorityIndex, TrustedExternalNicInventory,
 };
 use d2b_core_controller::authority_persistence::AuthorityRecoveryCoordinator;
@@ -112,6 +113,7 @@ use d2b_provider_network_local::{
     observe::{HostNetworkOccupancy, observe_host_network},
     routes::RouteTuple,
 };
+use d2b_provider_device_gpu::GpuLifecycleEffectPort;
 use d2b_provider_notification_desktop::{Category, GuestSourceConfig, NotificationProviderConfig};
 use d2b_provider_runtime_cloud_hypervisor::{
     AuthenticatedResourceApiAdapter, AuthenticatedResourceSession, BootstrapGraph, ChildRole,
@@ -682,6 +684,20 @@ pub(crate) struct DaemonSharedProviderEffects {
             crate::usbip_production::AuthorityLedger,
         >,
     >,
+    usbip_services: Arc<Mutex<BTreeSet<ResourceUid>>>,
+    gpu_controllers: Arc<Mutex<BTreeMap<ResourceUid, d2b_provider_device_gpu::GpuController>>>,
+    gpu_authority_leases: Arc<Mutex<BTreeMap<[u8; 16], AuthorityLease>>>,
+    gpu_processes: Arc<
+        Mutex<
+            BTreeMap<
+                (ResourceUid, u8),
+                d2b_provider_device_gpu::GpuProcessIdentity,
+            >,
+        >,
+    >,
+    gpu_opened_devices: Arc<Mutex<BTreeMap<ResourceUid, Vec<OwnedFd>>>>,
+    tpm_controllers:
+        Arc<Mutex<BTreeMap<ResourceUid, d2b_provider_device_tpm::TpmResourceController>>>,
 }
 
 impl DaemonSharedProviderEffects {
@@ -690,7 +706,48 @@ impl DaemonSharedProviderEffects {
             state,
             zone,
             usbip_ledger: crate::usbip_production::new_authority_ledger(),
+            usbip_services: Arc::new(Mutex::new(BTreeSet::new())),
+            gpu_controllers: Arc::new(Mutex::new(BTreeMap::new())),
+            gpu_authority_leases: Arc::new(Mutex::new(BTreeMap::new())),
+            gpu_processes: Arc::new(Mutex::new(BTreeMap::new())),
+            gpu_opened_devices: Arc::new(Mutex::new(BTreeMap::new())),
+            tpm_controllers: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_reconcile_registration(
+        &self,
+        registration: SharedProviderRunnerRegistration,
+        resource: &ResourceSnapshot,
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let controller_ref = ResourceRef::parse(registration.controller_ref)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let provider_ref = ResourceRef::parse(registration.provider_ref)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let identity = ControllerIdentity::new(
+            resource.key().zone().clone(),
+            controller_ref.clone(),
+            ControllerGeneration::new(1)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+            provider_ref,
+            ResourceGeneration::new(1)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+            controller_ref,
+            ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+            None,
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let context = SharedProviderEffectContext {
+            identity,
+            target: resource.key().clone(),
+            operation_id: "test-daemon-provider-effect".to_owned(),
+        };
+        let kind = SharedProviderResourceKind::from_registration(registration)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        <Self as SharedProviderEffectExecutor>::reconcile(self, kind, &context, resource, &[])
+            .await
     }
 
     fn validate(
@@ -761,11 +818,21 @@ impl DaemonSharedProviderEffects {
             .and_then(Value::as_str)
             .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
             .ok_or(SharedProviderEffectError::InvalidResource)?;
+        if device.pointer("/spec/providerRef").and_then(Value::as_str)
+                != Some(d2b_provider_device_usbip::PROVIDER_REF)
+            || device.pointer("/status/phase").and_then(Value::as_str) != Some("Ready")
+        {
+            return Err(SharedProviderEffectError::Unavailable);
+        }
         let env = value
             .pointer("/spec/env")
             .and_then(Value::as_str)
             .unwrap_or(resource.key().resource_ref().name().as_str());
-        let physical_key: [u8; 32] = Sha256::digest(device_uid.as_str().as_bytes()).into();
+        let physical_key =
+            d2b_core::device_usbip_adapter::UsbipCoreAdapter::physical_usb_backing_key(
+                device_uid.as_str().as_bytes(),
+            )
+            .as_bytes();
         let binding_context = crate::usbip_production::UsbipBindingContext::new(
             resource.key().resource_ref().name().as_str(),
             env,
@@ -799,6 +866,459 @@ impl DaemonSharedProviderEffects {
                 == Some(true)
         })
     }
+
+    async fn network_admission(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        resource: &ResourceSnapshot,
+        value: &Value,
+        spec: &d2b_contracts_resource::v3::network::NetworkSpec,
+        resolver: &d2b_core::bundle_resolver::BundleResolver,
+        operation_id: &str,
+    ) -> Result<NetworkAdmissionProof, SharedProviderEffectError> {
+        let zone_uid = runtime
+            .authority_zone_uid()
+            .cloned()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let network_generation = resource.generation();
+        let network_ref = resource.key().resource_ref().to_canonical_string();
+        let mut guest_uids = Vec::new();
+        let mut attachment_generation = network_generation.get();
+        for attachment in spec.attachments() {
+            let attached = self
+                .stored_resource(
+                    runtime,
+                    attachment.execution_ref(),
+                    None,
+                    operation_id,
+                )
+                .await?;
+            if attached.zone != self.zone {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+            attachment_generation = attachment_generation.max(attached.generation.get());
+            if attachment.execution_ref().resource_type().as_str() == "Guest" {
+                guest_uids.push(attached.uid);
+            }
+            let attached_value = serde_json::from_slice::<Value>(&attached.canonical_json)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            let reciprocal = attached_value
+                .pointer("/spec/networkAttachments")
+                .and_then(Value::as_array)
+                .is_some_and(|attachments| {
+                    attachments.iter().any(|candidate| {
+                        candidate.get("networkRef").and_then(Value::as_str)
+                            == Some(network_ref.as_str())
+                    })
+                });
+            if !reciprocal {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+        }
+        for guest in runtime
+            .committed_resources_of_type("Guest")
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+        {
+            let attached = guest
+                .pointer("/spec/networkAttachments")
+                .and_then(Value::as_array)
+                .is_some_and(|attachments| {
+                    attachments.iter().any(|candidate| {
+                        candidate.get("networkRef").and_then(Value::as_str)
+                            == Some(network_ref.as_str())
+                    })
+                });
+            if !attached {
+                continue;
+            }
+            if guest.pointer("/metadata/zone").and_then(Value::as_str)
+                != Some(self.zone.as_str())
+            {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+            let guest_uid = guest
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+                .ok_or(SharedProviderEffectError::InvalidResource)?;
+            guest_uids.push(guest_uid);
+            let generation = guest
+                .pointer("/metadata/generation")
+                .and_then(Value::as_u64)
+                .and_then(|value| ResourceGeneration::new(value).ok())
+                .ok_or(SharedProviderEffectError::InvalidResource)?;
+            attachment_generation = attachment_generation.max(generation.get());
+        }
+        let installed_generation = resolver
+            .installed_generation_identity()
+            .and_then(|identity| ResourceBundleGenerationId::parse(identity.as_str().to_owned()).ok())
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        if value.pointer("/metadata/uid").and_then(Value::as_str)
+            != Some(resource.key().uid().as_str())
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let attachment_generation = ResourceGeneration::new(attachment_generation)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let intent = NetworkAdmissionIntent::new(
+            NetworkAdmissionKey::new(
+                zone_uid,
+                resource.key().uid().clone(),
+                network_generation,
+                attachment_generation,
+                installed_generation,
+            ),
+            spec.clone(),
+            guest_uids,
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let plane = self
+            .state
+            .resource_plane
+            .lock()
+            .ok()
+            .and_then(|plane| plane.clone())
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let occupancy =
+            observe_host_network().map_err(|_| SharedProviderEffectError::Unavailable)?;
+        plane
+            .network_admission_index()
+            .lock()
+            .await
+            .admit(intent, &occupancy)
+            .map_err(|_| SharedProviderEffectError::Unavailable)
+    }
+
+    fn gpu_digest(
+        domain: &str,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        assignment_epoch: u64,
+        extra: &str,
+    ) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(domain.as_bytes());
+        digest.update([0]);
+        digest.update(resource.key().uid().as_str().as_bytes());
+        digest.update([0]);
+        digest.update(context.identity.provider_generation().get().to_be_bytes());
+        digest.update(context.identity.controller_generation().get().to_be_bytes());
+        digest.update(assignment_epoch.to_be_bytes());
+        digest.update(extra.as_bytes());
+        digest.finalize().into()
+    }
+
+    async fn gpu_admission(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        value: &Value,
+    ) -> Result<
+        (
+            Arc<ZoneResourceRuntime>,
+            d2b_provider_device_gpu::GpuAuthorityAdmission,
+            d2b_provider_device_gpu::GpuEffectTokenSet,
+            d2b_provider_device_gpu::GpuSettings,
+            ResourceRef,
+        ),
+        SharedProviderEffectError,
+    > {
+        let runtime = self.runtime()?;
+        if runtime.authority_zone_uid().is_none() {
+            return Err(SharedProviderEffectError::Unavailable);
+        }
+        let holder_ref = Self::owner_ref(value)?;
+        if !matches!(holder_ref.resource_type().as_str(), "Guest" | "Host") {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let _holder = self
+            .stored_resource(&runtime, &holder_ref, None, &context.operation_id)
+            .await?;
+        let hosts = runtime
+            .committed_resources_of_type("Host")
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let [host] = hosts.as_slice() else {
+            return Err(SharedProviderEffectError::InvalidResource);
+        };
+        let host_uid = host
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        let settings: d2b_provider_device_gpu::GpuSettings =
+            match value.pointer("/spec/provider/settings") {
+                Some(settings) => serde_json::from_value(settings.clone())
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+                None => d2b_provider_device_gpu::GpuSettings::default(),
+            };
+        let arbitration: d2b_contracts_resource::v3::device::DeviceArbitration =
+            serde_json::from_value(
+                value
+                    .pointer("/spec/arbitration")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("exclusive".to_owned())),
+            )
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let max_holders = value
+            .pointer("/spec/maxConcurrentClaims")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(1);
+        let session_generation = runtime
+            .core_controller_subject
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .as_ref()
+            .map(|subject| subject.reconnect_generation().get())
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let assignment = runtime
+            .store
+            .assignment_fence(self.zone.clone(), resource.key().resource_ref().clone())
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        if assignment.epoch == 0
+            || assignment.provider_generation != context.identity.provider_generation()
+            || assignment.controller_generation != context.identity.controller_generation()
+            || assignment.controller_role != *context.identity.controller_ref()
+            || assignment.target
+                != ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?
+            || assignment.session_generation.get() != session_generation
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let assignment_epoch = assignment.epoch;
+        let mut backing_digest = Self::gpu_digest(
+            "d2b:gpu-backing/v2",
+            context,
+            resource,
+            assignment_epoch,
+            "backing",
+        );
+        backing_digest[..8].copy_from_slice(&session_generation.to_be_bytes());
+        let platform_digest = Self::gpu_digest(
+            "d2b:gpu-platform/v2",
+            context,
+            resource,
+            assignment_epoch,
+            host_uid.as_str(),
+        );
+        let gpu_principal_digest = Self::gpu_digest(
+            "d2b:gpu-principal/v2",
+            context,
+            resource,
+            assignment_epoch,
+            "gpu",
+        );
+        let owner = d2b_provider_device_gpu::GpuOwnerProof::new(
+            ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+            holder_ref.clone(),
+            resource.key().uid().clone(),
+            host_uid,
+            resource.generation(),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let mut admission = d2b_provider_device_gpu::GpuAuthorityAdmission::new(
+            owner,
+            d2b_provider_device_gpu::GpuBackingToken::from_core(backing_digest),
+            d2b_provider_device_gpu::GpuPlatformToken::from_core(platform_digest),
+            arbitration,
+            u32::try_from(max_holders).map_err(|_| SharedProviderEffectError::InvalidResource)?,
+            settings.render_node_only,
+            d2b_provider_device_gpu::GpuPrincipalToken::from_core(gpu_principal_digest),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        if settings.video_sidecar {
+            admission = admission
+                .with_video_principal(d2b_provider_device_gpu::GpuPrincipalToken::from_core(
+                    Self::gpu_digest(
+                        "d2b:gpu-principal/v2",
+                        context,
+                        resource,
+                        assignment_epoch,
+                        "video",
+                    ),
+                ))
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        }
+        let mut token_values = vec!["dri"];
+        if !settings.render_node_only {
+            token_values.extend(["kvm", "udmabuf"]);
+        }
+        if settings.video_sidecar && settings.video_nvidia_decode {
+            token_values.extend(["nvidia-ctl", "nvidia-device", "nvidia-uvm"]);
+        }
+        let tokens = d2b_provider_device_gpu::GpuEffectTokenSet::from_core(
+            token_values
+                .into_iter()
+                .map(|device_class| {
+                    d2b_provider_device_gpu::GpuEffectToken::from_core(Self::gpu_digest(
+                        "d2b:gpu-device-grant/v2",
+                        context,
+                        resource,
+                        assignment_epoch,
+                        device_class,
+                    ))
+                })
+                .collect(),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        Ok((runtime, admission, tokens, settings, holder_ref))
+    }
+
+    async fn stored_resource(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        target: &ResourceRef,
+        expected_uid: Option<ResourceUid>,
+        operation_id: &str,
+    ) -> Result<StoredResource, SharedProviderEffectError> {
+        let resource = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: operation_id.to_owned(),
+                    idempotency_key: None,
+                    correlation_id: operation_id.to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: target.clone(),
+                expected_uid,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if resource.zone != self.zone || resource.resource_ref != *target {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        Ok(resource)
+    }
+
+    async fn reconcile_binding_children(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        owner: &ResourceSnapshot,
+        desired: d2b_contracts_provider::v3::semantic_services::child_resources::BindingChildSet,
+        operation_id: &str,
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let owner = self
+            .stored_resource(
+                runtime,
+                owner.key().resource_ref(),
+                Some(owner.key().uid().clone()),
+                operation_id,
+            )
+            .await?;
+        let owner_ref = owner.resource_ref.clone();
+        let client = runtime
+            .process_resource_client()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let converged = crate::binding_child_resource_runtime::reconcile_binding_children(
+            &runtime.store,
+            &client,
+            &self.zone,
+            &[crate::binding_child_resource_runtime::BindingChildOwner {
+                resource: owner,
+                desired: Some(desired),
+                fenced: false,
+            }],
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        Ok(if converged.contains(&owner_ref) {
+            SharedProviderEffectPhase::Ready
+        } else {
+            SharedProviderEffectPhase::Pending
+        })
+    }
+
+    async fn cleanup_binding_children(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        owner: &ResourceSnapshot,
+        operation_id: &str,
+    ) -> Result<bool, SharedProviderEffectError> {
+        let stored = self
+            .stored_resource(
+                runtime,
+                owner.key().resource_ref(),
+                Some(owner.key().uid().clone()),
+                operation_id,
+            )
+            .await?;
+        let children = crate::binding_child_resource_runtime::list_binding_children(
+            &runtime.store,
+            &self.zone,
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let has_children = children.iter().any(|child| {
+            ResourceEnvelope::from_json(&child.canonical_json)
+                .ok()
+                .and_then(|envelope| envelope.metadata().owner_ref().cloned())
+                == Some(stored.resource_ref.clone())
+        });
+        if !has_children {
+            return Ok(true);
+        }
+        let client = runtime
+            .process_resource_client()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        crate::binding_child_resource_runtime::reconcile_binding_children(
+            &runtime.store,
+            &client,
+            &self.zone,
+            &[crate::binding_child_resource_runtime::BindingChildOwner {
+                resource: stored,
+                desired: None,
+                fenced: false,
+            }],
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let remaining = crate::binding_child_resource_runtime::list_binding_children(
+            &runtime.store,
+            &self.zone,
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        Ok(!remaining.iter().any(|child| {
+            ResourceEnvelope::from_json(&child.canonical_json)
+                .ok()
+                .and_then(|envelope| envelope.metadata().owner_ref().cloned())
+                == Some(owner.key().resource_ref().clone())
+        }))
+    }
+
+    fn take_gpu_opened_devices(
+        &self,
+        device_uid: &ResourceUid,
+    ) -> Result<Vec<OwnedFd>, SharedProviderEffectError> {
+        Ok(self
+            .gpu_opened_devices
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .remove(device_uid)
+            .unwrap_or_default())
+    }
+
+    fn retain_gpu_opened_devices(
+        &self,
+        device_uid: &ResourceUid,
+        opened_devices: Vec<OwnedFd>,
+    ) -> Result<(), SharedProviderEffectError> {
+        self.gpu_opened_devices
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .insert(device_uid.clone(), opened_devices);
+        Ok(())
+    }
 }
 
 fn tpm_opaque_bytes(domain: &str, value: &str) -> [u8; 32] {
@@ -829,63 +1349,345 @@ fn tpm_state_intent(
     )
 }
 
-struct SharedRunnerNetworkResources;
+struct SharedRunnerNetworkResources {
+    runtime: Arc<ZoneResourceRuntime>,
+    owner_ref: ResourceRef,
+    guest_ref: ResourceRef,
+    volume_ref: ResourceRef,
+    agent_ref: ResourceRef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedRunnerNetworkReadiness {
+    volume_ready: bool,
+    guest_ready: bool,
+    attachment_ready: bool,
+}
+
+impl SharedRunnerNetworkResources {
+    fn new(runtime: Arc<ZoneResourceRuntime>, owner_ref: ResourceRef, network_uid: &ResourceUid) -> Self {
+        let guest_name = d2b_provider_network_local::ifname::derive_network_child_name(network_uid, "vm");
+        let agent_name =
+            d2b_provider_network_local::ifname::derive_network_child_name(network_uid, "agent");
+        Self {
+            runtime,
+            owner_ref,
+            guest_ref: ResourceRef::parse(&format!("Guest/{guest_name}"))
+                .expect("derived Network Guest ref is valid"),
+            volume_ref: ResourceRef::parse("Volume/net-config")
+                .expect("Network config Volume ref is valid"),
+            agent_ref: ResourceRef::parse(&format!("Process/{agent_name}"))
+                .expect("derived Network agent ref is valid"),
+        }
+    }
+
+    fn client(
+        &self,
+    ) -> Result<
+        Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+        NetworkEffectError,
+    > {
+        self.runtime
+            .process_resource_client()
+            .ok_or(NetworkEffectError::ConfigVolume)
+    }
+
+    async fn current(&self, target: &ResourceRef) -> Result<Option<Value>, NetworkEffectError> {
+        match self
+            .runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "shared-network-child-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "shared-network-child-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.runtime.zone.clone(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+        {
+            Ok(resource) => serde_json::from_slice(&resource.canonical_json)
+                .map(Some)
+                .map_err(|_| NetworkEffectError::ConfigVolume),
+            Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => Ok(None),
+            Err(_) => Err(NetworkEffectError::ConfigVolume),
+        }
+    }
+
+    async fn upsert(
+        &self,
+        target: &ResourceRef,
+        spec: Value,
+        operation: &str,
+    ) -> Result<(), NetworkEffectError> {
+        upsert_shared_provider_child(
+            &self.runtime,
+            target,
+            spec,
+            &self.owner_ref,
+            operation,
+        )
+        .await
+    }
+
+    async fn delete(&self, target: &ResourceRef, operation: &str) -> Result<(), NetworkEffectError> {
+        let Some(current) = self.current(target).await? else {
+            return Ok(());
+        };
+        let uid = current
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        let revision = current
+            .pointer("/metadata/revision")
+            .and_then(Value::as_u64)
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        let request = public_delete_request(
+            &self.runtime,
+            &json!({
+                "resourceRef": target.to_canonical_string(),
+                "uid": uid.as_str(),
+                "expectedRevision": revision,
+            }),
+            operation,
+        )
+        .await
+        .map_err(|_| NetworkEffectError::ConfigVolume)?;
+        if self.client()?.delete(request).await.error.is_some() {
+            return Err(NetworkEffectError::ConfigVolume);
+        }
+        Ok(())
+    }
+
+    async fn readiness(&self) -> Result<SharedRunnerNetworkReadiness, NetworkEffectError> {
+        let volume = self.current(&self.volume_ref).await?;
+        let guest = self.current(&self.guest_ref).await?;
+        let volume_ready = volume.as_ref().is_some_and(|value| {
+            value.pointer("/metadata/ownerRef").and_then(Value::as_str)
+                == Some(self.owner_ref.to_canonical_string().as_str())
+                && value.pointer("/status/phase").and_then(Value::as_str) == Some("Ready")
+        });
+        let guest_ready = guest.as_ref().is_some_and(|value| {
+            value.pointer("/metadata/ownerRef").and_then(Value::as_str)
+                == Some(self.owner_ref.to_canonical_string().as_str())
+                && value.pointer("/status/phase").and_then(Value::as_str) == Some("Ready")
+        });
+        let attachment_ready = volume.as_ref().is_some_and(|value| {
+            value.pointer("/status/phase").and_then(Value::as_str) == Some("Ready")
+                && value
+                    .pointer("/spec/attachments")
+                    .and_then(Value::as_array)
+                    .is_some_and(|attachments| {
+                        attachments.iter().any(|attachment| {
+                            attachment
+                                .get("executionRef")
+                                .and_then(Value::as_str)
+                                == Some(self.guest_ref.to_canonical_string().as_str())
+                        })
+                    })
+        });
+        Ok(SharedRunnerNetworkReadiness {
+            volume_ready,
+            guest_ready,
+            attachment_ready,
+        })
+    }
+}
 
 impl NetworkResourcePort for SharedRunnerNetworkResources {
     async fn upsert_volume_backing(
         &self,
-        _spec: &d2b_contracts_resource::v3::volume::VolumeSpec,
+        spec: &d2b_contracts_resource::v3::volume::VolumeSpec,
     ) -> Result<(), NetworkEffectError> {
-        Ok(())
+        let mut value = serde_json::to_value(spec).map_err(|_| NetworkEffectError::ConfigVolume)?;
+        value
+            .as_object_mut()
+            .ok_or(NetworkEffectError::ConfigVolume)?
+            .insert(
+                "providerRef".to_owned(),
+                Value::String("Provider/volume-local".to_owned()),
+            );
+        self.upsert(
+            &self.volume_ref,
+            value,
+            "shared-network-volume-upsert",
+        )
+        .await
     }
 
     async fn write_volume_content(
         &self,
         _content: &d2b_provider_network_local::controller::NetworkConfigContent,
     ) -> Result<(), NetworkEffectError> {
-        Ok(())
+        self.current(&self.volume_ref)
+            .await?
+            .map(|_| ())
+            .ok_or(NetworkEffectError::ConfigVolume)
     }
 
     async fn upsert_guest(
         &self,
-        _spec: &d2b_contracts_resource::v3::guest::GuestSpec,
+        spec: &d2b_contracts_resource::v3::guest::GuestSpec,
     ) -> Result<(), NetworkEffectError> {
-        Ok(())
+        let mut value = serde_json::to_value(spec).map_err(|_| NetworkEffectError::ConfigVolume)?;
+        value
+            .as_object_mut()
+            .ok_or(NetworkEffectError::ConfigVolume)?
+            .insert(
+                "providerRef".to_owned(),
+                Value::String("Provider/runtime-cloud-hypervisor".to_owned()),
+            );
+        self.upsert(&self.guest_ref, value, "shared-network-guest-upsert")
+            .await
     }
 
     async fn attach_volume(
         &self,
-        _attachment: &d2b_contracts_resource::v3::volume::VolumeAttachment,
+        attachment: &d2b_contracts_resource::v3::volume::VolumeAttachment,
     ) -> Result<(), NetworkEffectError> {
-        Ok(())
+        let current = self
+            .current(&self.volume_ref)
+            .await?
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        let mut spec = current
+            .get("spec")
+            .cloned()
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        let attachments = spec
+            .as_object_mut()
+            .ok_or(NetworkEffectError::ConfigVolume)?
+            .entry("attachments")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let attachments = attachments
+            .as_array_mut()
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        let attachment = serde_json::to_value(attachment)
+            .map_err(|_| NetworkEffectError::ConfigVolume)?;
+        if !attachments.iter().any(|current| current == &attachment) {
+            attachments.push(attachment);
+        }
+        self.upsert(&self.volume_ref, spec, "shared-network-volume-attach")
+            .await
     }
 
     async fn upsert_agent(
         &self,
-        _spec: &d2b_contracts_resource::v3::process::ProcessSpec,
+        spec: &d2b_contracts_resource::v3::process::ProcessSpec,
     ) -> Result<(), NetworkEffectError> {
-        Ok(())
+        let mut value = serde_json::to_value(spec).map_err(|_| NetworkEffectError::ConfigVolume)?;
+        value
+            .as_object_mut()
+            .ok_or(NetworkEffectError::ConfigVolume)?
+            .insert(
+                "providerRef".to_owned(),
+                Value::String("Provider/system-minijail".to_owned()),
+            );
+        self.upsert(&self.agent_ref, value, "shared-network-agent-upsert")
+            .await
     }
 
-    async fn reconcile_mdns(&self, _enabled: bool) -> Result<(), NetworkEffectError> {
+    async fn reconcile_mdns(&self, enabled: bool) -> Result<(), NetworkEffectError> {
+        if enabled {
+            return Err(NetworkEffectError::ConfigVolume);
+        }
         Ok(())
     }
 
     async fn delete_processes(&self) -> Result<(), NetworkEffectError> {
-        Ok(())
+        self.delete(&self.agent_ref, "shared-network-agent-delete")
+            .await
     }
 
     async fn detach_volume(&self) -> Result<(), NetworkEffectError> {
-        Ok(())
+        let Some(current) = self.current(&self.volume_ref).await? else {
+            return Ok(());
+        };
+        let mut spec = current
+            .get("spec")
+            .cloned()
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        if let Some(attachments) = spec
+            .as_object_mut()
+            .and_then(|spec| spec.get_mut("attachments"))
+            .and_then(Value::as_array_mut)
+        {
+            attachments.retain(|attachment| {
+                attachment
+                    .get("executionRef")
+                    .and_then(Value::as_str)
+                    != Some(self.guest_ref.to_canonical_string().as_str())
+            });
+        }
+        self.upsert(&self.volume_ref, spec, "shared-network-volume-detach")
+            .await
     }
 
     async fn delete_guest(&self) -> Result<(), NetworkEffectError> {
-        Ok(())
+        self.delete(&self.guest_ref, "shared-network-guest-delete")
+            .await
     }
 
     async fn delete_volume(&self) -> Result<(), NetworkEffectError> {
-        Ok(())
+        self.delete(&self.volume_ref, "shared-network-volume-delete")
+            .await
     }
+}
+
+async fn upsert_shared_provider_child(
+    runtime: &ZoneResourceRuntime,
+    target: &ResourceRef,
+    spec: Value,
+    owner_ref: &ResourceRef,
+    operation: &str,
+) -> Result<(), NetworkEffectError> {
+    let client = runtime
+        .process_resource_client()
+        .ok_or(NetworkEffectError::ConfigVolume)?;
+    let create = public_create_request(
+        runtime,
+        &json!({
+            "resourceType": target.resource_type().to_canonical_string(),
+            "resourceName": target.name().as_str(),
+            "spec": spec.clone(),
+            "ownerRef": owner_ref.to_canonical_string(),
+        }),
+        operation,
+    )
+    .await
+    .map_err(|_| NetworkEffectError::ConfigVolume)?;
+    if client.create(create).await.error.is_none() {
+        return Ok(());
+    }
+    let current = runtime
+        .committed_resource_value(target, operation)
+        .await
+        .map_err(|_| NetworkEffectError::ConfigVolume)?;
+    let expected_owner = owner_ref.to_canonical_string();
+    if current
+        .pointer("/metadata/ownerRef")
+        .and_then(Value::as_str)
+        != Some(expected_owner.as_str())
+    {
+        return Err(NetworkEffectError::NetworkAdmissionMismatch);
+    }
+    let update = public_update_spec_request_from_current(
+        runtime,
+        &json!({"spec": spec}),
+        operation,
+        target,
+        current,
+    )
+    .map_err(|_| NetworkEffectError::ConfigVolume)?;
+    if client.update_spec(update).await.error.is_some() {
+        return Err(NetworkEffectError::ConfigVolume);
+    }
+    Ok(())
 }
 
 struct SharedRunnerUsbipChildren;
@@ -899,7 +1701,7 @@ impl crate::usbip_production::UsbipChildResourcePort for SharedRunnerUsbipChildr
         d2b_provider_device_usbip::AttachProcessIdentity,
         d2b_provider_device_usbip::BindingLifecycleError,
     > {
-        Ok(d2b_provider_device_usbip::AttachProcessIdentity::from_adapter(1, 1))
+        Err(d2b_provider_device_usbip::BindingLifecycleError::Transient)
     }
 
     fn observe_attach_process(
@@ -910,10 +1712,7 @@ impl crate::usbip_production::UsbipChildResourcePort for SharedRunnerUsbipChildr
         d2b_provider_device_usbip::AttachmentObservation,
         d2b_provider_device_usbip::BindingLifecycleError,
     > {
-        Ok(d2b_provider_device_usbip::AttachmentObservation::Matching {
-            slot: d2b_provider_device_usbip::BindingSlotLease::from_adapter([1; 16]),
-            proxy: d2b_provider_device_usbip::BindingProxyLease::from_adapter([2; 16]),
-        })
+        Err(d2b_provider_device_usbip::BindingLifecycleError::Transient)
     }
 
     fn delete_guest_endpoint(
@@ -921,7 +1720,7 @@ impl crate::usbip_production::UsbipChildResourcePort for SharedRunnerUsbipChildr
         _binding: &d2b_provider_device_usbip::BindingIdentity,
         _proxy: &d2b_provider_device_usbip::BindingProxyLease,
     ) -> Result<(), d2b_provider_device_usbip::BindingLifecycleError> {
-        Ok(())
+        Err(d2b_provider_device_usbip::BindingLifecycleError::Transient)
     }
 
     fn delete_attach_process(
@@ -929,84 +1728,535 @@ impl crate::usbip_production::UsbipChildResourcePort for SharedRunnerUsbipChildr
         _binding: &d2b_provider_device_usbip::BindingIdentity,
         _identity: &d2b_provider_device_usbip::AttachProcessIdentity,
     ) -> Result<(), d2b_provider_device_usbip::BindingLifecycleError> {
-        Ok(())
+        Err(d2b_provider_device_usbip::BindingLifecycleError::Transient)
     }
 }
 
-struct SharedRunnerGpuAuthorityGate;
+struct DaemonGpuLifecyclePort {
+    state: Arc<ServerState>,
+    runtime: Arc<ZoneResourceRuntime>,
+    resolver: d2b_core::bundle_resolver::BundleResolver,
+    device_ref: ResourceRef,
+    device_uid: ResourceUid,
+    holder_ref: ResourceRef,
+    generation: ResourceGeneration,
+    settings: d2b_provider_device_gpu::GpuSettings,
+    operation_id: String,
+    authority_leases: Arc<Mutex<BTreeMap<[u8; 16], AuthorityLease>>>,
+    processes: Arc<
+        Mutex<
+            BTreeMap<
+                (ResourceUid, u8),
+                d2b_provider_device_gpu::GpuProcessIdentity,
+            >,
+        >,
+    >,
+    opened_devices: Vec<OwnedFd>,
+}
 
-impl d2b_provider_device_gpu::GpuLifecycleEffectPort for SharedRunnerGpuAuthorityGate {
+impl DaemonGpuLifecyclePort {
+    fn role_key(role: d2b_provider_device_gpu::GpuProcessRole) -> u8 {
+        match role {
+            d2b_provider_device_gpu::GpuProcessRole::FullGpu => 0,
+            d2b_provider_device_gpu::GpuProcessRole::RenderNode => 1,
+            d2b_provider_device_gpu::GpuProcessRole::Video => 2,
+        }
+    }
+
+    fn intent(
+        &self,
+        template: &str,
+    ) -> Result<d2b_core::bundle_resolver::ResolvedRunnerIntent, d2b_provider_device_gpu::GpuEffectError>
+    {
+        let vm = self.holder_ref.name().as_str();
+        self.resolver
+            .find_runner_intent_for_process_in_vm(
+                Some(vm),
+                "Host/host-system",
+                d2b_core::processes::ProcessExecutionDomain::System,
+                None,
+                template,
+            )
+            .cloned()
+            .ok_or(d2b_provider_device_gpu::GpuEffectError::SpawnRejected)
+    }
+
+    fn open_device_classes(
+        &mut self,
+        role_id: &str,
+        classes: &[&str],
+    ) -> Result<(), d2b_provider_device_gpu::GpuEffectError> {
+        for device_class in classes {
+            let request = d2b_contracts_broker::broker_wire::BrokerRequest::OpenDevice(
+                d2b_contracts_broker::broker_wire::OpenDeviceRequest {
+                    role_id: d2b_contracts::types::RoleId::new(role_id.to_owned()),
+                    device_class: (*device_class).to_owned(),
+                    tracing_span_id: None,
+                },
+            );
+            let (response, fds) = crate::dispatch_broker_request_with_fds_timeout_as(
+                &self.state,
+                request,
+                BrokerCallerRole::AdminUid {
+                    uid: self.state.daemon_uid,
+                },
+                std::time::Duration::from_secs(10),
+            )
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::OpenRejected)?;
+            let accepted = matches!(
+                response,
+                d2b_contracts_broker::broker_wire::BrokerResponse::Ack(response)
+                    if response.accepted
+            );
+            if !accepted || fds.len() != 1 {
+                crate::close_received_fds(&fds);
+                return Err(d2b_provider_device_gpu::GpuEffectError::OpenRejected);
+            }
+            let fd = crate::duplicate_received_fd(&fds, 0, "GPU device grant")
+                .map_err(|_| d2b_provider_device_gpu::GpuEffectError::OpenRejected)?;
+            crate::close_received_fds(&fds);
+            self.opened_devices.push(fd);
+        }
+        Ok(())
+    }
+
+    fn spawn_worker(
+        &mut self,
+        template: &str,
+        process_name: &str,
+        principal: &d2b_provider_device_gpu::GpuPrincipalToken,
+        platform: &d2b_provider_device_gpu::GpuPlatformToken,
+        generation: ResourceGeneration,
+        role: d2b_contracts_broker::broker_wire::RunnerRole,
+    ) -> Result<
+        d2b_provider_device_gpu::GpuProcessIdentity,
+        d2b_provider_device_gpu::GpuEffectError,
+    > {
+        let intent = self.intent(template)?;
+        let execution_ref = ResourceRef::parse(&intent.execution_ref)
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)?;
+        let owner_uid = crate::block_on_future(self.runtime.committed_resource_value(
+            &self.holder_ref,
+            &self.operation_id,
+        ))
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)
+        .and_then(|value| {
+            value
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+                .ok_or(d2b_provider_device_gpu::GpuEffectError::SpawnRejected)
+        })?;
+        let resource_ref = ResourceRef::parse(&format!("Process/{process_name}"))
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)?;
+        let request = d2b_contracts_broker::broker_wire::BrokerRequest::SpawnRunner(
+            d2b_contracts_broker::broker_wire::SpawnRunnerRequest {
+                vm_id: VmId::new(self.holder_ref.name().as_str()),
+                role_id: d2b_contracts::types::RoleId::new(intent.role_id.clone()),
+                resource_ref: Some(resource_ref.clone()),
+                resource_uid: None,
+                zone_uid: self.runtime.authority_zone_uid().cloned(),
+                owner_ref: Some(self.holder_ref.clone()),
+                owner_uid: Some(owner_uid),
+                provider_ref: Some(
+                    ResourceRef::parse("Provider/system-minijail")
+                        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)?,
+                ),
+                bundle_content_identity: self
+                    .runtime
+                    .authority_bundle_generation()
+                    .map(|value| value.as_str().to_owned()),
+                provider_identity: None,
+                template_identity: None,
+                generation: Some(generation.get()),
+                runtime_scope: Some(Self::scope_digest(
+                    &self.device_uid,
+                    &self.operation_id,
+                )),
+                activation_input: None,
+                sandbox_plan: None,
+                role,
+                bundle_runner_intent_ref: BundleOpId::new(intent.intent_id.clone()),
+                execution_ref: Some(execution_ref),
+                execution_domain: Some(match intent.execution_domain {
+                    d2b_core::processes::ProcessExecutionDomain::System => {
+                        d2b_contracts_resource::v3::execution_policy::ExecutionDomain::System
+                    }
+                    d2b_core::processes::ProcessExecutionDomain::User => {
+                        d2b_contracts_resource::v3::execution_policy::ExecutionDomain::User
+                    }
+                }),
+                user_ref: intent
+                    .user_ref
+                    .as_deref()
+                    .and_then(|value| ResourceRef::parse(value).ok()),
+                guest_execution: None,
+                runtime_allocations: Vec::new(),
+                tracing_span_id: None,
+                workload_identity: None,
+                inherited_fd_count: u16::try_from(self.opened_devices.len())
+                    .map_err(|_| d2b_provider_device_gpu::GpuEffectError::OpenRejected)?,
+                network_tap_context: None,
+            },
+        );
+        let request_fds = self
+            .opened_devices
+            .iter()
+            .map(AsRawFd::as_raw_fd)
+            .collect::<Vec<_>>();
+        let (response, received_fds) = crate::dispatch_broker_request_with_optional_request_fds(
+            &self.state,
+            request,
+            BrokerCallerRole::AdminUid {
+                uid: self.state.daemon_uid,
+            },
+            &request_fds,
+            std::time::Duration::from_secs(30),
+        )
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)?;
+        let response = match response {
+            d2b_contracts_broker::broker_wire::BrokerResponse::SpawnRunner(response) => response,
+            _ => {
+                crate::close_received_fds(&received_fds);
+                return Err(d2b_provider_device_gpu::GpuEffectError::SpawnRejected);
+            }
+        };
+        if response.vm_id != VmId::new(self.holder_ref.name().as_str())
+            || response.role != role
+            || response.role_id.as_str() != intent.role_id
+            || response.zone_uid != self.runtime.authority_zone_uid().cloned()
+            || response.owner_ref.as_ref() != Some(&self.holder_ref)
+            || response.generation != Some(generation.get())
+            || response.resource_ref.as_ref() != Some(&resource_ref)
+            || response.pid <= 0
+        {
+            crate::close_received_fds(&received_fds);
+            return Err(d2b_provider_device_gpu::GpuEffectError::StaleDeviceIdentity);
+        }
+        let pidfd = crate::duplicate_received_fd(
+            &received_fds,
+            response.pidfd_index,
+            "GPU SpawnRunner pidfd",
+        )
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)?;
+        crate::close_received_fds(&received_fds);
+        let vm = self.holder_ref.name().as_str().to_owned();
+        if self
+            .state
+            .pidfd_table
+            .register(
+                vm.clone(),
+                intent.role_id.clone(),
+                crate::PidfdEntry {
+                    pidfd,
+                    pid: response.pid,
+                    start_time_ticks: response.start_time_ticks,
+                },
+            )
+            .is_err()
+        {
+            let _ = crate::stop_vm_pidfd_role(
+                &self.state,
+                BrokerCallerRole::AdminUid {
+                    uid: self.state.daemon_uid,
+                },
+                "device-gpu",
+                &vm,
+                &intent.role_id,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            );
+            return Err(d2b_provider_device_gpu::GpuEffectError::SpawnRejected);
+        }
+        if self.state.pidfd_table.snapshot().is_err() {
+            self.state.pidfd_table.deregister_if_matches(
+                &vm,
+                &intent.role_id,
+                response.pid,
+                response.start_time_ticks,
+            );
+            let _ = crate::stop_vm_pidfd_role(
+                &self.state,
+                BrokerCallerRole::AdminUid {
+                    uid: self.state.daemon_uid,
+                },
+                "device-gpu",
+                &vm,
+                &intent.role_id,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            );
+            return Err(d2b_provider_device_gpu::GpuEffectError::SpawnRejected);
+        }
+        let identity = d2b_provider_device_gpu::GpuProcessIdentity::from_core(
+            Self::process_digest(&intent.intent_id, response.pid, response.start_time_ticks),
+            match role {
+                d2b_contracts_broker::broker_wire::RunnerRole::Video => {
+                    d2b_provider_device_gpu::GpuProcessRole::Video
+                }
+                _ if self.settings.render_node_only => {
+                    d2b_provider_device_gpu::GpuProcessRole::RenderNode
+                }
+                _ => d2b_provider_device_gpu::GpuProcessRole::FullGpu,
+            },
+            principal.clone(),
+            platform.clone(),
+            generation,
+        );
+        self.processes
+            .lock()
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)?
+            .insert(
+                (self.device_uid.clone(), Self::role_key(identity.role())),
+                identity.clone(),
+            );
+        Ok(identity)
+    }
+
+    fn scope_digest(device_uid: &ResourceUid, operation_id: &str) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"d2b:gpu-runtime-scope/v1");
+        digest.update(device_uid.as_str().as_bytes());
+        digest.update(operation_id.as_bytes());
+        digest.finalize().into()
+    }
+
+    fn process_digest(intent_id: &str, pid: i32, start_time_ticks: u64) -> [u8; 16] {
+        let mut digest = Sha256::new();
+        digest.update(b"d2b:gpu-process/v1");
+        digest.update(intent_id.as_bytes());
+        digest.update(pid.to_be_bytes());
+        digest.update(start_time_ticks.to_be_bytes());
+        let digest: [u8; 32] = digest.finalize().into();
+        digest[..16].try_into().expect("fixed process token length")
+    }
+}
+
+impl d2b_provider_device_gpu::GpuLifecycleEffectPort for DaemonGpuLifecyclePort {
     fn reserve_authority(
         &mut self,
-        _admission: &d2b_provider_device_gpu::GpuAuthorityAdmission,
+        admission: &d2b_provider_device_gpu::GpuAuthorityAdmission,
     ) -> Result<d2b_provider_device_gpu::GpuAuthorityLease, d2b_provider_device_gpu::GpuEffectError>
     {
-        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+        if admission.owner().device_uid() != &self.device_uid
+            || admission.owner().holder_ref() != &self.holder_ref
+            || admission.owner().generation() != self.generation
+        {
+            return Err(d2b_provider_device_gpu::GpuEffectError::StaleDeviceIdentity);
+        }
+        let request = AuthorityRequest::gpu_from_core(
+            admission.owner().host_uid().clone(),
+            self.device_ref.clone(),
+            admission.owner().device_uid().clone(),
+            admission.owner().generation(),
+            *admission.backing().as_bytes(),
+            admission.render_node_only(),
+            admission.max_holders() as usize,
+        )
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)?;
+        let lease = crate::block_on_future(async {
+            self.runtime
+                .authority_index
+                .lock()
+                .await
+                .admit_authority(request)
+        })
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)?;
+        let token = lease.token_bytes();
+        self.authority_leases
+            .lock()
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)?
+            .insert(token, lease);
+        Ok(d2b_provider_device_gpu::GpuAuthorityLease::from_core(token))
     }
 
     fn open_authorized_devices(
         &mut self,
-        _admission: &d2b_provider_device_gpu::GpuAuthorityAdmission,
-        _tokens: &d2b_provider_device_gpu::GpuEffectTokenSet,
+        admission: &d2b_provider_device_gpu::GpuAuthorityAdmission,
+        tokens: &d2b_provider_device_gpu::GpuEffectTokenSet,
     ) -> Result<d2b_provider_device_gpu::GpuLaunchTicket, d2b_provider_device_gpu::GpuEffectError>
     {
-        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+        if admission.owner().device_uid() != &self.device_uid
+            || admission.owner().generation() != self.generation
+            || !admission.owner().holder_ref().eq(&self.holder_ref)
+        {
+            return Err(d2b_provider_device_gpu::GpuEffectError::StaleDeviceIdentity);
+        }
+        if tokens.is_empty() {
+            return Err(d2b_provider_device_gpu::GpuEffectError::StaleDeviceIdentity);
+        }
+        let gpu_intent = self.intent(if self.settings.render_node_only {
+            "render-node-worker"
+        } else {
+            "gpu-worker"
+        })?;
+        let mut classes = if self.settings.render_node_only {
+            vec!["dri"]
+        } else {
+            vec!["kvm", "dri", "udmabuf"]
+        };
+        self.open_device_classes(&gpu_intent.role_id, &classes)?;
+        if self.settings.video_sidecar {
+            let video_intent = self.intent("video-worker")?;
+            classes.clear();
+            classes.push("dri");
+            if self.settings.video_nvidia_decode {
+                classes.extend(["nvidia-ctl", "nvidia-device", "nvidia-uvm"]);
+            }
+            self.open_device_classes(&video_intent.role_id, &classes)?;
+        }
+        Ok(d2b_provider_device_gpu::GpuLaunchTicket::from_core(
+            Self::scope_digest(&self.device_uid, &self.operation_id)[..16]
+                .try_into()
+                .expect("fixed launch ticket length"),
+        ))
     }
 
     fn start_gpu_worker(
         &mut self,
-        _spec: &d2b_provider_device_gpu::GpuWorkerSpec,
+        spec: &d2b_provider_device_gpu::GpuWorkerSpec,
         _ticket: &d2b_provider_device_gpu::GpuLaunchTicket,
-        _principal: &d2b_provider_device_gpu::GpuPrincipalToken,
-        _platform: &d2b_provider_device_gpu::GpuPlatformToken,
-        _generation: ResourceGeneration,
+        principal: &d2b_provider_device_gpu::GpuPrincipalToken,
+        platform: &d2b_provider_device_gpu::GpuPlatformToken,
+        generation: ResourceGeneration,
     ) -> Result<
         d2b_provider_device_gpu::GpuProcessIdentity,
         d2b_provider_device_gpu::GpuEffectError,
     > {
-        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+        self.spawn_worker(
+            spec.template(),
+            &format!("gpu-{}", self.device_ref.name().as_str()),
+            principal,
+            platform,
+            generation,
+            d2b_contracts_broker::broker_wire::RunnerRole::Gpu,
+        )
     }
 
     fn start_video_worker(
         &mut self,
-        _spec: &d2b_provider_device_gpu::VideoWorkerSpec,
+        spec: &d2b_provider_device_gpu::VideoWorkerSpec,
         _ticket: &d2b_provider_device_gpu::GpuLaunchTicket,
-        _principal: &d2b_provider_device_gpu::GpuPrincipalToken,
-        _platform: &d2b_provider_device_gpu::GpuPlatformToken,
-        _generation: ResourceGeneration,
+        principal: &d2b_provider_device_gpu::GpuPrincipalToken,
+        platform: &d2b_provider_device_gpu::GpuPlatformToken,
+        generation: ResourceGeneration,
     ) -> Result<
         d2b_provider_device_gpu::GpuProcessIdentity,
         d2b_provider_device_gpu::GpuEffectError,
     > {
-        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+        self.spawn_worker(
+            spec.template(),
+            &format!("video-{}", self.device_ref.name().as_str()),
+            principal,
+            platform,
+            generation,
+            d2b_contracts_broker::broker_wire::RunnerRole::Video,
+        )
     }
 
     fn observe_worker(
         &mut self,
-        _identity: &d2b_provider_device_gpu::GpuProcessIdentity,
+        identity: &d2b_provider_device_gpu::GpuProcessIdentity,
     ) -> Result<
         d2b_provider_device_gpu::GpuProcessObservation,
         d2b_provider_device_gpu::GpuEffectError,
     > {
-        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+        let known = self
+            .processes
+            .lock()
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::ProcessObservationUnavailable)?
+            .get(&(self.device_uid.clone(), Self::role_key(identity.role())))
+            .is_some_and(|current| current == identity);
+        if !known {
+            return Ok(d2b_provider_device_gpu::GpuProcessObservation::Missing);
+        }
+        let intent = self.intent(match identity.role() {
+            d2b_provider_device_gpu::GpuProcessRole::Video => "video-worker",
+            d2b_provider_device_gpu::GpuProcessRole::RenderNode => "render-node-worker",
+            d2b_provider_device_gpu::GpuProcessRole::FullGpu => "gpu-worker",
+        })?;
+        if self
+            .state
+            .pidfd_table
+            .contains(self.holder_ref.name().as_str(), &intent.role_id)
+        {
+            Ok(d2b_provider_device_gpu::GpuProcessObservation::Matching(
+                identity.clone(),
+            ))
+        } else {
+            Ok(d2b_provider_device_gpu::GpuProcessObservation::Missing)
+        }
     }
 
     fn stop_worker(
         &mut self,
-        _identity: &d2b_provider_device_gpu::GpuProcessIdentity,
+        identity: &d2b_provider_device_gpu::GpuProcessIdentity,
     ) -> Result<
         d2b_provider_device_gpu::GpuClosureProof,
         d2b_provider_device_gpu::GpuEffectError,
     > {
-        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+        let intent = self.intent(match identity.role() {
+            d2b_provider_device_gpu::GpuProcessRole::Video => "video-worker",
+            d2b_provider_device_gpu::GpuProcessRole::RenderNode => "render-node-worker",
+            d2b_provider_device_gpu::GpuProcessRole::FullGpu => "gpu-worker",
+        })?;
+        let known = self
+            .processes
+            .lock()
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::CloseUnconfirmed)?
+            .get(&(self.device_uid.clone(), Self::role_key(identity.role())))
+            .is_some_and(|current| current == identity);
+        if !known {
+            return Err(d2b_provider_device_gpu::GpuEffectError::StaleDeviceIdentity);
+        }
+        crate::stop_vm_pidfd_role(
+            &self.state,
+            BrokerCallerRole::AdminUid {
+                uid: self.state.daemon_uid,
+            },
+            "device-gpu",
+            self.holder_ref.name().as_str(),
+            &intent.role_id,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(10),
+        )
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::CloseUnconfirmed)?;
+        self.processes
+            .lock()
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::CloseUnconfirmed)?
+            .remove(&(self.device_uid.clone(), Self::role_key(identity.role())));
+        Ok(d2b_provider_device_gpu::GpuClosureProof::from_core(
+            identity.clone(),
+        ))
     }
 
     fn release_authority(
         &mut self,
-        _lease: d2b_provider_device_gpu::GpuAuthorityLease,
+        lease: d2b_provider_device_gpu::GpuAuthorityLease,
         _closures: &[d2b_provider_device_gpu::GpuClosureProof],
     ) -> Result<(), d2b_provider_device_gpu::GpuEffectError> {
-        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+        let token = *lease.as_bytes();
+        let generic = self
+            .authority_leases
+            .lock()
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)?
+            .remove(&token)
+            .ok_or(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)?;
+        let result = crate::block_on_future(async {
+            self.runtime
+                .authority_index
+                .lock()
+                .await
+                .release_authority(&generic)
+        });
+        if result.is_err() {
+            self.authority_leases
+                .lock()
+                .map_err(|_| d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)?
+                .insert(token, generic);
+            return Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict);
+        }
+        Ok(())
     }
 }
 
@@ -1038,67 +2288,36 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         let spec: d2b_contracts_resource::v3::network::NetworkSpec =
             serde_json::from_value(spec_value)
                 .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-        let runtime = self.runtime()?;
-        let zone_uid = runtime
-            .authority_zone_uid()
-            .cloned()
-            .ok_or(SharedProviderEffectError::Unavailable)?;
-        let installed_generation = runtime
-            .authority_bundle_generation()
-            .cloned()
-            .ok_or(SharedProviderEffectError::Unavailable)?;
-        let generation = resource.generation();
-        let admission_intent = NetworkAdmissionIntent::new(
-            NetworkAdmissionKey::new(
-                zone_uid,
-                resource.key().uid().clone(),
-                generation,
-                generation,
-                installed_generation.clone(),
-            ),
-            spec.clone(),
-            Vec::new(),
-        )
-        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-        let plane = self
-            .state
-            .resource_plane
-            .lock()
-            .ok()
-            .and_then(|plane| plane.clone())
-            .ok_or(SharedProviderEffectError::Unavailable)?;
-        let occupancy =
-            observe_host_network().map_err(|_| SharedProviderEffectError::Unavailable)?;
-        let admission = plane
-            .network_admission_index()
-            .lock()
-            .await
-            .admit(admission_intent, &occupancy)
+        let resolver = crate::load_bundle_resolver(&self.state)
             .map_err(|_| SharedProviderEffectError::Unavailable)?;
-        let broker_context = d2b_provider_network_local::broker::NetworkEffectContext::for_network(
-            admission.clone(),
-            VmId::new(format!("net-{}", resource.key().uid().as_str())),
-            BundleOpId::new(format!("shared-network-bridge-{}", resource.key().uid().as_str())),
-            BundleOpId::new(format!(
-                "shared-network-projection-{}",
-                resource.key().uid().as_str()
-            )),
-            BundleOpId::new(format!("shared-network-nm-{}", resource.key().uid().as_str())),
-            BundleOpId::new(format!(
-                "shared-network-hosts-{}",
-                resource.key().uid().as_str()
-            )),
-            Vec::new(),
-            Vec::new(),
-            installed_generation.clone(),
-            [0; 32],
-            false,
+        let runtime = self.runtime()?;
+        let children = SharedRunnerNetworkResources::new(
+            Arc::clone(&runtime),
+            resource.key().resource_ref().clone(),
+            resource.key().uid(),
         );
-        let broker_context = if spec.external_attachment().is_none() {
-            broker_context.with_host_global_nic_admission()
-        } else {
-            broker_context
-        };
+        let readiness = children
+            .readiness()
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let generation = resource.generation();
+        let admission = self
+            .network_admission(
+            &runtime,
+            resource,
+            &value,
+            &spec,
+            &resolver,
+            &context.operation_id,
+        )
+        .await?;
+        let broker_context = crate::resolve_network_effect_context(
+            &value,
+            &resolver,
+            &admission,
+        )
+        .map_err(|_| SharedProviderEffectError::Unavailable)?
+        .with_host_global_nic_admission();
         let effects = crate::network_effect_port::production_port(
             &self.state,
             BrokerCallerRole::AdminUid {
@@ -1106,16 +2325,17 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             },
             broker_context,
         );
+        let mdns_enabled = value
+            .pointer("/spec/mdns/enable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let input = ReconcileInput {
             spec: spec.clone(),
-            mdns_enabled: value
-                .pointer("/spec/mdns/enable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            mdns_enabled,
             network_uid: resource.key().uid().clone(),
             network_generation: generation,
-            attachment_generation: generation,
-            installed_generation,
+            attachment_generation: admission.key().attachment_generation(),
+            installed_generation: admission.key().bundle_generation().clone(),
             admission,
             artifact_catalog: vec![ArtifactCatalogEntry::new(
                 spec.net_vm_system_artifact_id().clone(),
@@ -1123,18 +2343,18 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             )],
             user_ready: true,
             host_memory_budget_available: d2b_provider_network_local::controller::CONFIG_VOLUME_MAX_BYTES,
-            volume_ready: true,
-            guest_ready: true,
-            volume_attachment_ready: true,
+            volume_ready: readiness.volume_ready,
+            guest_ready: readiness.guest_ready,
+            volume_attachment_ready: readiness.attachment_ready,
             workload_fds_closed: true,
             agent_deleted: true,
-            mdns_deleted: true,
+            mdns_deleted: !mdns_enabled,
             volume_attachment_removed: true,
             guest_deleted: true,
             volume_deleted: true,
             attachments: Vec::<AttachmentRealization>::new(),
         };
-        match NetworkReconciler::new(effects, SharedRunnerNetworkResources)
+        match NetworkReconciler::new(effects, children)
             .reconcile(&input)
             .await
             .map_err(|_| SharedProviderEffectError::Unavailable)?
@@ -1202,7 +2422,22 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             d2b_provider_device_tpm::BinaryKind::Swtpm,
             tpm_opaque_bytes("d2b:tpm-binary/v1", vm_id.as_str()),
         );
-        let result = crate::tpm_effect_port::reconcile_device_tpm(
+        let mut controller = if let Some(controller) = self
+            .tpm_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .remove(resource.key().uid())
+        {
+            controller
+        } else {
+            d2b_provider_device_tpm::TpmResourceController::new(
+                resource.key().uid().clone(),
+                resource.key().resource_ref().clone(),
+                execution_ref.clone(),
+            )
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?
+        };
+        let result = crate::tpm_effect_port::reconcile_device_tpm_controller(
             &self.state,
             &resolver,
             vm_id.clone(),
@@ -1221,8 +2456,21 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             d2b_contracts_broker::broker_wire::BrokerCallerRole::AdminUid {
                 uid: self.state.daemon_uid,
             },
+            &mut controller,
         )
-        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        .map_err(|_| SharedProviderEffectError::Unavailable);
+        if result.is_err() {
+            self.tpm_controllers
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .insert(resource.key().uid().clone(), controller);
+            return Err(SharedProviderEffectError::Unavailable);
+        }
+        let result = result.expect("TPM result was checked");
+        self.tpm_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .insert(resource.key().uid().clone(), controller);
         match result {
             d2b_provider_device_tpm::TpmResourceOutcome::Ready => {
                 Ok(SharedProviderEffectPhase::Ready)
@@ -1257,8 +2505,40 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             resource,
         )?;
         match component {
-            UsbipResourceComponent::Device => Ok(SharedProviderEffectPhase::Ready),
+            UsbipResourceComponent::Device => {
+                let runtime = self.runtime()?;
+                let services = runtime
+                    .committed_resources_of_type(
+                        d2b_provider_device_usbip::USB_SERVICE_RESOURCE_TYPE,
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let device_ref = resource.key().resource_ref().to_canonical_string();
+                let ready = services.iter().any(|service| {
+                    service.pointer("/spec/providerRef").and_then(Value::as_str)
+                        == Some(d2b_provider_device_usbip::PROVIDER_REF)
+                        && service
+                            .pointer("/spec/backingDeviceRef")
+                            .and_then(Value::as_str)
+                            == Some(device_ref.as_str())
+                        && service.pointer("/status/phase").and_then(Value::as_str)
+                            == Some("Ready")
+                });
+                Ok(if ready {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                })
+            }
             UsbipResourceComponent::Service => {
+                if self
+                    .usbip_services
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .contains(resource.key().uid())
+                {
+                    return Ok(SharedProviderEffectPhase::Ready);
+                }
                 let (zone_uid, zone_opted_in, mut port) =
                     self.usbip_service_port(context, resource, &value).await?;
                 let mut lifecycle = d2b_provider_device_usbip::ServiceLifecycle::new(
@@ -1268,6 +2548,10 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                 lifecycle
                     .activate(zone_opted_in, zone_uid, &mut port)
                     .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                self.usbip_services
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone());
                 Ok(SharedProviderEffectPhase::Ready)
             }
             UsbipResourceComponent::Binding => {
@@ -1290,6 +2574,14 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                     .committed_resource_value(&service_ref, &context.operation_id)
                     .await
                     .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if service.pointer("/spec/providerRef").and_then(Value::as_str)
+                    != Some(d2b_provider_device_usbip::PROVIDER_REF)
+                {
+                    return Err(SharedProviderEffectError::InvalidResource);
+                }
+                if service.pointer("/status/phase").and_then(Value::as_str) != Some("Ready") {
+                    return Ok(SharedProviderEffectPhase::Pending);
+                }
                 let service_uid = service
                     .pointer("/metadata/uid")
                     .and_then(Value::as_str)
@@ -1304,32 +2596,62 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                     .committed_resource_value(&guest_ref, &context.operation_id)
                     .await
                     .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if guest.pointer("/status/phase").and_then(Value::as_str) != Some("Ready") {
+                    return Ok(SharedProviderEffectPhase::Pending);
+                }
                 let guest_uid = guest
                     .pointer("/metadata/uid")
                     .and_then(Value::as_str)
                     .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
                     .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let assignment_epoch = runtime
+                    .store
+                    .assignment_fence(
+                        self.zone.clone(),
+                        resource.key().resource_ref().clone(),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .map(|fence| fence.epoch)
+                    .filter(|epoch| *epoch != 0)
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
                 let admission = d2b_provider_device_usbip::UsbipBindingAdmission::new(
                     zone_uid,
                     resource.key().uid().clone(),
                     service_uid,
                     guest_uid,
                     service_generation,
-                    1,
+                    assignment_epoch,
                 )
                 .map_err(|_| SharedProviderEffectError::InvalidResource)?;
                 let mut controller =
                     d2b_provider_device_usbip::UsbipBindingController::new_admitted(
+                        resource.key().resource_ref(),
+                        &service_ref,
+                        &guest_ref,
+                        admission,
+                    )
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let desired = d2b_provider_device_usbip::binding_child_resources(
                     resource.key().resource_ref(),
                     &service_ref,
                     &guest_ref,
-                    admission.clone(),
                 )
                 .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-                controller
-                    .observe_children_with_admission(admission, true)
-                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
-                Ok(SharedProviderEffectPhase::Ready)
+                let phase = self
+                    .reconcile_binding_children(
+                        &runtime,
+                        resource,
+                        desired,
+                        &context.operation_id,
+                    )
+                    .await?;
+                if phase == SharedProviderEffectPhase::Ready {
+                    controller
+                        .observe_children(true)
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                }
+                Ok(phase)
             }
         }
     }
@@ -1361,49 +2683,166 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         )?;
         match component {
             SecurityKeyResourceComponent::Device => {
-                let holder = Self::owner_ref(&value)?;
-                let runtime = self
-                    .state
-                    .resource_plane
-                    .lock()
-                    .ok()
-                    .and_then(|plane| plane.as_ref().and_then(|plane| plane.zone(&self.zone).ok()))
-                    .ok_or(SharedProviderEffectError::Unavailable)?;
-                let selector_id = value
-                    .pointer("/spec/inventory/selector/label")
-                    .and_then(Value::as_str)
-                    .unwrap_or(resource.key().resource_ref().name().as_str());
-                let request = json!({
-                    "vmId": holder.name().as_str(),
-                    "selectorId": selector_id,
-                    "operationId": context.operation_id,
-                    "resourceUid": resource.key().uid().as_str(),
-                    "deviceRef": resource.key().resource_ref().to_canonical_string(),
-                    "zoneRef": format!("Zone/{}", self.zone.as_str()),
-                    "holderRef": holder.to_canonical_string(),
-                });
-                let peer = crate::PeerIdentity {
-                    role: crate::PeerRole::Admin,
-                    uid: self.state.daemon_uid,
-                };
-                crate::security_key_effect_port::dispatch_reconcile(
-                    &self.state,
-                    &peer,
-                    &runtime,
-                    &request,
-                )
-                .map_err(|error| match error {
-                    ResourceRuntimeError::RequestInvalid
-                    | ResourceRuntimeError::RouteMismatch
-                    | ResourceRuntimeError::AuthenticationUnavailable => {
-                        SharedProviderEffectError::InvalidResource
-                    }
-                    _ => SharedProviderEffectError::Unavailable,
-                })?;
-                Ok(SharedProviderEffectPhase::Ready)
+                let admitted = value
+                    .pointer("/status/resource/devicePresent")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    && value
+                        .pointer("/status/resource/fidoConfirmed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                Ok(if admitted {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                })
             }
             SecurityKeyResourceComponent::Service => {
-                Ok(SharedProviderEffectPhase::Ready)
+                let runtime = self.runtime()?;
+                let mode = value
+                    .pointer("/spec/mode")
+                    .and_then(Value::as_str)
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                if mode == "projection" {
+                    let endpoint_ref = value
+                        .pointer("/status/resource/relayEndpointRef")
+                        .or_else(|| value.pointer("/status/provider/details/relayEndpointRef"))
+                        .and_then(Value::as_str)
+                        .and_then(|value| ResourceRef::parse(value).ok())
+                        .ok_or(SharedProviderEffectError::Unavailable)?;
+                    let endpoint = runtime
+                        .committed_resource_value(&endpoint_ref, &context.operation_id)
+                        .await
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                    return Ok(if endpoint.pointer("/status/phase").and_then(Value::as_str)
+                        == Some("Ready")
+                    {
+                        SharedProviderEffectPhase::Ready
+                    } else {
+                        SharedProviderEffectPhase::Pending
+                    });
+                }
+                let settings = value
+                    .pointer("/spec/provider/settings")
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let device_ref = settings
+                    .get("deviceRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let relay_endpoint_ref = settings
+                    .get("relayEndpointRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                if device_ref.resource_type().as_str() != "Device"
+                    || relay_endpoint_ref.resource_type().as_str() != "Endpoint"
+                {
+                    return Err(SharedProviderEffectError::InvalidResource);
+                }
+                let device = runtime
+                    .committed_resource_value(&device_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if device.pointer("/spec/providerRef").and_then(Value::as_str)
+                    != Some(d2b_provider_device_security_key::PROVIDER_REF)
+                {
+                    return Err(SharedProviderEffectError::InvalidResource);
+                }
+                if device.pointer("/status/phase").and_then(Value::as_str) != Some("Ready") {
+                    return Ok(SharedProviderEffectPhase::Pending);
+                }
+                let device_uid = device
+                    .pointer("/metadata/uid")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let relay_process_name =
+                    d2b_provider_device_security_key::security_key_process_name(
+                        &device_uid,
+                        d2b_provider_device_security_key::SecurityKeyProcessRole::HostRelay,
+                    )
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let relay_process_ref =
+                    ResourceRef::parse(&format!("Process/{relay_process_name}"))
+                        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let relay_process_spec = json!({
+                    "providerRef": "Provider/system-minijail",
+                    "executionRef": "Host/host-system",
+                    "domain": "system",
+                    "processClass": "service",
+                    "template": "sk-relay",
+                    "desiredLifecycle": "running",
+                    "deviceUsage": [{
+                        "deviceRef": device_ref.to_canonical_string(),
+                        "access": "exclusive",
+                        "purpose": "hidraw-fido"
+                    }],
+                    "sandbox": {
+                        "namespaceClasses": ["mount", "ipc", "pid"],
+                        "capabilityClasses": [],
+                        "seccompClass": "sk-relay",
+                        "environmentClass": "provider-defined",
+                        "startRoot": false,
+                        "noNewPrivileges": true,
+                        "readOnlyRoot": true
+                    },
+                    "budget": {
+                        "pids": {"limit": 32},
+                        "fds": {"limit": 64},
+                        "memory": {"limit": "32Mi"}
+                    }
+                });
+                upsert_shared_provider_child(
+                    &runtime,
+                    &relay_process_ref,
+                    relay_process_spec,
+                    resource.key().resource_ref(),
+                    "shared-security-key-relay-upsert",
+                )
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let endpoint_spec = json!({
+                    "providerRef": d2b_provider_device_security_key::PROVIDER_REF,
+                    "producerRef": relay_process_ref.to_canonical_string(),
+                    "endpointClass": "device",
+                    "transport": "vsock",
+                    "purpose": "device-security-key.d2bus.org/ctaphid-relay",
+                    "serviceFingerprint": "device-security-key.d2bus.org/SecurityKeyCtapRelay.v3",
+                    "locality": "cross-domain",
+                    "visibility": "zone",
+                    "attachmentPolicy": "component-session",
+                    "consumerPolicy": {
+                        "allowedProviderComponents": ["device-security-key.d2bus.org/frontend"],
+                        "allowedOperations": ["resolve"]
+                    },
+                    "lifecyclePolicy": "recycle-with-producer"
+                });
+                upsert_shared_provider_child(
+                    &runtime,
+                    &relay_endpoint_ref,
+                    endpoint_spec,
+                    resource.key().resource_ref(),
+                    "shared-security-key-relay-endpoint-upsert",
+                )
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let process = runtime
+                    .committed_resource_value(&relay_process_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let endpoint = runtime
+                    .committed_resource_value(&relay_endpoint_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(if process.pointer("/status/phase").and_then(Value::as_str)
+                    == Some("Ready")
+                    && endpoint.pointer("/status/phase").and_then(Value::as_str) == Some("Ready")
+                {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                })
             }
             SecurityKeyResourceComponent::Binding => {
                 let service_ref = value
@@ -1417,14 +2856,53 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                     .and_then(Value::as_str)
                     .and_then(|value| ResourceRef::parse(value).ok())
                     .ok_or(SharedProviderEffectError::InvalidResource)?;
-                let _children =
+                let runtime = self.runtime()?;
+                let service = runtime
+                    .committed_resource_value(&service_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if service.pointer("/spec/providerRef").and_then(Value::as_str)
+                    != Some(d2b_provider_device_security_key::PROVIDER_REF)
+                {
+                    return Err(SharedProviderEffectError::InvalidResource);
+                }
+                if service.pointer("/status/phase").and_then(Value::as_str) != Some("Ready") {
+                    return Ok(SharedProviderEffectPhase::Pending);
+                }
+                let guest = runtime
+                    .committed_resource_value(&target, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if guest.pointer("/status/phase").and_then(Value::as_str) != Some("Ready") {
+                    return Ok(SharedProviderEffectPhase::Pending);
+                }
+                let desired = if let Some(user) = value
+                    .pointer("/spec/target/userRef")
+                    .or_else(|| value.pointer("/spec/userRef"))
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                {
+                    d2b_provider_device_security_key::SecurityKeyController::child_resources_for_user(
+                        resource.key().resource_ref(),
+                        &service_ref,
+                        &target,
+                        &user,
+                    )
+                } else {
                     d2b_provider_device_security_key::SecurityKeyController::child_resources(
                         resource.key().resource_ref(),
                         &service_ref,
                         &target,
                     )
-                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-                Ok(SharedProviderEffectPhase::Ready)
+                }
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                self.reconcile_binding_children(
+                    &runtime,
+                    resource,
+                    desired,
+                    &context.operation_id,
+                )
+                .await
             }
         }
     }
@@ -1439,53 +2917,259 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             return Ok(SharedProviderEffectPhase::Pending);
         }
         let value = self.validate(SharedProviderResourceKind::GpuDevice, context, resource)?;
-        let holder = Self::owner_ref(&value)?;
-        let zone_ref =
-            ResourceRef::parse(&format!("Zone/{}", self.zone.as_str())).expect("Zone ref");
-        let owner = d2b_provider_device_gpu::GpuOwnerProof::new(
-            zone_ref,
-            holder,
-            resource.key().uid().clone(),
-            self.state
-                .resource_plane
+        let (runtime, admission, tokens, settings, holder_ref) =
+            self.gpu_admission(context, resource, &value).await?;
+        let resolver = crate::load_bundle_resolver(&self.state)
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let mut controller = if let Some(controller) = self
+            .gpu_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .remove(resource.key().uid())
+        {
+            controller
+        } else {
+            d2b_provider_device_gpu::GpuController::new_authorized(
+                admission.clone(),
+                settings.clone(),
+                tokens.clone(),
+            )
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?
+        };
+        if controller
+            .admission()
+            .is_some_and(|current| current != &admission)
+        {
+            self.gpu_controllers
                 .lock()
-                .ok()
-                .and_then(|plane| plane.as_ref().and_then(|plane| plane.zone(&self.zone).ok()))
-                .and_then(|runtime| runtime.authority_zone_uid().cloned())
-                .unwrap_or_else(|| resource.key().uid().clone()),
-            resource.generation(),
-        )
-        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .insert(resource.key().uid().clone(), controller);
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let opened_devices = self.take_gpu_opened_devices(resource.key().uid())?;
+        let mut port = DaemonGpuLifecyclePort {
+            state: Arc::clone(&self.state),
+            runtime,
+            resolver,
+            device_ref: resource.key().resource_ref().clone(),
+            device_uid: resource.key().uid().clone(),
+            holder_ref,
+            generation: resource.generation(),
+            settings,
+            operation_id: context.operation_id.clone(),
+            authority_leases: Arc::clone(&self.gpu_authority_leases),
+            processes: Arc::clone(&self.gpu_processes),
+            opened_devices,
+        };
+        let result = controller
+            .reconcile_lifecycle(&mut port)
+            .map_err(|_| SharedProviderEffectError::Unavailable)
+            .map(|outcome| match outcome {
+                d2b_provider_device_gpu::GpuReconcileOutcome::Converged => {
+                    SharedProviderEffectPhase::Ready
+                }
+                d2b_provider_device_gpu::GpuReconcileOutcome::Retry => {
+                    SharedProviderEffectPhase::Pending
+                }
+            });
+        let opened_devices = std::mem::take(&mut port.opened_devices);
+        self.retain_gpu_opened_devices(resource.key().uid(), opened_devices)?;
+        self.gpu_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .insert(resource.key().uid().clone(), controller);
+        result
+    }
+
+    async fn upgrade(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        if kind != SharedProviderResourceKind::GpuDevice {
+            return self.reconcile(kind, context, resource, dependencies).await;
+        }
+        if !Self::dependencies_ready(dependencies) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let value = self.validate(kind, context, resource)?;
+        let (runtime, admission, _tokens, settings, holder_ref) =
+            self.gpu_admission(context, resource, &value).await?;
+        let dependents = dependencies
+            .iter()
+            .map(|dependency| {
+                let dependency_value =
+                    serde_json::from_slice::<Value>(dependency.resource().canonical_json())
+                        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let ready = dependency_value
+                    .pointer("/status/phase")
+                    .and_then(Value::as_str)
+                    == Some("Ready");
+                let drained = dependency_value
+                    .pointer("/status/resource/drained")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_else(|| {
+                        dependency_value
+                            .pointer("/status/phase")
+                            .and_then(Value::as_str)
+                            == Some("Deleted")
+                    });
+                d2b_provider_device_gpu::GpuDependentResource::new(
+                    dependency.resource().key().resource_ref().clone(),
+                    ready,
+                    drained,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if dependents.iter().any(|dependent| !dependent.ready()) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        if dependents.iter().any(|dependent| !dependent.drained()) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let resolver = crate::load_bundle_resolver(&self.state)
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let mut controller = self
+            .gpu_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .remove(resource.key().uid())
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        if controller
+            .admission()
+            .is_some_and(|current| current != &admission)
+        {
+            self.gpu_controllers
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .insert(resource.key().uid().clone(), controller);
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let plan = match controller.plan_upgrade(settings.clone(), &dependents) {
+            Ok(plan) => plan,
+            Err(
+                d2b_provider_device_gpu::GpuControllerError::DependenciesNotReady
+                | d2b_provider_device_gpu::GpuControllerError::DependenciesNotDrained,
+            ) => {
+                self.gpu_controllers
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone(), controller);
+                return Ok(SharedProviderEffectPhase::Pending);
+            }
+            Err(_) => {
+                self.gpu_controllers
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone(), controller);
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+        };
+        let mut port = DaemonGpuLifecyclePort {
+            state: Arc::clone(&self.state),
+            runtime,
+            resolver,
+            device_ref: resource.key().resource_ref().clone(),
+            device_uid: resource.key().uid().clone(),
+            holder_ref,
+            generation: resource.generation(),
+            settings,
+            operation_id: context.operation_id.clone(),
+            authority_leases: Arc::clone(&self.gpu_authority_leases),
+            processes: Arc::clone(&self.gpu_processes),
+            opened_devices: self.take_gpu_opened_devices(resource.key().uid())?,
+        };
+        let result = controller
+            .execute_upgrade(&plan, &mut port)
+            .map_err(|_| SharedProviderEffectError::Unavailable)
+            .map(|outcome| match outcome {
+                d2b_provider_device_gpu::GpuReconcileOutcome::Converged => {
+                    SharedProviderEffectPhase::Ready
+                }
+                d2b_provider_device_gpu::GpuReconcileOutcome::Retry => {
+                    SharedProviderEffectPhase::Pending
+                }
+            });
+        let opened_devices = std::mem::take(&mut port.opened_devices);
+        self.retain_gpu_opened_devices(resource.key().uid(), opened_devices)?;
+        self.gpu_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .insert(resource.key().uid().clone(), controller);
+        result
+    }
+
+    async fn observe(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        if kind != SharedProviderResourceKind::GpuDevice {
+            return self.reconcile(kind, context, resource, &[]).await;
+        }
+        let value = self.validate(kind, context, resource)?;
+        let runtime = self.runtime()?;
         let settings: d2b_provider_device_gpu::GpuSettings =
             match value.pointer("/spec/provider/settings") {
                 Some(settings) => serde_json::from_value(settings.clone())
                     .map_err(|_| SharedProviderEffectError::InvalidResource)?,
                 None => d2b_provider_device_gpu::GpuSettings::default(),
             };
-        let admission = d2b_provider_device_gpu::GpuAuthorityAdmission::new(
-            owner,
-            d2b_provider_device_gpu::GpuBackingToken::from_core([1; 32]),
-            d2b_provider_device_gpu::GpuPlatformToken::from_core([2; 32]),
-            d2b_contracts_resource::v3::device::DeviceArbitration::Exclusive,
-            1,
-            settings.render_node_only,
-            d2b_provider_device_gpu::GpuPrincipalToken::from_core([3; 32]),
-        )
-        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-        let tokens = d2b_provider_device_gpu::GpuEffectTokenSet::from_core(vec![
-            d2b_provider_device_gpu::GpuEffectToken::from_core([4; 32]),
-        ])
-        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-        let mut controller = d2b_provider_device_gpu::GpuController::new_authorized(
-            admission,
-            settings,
-            tokens,
-        )
-        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-        controller
-            .reconcile_lifecycle(&mut SharedRunnerGpuAuthorityGate)
+        let admission = self
+            .gpu_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .get(resource.key().uid())
+            .and_then(|controller| controller.admission().cloned())
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let expected = self
+            .gpu_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .get(resource.key().uid())
+            .map(|controller| {
+                controller
+                    .gpu_identity()
+                    .into_iter()
+                    .chain(controller.video_identity())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        if expected.is_empty() {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let resolver = crate::load_bundle_resolver(&self.state)
             .map_err(|_| SharedProviderEffectError::Unavailable)?;
-        Ok(SharedProviderEffectPhase::Ready)
+        let mut port = DaemonGpuLifecyclePort {
+            state: Arc::clone(&self.state),
+            runtime,
+            resolver,
+            device_ref: resource.key().resource_ref().clone(),
+            device_uid: resource.key().uid().clone(),
+            holder_ref: admission.owner().holder_ref().clone(),
+            generation: resource.generation(),
+            settings,
+            operation_id: context.operation_id.clone(),
+            authority_leases: Arc::clone(&self.gpu_authority_leases),
+            processes: Arc::clone(&self.gpu_processes),
+            opened_devices: Vec::new(),
+        };
+        let observed = expected.iter().all(|identity| {
+            matches!(
+                port.observe_worker(identity),
+                Ok(d2b_provider_device_gpu::GpuProcessObservation::Matching(_))
+            )
+        });
+        Ok(if observed {
+            SharedProviderEffectPhase::Ready
+        } else {
+            SharedProviderEffectPhase::Pending
+        })
     }
 
     async fn finalize(
@@ -1495,15 +3179,246 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         resource: &ResourceSnapshot,
     ) -> Result<(), SharedProviderEffectError> {
         let value = self.validate(kind, context, resource)?;
-        if matches!(kind, SharedProviderResourceKind::SecurityKeyDevice) {
-            let holder = Self::owner_ref(&value)?;
-            self.state
-                .security_key_sessions
+        if kind == SharedProviderResourceKind::Network {
+            let resolver = crate::load_bundle_resolver(&self.state)
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let runtime = self.runtime()?;
+            let spec_for_admission = crate::parse_committed_network_spec(&value)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            let admission = self
+                .network_admission(
+                    &runtime,
+                    resource,
+                    &value,
+                    &spec_for_admission,
+                    &resolver,
+                    &context.operation_id,
+                )
+                .await?;
+            let mut spec_value = value
+                .get("spec")
+                .cloned()
+                .ok_or(SharedProviderEffectError::InvalidResource)?;
+            if let Some(spec) = spec_value.as_object_mut() {
+                for field in ["providerRef", "updatePolicy", "provider"] {
+                    spec.remove(field);
+                }
+            }
+            let spec: d2b_contracts_resource::v3::network::NetworkSpec =
+                serde_json::from_value(spec_value)
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            let children = SharedRunnerNetworkResources::new(
+                Arc::clone(&runtime),
+                resource.key().resource_ref().clone(),
+                resource.key().uid(),
+            );
+            let volume = children
+                .current(&children.volume_ref)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let guest = children
+                .current(&children.guest_ref)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let agent = children
+                .current(&children.agent_ref)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let volume_attachment_removed = volume.as_ref().is_none_or(|value| {
+                value
+                    .pointer("/spec/attachments")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+            });
+            let mdns_enabled = value
+                .pointer("/spec/mdns/enable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if mdns_enabled {
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            let broker_context = crate::resolve_network_effect_context(
+                &value,
+                &resolver,
+                &admission,
+            )
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .with_host_global_nic_admission();
+            let effects = crate::network_effect_port::production_port(
+                &self.state,
+                BrokerCallerRole::AdminUid {
+                    uid: self.state.daemon_uid,
+                },
+                broker_context,
+            );
+            let input = ReconcileInput {
+                spec,
+                mdns_enabled,
+                network_uid: resource.key().uid().clone(),
+                network_generation: resource.generation(),
+                attachment_generation: admission.key().attachment_generation(),
+                installed_generation: admission.key().bundle_generation().clone(),
+                admission,
+                artifact_catalog: Vec::new(),
+                user_ready: true,
+                host_memory_budget_available:
+                    d2b_provider_network_local::controller::CONFIG_VOLUME_MAX_BYTES,
+                volume_ready: true,
+                guest_ready: true,
+                volume_attachment_ready: true,
+                workload_fds_closed: true,
+                agent_deleted: agent.is_none(),
+                mdns_deleted: true,
+                volume_attachment_removed,
+                guest_deleted: guest.is_none(),
+                volume_deleted: volume.is_none(),
+                attachments: Vec::new(),
+            };
+            let stage = NetworkReconciler::new(effects, children)
+                .finalize(&input)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            if stage != d2b_provider_network_local::controller::FinalizerStage::Complete {
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            let zone_uid = runtime.authority_zone_uid().cloned();
+            let plane = self
+                .state
+                .resource_plane
                 .lock()
-                .stop_vm(holder.name().as_str());
+                .ok()
+                .and_then(|plane| plane.clone());
+            if let (Some(zone_uid), Some(plane)) = (zone_uid, plane) {
+                plane
+                    .network_admission_index()
+                    .lock()
+                    .await
+                    .release_owner_after_finalizer(
+                        &zone_uid,
+                        resource.key().uid(),
+                        true,
+                    );
+            }
+            return Ok(());
+        }
+        if kind == SharedProviderResourceKind::TpmDevice {
+            let holder = Self::owner_ref(&value)?;
+            if holder.resource_type().as_str() != "Guest" {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+            let execution_ref = value
+                .pointer("/spec/provider/settings/executionRef")
+                .and_then(Value::as_str)
+                .and_then(|value| ResourceRef::parse(value).ok())
+                .unwrap_or_else(|| ResourceRef::parse(CORE_CONTROLLER_HOST_REF).expect("Host ref"));
+            let runtime = self.runtime()?;
+            let runtime_for_children = Arc::clone(&runtime);
+            let vm_id = VmId::new(holder.name().as_str());
+            let migration_intent =
+                BundleOpId::new(format!("legacy-swtpm:vm:{}", vm_id.as_str()));
+            let decision = runtime
+                .tpm_device_is_admitted(
+                    resource.key().uid(),
+                    resource.key().resource_ref(),
+                    vm_id.as_str(),
+                    &context.operation_id,
+                    None,
+                )
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let lifecycle = runtime
+                .admit_internal_guest_lifecycle(holder.clone(), &context.operation_id)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let authorization =
+                crate::provider_effects::LifecycleAuthorization::from_lease(
+                    lifecycle.lease,
+                    holder,
+                    lifecycle.guest_uid,
+                    lifecycle.guest_generation,
+                    lifecycle.provider_assignment_generation,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            let resolver = crate::load_bundle_resolver(&self.state)
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let log_level = value
+                .pointer("/spec/provider/settings/logLevel")
+                .and_then(Value::as_u64)
+                .and_then(|value| u8::try_from(value).ok())
+                .unwrap_or(20);
+            let mut controller = self
+                .tpm_controllers
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .remove(resource.key().uid())
+                .ok_or(SharedProviderEffectError::Unavailable)?;
+            let result = crate::tpm_effect_port::finalize_device_tpm_controller(
+                &self.state,
+                &resolver,
+                vm_id.clone(),
+                migration_intent,
+                decision,
+                crate::tpm_effect_port::AdmittedTpmDevice::new(
+                    resource.key().uid().clone(),
+                    resource.key().resource_ref().clone(),
+                    self.zone.as_str(),
+                    execution_ref,
+                    authorization,
+                ),
+                tpm_state_intent(resource.key().uid(), vm_id.as_str()),
+                d2b_provider_device_tpm::SwtpmSettings { log_level },
+                d2b_provider_device_tpm::SignedBinaryRef::from_core(
+                    d2b_provider_device_tpm::BinaryKind::Swtpm,
+                    tpm_opaque_bytes("d2b:tpm-binary/v1", vm_id.as_str()),
+                ),
+                BrokerCallerRole::AdminUid {
+                    uid: self.state.daemon_uid,
+                },
+                &mut controller,
+            )
+            .map_err(|_| SharedProviderEffectError::Unavailable);
+            if result.is_err() {
+                self.tpm_controllers
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone(), controller);
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            let children_cleaned = match self
+                .cleanup_binding_children(&runtime_for_children, resource, &context.operation_id)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    self.tpm_controllers
+                        .lock()
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?
+                        .insert(resource.key().uid().clone(), controller);
+                    return Err(error);
+                }
+            };
+            if !children_cleaned {
+                self.tpm_controllers
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone(), controller);
+                return Err(SharedProviderEffectError::Unavailable);
+            }
             return Ok(());
         }
         if kind == SharedProviderResourceKind::UsbipService {
+            let runtime = self.runtime()?;
+            let service_ref = resource.key().resource_ref().to_canonical_string();
+            let bindings = runtime
+                .committed_resources_of_type(d2b_provider_device_usbip::USB_BINDING_RESOURCE_TYPE)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            if bindings.iter().any(|binding| {
+                binding.pointer("/spec/serviceRef").and_then(Value::as_str)
+                    == Some(service_ref.as_str())
+            }) {
+                return Err(SharedProviderEffectError::Unavailable);
+            }
             let (zone_uid, opted_in, mut port) =
                 self.usbip_service_port(context, resource, &value).await?;
             if !opted_in {
@@ -1520,6 +3435,159 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             supervisor
                 .finalize(&mut port)
                 .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            self.usbip_services
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .remove(resource.key().uid());
+            return Ok(());
+        }
+        if kind == SharedProviderResourceKind::GpuDevice {
+            let admission = self
+                .gpu_controllers
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .get(resource.key().uid())
+                .and_then(|controller| controller.admission().cloned())
+                .ok_or(SharedProviderEffectError::Unavailable)?;
+            let resolver = crate::load_bundle_resolver(&self.state)
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let runtime = self.runtime()?;
+            let runtime_for_children = Arc::clone(&runtime);
+            let opened_devices = self.take_gpu_opened_devices(resource.key().uid())?;
+            let mut controller = self
+                .gpu_controllers
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .remove(resource.key().uid())
+                .ok_or(SharedProviderEffectError::Unavailable)?;
+            let mut port = DaemonGpuLifecyclePort {
+                state: Arc::clone(&self.state),
+                runtime,
+                resolver,
+                device_ref: resource.key().resource_ref().clone(),
+                device_uid: resource.key().uid().clone(),
+                holder_ref: admission.owner().holder_ref().clone(),
+                generation: admission.owner().generation(),
+                settings: controller.settings().clone(),
+                operation_id: context.operation_id.clone(),
+                authority_leases: Arc::clone(&self.gpu_authority_leases),
+                processes: Arc::clone(&self.gpu_processes),
+                opened_devices,
+            };
+            let result = controller
+                .finalize_lifecycle(&mut port)
+                .map_err(|_| SharedProviderEffectError::Unavailable);
+            if result.is_err() {
+                let opened_devices = std::mem::take(&mut port.opened_devices);
+                self.retain_gpu_opened_devices(resource.key().uid(), opened_devices)?;
+                self.gpu_controllers
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone(), controller);
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            let children_cleaned = match self
+                .cleanup_binding_children(&runtime_for_children, resource, &context.operation_id)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    let opened_devices = std::mem::take(&mut port.opened_devices);
+                    self.retain_gpu_opened_devices(resource.key().uid(), opened_devices)?;
+                    self.gpu_controllers
+                        .lock()
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?
+                        .insert(resource.key().uid().clone(), controller);
+                    return Err(error);
+                }
+            };
+            if !children_cleaned {
+                let opened_devices = std::mem::take(&mut port.opened_devices);
+                self.retain_gpu_opened_devices(resource.key().uid(), opened_devices)?;
+                self.gpu_controllers
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone(), controller);
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            return Ok(());
+        }
+        if matches!(
+            kind,
+            SharedProviderResourceKind::UsbipBinding
+                | SharedProviderResourceKind::SecurityKeyBinding
+                | SharedProviderResourceKind::SecurityKeyService
+        ) {
+            let runtime = self.runtime()?;
+            if kind == SharedProviderResourceKind::SecurityKeyService {
+                let service_ref = resource.key().resource_ref().to_canonical_string();
+                let bindings = runtime
+                    .committed_resources_of_type(
+                        d2b_provider_device_security_key::SECURITY_KEY_BINDING_RESOURCE_TYPE,
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if bindings.iter().any(|binding| {
+                    binding.pointer("/spec/serviceRef").and_then(Value::as_str)
+                        == Some(service_ref.as_str())
+                }) {
+                    return Err(SharedProviderEffectError::Unavailable);
+                }
+            }
+            if kind == SharedProviderResourceKind::UsbipBinding {
+                let service_ref = value
+                    .pointer("/spec/serviceRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let guest_ref = value
+                    .pointer("/spec/guestRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let mut controller = d2b_provider_device_usbip::UsbipBindingController::new(
+                    resource.key().resource_ref(),
+                    &service_ref,
+                    &guest_ref,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                controller.finalize();
+            }
+            if self
+                .cleanup_binding_children(&runtime, resource, &context.operation_id)
+                .await?
+            {
+                return Ok(());
+            }
+            return Err(SharedProviderEffectError::Unavailable);
+        }
+        if matches!(
+            kind,
+            SharedProviderResourceKind::UsbipDevice
+                | SharedProviderResourceKind::SecurityKeyDevice
+        ) {
+            let child_type = if kind == SharedProviderResourceKind::UsbipDevice {
+                d2b_provider_device_usbip::USB_SERVICE_RESOURCE_TYPE
+            } else {
+                d2b_provider_device_security_key::SECURITY_KEY_SERVICE_RESOURCE_TYPE
+            };
+            let runtime = self.runtime()?;
+            let children = runtime
+                .committed_resources_of_type(child_type)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let device_ref = resource.key().resource_ref().to_canonical_string();
+            if children.iter().any(|child| {
+                child
+                    .pointer("/spec/provider/settings/deviceRef")
+                    .or_else(|| child.pointer("/spec/backingDeviceRef"))
+                    .and_then(Value::as_str)
+                    == Some(device_ref.as_str())
+                    || child.pointer("/metadata/ownerRef").and_then(Value::as_str)
+                        == Some(device_ref.as_str())
+            }) {
+                return Err(SharedProviderEffectError::Unavailable);
+            }
             return Ok(());
         }
         Err(SharedProviderEffectError::Unavailable)
@@ -14364,11 +16432,12 @@ mod tests {
         }
     }
 
-    fn shared_provider_test_descriptor() -> (
+    fn shared_provider_test_descriptor_for(
+        registration: SharedProviderRunnerRegistration,
+    ) -> (
         SharedProviderRunnerRegistration,
         ControllerDescriptor,
     ) {
-        let registration = U8_SHARED_PROVIDER_RUNNERS[0];
         let provider_ref = ResourceRef::parse(registration.provider_ref).unwrap();
         let generations = BTreeMap::from([(provider_ref, ResourceGeneration::new(7).unwrap())]);
         compose_shared_provider_runner_descriptors(
@@ -14383,9 +16452,29 @@ mod tests {
         .unwrap()
     }
 
+    fn shared_provider_test_descriptor() -> (
+        SharedProviderRunnerRegistration,
+        ControllerDescriptor,
+    ) {
+        shared_provider_test_descriptor_for(U8_SHARED_PROVIDER_RUNNERS[0])
+    }
+
     fn shared_provider_test_resource(finalizers: &[&str], deleting: bool) -> ResourceSnapshot {
+        shared_provider_test_resource_for(
+            U8_SHARED_PROVIDER_RUNNERS[0],
+            finalizers,
+            deleting,
+        )
+    }
+
+    fn shared_provider_test_resource_for(
+        registration: SharedProviderRunnerRegistration,
+        finalizers: &[&str],
+        deleting: bool,
+    ) -> ResourceSnapshot {
         let zone = ZoneId::parse("work").unwrap();
-        let resource_ref = ResourceRef::parse("Network/work").unwrap();
+        let resource_ref =
+            ResourceRef::parse(&format!("{}/work", registration.resource_type)).unwrap();
         let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
         let finalizers = finalizers
             .iter()
@@ -14393,7 +16482,7 @@ mod tests {
             .collect::<Vec<_>>();
         let body = json!({
             "apiVersion": "resources.d2bus.org/v3",
-            "type": "Network",
+            "type": registration.resource_type,
             "metadata": {
                 "name": "work",
                 "zone": "work",
@@ -14403,7 +16492,7 @@ mod tests {
                 "finalizers": finalizers,
             },
             "spec": {
-                "providerRef": "Provider/network-local",
+                "providerRef": registration.provider_ref,
             },
             "status": {
                 "phase": "Pending",
@@ -14466,6 +16555,49 @@ mod tests {
             d2b_core_controller::MutationIntentKind::UpdateFinalizers
         );
         assert_eq!(effects.finalizes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn every_u8_descriptor_cleans_before_finalizer_removal() {
+        for registration in U8_SHARED_PROVIDER_RUNNERS {
+            let (_, descriptor) = shared_provider_test_descriptor_for(registration);
+            let effects = Arc::new(RecordingSharedProviderEffects {
+                reconciles: AtomicUsize::new(0),
+                finalizes: AtomicUsize::new(0),
+                cleanup_ready: std::sync::atomic::AtomicBool::new(true),
+            });
+            let kind = SharedProviderResourceKind::from_registration(registration).unwrap();
+            let reconciler =
+                SharedProviderResourceReconciler::new(descriptor, kind, effects.clone());
+            let deleting =
+                shared_provider_test_resource_for(registration, &[registration.finalizer], true);
+            let result = reconciler.execute_finalize_for_test(&deleting).await.unwrap();
+            assert!(result.mutation_batch().is_some());
+            assert_eq!(effects.finalizes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn network_runner_uses_durable_child_readiness() {
+        let fixture = PublicationStoreFixture::new().await;
+        let bundle = publication_bundle(&fixture.zone, fixture.identity.zone_uid(), "network");
+        let runtime = Arc::new(fixture.open(&bundle).await);
+        let children = SharedRunnerNetworkResources::new(
+            Arc::clone(&runtime),
+            ResourceRef::parse("Network/work").unwrap(),
+            &ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+        );
+        assert_eq!(
+            children.readiness().await.unwrap(),
+            SharedRunnerNetworkReadiness {
+                volume_ready: false,
+                guest_ready: false,
+                attachment_ready: false,
+            }
+        );
+        drop(children);
+        let runtime = Arc::try_unwrap(runtime).expect("test runtime has one owner");
+        runtime.shutdown().await.unwrap();
     }
 
     #[test]

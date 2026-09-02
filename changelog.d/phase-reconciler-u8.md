@@ -7,3 +7,8 @@
 - Bind the U8 registrations to typed Provider reconcilers, keep provider
   cleanup ahead of finalizer removal, and make shared Runner startup resolve
   every accepted Provider before spawning any runner.
+- Complete production Provider wiring for Network child resources, device
+  authority, dependency-aware GPU lifecycle, and typed cleanup before any
+  shared Runner finalizer is removed.
+- Make child readiness and cleanup durable across Resource API passes, with
+  Core-issued GPU authority and identity fences instead of synthetic grants.

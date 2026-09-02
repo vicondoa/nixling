@@ -1106,6 +1106,31 @@ impl AuthorityRequest {
         )
     }
 
+    /// Build a GPU claim from Core-resolved opaque identity bytes.
+    ///
+    /// This is the narrow adapter used by the daemon's typed GPU Provider
+    /// port. The caller supplies only identities and generation evidence
+    /// already resolved by Core; no host locator or caller-selected
+    /// authority class is accepted.
+    pub fn gpu_from_core(
+        host_uid: ResourceUid,
+        owner_ref: ResourceRef,
+        owner_uid: ResourceUid,
+        owner_generation: ResourceGeneration,
+        backing: [u8; 32],
+        render_node_only: bool,
+        max_holders: usize,
+    ) -> Result<Self, AuthorityError> {
+        let owner_proof =
+            AuthorityOwnerProof::from_resource_ref(owner_ref, owner_uid, owner_generation);
+        let backing = AuthorityDigest(backing);
+        if render_node_only {
+            Self::gpu_render_node(host_uid, backing, max_holders, owner_proof)
+        } else {
+            Self::gpu_full_device(host_uid, backing, owner_proof)
+        }
+    }
+
     /// Build a bounded shared render-node claim.
     pub fn gpu_render_node(
         host_uid: ResourceUid,
@@ -1599,6 +1624,11 @@ impl AuthorityLease {
     /// Return the class held by this lease.
     pub const fn class(&self) -> AuthorityClass {
         self.key.class
+    }
+
+    /// Return the opaque token for a typed Core adapter.
+    pub const fn token_bytes(&self) -> [u8; 16] {
+        self.token.to_be_bytes()
     }
 }
 
