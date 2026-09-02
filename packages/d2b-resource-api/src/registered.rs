@@ -101,7 +101,7 @@ where
 pub struct RedbRegisteredControllerApi {
     store: Arc<RedbResourceStore>,
     commit: Option<NativeCommitPath>,
-    descriptor: Mutex<Option<ControllerDescriptor>>,
+    descriptor: Mutex<Option<Arc<ControllerDescriptor>>>,
     watch: tokio::sync::Mutex<Option<ResourceWatch>>,
     pending: tokio::sync::Mutex<VecDeque<(ChangeRecord, OperationContext, ZoneRevision)>>,
     acknowledge_after: tokio::sync::Mutex<Option<ZoneRevision>>,
@@ -327,11 +327,12 @@ impl RedbRegisteredControllerApi {
         Ok(())
     }
 
-    fn descriptor(&self) -> Result<ControllerDescriptor, SourceError> {
+    fn descriptor(&self) -> Result<Arc<ControllerDescriptor>, SourceError> {
         self.descriptor
             .lock()
             .map_err(|_| SourceError::Integrity)?
-            .clone()
+            .as_ref()
+            .cloned()
             .ok_or(SourceError::Integrity)
     }
 
@@ -925,11 +926,11 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
             let mut registered = self.descriptor.lock().map_err(|_| SourceError::Integrity)?;
             if registered
                 .as_ref()
-                .is_some_and(|current| current != descriptor)
+                .is_some_and(|current| current.as_ref() != descriptor)
             {
                 return Err(SourceError::Integrity);
             }
-            *registered = Some(descriptor.clone());
+            *registered = Some(Arc::new(descriptor.clone()));
             Ok(())
         }
     }
@@ -940,7 +941,7 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
     ) -> impl Future<Output = Result<InitialList, SourceError>> + Send {
         let descriptor = descriptor.clone();
         async move {
-            if self.descriptor()? != descriptor {
+            if self.descriptor()?.as_ref() != &descriptor {
                 return Err(SourceError::Integrity);
             }
             let (resources, snapshot_revision) = self
@@ -978,7 +979,7 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
         let descriptor = descriptor.clone();
         async move {
-            if self.descriptor()? != descriptor {
+            if self.descriptor()?.as_ref() != &descriptor {
                 return Err(SourceError::Integrity);
             }
             let (resource_types, filters) = if descriptor.consumes_owner_triggers() {
@@ -1107,7 +1108,15 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
                     }
                     continue;
                 }
-                self.pending.lock().await.extend(changes);
+                let mut changes = changes.into_iter();
+                let first = changes.next().expect("nonempty watch changes");
+                let remaining = changes.collect::<Vec<_>>();
+                if remaining.is_empty() {
+                    *self.acknowledge_after.lock().await = Some(batch.revision());
+                } else {
+                    self.pending.lock().await.extend(remaining);
+                }
+                return Ok(Some((first.0, first.1)));
             }
         }
     }
@@ -1565,8 +1574,13 @@ fn deleting(bytes: &[u8]) -> bool {
 
 fn observed_generation(bytes: Option<&[u8]>, fallback: ResourceGeneration) -> ObservedGeneration {
     bytes
-        .and_then(|bytes| ResourceEnvelope::from_json(bytes).ok())
-        .map(|envelope| envelope.status().observed_generation())
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+        .and_then(|value| {
+            value
+                .pointer("/status/observedGeneration")
+                .and_then(Value::as_u64)
+                .map(ObservedGeneration::new)
+        })
         .unwrap_or_else(|| ObservedGeneration::new(fallback.get().saturating_sub(1)))
 }
 
