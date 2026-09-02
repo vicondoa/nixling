@@ -905,6 +905,7 @@ where
             }
 
             if watch_closed && workers.is_empty() && queue.is_empty() {
+                watchers.shutdown().await;
                 return Ok(());
             }
 
