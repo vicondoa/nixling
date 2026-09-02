@@ -12172,11 +12172,21 @@ impl ZoneResourceRuntime {
     #[allow(dead_code)]
     pub(crate) fn scoped_credential_client(
         &self,
+        session: Option<&d2bd_runtime::guest_component_session::GuestComponentSessionClient>,
         delegate: Arc<dyn d2b_provider_transport_azure_relay::ScopedCredentialClient>,
     ) -> Result<
         Arc<crate::credential_resource_runtime::SameZoneScopedCredentialClient>,
         ResourceRuntimeError,
     > {
+        if let Some(session) = session {
+            return crate::credential_resource_runtime::SameZoneScopedCredentialClient::with_component_session(
+                self.zone.clone(),
+                session,
+                delegate,
+            )
+            .map(Arc::new)
+            .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed);
+        }
         let resource = self.status_client()?;
         Ok(Arc::new(
             crate::credential_resource_runtime::SameZoneScopedCredentialClient::new(

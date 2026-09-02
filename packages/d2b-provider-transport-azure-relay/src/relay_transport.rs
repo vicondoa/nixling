@@ -1249,8 +1249,8 @@ where
     /// Open a connection through the narrow same-Zone Credential boundary.
     ///
     /// The request is the only place where the transport sees a Credential
-    /// reference. U10 can replace the port implementation with its scoped
-    /// ResourceClient without changing transport ownership or scheduling.
+    /// reference. U10 supplies the scoped ResourceClient/session gate without
+    /// changing transport ownership or scheduling.
     pub async fn open_scoped(
         &self,
         request: ScopedCredentialRequest,

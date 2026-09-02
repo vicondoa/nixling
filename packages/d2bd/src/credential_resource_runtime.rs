@@ -5,12 +5,21 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use d2b_contracts_provider::v3::{
-    credential::CREDENTIAL_SERVICE_NAME,
+    credential::{CREDENTIAL_SERVICE_NAME, CredentialSpec, PlacementBinding},
     credential_controller::{CREDENTIAL_PROVIDER_REVOKE_FINALIZER, CredentialProviderKind},
 };
 use d2b_contracts_resource::resource_proto as wire;
 use d2b_contracts_resource::v3::{
-    CanonicalJsonValue, ResourcePhase, ResourceRef, ResourceTypeName, ZoneId,
+    CanonicalJsonValue, DesiredLifecycle, ResourceEnvelope, ResourcePhase, ResourceRef,
+    ResourceTypeName, ZoneId,
+    execution_policy::{
+        BoundedToken, BudgetSpec, DurationMs, ExecutionDomain,
+    },
+    process::{
+        AdoptionPolicy, EnvironmentClass, ExecutionSpec, HealthCheckSpec, NamespaceClass,
+        NetworkUsageSpec, ProcessClass, ProcessSpec, ReadinessClass, ReadinessSpec,
+        RestartPolicySpec, SandboxSpec, TelemetrySpec,
+    },
 };
 use d2b_core_controller::{
     ControllerDescriptor, ControllerExecutionPolicy, ControllerIdentity, ControllerSelector,
@@ -25,7 +34,7 @@ use d2b_provider_transport_azure_relay::{
 };
 use d2b_resource_api::{RedbBackend, ResourceApiClient, service::UnavailableUpgradeDispatcher};
 use d2b_resource_store::{
-    StoreListRequest, StoreOperationContext, StoreProjection, StoredResource,
+    StoreFilter, StoreListRequest, StoreOperationContext, StoreProjection, StoredResource,
 };
 use d2b_resource_store_redb::RedbResourceStore;
 
@@ -219,9 +228,58 @@ impl CredentialResourceReconciler {
             .map_err(|_| CredentialResourceRuntimeError::InvalidResource)
     }
 
+    async fn managed_identity_child_batch(
+        &self,
+        dependencies: &[DependencySnapshot],
+        resource: &ResourceSnapshot,
+    ) -> Result<Option<ResourceMutationBatch>, CredentialResourceRuntimeError> {
+        if self.provider_kind != CredentialProviderKind::ManagedIdentity
+            || !dependency_ready(dependencies, &self.provider_ref)
+        {
+            return Ok(None);
+        }
+        let spec = credential_spec(resource)?;
+        let execution_ref = credential_execution_ref(&spec)?;
+        if !dependency_ready(dependencies, execution_ref) {
+            return Ok(None);
+        }
+        let child_ref = managed_identity_agent_ref(resource)?;
+        let children = self.owned_processes(resource).await?;
+        let child = children
+            .iter()
+            .find(|child| child.resource_ref == child_ref);
+        let Some(child) = child else {
+            let mutation = d2b_core_controller::MutationIntent::new(
+                child_ref,
+                None,
+                None,
+                d2b_core_controller::MutationIntentKind::Create,
+                Some(managed_identity_agent_payload(resource)?),
+            )
+            .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?;
+            return ResourceMutationBatch::new(vec![mutation])
+                .map(Some)
+                .map_err(|_| CredentialResourceRuntimeError::InvalidResource);
+        };
+        if managed_identity_agent_matches(child, resource) || deletion_requested(child) {
+            return Ok(None);
+        }
+        let mutation = d2b_core_controller::MutationIntent::new(
+            child.resource_ref.clone(),
+            Some(child.uid.clone()),
+            Some(child.revision),
+            d2b_core_controller::MutationIntentKind::Delete,
+            None,
+        )
+        .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?;
+        ResourceMutationBatch::new(vec![mutation])
+            .map(Some)
+            .map_err(|_| CredentialResourceRuntimeError::InvalidResource)
+    }
+
     async fn owned_processes(
         &self,
-        owner: &ResourceRef,
+        owner: &ResourceSnapshot,
     ) -> Result<Vec<StoredResource>, CredentialResourceRuntimeError> {
         let mut resources = Vec::new();
         let mut cursor = None;
@@ -242,7 +300,10 @@ impl CredentialResourceReconciler {
                             .expect("Process ResourceType"),
                     ],
                     resource_names: Vec::new(),
-                    filters: Vec::new(),
+                    filters: vec![StoreFilter {
+                        field: "owner.resourceUid".to_owned(),
+                        values: vec![owner.key().uid().as_str().to_owned()],
+                    }],
                     page_size: 256,
                     cursor,
                     projection: StoreProjection::Full,
@@ -257,7 +318,7 @@ impl CredentialResourceReconciler {
         }
         Ok(resources
             .into_iter()
-            .filter(|resource| owner_ref(resource).as_ref() == Some(owner))
+            .filter(|resource| owner_ref(resource).as_ref() == Some(owner.key().resource_ref()))
             .collect())
     }
 
@@ -331,15 +392,18 @@ impl ResourceReconciler for CredentialResourceReconciler {
         _context: &ReconcileContext,
         resource: &ResourceSnapshot,
     ) -> impl std::future::Future<Output = Result<ValidationResult, Self::Error>> + Send {
-        let result = match serde_json::from_slice::<serde_json::Value>(resource.canonical_json()) {
-            Ok(value)
-                if resource.key().resource_ref().resource_type().as_str()
-                    == CREDENTIAL_RESOURCE_TYPE
-                    && value
-                        .pointer("/spec/providerRef")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|provider| ResourceRef::parse(provider).ok())
-                        .is_some() =>
+        let result = match credential_spec(resource) {
+            Ok(spec)
+                if serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .pointer("/spec/providerRef")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|provider| ResourceRef::parse(provider).ok())
+                    })
+                    .is_some_and(|provider| provider == self.provider_ref)
+                    && credential_scope_valid(self.provider_kind, &spec) =>
             {
                 ValidationResult::Valid
             }
@@ -403,6 +467,22 @@ impl ResourceReconciler for CredentialResourceReconciler {
                 )
                 .map_err(|_| CredentialResourceRuntimeError::InvalidResource);
             }
+            if let Some(batch) = self
+                .managed_identity_child_batch(_dependencies, resource)
+                .await?
+            {
+                return ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    Some(batch),
+                    None,
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    d2b_core_controller::StatusPersistence::NotRequested,
+                )
+                .map_err(|_| CredentialResourceRuntimeError::InvalidResource);
+            }
             Ok(ReconcileResult::converged(
                 resource.revision(),
                 resource.generation(),
@@ -426,30 +506,63 @@ impl ResourceReconciler for CredentialResourceReconciler {
                 )
                 .ok()
                 .and_then(|value| {
-                    value
+                    (value
                         .pointer("/status/phase")
                         .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
+                        == Some("Ready")
+                        && value
+                            .pointer("/status/observedGeneration")
+                            .and_then(serde_json::Value::as_u64)
+                            == Some(dependency.resource().generation().get()))
+                    .then_some(())
                 })
-                .is_some_and(|phase| phase == "Ready")
+                .is_some()
         });
-        let phase = if provider_ready {
-            ResourcePhase::Ready
-        } else {
-            ResourcePhase::Degraded
-        };
+        let provider_kind = self.provider_kind;
         let result = async move {
             context
                 .authorize_effect()
                 .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?;
+            let (phase, outcome, disposition) = if provider_ready
+                && provider_kind == CredentialProviderKind::ManagedIdentity
+            {
+                let children = self.owned_processes(resource).await?;
+                let child_ref = managed_identity_agent_ref(resource)?;
+                match children.iter().find(|child| child.resource_ref == child_ref) {
+                    Some(child) if managed_identity_agent_ready(child) => (
+                        ResourcePhase::Ready,
+                        "success",
+                        ReconcileDisposition::Converged,
+                    ),
+                    Some(child) if deletion_requested(child) => (
+                        ResourcePhase::Degraded,
+                        "credential-agent-draining",
+                        ReconcileDisposition::Pending,
+                    ),
+                    Some(_) => (
+                        ResourcePhase::Degraded,
+                        "credential-agent-unavailable",
+                        ReconcileDisposition::Pending,
+                    ),
+                    None => (
+                        ResourcePhase::Pending,
+                        "credential-agent-pending",
+                        ReconcileDisposition::Pending,
+                    ),
+                }
+            } else if provider_ready {
+                (ResourcePhase::Ready, "success", ReconcileDisposition::Converged)
+            } else {
+                (
+                    ResourcePhase::Degraded,
+                    "credential-provider-unavailable",
+                    ReconcileDisposition::Degraded,
+                )
+            };
             let status = credential_status_candidate(
                 resource,
                 phase,
-                if provider_ready {
-                    "success"
-                } else {
-                    "credential-provider-unavailable"
-                },
+                outcome,
                 false,
             )?;
             ReconcileResult::new(
@@ -457,11 +570,7 @@ impl ResourceReconciler for CredentialResourceReconciler {
                 resource.generation(),
                 None,
                 Some(status),
-                if provider_ready {
-                    ReconcileDisposition::Converged
-                } else {
-                    ReconcileDisposition::Degraded
-                },
+                disposition,
                 None,
                 None,
                 d2b_core_controller::StatusPersistence::Pending,
@@ -533,7 +642,7 @@ impl ResourceReconciler for CredentialResourceReconciler {
                 )
                 .map_err(|_| CredentialResourceRuntimeError::InvalidResource);
             }
-            let children = self.owned_processes(resource.key().resource_ref()).await?;
+            let children = self.owned_processes(resource).await?;
             if let Some(child) = children.iter().find(|child| !deletion_requested(child)) {
                 self.request_process_deletion(child).await?;
                 return Ok(ReconcileResult::converged(
@@ -620,6 +729,289 @@ fn provider_kind(provider_ref: &ResourceRef) -> Option<CredentialProviderKind> {
         "Provider/credential-managed-identity" => Some(CredentialProviderKind::ManagedIdentity),
         _ => None,
     }
+}
+
+fn credential_spec(
+    resource: &ResourceSnapshot,
+) -> Result<CredentialSpec, CredentialResourceRuntimeError> {
+    let envelope = ResourceEnvelope::from_json(resource.canonical_json())
+        .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?;
+    if envelope.resource_type().as_str() != CREDENTIAL_RESOURCE_TYPE
+        || envelope.metadata().zone() != resource.key().zone()
+        || envelope.metadata().uid() != resource.key().uid()
+        || envelope.metadata().generation() != resource.generation()
+        || envelope.metadata().revision() != resource.revision()
+    {
+        return Err(CredentialResourceRuntimeError::InvalidResource);
+    }
+    serde_json::from_slice(&envelope.spec().base().to_canonical_bytes())
+        .map_err(|_| CredentialResourceRuntimeError::InvalidResource)
+}
+
+fn dependency_ready(dependencies: &[DependencySnapshot], target: &ResourceRef) -> bool {
+    dependencies.iter().any(|dependency| {
+        let resource = dependency.resource();
+        resource.key().resource_ref() == target
+            && serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+                .ok()
+                .is_some_and(|value| {
+                    value
+                        .pointer("/status/phase")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("Ready")
+                        && value
+                            .pointer("/status/observedGeneration")
+                            .and_then(serde_json::Value::as_u64)
+                            == Some(resource.generation().get())
+                })
+    })
+}
+
+fn credential_execution_ref(
+    spec: &CredentialSpec,
+) -> Result<&ResourceRef, CredentialResourceRuntimeError> {
+    let execution_ref = spec
+        .scope()
+        .execution_ref()
+        .ok_or(CredentialResourceRuntimeError::InvalidResource)?;
+    if !matches!(
+        execution_ref.resource_type().as_str(),
+        "Host" | "Guest"
+    ) {
+        return Err(CredentialResourceRuntimeError::InvalidResource);
+    }
+    Ok(execution_ref)
+}
+
+fn credential_scope_valid(provider_kind: CredentialProviderKind, spec: &CredentialSpec) -> bool {
+    let Some(execution_ref) = spec.scope().execution_ref() else {
+        return false;
+    };
+    match provider_kind {
+        CredentialProviderKind::SecretService => {
+            spec.scope().domain_filter() == Some(ExecutionDomain::User)
+                && spec.scope().user_ref().is_some()
+                && matches!(
+                    execution_ref.resource_type().as_str(),
+                    "Host" | "Guest"
+                )
+        }
+        CredentialProviderKind::Entra => {
+            execution_ref.resource_type().as_str() == "Guest"
+                && spec.scope().domain_filter() != Some(ExecutionDomain::User)
+        }
+        CredentialProviderKind::ManagedIdentity => {
+            matches!(
+                execution_ref.resource_type().as_str(),
+                "Host" | "Guest"
+            ) && spec.scope().domain_filter() != Some(ExecutionDomain::User)
+        }
+    }
+}
+
+fn managed_identity_agent_ref(
+    resource: &ResourceSnapshot,
+) -> Result<ResourceRef, CredentialResourceRuntimeError> {
+    let value = format!(
+        "{PROCESS_RESOURCE_TYPE}/mi-agent-{}",
+        resource.key().resource_ref().name().as_str()
+    );
+    ResourceRef::parse(&value)
+    .map_err(|_| CredentialResourceRuntimeError::InvalidResource)
+}
+
+fn managed_identity_agent_payload(
+    resource: &ResourceSnapshot,
+) -> Result<Vec<u8>, CredentialResourceRuntimeError> {
+    let spec = credential_spec(resource)?;
+    let execution_ref = credential_execution_ref(&spec)?.clone();
+    if spec.scope().domain_filter() == Some(ExecutionDomain::User) {
+        return Err(CredentialResourceRuntimeError::InvalidResource);
+    }
+    let placement = match execution_ref.resource_type().as_str() {
+        "Host" => PlacementBinding::HostSystem,
+        "Guest" => PlacementBinding::GuestAgent,
+        _ => return Err(CredentialResourceRuntimeError::InvalidResource),
+    };
+    let zone_ref = format!("Zone/{}", resource.key().zone().as_str());
+    let placement = d2b_provider_credential_managed_identity::ManagedIdentityPlacement::new(
+        placement,
+        execution_ref.clone(),
+        ResourceRef::parse(&zone_ref)
+            .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?,
+    )
+    .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?;
+    let controller =
+        d2b_provider_credential_managed_identity::ManagedIdentityController::new(placement);
+    let agent = controller
+        .plan_agent(resource.key().resource_ref().clone(), true, true)
+        .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?
+        .ok_or(CredentialResourceRuntimeError::InvalidResource)?;
+    let execution = ExecutionSpec::new(
+        agent.execution_ref().clone(),
+        Some(ExecutionDomain::System),
+        None,
+        ProcessClass::Service,
+        BoundedToken::parse(agent.binary())
+            .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?,
+        None,
+        Vec::new(),
+        Vec::new(),
+        SandboxSpec::new(
+            vec![
+                NamespaceClass::Mount,
+                NamespaceClass::Pid,
+                NamespaceClass::Ipc,
+            ],
+            Vec::new(),
+            BoundedToken::parse("strict")
+                .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?,
+            true,
+            false,
+            EnvironmentClass::Minimal,
+            true,
+            Some("0022".to_owned()),
+            0,
+            None,
+        )
+        .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?,
+        BudgetSpec::default(),
+        Some(
+            NetworkUsageSpec::new(None, Vec::new(), false)
+                .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?,
+        ),
+        Vec::new(),
+        TelemetrySpec::default(),
+    )
+    .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?;
+    let process = ProcessSpec::new(
+        execution,
+        DesiredLifecycle::Running,
+        RestartPolicySpec::default(),
+        ReadinessSpec::new(
+            DurationMs::parse("0s", 0, 300_000)
+                .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?,
+            DurationMs::parse("30s", 1_000, 300_000)
+                .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?,
+            3,
+            1,
+            ReadinessClass::ProviderDefined,
+        )
+        .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?,
+        HealthCheckSpec::default(),
+        AdoptionPolicy::AdoptOnRestart,
+        DurationMs::parse("30s", 0, 3_600_000)
+            .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?,
+    )
+    .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?;
+    let mut process_spec =
+        serde_json::to_value(process).map_err(|_| CredentialResourceRuntimeError::InvalidResource)?;
+    let process_spec = process_spec
+        .as_object_mut()
+        .ok_or(CredentialResourceRuntimeError::InvalidResource)?;
+    process_spec.insert(
+        "providerRef".to_owned(),
+        serde_json::Value::String("Provider/system-systemd".to_owned()),
+    );
+    let child_ref = managed_identity_agent_ref(resource)?;
+    let value = serde_json::json!({
+        "apiVersion": "resources.d2bus.org/v3",
+        "type": PROCESS_RESOURCE_TYPE,
+        "metadata": {
+            "name": child_ref.name().as_str(),
+            "zone": resource.key().zone().as_str(),
+            "ownerRef": resource.key().resource_ref().to_canonical_string(),
+            "finalizers": [],
+            "deletionRequestedAt": null,
+            "createdAt": "1970-01-01T00:00:00.000Z",
+            "updatedAt": "1970-01-01T00:00:00.000Z",
+            "generation": 1,
+            "revision": 1,
+            "managedBy": "controller"
+        },
+        "spec": process_spec,
+        "status": {
+            "observedGeneration": 0,
+            "phase": "Pending",
+            "conditions": [],
+            "lastReconciledAt": null,
+            "startedAt": null,
+            "completedAt": null,
+            "outcome": null,
+            "update": {
+                "dependencies": {"count": 0, "refs": []},
+                "disruption": "None",
+                "lastAssessedAt": null,
+                "observedGeneration": 0,
+                "operationId": null,
+                "owned": {"count": 0, "refs": []},
+                "preserveState": true,
+                "reasons": [],
+                "state": "Unknown",
+                "targetGeneration": 1
+            },
+            "resource": {}
+        }
+    });
+    let bytes =
+        serde_json::to_vec(&value).map_err(|_| CredentialResourceRuntimeError::InvalidResource)?;
+    CanonicalJsonValue::parse(&bytes)
+        .map(|value| value.to_canonical_bytes())
+        .map_err(|_| CredentialResourceRuntimeError::InvalidResource)
+}
+
+fn managed_identity_agent_matches(
+    resource: &StoredResource,
+    owner: &ResourceSnapshot,
+) -> bool {
+    let Ok(expected_ref) = managed_identity_agent_ref(owner) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&resource.canonical_json) else {
+        return false;
+    };
+    resource.zone == *owner.key().zone()
+        && resource.resource_ref == expected_ref
+        && value.get("type").and_then(serde_json::Value::as_str) == Some(PROCESS_RESOURCE_TYPE)
+        && value
+            .pointer("/metadata/ownerRef")
+            .and_then(serde_json::Value::as_str)
+            == Some(owner.key().resource_ref().to_canonical_string().as_str())
+        && value
+            .pointer("/spec/providerRef")
+            .and_then(serde_json::Value::as_str)
+            == Some("Provider/system-systemd")
+        && value
+            .pointer("/spec/template")
+            .and_then(serde_json::Value::as_str)
+            == Some(d2b_provider_credential_managed_identity::AGENT_BINARY)
+        && value
+            .pointer("/spec/processClass")
+            .and_then(serde_json::Value::as_str)
+            == Some("service")
+        && value
+            .pointer("/spec/domain")
+            .and_then(serde_json::Value::as_str)
+            == Some("system")
+        && value
+            .pointer("/spec/networkUsage/allowEgress")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+}
+
+fn managed_identity_agent_ready(resource: &StoredResource) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&resource.canonical_json) else {
+        return false;
+    };
+    value
+        .pointer("/status/phase")
+        .and_then(serde_json::Value::as_str)
+        == Some("Ready")
+        && value
+            .pointer("/status/observedGeneration")
+            .and_then(serde_json::Value::as_u64)
+            == Some(resource.generation.get())
+        && !deletion_requested(resource)
 }
 
 fn has_finalizer(resource: &ResourceSnapshot) -> bool {
@@ -894,8 +1286,43 @@ fn cleanup_action(
 /// already-authorized request.
 pub(crate) struct SameZoneScopedCredentialClient {
     zone: ZoneId,
-    resource: Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+    resource: Arc<dyn CredentialResourceReader>,
     delegate: Arc<dyn ScopedCredentialClient>,
+}
+
+#[async_trait]
+trait CredentialResourceReader: Send + Sync {
+    async fn get(&self, request: wire::GetRequest) -> wire::GetResponse;
+}
+
+#[async_trait]
+impl CredentialResourceReader for ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher> {
+    async fn get(&self, request: wire::GetRequest) -> wire::GetResponse {
+        ResourceApiClient::get(self, request).await
+    }
+}
+
+struct ComponentSessionCredentialResourceReader {
+    client: d2b_resource_api::generated::d2b_resource_v3_ttrpc::ResourceServiceClient,
+}
+
+#[async_trait]
+impl CredentialResourceReader for ComponentSessionCredentialResourceReader {
+    async fn get(&self, request: wire::GetRequest) -> wire::GetResponse {
+        self.client
+            .get(ttrpc::context::Context::default(), &request)
+            .await
+            .unwrap_or_else(|_| {
+                let mut response = wire::GetResponse::new();
+                response.error = protobuf::MessageField::some(wire::ResourceError {
+                    kind: protobuf::EnumOrUnknown::new(
+                        wire::ResourceErrorKind::RESOURCE_ERROR_KIND_INTERNAL_INTEGRITY_FAILURE,
+                    ),
+                    ..wire::ResourceError::new()
+                });
+                response
+            })
+    }
 }
 
 impl core::fmt::Debug for SameZoneScopedCredentialClient {
@@ -909,6 +1336,37 @@ impl SameZoneScopedCredentialClient {
     pub(crate) fn new(
         zone: ZoneId,
         resource: Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+        delegate: Arc<dyn ScopedCredentialClient>,
+    ) -> Self {
+        Self::with_resource_reader(zone, resource, delegate)
+    }
+
+    pub(crate) fn with_component_session(
+        zone: ZoneId,
+        session: &d2bd_runtime::guest_component_session::GuestComponentSessionClient,
+        delegate: Arc<dyn ScopedCredentialClient>,
+    ) -> Result<Self, RelayCredentialError> {
+        if session.identity().zone() != &zone
+            || session.generation() == 0
+            || session
+                .identity()
+                .validate_route(&session.route_binding())
+                .is_err()
+        {
+            return Err(RelayCredentialError::InvalidScope);
+        }
+        Ok(Self::with_resource_reader(
+            zone,
+            Arc::new(ComponentSessionCredentialResourceReader {
+                client: session.resource_service_client(),
+            }),
+            delegate,
+        ))
+    }
+
+    fn with_resource_reader(
+        zone: ZoneId,
+        resource: Arc<dyn CredentialResourceReader>,
         delegate: Arc<dyn ScopedCredentialClient>,
     ) -> Self {
         Self {
@@ -940,9 +1398,7 @@ impl ScopedCredentialClient for SameZoneScopedCredentialClient {
         request: &ScopedCredentialRequest,
     ) -> Result<RelayCredentialLease, RelayCredentialError> {
         Self::validate_request_scope(request, &self.zone)?;
-        let response = self
-            .resource
-            .get({
+        let response = self.resource.get({
                 let mut get = wire::GetRequest::new();
                 get.meta = protobuf::MessageField::some(
                     d2bd_runtime::resource_runtime_support::public_request_meta(
@@ -1059,7 +1515,15 @@ mod tests {
                     "uid": "123e4567-e89b-42d3-a456-426614174000",
                     "generation": 1,
                     "revision": 3,
-                    "finalizers": []
+                    "finalizers": [],
+                    "labels": {},
+                    "annotations": {},
+                    "ownerRef": null,
+                    "managedBy": "controller",
+                    "configurationGeneration": 1,
+                    "deletionRequestedAt": null,
+                    "createdAt": "1970-01-01T00:00:00.000Z",
+                    "updatedAt": "1970-01-01T00:00:00.000Z"
                 },
                 "spec": {
                     "providerRef": "Provider/credential-managed-identity",
@@ -1070,6 +1534,22 @@ mod tests {
                 "status": {
                     "phase": "Pending",
                     "observedGeneration": 0,
+                    "conditions": [],
+                    "startedAt": null,
+                    "completedAt": null,
+                    "outcome": null,
+                    "update": {
+                        "dependencies": {"count": 0, "refs": []},
+                        "disruption": "None",
+                        "lastAssessedAt": null,
+                        "observedGeneration": 0,
+                        "operationId": null,
+                        "owned": {"count": 0, "refs": []},
+                        "preserveState": true,
+                        "reasons": [],
+                        "state": "Unknown",
+                        "targetGeneration": 1
+                    },
                     "resource": {
                         "credential": {
                             "leaseState": "Active",
@@ -1164,6 +1644,173 @@ mod tests {
     }
 
     #[test]
+    fn managed_identity_agent_payload_is_owner_bound_and_egress_denied() {
+        let payload = managed_identity_agent_payload(&resource()).expect("agent payload");
+        let value: serde_json::Value = serde_json::from_slice(&payload).expect("agent JSON");
+        let mut process_value = value["spec"].clone();
+        process_value
+            .as_object_mut()
+            .expect("Process spec object")
+            .remove("providerRef");
+        serde_json::from_value::<ProcessSpec>(process_value).expect("valid Process spec");
+        assert_eq!(value["type"], "Process");
+        assert_eq!(value["metadata"]["ownerRef"], "Credential/relay");
+        assert_eq!(
+            value["spec"]["executionRef"],
+            "Guest/gateway"
+        );
+        assert_eq!(value["spec"]["providerRef"], "Provider/system-systemd");
+        assert_eq!(value["spec"]["processClass"], "service");
+        assert_eq!(
+            value["spec"]["template"],
+            d2b_provider_credential_managed_identity::AGENT_BINARY
+        );
+        assert_eq!(value["spec"]["domain"], "system");
+        assert_eq!(value["spec"]["networkUsage"]["allowEgress"], false);
+        assert_eq!(
+            value["spec"]["sandbox"]["namespaceClasses"],
+            serde_json::json!(["mount", "pid", "ipc"])
+        );
+        assert!(!payload.windows(1).any(|window| window == b"credential-secret-canary"));
+    }
+
+    #[test]
+    fn managed_identity_agent_readiness_requires_current_ready_status() {
+        let mut child = managed_identity_agent_process("Ready", 1);
+        assert!(managed_identity_agent_ready(&child));
+        child.canonical_json =
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": {"generation": 1},
+                "status": {"phase": "Ready", "observedGeneration": 0}
+            }))
+            .unwrap();
+        assert!(!managed_identity_agent_ready(&child));
+        child.canonical_json =
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": {"generation": 1},
+                "status": {"phase": "Degraded", "observedGeneration": 1}
+            }))
+            .unwrap();
+        assert!(!managed_identity_agent_ready(&child));
+    }
+
+    #[test]
+    fn managed_identity_agent_matching_is_exactly_scoped_to_the_credential() {
+        let owner = resource();
+        let payload = managed_identity_agent_payload(&owner).expect("agent payload");
+        let child = StoredResource {
+            resource_ref: managed_identity_agent_ref(&owner).unwrap(),
+            zone: ZoneId::parse("dev").unwrap(),
+            uid: ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap(),
+            generation: ResourceGeneration::new(1).unwrap(),
+            revision: ZoneRevision::new(2),
+            canonical_json: payload,
+            payload_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_owned(),
+        };
+        assert!(managed_identity_agent_matches(&child, &owner));
+        let foreign_owner = ResourceSnapshot::new(
+            ResourceKey::new(
+                ZoneId::parse("dev").unwrap(),
+                ResourceRef::parse("Credential/other").unwrap(),
+                ResourceUid::parse("323e4567-e89b-42d3-a456-426614174002").unwrap(),
+            ),
+            ZoneRevision::new(3),
+            ResourceGeneration::new(1).unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "resources.d2bus.org/v3",
+                "type": "Credential",
+                "metadata": {
+                    "name": "other",
+                    "zone": "dev",
+                    "uid": "323e4567-e89b-42d3-a456-426614174002",
+                    "generation": 1,
+                    "revision": 3,
+                    "finalizers": [],
+                    "labels": {},
+                    "annotations": {},
+                    "ownerRef": null,
+                    "managedBy": "controller",
+                    "configurationGeneration": 1,
+                    "deletionRequestedAt": null,
+                    "createdAt": "1970-01-01T00:00:00.000Z",
+                    "updatedAt": "1970-01-01T00:00:00.000Z"
+                },
+                "spec": {
+                    "providerRef": "Provider/credential-managed-identity",
+                    "scope": {"executionRef": "Guest/gateway", "domainFilter": "system"},
+                    "allowedOperations": ["acquire-token"],
+                    "audience": "relay"
+                },
+                "status": {
+                    "phase": "Pending",
+                    "observedGeneration": 0,
+                    "conditions": [],
+                    "startedAt": null,
+                    "completedAt": null,
+                    "outcome": null,
+                    "update": {
+                        "dependencies": {"count": 0, "refs": []},
+                        "disruption": "None",
+                        "lastAssessedAt": null,
+                        "observedGeneration": 0,
+                        "operationId": null,
+                        "owned": {"count": 0, "refs": []},
+                        "preserveState": true,
+                        "reasons": [],
+                        "state": "Unknown",
+                        "targetGeneration": 1
+                    },
+                    "resource": {}
+                }
+            }))
+            .unwrap(),
+            false,
+        );
+        assert!(!managed_identity_agent_matches(&child, &foreign_owner));
+    }
+
+    #[test]
+    fn credential_scope_validation_rejects_user_or_host_mismatches() {
+        let user_scope: CredentialSpec = serde_json::from_value(json!({
+            "scope": {
+                "executionRef": "Guest/gateway",
+                "domainFilter": "user",
+                "userRef": "User/example"
+            },
+            "audience": "relay",
+            "allowedOperations": ["acquire-token"]
+        }))
+        .expect("user scope");
+        assert!(credential_scope_valid(
+            CredentialProviderKind::SecretService,
+            &user_scope
+        ));
+        assert!(!credential_scope_valid(
+            CredentialProviderKind::ManagedIdentity,
+            &user_scope
+        ));
+
+        let host_scope: CredentialSpec = serde_json::from_value(json!({
+            "scope": {
+                "executionRef": "Host/host-system",
+                "domainFilter": "system"
+            },
+            "audience": "relay",
+            "allowedOperations": ["acquire-token"]
+        }))
+        .expect("host scope");
+        assert!(credential_scope_valid(
+            CredentialProviderKind::ManagedIdentity,
+            &host_scope
+        ));
+        assert!(!credential_scope_valid(
+            CredentialProviderKind::Entra,
+            &host_scope
+        ));
+    }
+
+    #[test]
     fn scoped_resource_client_rejects_wrong_zone_or_execution_before_session() {
         let request = ScopedCredentialRequest::new(
             ZoneId::parse("other").unwrap(),
@@ -1187,5 +1834,33 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn managed_identity_agent_process(phase: &str, observed_generation: u64) -> StoredResource {
+        let resource_ref = ResourceRef::parse("Process/mi-agent-relay").unwrap();
+        let zone = ZoneId::parse("dev").unwrap();
+        let canonical_json = serde_json::to_vec(&serde_json::json!({
+            "type": "Process",
+            "metadata": {
+                "name": "mi-agent-relay",
+                "zone": "dev",
+                "generation": 1
+            },
+            "status": {
+                "phase": phase,
+                "observedGeneration": observed_generation
+            }
+        }))
+        .unwrap();
+        StoredResource {
+            resource_ref,
+            zone,
+            uid: ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap(),
+            generation: ResourceGeneration::new(1).unwrap(),
+            revision: ZoneRevision::new(2),
+            canonical_json,
+            payload_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_owned(),
+        }
     }
 }

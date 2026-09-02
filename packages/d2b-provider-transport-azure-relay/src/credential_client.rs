@@ -107,12 +107,12 @@ impl fmt::Debug for RelayCredentialBinding {
     }
 }
 
-/// The narrow Credential read boundary reserved for U10's ResourceClient.
+/// The narrow Credential read boundary supplied by U10's ResourceClient.
 ///
 /// This request contains only non-secret, same-Zone admission data. The
 /// transport Provider does not resolve resources, own Credential rows, or
-/// retain a credential registry; U10 can implement `acquire_scoped` on the
-/// existing port when its ResourceClient surface is available.
+/// retain a credential registry; U10 supplies the scoped ResourceClient/session
+/// gate through this boundary.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ScopedCredentialRequest {
     zone: ZoneId,
@@ -570,7 +570,7 @@ pub trait RelayCredentialPort: Send + Sync {
 
 /// Narrow scoped credential-client boundary consumed by the Relay carriage.
 ///
-/// U10 can implement this boundary with its authenticated same-Zone
+/// U10 implements this boundary with its authenticated same-Zone
 /// `ResourceClient`/ComponentSession path. It deliberately exposes no list,
 /// watch, mutation, Host, or ZoneLink scheduling operations.
 #[async_trait]

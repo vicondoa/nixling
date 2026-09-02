@@ -553,6 +553,8 @@ impl RedbRegisteredControllerApi {
                 context.target().zone(),
                 context.revision(),
                 context.target().uid(),
+                context.target().resource_ref(),
+                Some(context.generation()),
                 operation,
                 mutations,
             )
@@ -570,6 +572,8 @@ impl RedbRegisteredControllerApi {
         zone: &ZoneId,
         fallback_revision: ZoneRevision,
         context_uid: &ResourceUid,
+        context_target: &ResourceRef,
+        context_generation: Option<ResourceGeneration>,
         operation: StoreOperationContext,
         mutations: Vec<StoreMutation>,
     ) -> Result<CommitOutcome, SourceError> {
@@ -579,7 +583,42 @@ impl RedbRegisteredControllerApi {
         let mut mutations = mutations;
         let resolver = commit.assignment_resolver.clone();
         for mutation in &mut mutations {
-            let fence = if let Some(resolver) = resolver.as_ref() {
+            let owner_child = mutation
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner == context_target)
+                && mutation.target != *context_target
+                && mutation.target.resource_type().as_str() == "Process"
+                && matches!(
+                    mutation.kind,
+                    ResourceMutationKind::Create
+                        | ResourceMutationKind::UpdateSpec
+                        | ResourceMutationKind::Delete
+                );
+            let fence = if owner_child {
+                let owner = mutation.owner.as_ref().ok_or(SourceError::Integrity)?;
+                let owner_uid = context_uid;
+                let owner_revision = fallback_revision;
+                let parent_fence = if let Some(resolver) = resolver.as_ref() {
+                    resolver(owner.clone(), owner_uid.clone(), owner_revision).await?
+                } else {
+                    commit
+                        .assignments
+                        .lock()
+                        .map_err(|_| SourceError::Integrity)?
+                        .get(owner)
+                        .cloned()
+                        .ok_or(SourceError::Integrity)?
+                };
+                Some(owner_child_assignment_fence(
+                    &parent_fence,
+                    owner,
+                    owner_uid,
+                    owner_revision,
+                    context_generation.ok_or(SourceError::Integrity)?,
+                    &mutation.target,
+                )?)
+            } else if let Some(resolver) = resolver.as_ref() {
                 let expected_revision = match mutation.expected {
                     ExpectedRevision::Exact(revision) => revision,
                     ExpectedRevision::CreateAbsent => return Err(SourceError::Integrity),
@@ -869,6 +908,8 @@ impl RedbRegisteredControllerApi {
                 &current.zone,
                 current.revision,
                 &current.uid,
+                &current.resource_ref,
+                None,
                 operation,
                 vec![mutation],
             )
@@ -1430,6 +1471,26 @@ impl RedbRegisteredControllerApi {
                 .as_deref()
                 .and_then(|bytes| ResourceEnvelope::from_json(bytes).ok())
                 .and_then(|envelope| envelope.metadata().owner_ref().cloned())
+        } else if target != *context.target().resource_ref()
+            && matches!(
+                kind,
+                ResourceMutationKind::UpdateSpec | ResourceMutationKind::Delete
+            )
+        {
+            let child_uid = expected_uid.clone().ok_or(SourceError::Integrity)?;
+            let key = ResourceKey::new(
+                context.target().zone().clone(),
+                target.clone(),
+                child_uid,
+            );
+            match self.read_target(&key).await? {
+                Ok(resource) => ResourceEnvelope::from_json(&resource.canonical_json)
+                    .map_err(|_| SourceError::Integrity)?
+                    .metadata()
+                    .owner_ref()
+                    .cloned(),
+                Err(revision) => return Err(SourceError::Conflict(revision)),
+            }
         } else {
             None
         };
@@ -2101,6 +2162,32 @@ fn source_error(error: StoreError, fallback: ZoneRevision) -> SourceError {
     }
 }
 
+fn owner_child_assignment_fence(
+    parent_fence: &ResourceAssignmentFence,
+    owner_ref: &ResourceRef,
+    owner_uid: &ResourceUid,
+    owner_revision: ZoneRevision,
+    owner_generation: ResourceGeneration,
+    child_ref: &ResourceRef,
+) -> Result<ResourceAssignmentFence, SourceError> {
+    if child_ref.resource_type().as_str() != "Process"
+        || owner_generation.get() == 0
+        || parent_fence.resource_uid != *owner_uid
+        || parent_fence.resource_revision != owner_revision
+        || !matches!(parent_fence.scope, ResourceAssignmentScope::Primary)
+    {
+        return Err(SourceError::Integrity);
+    }
+    let mut fence = parent_fence.clone();
+    fence.scope = ResourceAssignmentScope::OwnerChild {
+        owner_ref: owner_ref.clone(),
+        owner_uid: owner_uid.clone(),
+        owner_revision,
+        owner_generation,
+    };
+    Ok(fence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2250,6 +2337,46 @@ mod tests {
             ..resource
         };
         assert!(!selector_matches(&selector, &wrong));
+    }
+
+    #[test]
+    fn owner_child_fence_reuses_the_exact_parent_assignment_identity() {
+        let parent = ResourceRef::parse("Credential/relay").unwrap();
+        let child = ResourceRef::parse("Process/mi-agent-relay").unwrap();
+        let owner_uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let parent_fence = ResourceAssignmentFence {
+            resource_uid: owner_uid.clone(),
+            resource_revision: ZoneRevision::new(7),
+            provider_generation: ResourceGeneration::new(2).unwrap(),
+            controller_generation: ControllerGeneration::new(3).unwrap(),
+            controller_role: ResourceRef::parse("Process/credential-controller").unwrap(),
+            target: ResourceRef::parse("Zone/work").unwrap(),
+            session_generation: ReconnectGeneration::new(1).unwrap(),
+            epoch: 9,
+            scope: ResourceAssignmentScope::Primary,
+        };
+        let fence = owner_child_assignment_fence(
+            &parent_fence,
+            &parent,
+            &owner_uid,
+            ZoneRevision::new(7),
+            ResourceGeneration::new(1).unwrap(),
+            &child,
+        )
+        .expect("owner-child fence");
+        assert_eq!(fence.resource_uid, owner_uid);
+        assert_eq!(fence.resource_revision, ZoneRevision::new(7));
+        assert!(matches!(
+            fence.scope,
+            ResourceAssignmentScope::OwnerChild {
+                owner_ref,
+                owner_uid: _,
+                owner_revision,
+                owner_generation
+            } if owner_ref == parent
+                && owner_revision == ZoneRevision::new(7)
+                && owner_generation == ResourceGeneration::new(1).unwrap()
+        ));
     }
 
     fn verified_create(
