@@ -10757,10 +10757,13 @@ impl ZoneResourceRuntime {
         let client = self.cloud_hypervisor_resource_client().inspect_err(|error| {
             tracing::warn!(error = ?error, "Cloud Hypervisor reconcile stage failed: controller-client");
         })?;
-        let guests = self
-            .list_cloud_hypervisor_guests()
-            .await
-            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        let guests = match selected_guest {
+            Some(guest_ref) => vec![guest_ref.clone()],
+            None => self
+                .list_cloud_hypervisor_guests()
+                .await
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?,
+        };
         for guest_ref in guests {
             if selected_guest.is_some_and(|selected| selected != &guest_ref) {
                 continue;
