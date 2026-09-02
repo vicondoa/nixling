@@ -1589,12 +1589,17 @@ impl DaemonSharedProviderEffects {
                 .committed_resource_value(&credential_ref, &context.operation_id)
                 .await
                 .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            // U10 owns token acquisition and delivery. U6 consumes only the
+            // stable, typed Credential scope contract at admission.
             let scope = credential
-                .pointer("/spec/scope/executionRef")
-                .and_then(Value::as_str)
-                .and_then(|value| ResourceRef::parse(value).ok())
+                .pointer("/spec/scope")
+                .cloned()
                 .ok_or(SharedProviderEffectError::InvalidResource)?;
-            if scope != gateway {
+            let scope = serde_json::from_value::<
+                d2b_contracts_provider::v3::credential::CredentialScope,
+            >(scope)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            if scope.execution_ref() != Some(&gateway) {
                 return Err(SharedProviderEffectError::InvalidResource);
             }
         }
