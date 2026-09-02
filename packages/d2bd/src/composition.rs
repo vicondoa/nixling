@@ -17077,12 +17077,28 @@ mod zone_publication_order_tests {
     #[test]
     fn u12_attach_failure_is_not_downgraded_to_a_startup_warning() {
         let source = include_str!("composition.rs");
-        let start = source
-            .find("start_u12_controller_runners")
-            .expect("U12 runner attach");
-        let tail = &source[start..];
-        assert!(tail.contains("return Err(error);"));
-        assert!(tail.contains("observability and activation controller runners refused during startup"));
+        let attach_arm = "if let Err(error) = runtime
+            .start_u12_controller_runners(Arc::new(state.clone()))
+            .await
+        {";
+        let start = source.find(attach_arm).expect("U12 runner attach arm");
+        let arm_end_marker = "        let _ = runtime.audio_binding_statuses();";
+        let end = source[start..]
+            .find(arm_end_marker)
+            .map(|offset| start + offset)
+            .expect("U12 runner attach arm end");
+        let arm = &source[start..end];
+        let require_ready = source
+            .find("if let Err(error) = runtime.require_ready()")
+            .expect("startup readiness check");
+
+        assert!(arm.contains("return Err(error);"));
+        assert!(arm.contains(
+            "observability and activation controller runners refused during startup"
+        ));
+        assert!(!arm.contains("tracing::warn!"));
+        assert!(!arm.contains("degraded"));
+        assert!(end < require_ready);
     }
 }
 
