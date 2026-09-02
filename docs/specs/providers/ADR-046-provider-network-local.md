@@ -915,9 +915,14 @@ any Volume file in a form that constitutes a network configuration secret.
 
 ### 9.2 Writes through Volume service
 
-The controller writes all content through the typed Volume write service
-(`Provider/volume-local`'s write API).  It does **not** directly manipulate the
-underlying filesystem path.
+The controller submits a typed `network-config` content projection through the
+canonical `Volume` spec update path. `Provider/volume-local` consumes that
+projection, resolves its own anchored root, verifies the Volume marker and
+declared owner/mode, and materializes the four files through its content effect
+port. Network-local never receives or manipulates the underlying filesystem
+path. The Volume status provider details carry only the bounded materialization
+evidence and content digest used by Network readiness; the desired projection
+bytes are not readiness evidence.
 
 ### 9.3 Two-phase provisioning
 

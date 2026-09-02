@@ -17,6 +17,10 @@ use crate::content::{
     NetworkConfigMaterializationEvidence,
 };
 use crate::error::VolumeLocalError;
+use crate::content::{
+    NetworkConfigContentProjection, NetworkConfigMaterializationEvidence,
+    VolumeContentEffectPort,
+};
 use crate::finalization::{
     FinalizationAction, FinalizationObservation, FinalizationResult, finalization_plan,
 };
@@ -229,6 +233,59 @@ impl<S: VolumeSourceEffectPort, L: VolumeLayoutEffectPort> VolumeLocalController
                 .collect(),
             content: None,
         })
+    }
+
+    /// Materialize a typed Network configuration projection through the
+    /// Volume-owned content effect port.
+    pub async fn reconcile_network_config_content<C: VolumeContentEffectPort>(
+        &self,
+        volume_uid: &ResourceUid,
+        spec: &VolumeSpec,
+        projection: &NetworkConfigContentProjection,
+        owner_ref: &d2b_contracts_resource::v3::ResourceRef,
+        content: &C,
+    ) -> Result<NetworkConfigMaterializationEvidence, VolumeLocalError> {
+        let kind = self.validate_spec(spec)?;
+        if projection.volume_uid() != volume_uid || projection.network_ref() != owner_ref {
+            return Err(VolumeLocalError::InvalidSpec);
+        }
+        validate_network_config_layout(spec, projection)?;
+        let root = self
+            .source
+            .resolve_root(
+                spec.source().settings().source_policy_id(),
+                spec.source().settings().system_artifact_id(),
+                kind,
+            )
+            .await?;
+        if self.layout.marker_state(&root).await? != MarkerState::Provisioned {
+            return Err(VolumeLocalError::InvariantViolated);
+        }
+        let evidence = content
+            .materialize_network_config(&root, projection)
+            .await?;
+        if !evidence.matches(projection) {
+            return Err(VolumeLocalError::EffectFailed);
+        }
+        Ok(evidence)
+    }
+
+    /// Reconcile the Volume layout and materialize a typed Network
+    /// configuration projection, returning the evidence for status.
+    pub async fn reconcile_with_network_config_content<C: VolumeContentEffectPort>(
+        &self,
+        volume_uid: &ResourceUid,
+        spec: &VolumeSpec,
+        projection: &NetworkConfigContentProjection,
+        owner_ref: &d2b_contracts_resource::v3::ResourceRef,
+        content: &C,
+    ) -> Result<VolumeStatusReport, VolumeLocalError> {
+        let mut status = self.reconcile(volume_uid, spec).await?;
+        status.content = Some(
+            self.reconcile_network_config_content(volume_uid, spec, projection, owner_ref, content)
+                .await?,
+        );
+        Ok(status)
     }
 
     /// Remove every declared entry whose cleanup policy admits removal.
@@ -451,17 +508,21 @@ fn validate_network_config_layout(
     projection: &NetworkConfigContentProjection,
 ) -> Result<(), VolumeLocalError> {
     let expected = [
-        "dnsmasq.conf",
-        "nftables.rules",
-        "routing.conf",
-        "attachments.json",
+        ("dnsmasq.conf", projection.file_owner(), projection.file_group()),
+        ("nftables.rules", projection.file_owner(), projection.file_group()),
+        ("routing.conf", projection.file_owner(), projection.file_group()),
+        (
+            "attachments.json",
+            projection.file_owner(),
+            projection.file_group(),
+        ),
     ];
-    if expected.iter().all(|path| {
+    if expected.iter().all(|(path, owner, group)| {
         spec.layout().iter().any(|entry| {
             entry.path() == *path
                 && entry.entry_type() == d2b_contracts_resource::v3::volume::EntryType::File
-                && entry.owner_ref() == projection.file_owner()
-                && entry.group_ref() == projection.file_group()
+                && entry.owner_ref() == *owner
+                && entry.group_ref() == *group
                 && entry.mode() == projection.file_mode()
         })
     }) {

@@ -719,11 +719,12 @@ impl DaemonSharedProviderEffects {
 
     fn project_network_volume_spec(
         spec: Value,
+        volume_uid: &ResourceUid,
         content: &d2b_provider_network_local::controller::NetworkConfigContent,
         fence: &SharedRunnerNetworkContentFence,
         owner_ref: &ResourceRef,
     ) -> Result<Value, NetworkEffectError> {
-        network_config_spec_with_content(spec, content, fence, owner_ref)
+        network_config_spec_with_content(spec, volume_uid, content, fence, owner_ref)
     }
 
     #[cfg(test)]
@@ -1635,8 +1636,14 @@ impl NetworkResourcePort for SharedRunnerNetworkResources {
         if !network_assignment_matches(&assignment, fence) {
             return Err(NetworkEffectError::NetworkAdmissionMismatch);
         }
+        let volume_uid = current
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+            .ok_or(NetworkEffectError::ConfigVolume)?;
         spec = DaemonSharedProviderEffects::project_network_volume_spec(
             spec,
+            &volume_uid,
             content,
             fence,
             &self.owner_ref,
@@ -1757,11 +1764,12 @@ impl NetworkResourcePort for SharedRunnerNetworkResources {
     }
 }
 
-const NETWORK_CONFIG_VOLUME_SCHEMA_ID: &str = "volume-local.d2bus.org/Volume/spec";
-const NETWORK_CONFIG_VOLUME_SCHEMA_VERSION: &str = "1.0";
-const NETWORK_CONFIG_CONTENT_KIND: &str = "network-config";
-const NETWORK_CONFIG_FILE_OWNER: &str = "User/net-local-controller";
-const NETWORK_CONFIG_FILE_MODE: &str = "0640";
+const NETWORK_CONFIG_VOLUME_SCHEMA_ID: &str = d2b_provider_volume_local::VOLUME_CONTENT_SCHEMA_ID;
+const NETWORK_CONFIG_VOLUME_SCHEMA_VERSION: &str =
+    d2b_provider_volume_local::VOLUME_CONTENT_SCHEMA_VERSION;
+const NETWORK_CONFIG_CONTENT_KIND: &str = d2b_provider_volume_local::NETWORK_CONFIG_CONTENT_KIND;
+const NETWORK_CONFIG_FILE_OWNER: &str = d2b_provider_volume_local::NETWORK_CONFIG_FILE_OWNER;
+const NETWORK_CONFIG_FILE_MODE: &str = d2b_provider_volume_local::NETWORK_CONFIG_FILE_MODE;
 
 fn validate_network_config_volume_spec(spec: &Value) -> Result<(), NetworkEffectError> {
     let provider_ref = spec
@@ -1817,49 +1825,108 @@ fn network_config_content_projection_ready(value: &Value) -> bool {
             .pointer("/settings/kind")
             .and_then(Value::as_str)
             != Some(NETWORK_CONFIG_CONTENT_KIND)
-        || provider
-            .pointer("/settings/ownershipMarker")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty)
-        || provider
-            .pointer("/settings/networkRef")
-            .and_then(Value::as_str)
-            .is_none()
-        || provider
-            .pointer("/settings/fileOwner")
-            .and_then(Value::as_str)
-            != Some(NETWORK_CONFIG_FILE_OWNER)
-        || provider
-            .pointer("/settings/fileGroup")
-            .and_then(Value::as_str)
-            != Some(NETWORK_CONFIG_FILE_OWNER)
-        || provider
-            .pointer("/settings/fileMode")
-            .and_then(Value::as_str)
-            != Some(NETWORK_CONFIG_FILE_MODE)
     {
         return false;
     }
-    [
-        "dnsmasq.conf",
-        "nftables.rules",
-        "routing.conf",
-        "attachments.json",
-    ]
-    .iter()
-    .all(|path| {
-        provider
-            .pointer(&format!("/settings/files/{path}"))
-            .and_then(Value::as_array)
-            .is_some_and(|bytes| !bytes.is_empty())
-    })
+    let Some(desired) = provider.pointer("/settings/content") else {
+        return false;
+    };
+    let Ok(desired) =
+        d2b_provider_volume_local::NetworkConfigContentProjection::from_settings(desired)
+    else {
+        return false;
+    };
+    let Some(volume_uid) = value
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .and_then(|uid| ResourceUid::parse(uid.to_owned()).ok())
+    else {
+        return false;
+    };
+    if desired.volume_uid() != &volume_uid {
+        return false;
+    }
+    let Some(status_provider) = value.pointer("/status/provider") else {
+        return false;
+    };
+    if value
+        .pointer("/status/phase")
+        .and_then(Value::as_str)
+        != Some("Ready")
+        || value
+            .pointer("/metadata/generation")
+            .and_then(Value::as_u64)
+            != value
+                .pointer("/status/observedGeneration")
+                .and_then(Value::as_u64)
+    {
+        return false;
+    }
+    if status_provider
+        .get("providerRef")
+        .and_then(Value::as_str)
+        != Some("Provider/volume-local")
+        || status_provider
+            .get("schemaId")
+            .and_then(Value::as_str)
+            != Some("volume-local.d2bus.org/Volume/status")
+        || status_provider
+            .get("schemaVersion")
+            .and_then(Value::as_str)
+            != Some("1.0")
+    {
+        return false;
+    }
+    let Some(observed) = status_provider
+        .pointer("/details/content")
+        .or_else(|| value.pointer("/status/content"))
+    else {
+        return false;
+    };
+    let Ok(observed) =
+        serde_json::from_value::<d2b_provider_volume_local::NetworkConfigMaterializationEvidence>(
+            observed.clone(),
+        )
+    else {
+        return false;
+    };
+    observed.matches(&desired)
 }
 
 fn network_config_provider_matches(
     provider: &Value,
+    volume_uid: &ResourceUid,
     owner_ref: &ResourceRef,
     marker: &str,
 ) -> bool {
+    provider.get("schemaId").and_then(Value::as_str)
+        == Some(NETWORK_CONFIG_VOLUME_SCHEMA_ID)
+        && provider.get("schemaVersion").and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_VOLUME_SCHEMA_VERSION)
+        && provider
+            .pointer("/settings/kind")
+            .and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_CONTENT_KIND)
+        && provider
+            .pointer("/settings/content")
+            .and_then(|content| {
+                d2b_provider_volume_local::NetworkConfigContentProjection::from_settings(content)
+                    .ok()
+            })
+            .is_some_and(|content| {
+                content.volume_uid() == volume_uid
+                    && content.network_ref() == owner_ref
+                    && content.ownership_marker() == marker
+            })
+}
+
+fn network_config_legacy_provider_matches(
+    provider: &Value,
+    owner_ref: &ResourceRef,
+    marker: &str,
+) -> bool {
+    // Accept the previous projection only to migrate its ownership marker;
+    // its files are never used as readiness evidence.
     provider.get("schemaId").and_then(Value::as_str)
         == Some(NETWORK_CONFIG_VOLUME_SCHEMA_ID)
         && provider.get("schemaVersion").and_then(Value::as_str)
@@ -1888,10 +1955,12 @@ fn network_config_provider_matches(
             .pointer("/settings/fileMode")
             .and_then(Value::as_str)
             == Some(NETWORK_CONFIG_FILE_MODE)
+        && provider.pointer("/settings/files").is_some()
 }
 
 fn network_config_spec_with_content(
     mut spec: Value,
+    volume_uid: &ResourceUid,
     content: &d2b_provider_network_local::controller::NetworkConfigContent,
     fence: &SharedRunnerNetworkContentFence,
     owner_ref: &ResourceRef,
@@ -1903,11 +1972,15 @@ fn network_config_spec_with_content(
     );
     if spec
         .get("provider")
-        .is_some_and(|provider| !network_config_provider_matches(provider, owner_ref, &marker))
+        .is_some_and(|provider| {
+            !network_config_provider_matches(provider, volume_uid, owner_ref, &marker)
+                && !network_config_legacy_provider_matches(provider, owner_ref, &marker)
+        })
     {
         return Err(NetworkEffectError::NetworkAdmissionMismatch);
     }
-    let provider = network_config_provider_extension(content, owner_ref, fence, &marker)?;
+    let provider =
+        network_config_provider_extension(volume_uid, content, owner_ref, fence, &marker)?;
     spec.as_object_mut()
         .ok_or(NetworkEffectError::ConfigVolume)?
         .insert("provider".to_owned(), provider);
@@ -1931,38 +2004,37 @@ fn network_assignment_matches(
 }
 
 fn network_config_provider_extension(
+    volume_uid: &ResourceUid,
     content: &d2b_provider_network_local::controller::NetworkConfigContent,
     owner_ref: &ResourceRef,
     fence: &SharedRunnerNetworkContentFence,
     marker: &str,
 ) -> Result<Value, NetworkEffectError> {
-    let files = serde_json::json!({
-        "dnsmasq.conf": content.dnsmasq,
-        "nftables.rules": content.nftables,
-        "routing.conf": content.routing,
-        "attachments.json": content.attachments,
-    });
-    let total_bytes = [&content.dnsmasq, &content.nftables, &content.routing, &content.attachments]
-        .into_iter()
-        .map(Vec::len)
-        .sum::<usize>();
-    if total_bytes == 0
-        || total_bytes > d2b_provider_network_local::controller::CONFIG_VOLUME_MAX_BYTES as usize
-    {
-        return Err(NetworkEffectError::ConfigVolume);
-    }
+    let file_owner = ResourceRef::parse(NETWORK_CONFIG_FILE_OWNER)
+        .map_err(|_| NetworkEffectError::ConfigVolume)?;
+    let projection = d2b_provider_volume_local::NetworkConfigContentProjection::new(
+        volume_uid.clone(),
+        owner_ref.clone(),
+        fence.provenance.clone(),
+        marker,
+        file_owner.clone(),
+        file_owner,
+        NETWORK_CONFIG_FILE_MODE,
+        content.dnsmasq.clone(),
+        content.nftables.clone(),
+        content.routing.clone(),
+        content.attachments.clone(),
+        content.digest(),
+    )
+    .map_err(|_| NetworkEffectError::NetworkAdmissionMismatch)?;
+    let content = serde_json::to_value(&projection)
+        .map_err(|_| NetworkEffectError::ConfigVolume)?;
     Ok(serde_json::json!({
         "schemaId": NETWORK_CONFIG_VOLUME_SCHEMA_ID,
         "schemaVersion": NETWORK_CONFIG_VOLUME_SCHEMA_VERSION,
         "settings": {
             "kind": NETWORK_CONFIG_CONTENT_KIND,
-            "networkRef": owner_ref,
-            "ownershipMarker": marker,
-            "fileOwner": NETWORK_CONFIG_FILE_OWNER,
-            "fileGroup": NETWORK_CONFIG_FILE_OWNER,
-            "fileMode": NETWORK_CONFIG_FILE_MODE,
-            "contentDigest": format!("sha256:{}", hex_digest(&content.digest())),
-            "provenance": fence.provenance,
+            "content": content,
             "assignmentFence": {
                 "resourceUid": fence.assignment.resource_uid,
                 "resourceRevision": fence.assignment.resource_revision,
@@ -1974,19 +2046,8 @@ fn network_config_provider_extension(
                 "epoch": fence.assignment.epoch,
                 "scope": "primary",
             },
-            "files": files,
         },
     }))
-}
-
-fn hex_digest(bytes: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(64);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 async fn upsert_shared_provider_child(
@@ -16760,7 +16821,14 @@ impl ResourcePlane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, fs::OpenOptions, os::fd::AsRawFd, sync::Arc};
+    use std::{
+        collections::VecDeque,
+        fs::{self, File, OpenOptions},
+        io::Write,
+        os::{fd::AsRawFd, unix::fs::PermissionsExt},
+        path::PathBuf,
+        sync::Arc,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use d2b_contracts_resource::v3::{
@@ -16769,6 +16837,7 @@ mod tests {
     };
     use d2b_contracts_zone_session::v3::component_session::LimitProfile;
     use d2b_contracts_zone_session::v3::resource_bundle::{BundleResource, BundleResourceMetadata};
+    use d2b_provider_volume_local::VolumeLocalError;
     use d2b_resource_store::mutation_seal::mutation_seal_pair;
     use d2b_resource_store_redb::write_provisioning_marker;
     use d2b_session_unix::{CreditPool, CreditScopeSet, OutboundPacket, prearmed_seqpacket_pair};
@@ -16777,6 +16846,107 @@ mod tests {
         reconciles: AtomicUsize,
         finalizes: AtomicUsize,
         cleanup_ready: std::sync::atomic::AtomicBool,
+    }
+
+    struct MaterializingNetworkContentPort {
+        root: PathBuf,
+        lock: std::sync::Mutex<()>,
+    }
+
+    impl MaterializingNetworkContentPort {
+        fn new(root: impl Into<PathBuf>) -> Self {
+            Self {
+                root: root.into(),
+                lock: std::sync::Mutex::new(()),
+            }
+        }
+
+        fn marker_path(&self) -> PathBuf {
+            self.root.join(".d2b-network-config-marker")
+        }
+
+        fn target(&self, name: &str) -> PathBuf {
+            self.root.join(name)
+        }
+
+        fn atomic_write(&self, name: &str, bytes: &[u8]) -> Result<(), VolumeLocalError> {
+            let target = self.target(name);
+            let temporary = self.root.join(format!(".{name}.d2b-new"));
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .map_err(|_| VolumeLocalError::EffectFailed)?;
+            file.write_all(bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|_| VolumeLocalError::EffectFailed)?;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o640))
+                .map_err(|_| VolumeLocalError::EffectFailed)?;
+            fs::rename(&temporary, target).map_err(|_| VolumeLocalError::EffectFailed)?;
+            File::open(&self.root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| VolumeLocalError::EffectFailed)
+        }
+    }
+
+    impl d2b_provider_volume_local::VolumeContentEffectPort
+        for MaterializingNetworkContentPort
+    {
+        async fn materialize_network_config(
+            &self,
+            _root: &d2b_provider_volume_local::VolumeRootHandle,
+            projection: &d2b_provider_volume_local::NetworkConfigContentProjection,
+        ) -> Result<
+            d2b_provider_volume_local::NetworkConfigMaterializationEvidence,
+            VolumeLocalError,
+        > {
+            projection.validate()?;
+            let _guard = self.lock.lock().map_err(|_| VolumeLocalError::EffectFailed)?;
+            let marker = fs::read(self.marker_path()).map_err(|_| VolumeLocalError::EffectFailed)?;
+            if marker != projection.ownership_marker().as_bytes()
+                || projection.file_owner().to_canonical_string()
+                    != d2b_provider_volume_local::NETWORK_CONFIG_FILE_OWNER
+                || projection.file_group().to_canonical_string()
+                    != d2b_provider_volume_local::NETWORK_CONFIG_FILE_OWNER
+            {
+                return Err(VolumeLocalError::InvariantViolated);
+            }
+            for name in [
+                "dnsmasq.conf",
+                "nftables.rules",
+                "routing.conf",
+                "attachments.json",
+            ] {
+                let path = self.target(name);
+                if path.exists()
+                    && fs::metadata(&path)
+                        .map_err(|_| VolumeLocalError::EffectFailed)?
+                        .permissions()
+                        .mode()
+                        & 0o777
+                        != 0o640
+                {
+                    return Err(VolumeLocalError::InvariantViolated);
+                }
+            }
+            for (name, bytes) in [
+                ("dnsmasq.conf", projection.dnsmasq()),
+                ("nftables.rules", projection.nftables()),
+                ("routing.conf", projection.routing()),
+                ("attachments.json", projection.attachments()),
+            ] {
+                self.atomic_write(name, bytes)?;
+            }
+            let read = |name: &str| fs::read(self.target(name))
+                .map_err(|_| VolumeLocalError::EffectFailed);
+            d2b_provider_volume_local::NetworkConfigMaterializationEvidence::from_observed_files(
+                projection,
+                &read("dnsmasq.conf")?,
+                &read("nftables.rules")?,
+                &read("routing.conf")?,
+                &read("attachments.json")?,
+            )
+        }
     }
 
     #[async_trait]
@@ -17022,7 +17192,8 @@ mod tests {
     }
 
     #[test]
-    fn daemon_shared_provider_effects_network_content_path_round_trips_and_preserves_foreign_marker()
+    #[tokio::test]
+    async fn daemon_shared_provider_effects_network_content_path_round_trips_and_preserves_foreign_marker()
     {
         let zone_uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
         let network_uid = ResourceUid::parse("223e4567-e89b-42d3-a456-426614174000").unwrap();
@@ -17070,38 +17241,160 @@ mod tests {
             provider_generation: ResourceGeneration::new(7).unwrap(),
             session_generation: ReconnectGeneration::new(5).unwrap(),
         };
-        let mut spec = serde_json::to_value(
+        let volume_spec =
             d2b_provider_network_local::controller::config_volume_spec("host-system", None)
-                .unwrap(),
-        )
-        .unwrap();
+                .unwrap();
+        let mut spec = serde_json::to_value(&volume_spec).unwrap();
         spec.as_object_mut()
             .unwrap()
             .insert("providerRef".to_owned(), Value::String("Provider/volume-local".to_owned()));
+        let volume_uid =
+            ResourceUid::parse("323e4567-e89b-42d3-a456-426614174000").unwrap();
         let projected = DaemonSharedProviderEffects::project_network_volume_spec(
             spec,
+            &volume_uid,
             &content,
             &fence,
             &owner_ref,
         )
         .unwrap();
-        let envelope = json!({ "spec": projected });
-        assert!(network_config_content_projection_ready(&envelope));
+        let mut envelope = json!({
+            "metadata": { "uid": volume_uid, "generation": 1 },
+            "spec": projected,
+        });
+        assert!(!network_config_content_projection_ready(&envelope));
+        let projection = d2b_provider_volume_local::NetworkConfigContentProjection::from_settings(
+            &envelope["spec"]["provider"]["settings"]["content"],
+        )
+        .unwrap();
+        let mut tampered = serde_json::to_value(&projection).unwrap();
+        tampered["dnsmasq"][0] = Value::from(b'X');
+        assert_eq!(
+            d2b_provider_volume_local::NetworkConfigContentProjection::from_settings(&tampered),
+            Err(VolumeLocalError::InvalidSpec)
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let materializer = MaterializingNetworkContentPort::new(directory.path());
+        fs::write(materializer.marker_path(), projection.ownership_marker()).unwrap();
+        let scripted =
+            d2b_provider_volume_local::testing::ScriptedPort::empty()
+                .with_marker(d2b_provider_volume_local::MarkerState::Provisioned);
+        let controller = d2b_provider_volume_local::VolumeLocalController::new(
+            d2b_provider_volume_local::VolumeLocalProfile::shipped(),
+            &scripted,
+            &scripted,
+        );
+        let status = controller
+            .reconcile_with_network_config_content(
+                &volume_uid,
+                &volume_spec,
+                &projection,
+                &owner_ref,
+                &materializer,
+            )
+            .await
+            .unwrap();
+        let evidence = status.content.as_ref().unwrap();
+        assert!(evidence.matches(&projection));
+        assert_eq!(evidence.content_digest(), projection.content_digest());
         for (path, bytes) in [
-            ("dnsmasq.conf", &content.dnsmasq),
-            ("nftables.rules", &content.nftables),
-            ("routing.conf", &content.routing),
-            ("attachments.json", &content.attachments),
+            ("dnsmasq.conf", content.dnsmasq.as_slice()),
+            ("nftables.rules", content.nftables.as_slice()),
+            ("routing.conf", content.routing.as_slice()),
+            ("attachments.json", content.attachments.as_slice()),
         ] {
+            assert_eq!(fs::read(materializer.target(path)).unwrap(), bytes);
             assert_eq!(
-                envelope
-                    .pointer(&format!("/spec/provider/settings/files/{path}"))
-                    .unwrap(),
-                &serde_json::to_value(bytes).unwrap()
+                fs::metadata(materializer.target(path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
             );
         }
+        envelope["status"] = json!({
+            "phase": "Ready",
+            "observedGeneration": 1,
+            "provider": {
+                "providerRef": "Provider/volume-local",
+                "schemaId": "volume-local.d2bus.org/Volume/status",
+                "schemaVersion": "1.0",
+                "details": { "content": evidence },
+            },
+        });
+        assert!(network_config_content_projection_ready(&envelope));
+        let materialized_before_foreign = [
+            "dnsmasq.conf",
+            "nftables.rules",
+            "routing.conf",
+            "attachments.json",
+        ]
+        .into_iter()
+        .map(|path| fs::read(materializer.target(path)).unwrap())
+        .collect::<Vec<_>>();
+        fs::write(materializer.marker_path(), b"foreign-marker").unwrap();
+        assert_eq!(
+            controller
+                .reconcile_network_config_content(
+                    &volume_uid,
+                    &volume_spec,
+                    &projection,
+                    &owner_ref,
+                    &materializer,
+                )
+                .await,
+            Err(VolumeLocalError::InvariantViolated)
+        );
+        assert_eq!(fs::read(materializer.marker_path()).unwrap(), b"foreign-marker");
+        for (index, path) in [
+            "dnsmasq.conf",
+            "nftables.rules",
+            "routing.conf",
+            "attachments.json",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(fs::read(materializer.target(path)).unwrap(), materialized_before_foreign[index]);
+        }
+        fs::write(materializer.marker_path(), projection.ownership_marker()).unwrap();
+        let mut wrong_owner_value = serde_json::to_value(&projection).unwrap();
+        wrong_owner_value["fileOwner"] = Value::String("User/other".to_owned());
+        let wrong_owner =
+            d2b_provider_volume_local::NetworkConfigContentProjection::from_settings(
+                &wrong_owner_value,
+            )
+            .unwrap();
+        assert_eq!(
+            controller
+                .reconcile_network_config_content(
+                    &volume_uid,
+                    &volume_spec,
+                    &wrong_owner,
+                    &owner_ref,
+                    &materializer,
+                )
+                .await,
+            Err(VolumeLocalError::InvariantViolated)
+        );
+        assert_eq!(
+            fs::read(materializer.marker_path()).unwrap(),
+            projection.ownership_marker().as_bytes()
+        );
+        for (index, path) in [
+            "dnsmasq.conf",
+            "nftables.rules",
+            "routing.conf",
+            "attachments.json",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(fs::read(materializer.target(path)).unwrap(), materialized_before_foreign[index]);
+        }
         let mut foreign = envelope["spec"].clone();
-        foreign["provider"]["settings"]["ownershipMarker"] =
+        foreign["provider"]["settings"]["content"]["ownershipMarker"] =
             Value::String("foreign-marker".to_owned());
         let before = serde_json::to_vec(&foreign).unwrap();
         let marker = d2b_contracts_resource::v3::derive_network_ownership_marker(
@@ -17110,12 +17403,14 @@ mod tests {
         );
         assert!(!network_config_provider_matches(
             &foreign["provider"],
+            &volume_uid,
             &owner_ref,
             &marker
         ));
         assert_eq!(
             DaemonSharedProviderEffects::project_network_volume_spec(
                 foreign.clone(),
+                &volume_uid,
                 &content,
                 &fence,
                 &owner_ref,

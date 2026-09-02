@@ -82,9 +82,10 @@ The v3 target name appears in parentheses or an explicit mapping.
 **D089 desired-spec shape.** `Provider/volume-local` owns the `Volume`
 ResourceType base spec: fields such as `spec.providerRef`,
 `spec.source.settings.kind`, and `spec.source.settings.sourcePolicyId` are base
-Volume fields, not Provider extensions. It carries no optional
-`spec.provider` payload today. If a future implementation-only desired setting
-is required, it must use the canonical `spec.provider = { schemaId,
+Volume fields, not Provider extensions. The optional `spec.provider` payload is
+currently limited to the typed `network-config` content projection consumed by
+the Volume controller. Any future implementation-only desired setting must use
+the canonical `spec.provider = { schemaId,
 schemaVersion, settings }` envelope, registered/signed in the Provider
 manifest, deny-unknown, bounded, versioned/digested, validated against
 `spec.providerRef` at Nix build and API admission, and forbidden to shadow base

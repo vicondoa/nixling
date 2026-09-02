@@ -15,3 +15,5 @@
 - Persist the four rendered Network config files through the owned Volume
   projection, with exact byte, provenance, owner, mode, assignment, and marker
   fencing.
+- Route Network config through volume-local's typed materialization boundary and
+  require its observed digest evidence before Network reports Ready.

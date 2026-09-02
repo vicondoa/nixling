@@ -1245,8 +1245,28 @@ pub fn config_volume_spec(
     )
     .map_err(|_| NetworkEffectError::InvalidState)?;
     let mut layout = vec![
-        LayoutEntry::root_directory(owner.clone(), owner.clone(), "0750")
-            .map_err(|_| NetworkEffectError::InvalidState)?,
+        LayoutEntry::new(
+            "",
+            EntryType::Directory,
+            owner.clone(),
+            owner.clone(),
+            "0750",
+            None,
+            Vec::new(),
+            Vec::new(),
+            ForeignChildPolicy::Preserve,
+            true,
+            false,
+            SensitivityClass::Private,
+            CreatePolicy::CreateIfAbsent,
+            RepairPolicy::ExactOwner,
+            CleanupPolicy::Never,
+            EntryAdoptionPolicy::AdoptWithLiveOwnerProof,
+            EntryRestartPolicy::RecreateOnControllerRestart,
+            LeaseClass::None,
+            vec![Invariant::NoSymlink],
+        )
+        .map_err(|_| NetworkEffectError::InvalidState)?,
     ];
     for path in [
         "dnsmasq.conf",
@@ -1272,7 +1292,7 @@ pub fn config_volume_spec(
                 RepairPolicy::ExactOwner,
                 CleanupPolicy::OwnerControlled,
                 EntryAdoptionPolicy::AdoptWithLiveOwnerProof,
-                EntryRestartPolicy::PreserveAcrossControllerRestart,
+                EntryRestartPolicy::RecreateOnControllerRestart,
                 LeaseClass::None,
                 vec![Invariant::NoSymlink, Invariant::BrokerOpaqueIdOnly],
             )
