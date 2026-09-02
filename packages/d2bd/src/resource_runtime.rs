@@ -1481,38 +1481,24 @@ impl DaemonSharedProviderEffects {
     ) -> Result<bool, SharedProviderEffectError> {
         let dependency_value = serde_json::from_slice::<Value>(dependency.resource().canonical_json())
             .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-        let dependency_ref = dependency.resource().key().resource_ref();
-        let provider_ref = guest
-            .pointer("/spec/providerRef")
-            .and_then(Value::as_str)
-            .and_then(|value| ResourceRef::parse(value).ok());
-        let attachment = guest
-            .pointer("/spec/networkAttachments")
-            .and_then(Value::as_array)
-            .is_some_and(|attachments| {
-                attachments.iter().any(|attachment| {
-                    attachment
-                        .get("networkRef")
-                        .and_then(Value::as_str)
-                        == Some(dependency_ref.to_canonical_string().as_str())
-                })
-            })
-            || guest
-                .pointer("/spec/deviceAttachments")
-                .and_then(Value::as_array)
-                .is_some_and(|attachments| {
-                    attachments.iter().any(|attachment| {
-                        attachment
-                            .get("deviceRef")
-                            .and_then(Value::as_str)
-                            == Some(dependency_ref.to_canonical_string().as_str())
-                    })
-                });
-        let is_provider = provider_ref.as_ref() == Some(dependency_ref);
-        if is_provider || attachment {
+        let dependency_ref = dependency.resource().key().resource_ref().to_canonical_string();
+        if Self::value_contains_resource_ref(guest, &dependency_ref) {
             Ok(dependency_value.pointer("/status/phase").and_then(Value::as_str) == Some("Ready"))
         } else {
             Ok(true)
+        }
+    }
+
+    fn value_contains_resource_ref(value: &Value, expected: &str) -> bool {
+        match value {
+            Value::String(value) => value == expected,
+            Value::Array(values) => values
+                .iter()
+                .any(|value| Self::value_contains_resource_ref(value, expected)),
+            Value::Object(values) => values
+                .values()
+                .any(|value| Self::value_contains_resource_ref(value, expected)),
+            Value::Null | Value::Bool(_) | Value::Number(_) => false,
         }
     }
 
@@ -5819,6 +5805,7 @@ struct CloudHypervisorResourceSession {
     session_target: Option<crate::CommittedGuestSessionTarget>,
     session_evidence: Option<GuestSessionEvidence>,
     suppress_finalizer_clear: bool,
+    finalizer_clear_requested: Arc<AtomicBool>,
 }
 
 pub(crate) struct CatalogDescriptorVerifier {
@@ -7028,6 +7015,7 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                     return Ok(CloudHypervisorResourceResponse::LifecycleApplied);
                 }
                 if self.suppress_finalizer_clear {
+                    self.finalizer_clear_requested.store(true, Ordering::Release);
                     return Ok(CloudHypervisorResourceResponse::LifecycleApplied);
                 }
                 let mut request = wire::UpdateFinalizersRequest::new();
@@ -10890,6 +10878,7 @@ impl ZoneResourceRuntime {
                     guest_session_evidence(&guest_ref, session.as_ref(), &descriptor, target)
                 })
             });
+            let finalizer_clear_requested = Arc::new(AtomicBool::new(false));
             self.ensure_cloud_hypervisor_controller_deployment(
                 &provider_ref,
                 &config,
@@ -10920,7 +10909,8 @@ impl ZoneResourceRuntime {
                     .unwrap_or_else(|| ControllerGeneration::new(1).expect("generation one")),
                 session_target: guest_session_target,
                 session_evidence,
-                    suppress_finalizer_clear: selected_guest.is_some(),
+                suppress_finalizer_clear: selected_guest.is_some(),
+                finalizer_clear_requested: Arc::clone(&finalizer_clear_requested),
             };
             let adapter = AuthenticatedResourceApiAdapter::new(Arc::new(session));
             let mut controller = CloudHypervisorController::from_verified_descriptor(
@@ -10957,6 +10947,11 @@ impl ZoneResourceRuntime {
                 })
                 .unwrap_or(true);
             if deleting_or_gone {
+                if selected_guest.is_some()
+                    && !finalizer_clear_requested.load(Ordering::Acquire)
+                {
+                    return Err(ResourceRuntimeError::CapabilityUnavailable);
+                }
                 continue;
             }
             self.reconcile_cloud_hypervisor_setup_volume(&state, &guest_ref)
