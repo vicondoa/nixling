@@ -33,3 +33,6 @@
   adapter from daemon composition; confirmed and uncertain revocation evidence
   remains durable and provider service entrypoints expose the supervised typed
   Credential session lifecycle.
+- Credential Provider controller sessions now use the dedicated typed
+  `d2b.credential.v3` endpoint, and the service runtime drains registrations
+  before reporting shutdown.
