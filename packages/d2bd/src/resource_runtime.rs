@@ -17639,6 +17639,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn u6_guest_runner_enrolls_its_exact_finalizer_before_effects() {
+        let registration = U6_SHARED_PROVIDER_RUNNERS[1];
+        let (_, descriptor) = shared_provider_test_descriptor_for(registration);
+        let reconciler = SharedProviderResourceReconciler::new(
+            descriptor,
+            SharedProviderResourceKind::QemuMediaGuest,
+            Arc::new(UnavailableSharedProviderEffects),
+        );
+        let result = reconciler
+            .first_pass_for_test(&shared_provider_test_resource_for(
+                registration,
+                &[],
+                false,
+            ))
+            .expect("finalizer enrollment result");
+        let mutation = result
+            .mutation_batch()
+            .expect("first pass must mutate only finalizers")
+            .mutations()
+            .first()
+            .expect("finalizer mutation");
+        assert_eq!(
+            mutation.kind(),
+            d2b_core_controller::MutationIntentKind::UpdateFinalizers
+        );
+        let payload = mutation
+            .canonical_resource()
+            .expect("full finalizer candidate");
+        let value: Value = serde_json::from_slice(payload).expect("candidate JSON");
+        assert_eq!(
+            value["metadata"]["finalizers"],
+            serde_json::json!([registration.finalizer])
+        );
+    }
+
     #[tokio::test]
     async fn every_u8_descriptor_cleans_before_finalizer_removal() {
         for registration in U8_SHARED_PROVIDER_RUNNERS {
