@@ -975,7 +975,7 @@ impl<R: BrokerLaunchResolver> ProcessEffectBackend for BrokerProcessBackend<R> {
         handle: &Self::Handle,
         timeout: Duration,
     ) -> Result<(), ProcessEffectError> {
-        wait_pidfd_exit(&handle.pidfd, timeout)
+        wait_pidfd_observer(&handle.pidfd, timeout)
     }
 
     fn take_controller_bootstrap(
@@ -1103,6 +1103,23 @@ pub(crate) fn wait_pidfd_exit(
         Ok(0) | Err(_) => Err(ProcessEffectError::StopFailed),
         Ok(_) if fds[0].revents().intersects(PollFlags::IN | PollFlags::HUP) => Ok(()),
         Ok(_) => Err(ProcessEffectError::StopFailed),
+    }
+}
+
+pub(crate) fn wait_pidfd_observer(
+    pidfd: &OwnedFd,
+    timeout: Duration,
+) -> Result<(), ProcessEffectError> {
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let mut fds = [PollFd::new(
+        pidfd,
+        PollFlags::IN | PollFlags::ERR | PollFlags::HUP,
+    )];
+    match poll(&mut fds, timeout_ms) {
+        Ok(0) => Err(ProcessEffectError::DeadlineExceeded),
+        Err(_) => Err(ProcessEffectError::ObserveFailed),
+        Ok(_) if fds[0].revents().intersects(PollFlags::IN | PollFlags::HUP) => Ok(()),
+        Ok(_) => Err(ProcessEffectError::ObserveFailed),
     }
 }
 

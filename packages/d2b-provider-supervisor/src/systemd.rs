@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::broker::{
     BrokerFrame, BrokerLaunchIntent, BrokerLaunchResolver, BundleBackedLaunchResolver,
-    broker_round_trip, wait_pidfd_exit,
+    broker_round_trip, wait_pidfd_observer,
 };
 
 const MAX_PENDING_OBSERVATIONS: usize = 1024;
@@ -758,7 +758,7 @@ impl SystemdEffectOwner for BrokerSystemdEffectOwner {
         handle: &Self::Handle,
         timeout: std::time::Duration,
     ) -> Result<(), ProcessEffectError> {
-        wait_pidfd_exit(&handle.pidfd, timeout)
+        wait_pidfd_observer(&handle.pidfd, timeout)
     }
 
     fn stop(
