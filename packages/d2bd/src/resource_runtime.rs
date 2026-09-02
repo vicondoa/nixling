@@ -109,7 +109,7 @@ use d2b_provider_network_local::{
         ReconcileProgress,
     },
     artifact::{ArtifactCatalogEntry, ArtifactKind},
-    observe::HostNetworkOccupancy,
+    observe::{HostNetworkOccupancy, observe_host_network},
     routes::RouteTuple,
 };
 use d2b_provider_notification_desktop::{Category, GuestSourceConfig, NotificationProviderConfig};
@@ -677,11 +677,20 @@ impl SharedProviderEffectExecutor for UnavailableSharedProviderEffects {
 pub(crate) struct DaemonSharedProviderEffects {
     state: Arc<ServerState>,
     zone: ZoneId,
+    usbip_ledger: Arc<
+        std::sync::Mutex<
+            crate::usbip_production::AuthorityLedger,
+        >,
+    >,
 }
 
 impl DaemonSharedProviderEffects {
     pub(crate) fn new(state: Arc<ServerState>, zone: ZoneId) -> Self {
-        Self { state, zone }
+        Self {
+            state,
+            zone,
+            usbip_ledger: crate::usbip_production::new_authority_ledger(),
+        }
     }
 
     fn validate(
@@ -725,6 +734,56 @@ impl DaemonSharedProviderEffects {
             .ok()
             .and_then(|plane| plane.as_ref().and_then(|plane| plane.zone(&self.zone).ok()))
             .ok_or(SharedProviderEffectError::Unavailable)
+    }
+
+    async fn usbip_service_port(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        value: &Value,
+    ) -> Result<(ResourceUid, bool, SharedRunnerUsbipPort<'_>), SharedProviderEffectError> {
+        let runtime = self.runtime()?;
+        let zone_uid = runtime
+            .authority_zone_uid()
+            .cloned()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let device_ref = value
+            .pointer("/spec/backingDeviceRef")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceRef::parse(value).ok())
+            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        let device = runtime
+            .committed_resource_value(&device_ref, &context.operation_id)
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let device_uid = device
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        let env = value
+            .pointer("/spec/env")
+            .and_then(Value::as_str)
+            .unwrap_or(resource.key().resource_ref().name().as_str());
+        let physical_key: [u8; 32] = Sha256::digest(device_uid.as_str().as_bytes()).into();
+        let binding_context = crate::usbip_production::UsbipBindingContext::new(
+            resource.key().resource_ref().name().as_str(),
+            env,
+            format!("shared-usbip-bind-{}", resource.key().uid().as_str()),
+            format!("shared-usbip-runner-{}", resource.key().uid().as_str()),
+            physical_key,
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let port = crate::usbip_production::DaemonUsbipDispatcher::new(
+            &self.state,
+            binding_context,
+            Arc::clone(&self.usbip_ledger),
+            SharedRunnerUsbipChildren,
+        )
+        .into_port();
+        let opted_in =
+            value.pointer("/spec/mode").and_then(Value::as_str) == Some("authority");
+        Ok((zone_uid, opted_in, port))
     }
 
     fn dependencies_ready(dependencies: &[DependencySnapshot]) -> bool {
@@ -874,6 +933,87 @@ impl crate::usbip_production::UsbipChildResourcePort for SharedRunnerUsbipChildr
     }
 }
 
+struct SharedRunnerGpuAuthorityGate;
+
+impl d2b_provider_device_gpu::GpuLifecycleEffectPort for SharedRunnerGpuAuthorityGate {
+    fn reserve_authority(
+        &mut self,
+        _admission: &d2b_provider_device_gpu::GpuAuthorityAdmission,
+    ) -> Result<d2b_provider_device_gpu::GpuAuthorityLease, d2b_provider_device_gpu::GpuEffectError>
+    {
+        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+    }
+
+    fn open_authorized_devices(
+        &mut self,
+        _admission: &d2b_provider_device_gpu::GpuAuthorityAdmission,
+        _tokens: &d2b_provider_device_gpu::GpuEffectTokenSet,
+    ) -> Result<d2b_provider_device_gpu::GpuLaunchTicket, d2b_provider_device_gpu::GpuEffectError>
+    {
+        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+    }
+
+    fn start_gpu_worker(
+        &mut self,
+        _spec: &d2b_provider_device_gpu::GpuWorkerSpec,
+        _ticket: &d2b_provider_device_gpu::GpuLaunchTicket,
+        _principal: &d2b_provider_device_gpu::GpuPrincipalToken,
+        _platform: &d2b_provider_device_gpu::GpuPlatformToken,
+        _generation: ResourceGeneration,
+    ) -> Result<
+        d2b_provider_device_gpu::GpuProcessIdentity,
+        d2b_provider_device_gpu::GpuEffectError,
+    > {
+        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+    }
+
+    fn start_video_worker(
+        &mut self,
+        _spec: &d2b_provider_device_gpu::VideoWorkerSpec,
+        _ticket: &d2b_provider_device_gpu::GpuLaunchTicket,
+        _principal: &d2b_provider_device_gpu::GpuPrincipalToken,
+        _platform: &d2b_provider_device_gpu::GpuPlatformToken,
+        _generation: ResourceGeneration,
+    ) -> Result<
+        d2b_provider_device_gpu::GpuProcessIdentity,
+        d2b_provider_device_gpu::GpuEffectError,
+    > {
+        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+    }
+
+    fn observe_worker(
+        &mut self,
+        _identity: &d2b_provider_device_gpu::GpuProcessIdentity,
+    ) -> Result<
+        d2b_provider_device_gpu::GpuProcessObservation,
+        d2b_provider_device_gpu::GpuEffectError,
+    > {
+        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+    }
+
+    fn stop_worker(
+        &mut self,
+        _identity: &d2b_provider_device_gpu::GpuProcessIdentity,
+    ) -> Result<
+        d2b_provider_device_gpu::GpuClosureProof,
+        d2b_provider_device_gpu::GpuEffectError,
+    > {
+        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+    }
+
+    fn release_authority(
+        &mut self,
+        _lease: d2b_provider_device_gpu::GpuAuthorityLease,
+        _closures: &[d2b_provider_device_gpu::GpuClosureProof],
+    ) -> Result<(), d2b_provider_device_gpu::GpuEffectError> {
+        Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)
+    }
+}
+
+type SharedRunnerUsbipPort<'a> = d2b_provider_device_usbip::ProductionPort<
+    crate::usbip_production::DaemonUsbipDispatcher<'a, SharedRunnerUsbipChildren>,
+>;
+
 #[async_trait]
 impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
     async fn reconcile_network(
@@ -908,7 +1048,7 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             .cloned()
             .ok_or(SharedProviderEffectError::Unavailable)?;
         let generation = resource.generation();
-        let admission = NetworkAdmissionIntent::new(
+        let admission_intent = NetworkAdmissionIntent::new(
             NetworkAdmissionKey::new(
                 zone_uid,
                 resource.key().uid().clone(),
@@ -920,8 +1060,23 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             Vec::new(),
         )
         .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let plane = self
+            .state
+            .resource_plane
+            .lock()
+            .ok()
+            .and_then(|plane| plane.clone())
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let occupancy =
+            observe_host_network().map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let admission = plane
+            .network_admission_index()
+            .lock()
+            .await
+            .admit(admission_intent, &occupancy)
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
         let broker_context = d2b_provider_network_local::broker::NetworkEffectContext::for_network(
-            admission.proof(),
+            admission.clone(),
             VmId::new(format!("net-{}", resource.key().uid().as_str())),
             BundleOpId::new(format!("shared-network-bridge-{}", resource.key().uid().as_str())),
             BundleOpId::new(format!(
@@ -961,7 +1116,7 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             network_generation: generation,
             attachment_generation: generation,
             installed_generation,
-            admission: admission.proof(),
+            admission,
             artifact_catalog: vec![ArtifactCatalogEntry::new(
                 spec.net_vm_system_artifact_id().clone(),
                 ArtifactKind::NixosSystem,
@@ -1104,52 +1259,12 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         match component {
             UsbipResourceComponent::Device => Ok(SharedProviderEffectPhase::Ready),
             UsbipResourceComponent::Service => {
-                let runtime = self.runtime()?;
-                let zone_uid = runtime
-                    .authority_zone_uid()
-                    .cloned()
-                    .ok_or(SharedProviderEffectError::Unavailable)?;
-                let device_ref = value
-                    .pointer("/spec/backingDeviceRef")
-                    .and_then(Value::as_str)
-                    .and_then(|value| ResourceRef::parse(value).ok())
-                    .ok_or(SharedProviderEffectError::InvalidResource)?;
-                let device = runtime
-                    .committed_resource_value(&device_ref, &context.operation_id)
-                    .await
-                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
-                let device_uid = device
-                    .pointer("/metadata/uid")
-                    .and_then(Value::as_str)
-                    .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
-                    .ok_or(SharedProviderEffectError::InvalidResource)?;
-                let env = value
-                    .pointer("/spec/env")
-                    .and_then(Value::as_str)
-                    .unwrap_or(resource.key().resource_ref().name().as_str());
-                let physical_key: [u8; 32] =
-                    Sha256::digest(device_uid.as_str().as_bytes()).into();
-                let binding_context = crate::usbip_production::UsbipBindingContext::new(
-                    resource.key().resource_ref().name().as_str(),
-                    env,
-                    format!("shared-usbip-bind-{}", resource.key().uid().as_str()),
-                    format!("shared-usbip-runner-{}", resource.key().uid().as_str()),
-                    physical_key,
-                )
-                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-                let mut port = crate::usbip_production::DaemonUsbipDispatcher::new(
-                    &self.state,
-                    binding_context,
-                    crate::usbip_production::new_authority_ledger(),
-                    SharedRunnerUsbipChildren,
-                )
-                .into_port();
+                let (zone_uid, zone_opted_in, mut port) =
+                    self.usbip_service_port(context, resource, &value).await?;
                 let mut lifecycle = d2b_provider_device_usbip::ServiceLifecycle::new(
                     zone_uid.clone(),
                     resource.key().uid().clone(),
                 );
-                let zone_opted_in = value.pointer("/spec/mode").and_then(Value::as_str)
-                    == Some("authority");
                 lifecycle
                     .activate(zone_opted_in, zone_uid, &mut port)
                     .map_err(|_| SharedProviderEffectError::Unavailable)?;
@@ -1341,11 +1456,12 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             resource.generation(),
         )
         .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-        let settings: d2b_provider_device_gpu::GpuSettings = value
-            .pointer("/spec/provider/settings")
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or_default();
+        let settings: d2b_provider_device_gpu::GpuSettings =
+            match value.pointer("/spec/provider/settings") {
+                Some(settings) => serde_json::from_value(settings.clone())
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+                None => d2b_provider_device_gpu::GpuSettings::default(),
+            };
         let admission = d2b_provider_device_gpu::GpuAuthorityAdmission::new(
             owner,
             d2b_provider_device_gpu::GpuBackingToken::from_core([1; 32]),
@@ -1360,13 +1476,16 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             d2b_provider_device_gpu::GpuEffectToken::from_core([4; 32]),
         ])
         .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-        let _controller = d2b_provider_device_gpu::GpuController::new_authorized(
+        let mut controller = d2b_provider_device_gpu::GpuController::new_authorized(
             admission,
             settings,
             tokens,
         )
         .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-        Err(SharedProviderEffectError::Unavailable)
+        controller
+            .reconcile_lifecycle(&mut SharedRunnerGpuAuthorityGate)
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        Ok(SharedProviderEffectPhase::Ready)
     }
 
     async fn finalize(
@@ -1382,6 +1501,25 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                 .security_key_sessions
                 .lock()
                 .stop_vm(holder.name().as_str());
+            return Ok(());
+        }
+        if kind == SharedProviderResourceKind::UsbipService {
+            let (zone_uid, opted_in, mut port) =
+                self.usbip_service_port(context, resource, &value).await?;
+            if !opted_in {
+                return Ok(());
+            }
+            let mut lifecycle = d2b_provider_device_usbip::ServiceLifecycle::new(
+                zone_uid.clone(),
+                resource.key().uid().clone(),
+            );
+            lifecycle
+                .activate(true, zone_uid, &mut port)
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let mut supervisor = d2b_provider_device_usbip::UsbipSupervisor::new(lifecycle);
+            supervisor
+                .finalize(&mut port)
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
             return Ok(());
         }
         Err(SharedProviderEffectError::Unavailable)
