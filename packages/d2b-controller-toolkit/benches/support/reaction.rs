@@ -1116,9 +1116,13 @@ fn process_spec_update_body(canonical: &[u8]) -> Vec<u8> {
     else {
         panic!("stored Process spec is an object");
     };
+    let template = match spec.get("template") {
+        Some(CanonicalJsonValue::String(value)) => format!("{value}-next"),
+        _ => "reaction-updated".to_owned(),
+    };
     spec.insert(
         "template".to_owned(),
-        CanonicalJsonValue::String("reaction-updated".to_owned()),
+        CanonicalJsonValue::String(template),
     );
     value.to_canonical_bytes()
 }

@@ -34,8 +34,9 @@ use d2b_controller_toolkit::{
     ControllerHealth, ControllerIdentity, ControllerSelector, ControllerSource, ControllerVerb,
     DependencySnapshot, DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot, InitialList,
     ObservationResult, OperationContext, PriorityLane, ReconcileContext, ReconcilePlan,
-    ReconcileProjection, ReconcileResult, ResourceKey, ResourceReconciler, ResourceRegistration,
-    ResourceSnapshot, ResyncPolicy, Runner, RunnerConfig, SourceError, StatusPersistence,
+    ReconcileProjection, ReconcileResult, ResourceKey, ResourceReconciler,
+    ResourceRegistration, ResourceSnapshot, ResyncPolicy, Runner, RunnerConfig, SourceError,
+    StatusPersistence,
     TriggerReason, TriggerSet, UpdateAssessment, UpdateAssessmentState, UpgradePlan, UpgradeStage,
     ValidationResult, WatchEvent, WatchFailure, WatchHint, MutationIntent,
 };
@@ -506,7 +507,9 @@ impl ResourceReconciler for ExitProcessReconciler {
             && matches!(Self::phase(resource).as_deref(), Some("Pending" | "Ready"));
         std::future::ready(
             ReconcilePlan::new(
-                effect.then(|| vec!["process-liveness".to_owned()]).unwrap_or_default(),
+                effect
+                    .then_some(vec!["process-liveness".to_owned()])
+                    .unwrap_or_default(),
                 !effect,
             )
             .map_err(|_| HandlerError),
