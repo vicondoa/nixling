@@ -1684,6 +1684,16 @@ impl DaemonSharedProviderEffects {
                 .map_err(|_| SharedProviderEffectError::Unavailable)?;
             return Ok(());
         }
+        let provider_phase = value
+            .pointer("/status/provider/details/providerPhase")
+            .or_else(|| value.pointer("/status/provider/providerPhase"))
+            .and_then(Value::as_str);
+        let cleanup_confirmed = value.pointer("/status/phase").and_then(Value::as_str)
+            == Some("Deleted")
+            || matches!(provider_phase, Some("absent" | "deleted" | "finalized"));
+        if !cleanup_confirmed {
+            return Err(SharedProviderEffectError::Unavailable);
+        }
         let runtime = self.runtime()?;
         for resource_type in ["Process", "Endpoint", "Volume"] {
             if runtime
