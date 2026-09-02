@@ -6,6 +6,9 @@
 - Added same-Zone scoped ResourceService admission for Azure Relay credential
   reads while keeping typed ComponentSession delivery and credential custody
   inside the selected Guest.
+- Finalization now accepts one durable typed revocation effect, records bounded
+  revocation evidence, survives reconnect deduplication, and retains the
+  Credential finalizer until managed-identity Process children are gone.
 
 ### Security
 
@@ -23,3 +26,6 @@
   Owner-child mutations reuse the parent assignment fence, and Azure Relay
   Guest composition accepts an authenticated scoped Credential client without
   taking transport ownership of Resource rows or credential registries.
+- Provider-filtered runners are now attached for all three providers before
+  any Credential row exists, while standalone provider binaries refuse
+  unauthenticated or ambient-chain startup instead of reporting readiness.

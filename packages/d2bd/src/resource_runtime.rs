@@ -218,6 +218,7 @@ pub use volume_effect_adapter::{
 const CORE_CONTROLLER_PROCESS_REF: &str = "Process/d2b-core-controller";
 const CORE_CONTROLLER_PROVIDER_REF: &str = "Provider/system-core";
 const CORE_CONTROLLER_HOST_REF: &str = "Host/host-system";
+const U10_PROVIDER_COUNT: usize = 3;
 
 /// One Provider-owned ResourceType registration served by the shared Runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12178,23 +12179,16 @@ impl ZoneResourceRuntime {
         Arc<crate::credential_resource_runtime::SameZoneScopedCredentialClient>,
         ResourceRuntimeError,
     > {
-        if let Some(session) = session {
-            return crate::credential_resource_runtime::SameZoneScopedCredentialClient::with_component_session(
-                self.zone.clone(),
-                session,
-                delegate,
-            )
-            .map(Arc::new)
-            .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed);
-        }
-        let resource = self.status_client()?;
-        Ok(Arc::new(
-            crate::credential_resource_runtime::SameZoneScopedCredentialClient::new(
-                self.zone.clone(),
-                resource,
-                delegate,
-            ),
-        ))
+        let Some(session) = session else {
+            return Err(ResourceRuntimeError::ResourceApiBindFailed);
+        };
+        crate::credential_resource_runtime::SameZoneScopedCredentialClient::with_component_session(
+            self.zone.clone(),
+            session,
+            delegate,
+        )
+        .map(Arc::new)
+        .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)
     }
 
     fn status_client(
@@ -12808,9 +12802,9 @@ impl ZoneResourceRuntime {
         Ok(())
     }
 
-    /// Attach Credential Provider controllers to the shared Core source and
-    /// Runner path. A controller is registered only when its Provider owns at
-    /// least one Credential row, avoiding zero-resource registrations.
+    /// Attach all Credential Provider controllers to the shared Core source
+    /// and Runner path. Empty initial lists still retain their exact
+    /// Provider-filtered watches for later Credential creates.
     pub(crate) async fn start_u10_controller_runners(
         &self,
     ) -> Result<(), ResourceRuntimeError> {
@@ -12822,24 +12816,29 @@ impl ZoneResourceRuntime {
         if !self.readiness.resource_api_ready {
             return Ok(());
         }
-        {
+        let live_count = {
             let tasks = self
                 .u10_runner_tasks
                 .lock()
                 .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            if tasks.iter().any(|task| !task.is_finished()) {
-                return Ok(());
-            }
-        }
-        let stale = {
-            let mut tasks = self
-                .u10_runner_tasks
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            std::mem::take(&mut *tasks)
+            tasks.iter().filter(|task| !task.is_finished()).count()
         };
-        for task in stale {
-            let _ = task.await;
+        if live_count == U10_PROVIDER_COUNT {
+            return Ok(());
+        }
+        if live_count != 0 {
+            self.stop_u10_controller_runners_locked().await?;
+        } else {
+            let stale = {
+                let mut tasks = self
+                    .u10_runner_tasks
+                    .lock()
+                    .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+                std::mem::take(&mut *tasks)
+            };
+            for task in stale {
+                let _ = task.await;
+            }
         }
 
         let subject_context = self
@@ -12884,14 +12883,10 @@ impl ZoneResourceRuntime {
                 d2b_provider_credential_managed_identity::PROVIDER_REF,
             ),
         ];
-        let mut new_tasks = Vec::new();
-        let build_result: Result<(), ResourceRuntimeError> = async {
-            for (provider_name, controller_ref, provider_kind, provider_ref_text) in providers {
-            let provider_ref =
-                ResourceRef::parse(provider_ref_text).map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-            if !self.credential_resources_present(&provider_ref).await? {
-                continue;
-            }
+        let mut provider_inputs = Vec::with_capacity(providers.len());
+        for (provider_name, controller_ref, provider_kind, provider_ref_text) in providers {
+            let provider_ref = ResourceRef::parse(provider_ref_text)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
             let provider = match self
                 .store
                 .get(StoreGetRequest {
@@ -12921,138 +12916,157 @@ impl ZoneResourceRuntime {
             {
                 return Err(ResourceRuntimeError::HandlerNotReady);
             }
-            let identity = ControllerIdentity::new(
-                self.zone.clone(),
-                controller_ref.clone(),
-                controller_generation,
-                provider_ref.clone(),
+            provider_inputs.push((
+                provider_name,
+                controller_ref,
+                provider_kind,
+                provider_ref,
                 provider.generation,
-                controller_ref.clone(),
-                ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
-                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
-                None,
-            )
-            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-            let descriptor = credential_controller_descriptor(identity.clone())
-                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-            let (assignments, authority) = self
-                .u12_controller_assignments(
-                    &descriptor,
+            ));
+        }
+        let mut new_tasks = Vec::new();
+        let build_result: Result<(), ResourceRuntimeError> = async {
+            for (
+                _provider_name,
+                controller_ref,
+                provider_kind,
+                provider_ref,
+                provider_generation,
+            ) in provider_inputs
+            {
+                let identity = ControllerIdentity::new(
+                    self.zone.clone(),
                     controller_ref.clone(),
-                    provider.generation,
                     controller_generation,
-                    session_generation,
+                    provider_ref.clone(),
+                    provider_generation,
+                    controller_ref.clone(),
+                    ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                    None,
                 )
-                .await?;
-            let subject = self
-                .authorizer
-                .issue_authenticated_subject(subject_context.clone(), authorization_state.clone())
-                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
-            let api = self
-                .api
-                .registered_controller_api(
-                    subject,
-                    authorization_state.clone(),
-                    assignments,
-                )
-                .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
-            let allowed_types = descriptor.resource_types().cloned().collect::<BTreeSet<_>>();
-            let resolver_store = Arc::clone(&self.store);
-            let resolver_zone = self.zone.clone();
-            let resolver_authority = Arc::clone(&authority);
-            let resolver: AssignmentFenceResolver = Arc::new(move |target, uid, revision| {
-                let store = Arc::clone(&resolver_store);
-                let zone = resolver_zone.clone();
-                let authority = Arc::clone(&resolver_authority);
-                let allowed_types = allowed_types.clone();
-                Box::pin(async move {
-                    if !allowed_types.contains(target.resource_type()) {
-                        return Err(SourceError::Integrity);
-                    }
-                    if let Some(stored) = store
-                        .assignment_fence(zone.clone(), target.clone())
-                        .await
-                        .map_err(|error| match error.kind() {
-                            StoreErrorKind::Backpressure
-                            | StoreErrorKind::StoreBackpressure => SourceError::Backpressure,
-                            StoreErrorKind::Timeout => SourceError::Timeout,
-                            _ => SourceError::Unavailable,
-                        })?
-                    {
-                        if stored.resource_uid != uid
-                            || stored.epoch > authority.epoch
-                            || (stored.epoch == authority.epoch
-                                && (stored.provider_generation != authority.provider_generation
-                                    || stored.controller_generation
-                                        != authority.controller_generation
-                                    || stored.controller_role != authority.controller_role
-                                    || stored.target != authority.target
-                                    || stored.session_generation != authority.session_generation))
-                        {
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+                let descriptor = credential_controller_descriptor(identity.clone())
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+                let (assignments, authority) = self
+                    .u12_controller_assignments(
+                        &descriptor,
+                        controller_ref.clone(),
+                        provider_generation,
+                        controller_generation,
+                        session_generation,
+                    )
+                    .await?;
+                let subject = self
+                    .authorizer
+                    .issue_authenticated_subject(subject_context.clone(), authorization_state.clone())
+                    .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+                let api = self
+                    .api
+                    .registered_controller_api(
+                        subject,
+                        authorization_state.clone(),
+                        assignments,
+                    )
+                    .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
+                let allowed_types = descriptor.resource_types().cloned().collect::<BTreeSet<_>>();
+                let resolver_store = Arc::clone(&self.store);
+                let resolver_zone = self.zone.clone();
+                let resolver_authority = Arc::clone(&authority);
+                let resolver: AssignmentFenceResolver = Arc::new(move |target, uid, revision| {
+                    let store = Arc::clone(&resolver_store);
+                    let zone = resolver_zone.clone();
+                    let authority = Arc::clone(&resolver_authority);
+                    let allowed_types = allowed_types.clone();
+                    Box::pin(async move {
+                        if !allowed_types.contains(target.resource_type()) {
                             return Err(SourceError::Integrity);
                         }
-                        if stored.epoch == authority.epoch
-                            && stored.resource_revision != revision
+                        if let Some(stored) = store
+                            .assignment_fence(zone.clone(), target.clone())
+                            .await
+                            .map_err(|error| match error.kind() {
+                                StoreErrorKind::Backpressure
+                                | StoreErrorKind::StoreBackpressure => SourceError::Backpressure,
+                                StoreErrorKind::Timeout => SourceError::Timeout,
+                                _ => SourceError::Unavailable,
+                            })?
                         {
-                            return Err(SourceError::Conflict(stored.resource_revision));
+                            if stored.resource_uid != uid
+                                || stored.epoch > authority.epoch
+                                || (stored.epoch == authority.epoch
+                                    && (stored.provider_generation != authority.provider_generation
+                                        || stored.controller_generation
+                                            != authority.controller_generation
+                                        || stored.controller_role != authority.controller_role
+                                        || stored.target != authority.target
+                                        || stored.session_generation != authority.session_generation))
+                            {
+                                return Err(SourceError::Integrity);
+                            }
+                            if stored.epoch == authority.epoch
+                                && stored.resource_revision != revision
+                            {
+                                return Err(SourceError::Conflict(stored.resource_revision));
+                            }
+                        }
+                        Ok(ResourceAssignmentFence {
+                            resource_uid: uid,
+                            resource_revision: revision,
+                            provider_generation: authority.provider_generation,
+                            controller_generation: authority.controller_generation,
+                            controller_role: authority.controller_role.clone(),
+                            target: authority.target.clone(),
+                            session_generation: authority.session_generation,
+                            epoch: authority.epoch,
+                            scope: ResourceAssignmentScope::Primary,
+                        })
+                    })
+                });
+                let api = api.with_assignment_fence_resolver(resolver);
+                let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+                let reconciler = Arc::new(
+                    CredentialResourceReconciler::new(
+                        Arc::clone(&self.store),
+                        Arc::clone(&status_client),
+                        identity,
+                        provider_ref,
+                        session_generation,
+                    )
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                );
+                let runner = Runner::new(
+                    reconciler,
+                    source,
+                    RunnerConfig {
+                        policy_revision: authorization_state.snapshot.policy_revision,
+                        api_revision: authorization_state.snapshot.api_catalog_revision,
+                        configuration_revision: authorization_state
+                            .snapshot
+                            .active_configuration_revision,
+                        deadline_tick: 5_000,
+                        max_attempts: 3,
+                    },
+                );
+                new_tasks.push(tokio::spawn(async move {
+                    match runner.run().await {
+                        Ok(report) => {
+                            tracing::debug!(
+                                provider = provider_kind.as_str(),
+                                dispatched = report.dispatched,
+                                relists = report.relists,
+                                "Credential resource runner stopped",
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                provider = provider_kind.as_str(),
+                                error = %error,
+                                "Credential resource runner isolated failure",
+                            );
                         }
                     }
-                    Ok(ResourceAssignmentFence {
-                        resource_uid: uid,
-                        resource_revision: revision,
-                        provider_generation: authority.provider_generation,
-                        controller_generation: authority.controller_generation,
-                        controller_role: authority.controller_role.clone(),
-                        target: authority.target.clone(),
-                        session_generation: authority.session_generation,
-                        epoch: authority.epoch,
-                        scope: ResourceAssignmentScope::Primary,
-                    })
-                })
-            });
-            let api = api.with_assignment_fence_resolver(resolver);
-            let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
-            let reconciler = Arc::new(
-                CredentialResourceReconciler::new(
-                    Arc::clone(&self.store),
-                    Arc::clone(&status_client),
-                    identity,
-                    provider_ref,
-                )
-                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
-            );
-            let runner = Runner::new(
-                reconciler,
-                source,
-                RunnerConfig {
-                    policy_revision: authorization_state.snapshot.policy_revision,
-                    api_revision: authorization_state.snapshot.api_catalog_revision,
-                    configuration_revision: authorization_state
-                        .snapshot
-                        .active_configuration_revision,
-                    deadline_tick: 5_000,
-                    max_attempts: 3,
-                },
-            );
-            new_tasks.push(tokio::spawn(async move {
-                match runner.run().await {
-                    Ok(report) => {
-                        tracing::debug!(
-                            provider = provider_kind.as_str(),
-                            dispatched = report.dispatched,
-                            relists = report.relists,
-                            "Credential resource runner stopped",
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            provider = provider_kind.as_str(),
-                            error = %error,
-                            "Credential resource runner isolated failure",
-                        );
-                    }
-                }
-            }));
+                }));
             }
             Ok(())
         }
@@ -13062,7 +13076,7 @@ impl ZoneResourceRuntime {
             self.u10_required.store(false, Ordering::Release);
             return Err(error);
         }
-        let required = !new_tasks.is_empty();
+        let required = new_tasks.len() == U10_PROVIDER_COUNT;
         match self.u10_runner_tasks.lock() {
             Ok(mut tasks) => tasks.extend(new_tasks),
             Err(_) => {
@@ -13073,55 +13087,6 @@ impl ZoneResourceRuntime {
         }
         self.u10_required.store(required, Ordering::Release);
         Ok(())
-    }
-
-    async fn credential_resources_present(
-        &self,
-        provider_ref: &ResourceRef,
-    ) -> Result<bool, ResourceRuntimeError> {
-        let mut cursor = None;
-        loop {
-            let page = self
-                .store
-                .list(StoreListRequest {
-                    operation: StoreOperationContext {
-                        operation_id: "u10-credential-presence".to_owned(),
-                        idempotency_key: None,
-                        correlation_id: "u10-credential-presence".to_owned(),
-                        trace_id: None,
-                        deadline_ms: 10_000,
-                    },
-                    zone: self.zone.clone(),
-                    resource_types: vec![
-                        ResourceTypeName::parse("Credential")
-                            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
-                    ],
-                    resource_names: Vec::new(),
-                    filters: Vec::new(),
-                    page_size: 256,
-                    cursor,
-                    projection: StoreProjection::Full,
-                })
-                .await
-                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-            if page.resources.iter().any(|resource| {
-                serde_json::from_slice::<Value>(&resource.canonical_json)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .pointer("/spec/providerRef")
-                            .and_then(Value::as_str)
-                            .and_then(|value| ResourceRef::parse(value).ok())
-                    })
-                    .is_some_and(|selected| selected == *provider_ref)
-            }) {
-                return Ok(true);
-            }
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                return Ok(false);
-            }
-        }
     }
 
     async fn stop_u12_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {

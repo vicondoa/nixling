@@ -5,16 +5,21 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use d2b_contracts_provider::v3::{
-    credential::{CREDENTIAL_SERVICE_NAME, CredentialSpec, PlacementBinding},
-    credential_controller::{CREDENTIAL_PROVIDER_REVOKE_FINALIZER, CredentialProviderKind},
+    credential::{
+        CREDENTIAL_SERVICE_NAME, CredentialMethod, CredentialSpec, PlacementBinding,
+    },
+    credential_controller::{
+        CREDENTIAL_PROVIDER_REVOKE_FINALIZER, CredentialIdempotencyKey, CredentialProviderKind,
+    },
 };
 use d2b_contracts_resource::resource_proto as wire;
 use d2b_contracts_resource::v3::{
     CanonicalJsonValue, DesiredLifecycle, ResourceEnvelope, ResourcePhase, ResourceRef,
-    ResourceTypeName, ZoneId,
+    ResourceTypeName, ZoneId, canonical_digest,
     execution_policy::{
         BoundedToken, BudgetSpec, DurationMs, ExecutionDomain,
     },
+    identity::ReconnectGeneration,
     process::{
         AdoptionPolicy, EnvironmentClass, ExecutionSpec, HealthCheckSpec, NamespaceClass,
         NetworkUsageSpec, ProcessClass, ProcessSpec, ReadinessClass, ReadinessSpec,
@@ -34,7 +39,8 @@ use d2b_provider_transport_azure_relay::{
 };
 use d2b_resource_api::{RedbBackend, ResourceApiClient, service::UnavailableUpgradeDispatcher};
 use d2b_resource_store::{
-    StoreFilter, StoreListRequest, StoreOperationContext, StoreProjection, StoredResource,
+    StoreError, StoreFilter, StoreListRequest, StoreListResult, StoreOperationContext,
+    StoreProjection, StoredResource,
 };
 use d2b_resource_store_redb::RedbResourceStore;
 
@@ -50,6 +56,8 @@ pub(crate) enum CredentialResourceRuntimeError {
     Store,
     /// A bounded cleanup or Resource API operation failed.
     Cleanup,
+    /// A typed Credential session refused or could not confirm revocation.
+    Revocation,
 }
 
 impl core::fmt::Display for CredentialResourceRuntimeError {
@@ -58,11 +66,191 @@ impl core::fmt::Display for CredentialResourceRuntimeError {
             Self::InvalidResource => "credential-resource-invalid",
             Self::Store => "credential-resource-store-failed",
             Self::Cleanup => "credential-resource-cleanup-failed",
+            Self::Revocation => "credential-revocation-unconfirmed",
         })
     }
 }
 
 impl std::error::Error for CredentialResourceRuntimeError {}
+
+#[async_trait]
+pub(crate) trait CredentialResourceStore: Send + Sync {
+    async fn list(&self, request: StoreListRequest) -> Result<StoreListResult, StoreError>;
+}
+
+#[async_trait]
+impl CredentialResourceStore for RedbResourceStore {
+    async fn list(&self, request: StoreListRequest) -> Result<StoreListResult, StoreError> {
+        RedbResourceStore::list(self, request).await
+    }
+}
+
+#[async_trait]
+pub(crate) trait CredentialResourceClient: Send + Sync {
+    async fn delete(&self, request: wire::DeleteRequest) -> wire::DeleteResponse;
+
+    async fn update_finalizers(
+        &self,
+        request: wire::UpdateFinalizersRequest,
+    ) -> wire::UpdateFinalizersResponse;
+}
+
+#[async_trait]
+impl CredentialResourceClient for ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher> {
+    async fn delete(&self, request: wire::DeleteRequest) -> wire::DeleteResponse {
+        ResourceApiClient::delete(self, request).await
+    }
+
+    async fn update_finalizers(
+        &self,
+        request: wire::UpdateFinalizersRequest,
+    ) -> wire::UpdateFinalizersResponse {
+        ResourceApiClient::update_finalizers(self, request).await
+    }
+}
+
+/// Exact non-secret input for one provider-side RevokeToken call.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CredentialRevocationRequest {
+    credential_ref: ResourceRef,
+    credential_uid: d2b_contracts_resource::v3::ResourceUid,
+    credential_generation: d2b_contracts_resource::v3::ResourceGeneration,
+    provider_ref: ResourceRef,
+    provider_generation: d2b_contracts_resource::v3::ResourceGeneration,
+    controller_generation: d2b_contracts_resource::v3::ControllerGeneration,
+    session_generation: ReconnectGeneration,
+    operation_id: String,
+    idempotency_key: String,
+    deadline_ms: u64,
+}
+
+impl core::fmt::Debug for CredentialRevocationRequest {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("CredentialRevocationRequest")
+            .field("credential_ref", &"<redacted>")
+            .field("credential_uid", &"<redacted>")
+            .field("credential_generation", &self.credential_generation)
+            .field("provider_ref", &"<redacted>")
+            .field("provider_generation", &self.provider_generation)
+            .field("controller_generation", &self.controller_generation)
+            .field("session_generation", &self.session_generation)
+            .field("operation_id", &"<redacted>")
+            .field("idempotency_key", &"<redacted>")
+            .field("deadline_ms", &self.deadline_ms)
+            .finish()
+    }
+}
+
+impl CredentialRevocationRequest {
+    fn new(
+        resource: &ResourceSnapshot,
+        provider_ref: &ResourceRef,
+        identity: &ControllerIdentity,
+        session_generation: ReconnectGeneration,
+    ) -> Result<Self, CredentialResourceRuntimeError> {
+        if identity.zone() != resource.key().zone()
+            || identity.provider_ref() != provider_ref
+            || session_generation.get() == 0
+        {
+            return Err(CredentialResourceRuntimeError::InvalidResource);
+        }
+        let rotation_generation = credential_lease_generation(resource).unwrap_or(1);
+        let operation_id = credential_revoke_operation_id(
+            resource,
+            provider_ref,
+            identity.provider_generation(),
+            identity.controller_generation(),
+        );
+        let idempotency_key = CredentialIdempotencyKey::derive(
+            resource.key().uid(),
+            rotation_generation,
+            CredentialMethod::RevokeToken,
+        )
+        .map_err(|_| CredentialResourceRuntimeError::Revocation)?
+        .request_value();
+        Ok(Self {
+            credential_ref: resource.key().resource_ref().clone(),
+            credential_uid: resource.key().uid().clone(),
+            credential_generation: resource.generation(),
+            provider_ref: provider_ref.clone(),
+            provider_generation: identity.provider_generation(),
+            controller_generation: identity.controller_generation(),
+            session_generation,
+            operation_id,
+            idempotency_key,
+            deadline_ms: 10_000,
+        })
+    }
+}
+
+/// Provider-side revocation result. Only confirmed outcomes may unblock
+/// Process cleanup and finalizer release.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialRevocationOutcome {
+    Revoked,
+    AlreadyRevoked,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CredentialRevocationEvidence {
+    operation_id: String,
+    outcome: CredentialRevocationOutcome,
+    session_generation: ReconnectGeneration,
+}
+
+impl CredentialRevocationEvidence {
+    fn confirmed(
+        request: &CredentialRevocationRequest,
+        outcome: CredentialRevocationOutcome,
+    ) -> Self {
+        Self {
+            operation_id: request.operation_id.clone(),
+            outcome,
+            session_generation: request.session_generation,
+        }
+    }
+
+    fn outcome_code(&self) -> &'static str {
+        match self.outcome {
+            CredentialRevocationOutcome::Revoked => "revoked",
+            CredentialRevocationOutcome::AlreadyRevoked => "already-revoked",
+        }
+    }
+}
+
+impl core::fmt::Debug for CredentialRevocationEvidence {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("CredentialRevocationEvidence")
+            .field("operation_id", &"<redacted>")
+            .field("outcome", &self.outcome)
+            .field("session_generation", &self.session_generation)
+            .finish()
+    }
+}
+
+/// Typed Credential session used by the resource controller's cleanup effect.
+#[async_trait]
+pub(crate) trait CredentialSession: Send + Sync {
+    async fn revoke_credential(
+        &self,
+        request: &CredentialRevocationRequest,
+    ) -> Result<CredentialRevocationOutcome, CredentialResourceRuntimeError>;
+}
+
+struct UnavailableCredentialSession;
+
+#[async_trait]
+impl CredentialSession for UnavailableCredentialSession {
+    async fn revoke_credential(
+        &self,
+        _request: &CredentialRevocationRequest,
+    ) -> Result<CredentialRevocationOutcome, CredentialResourceRuntimeError> {
+        Err(CredentialResourceRuntimeError::Revocation)
+    }
+}
 
 /// Build the exact descriptor shared by one Credential Provider controller.
 pub(crate) fn credential_controller_descriptor(
@@ -138,30 +326,48 @@ pub(crate) fn credential_controller_descriptor(
 }
 
 /// ResourceService-backed Credential handler for the shared Runner.
-pub(crate) struct CredentialResourceReconciler {
-    store: Arc<RedbResourceStore>,
-    client: Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+pub(crate) struct CredentialResourceReconciler<
+    S = RedbResourceStore,
+    C = ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
+> {
+    store: Arc<S>,
+    client: Arc<C>,
     identity: ControllerIdentity,
     provider_ref: ResourceRef,
     provider_kind: CredentialProviderKind,
+    session_generation: ReconnectGeneration,
+    credential_session: Arc<dyn CredentialSession>,
 }
 
-impl CredentialResourceReconciler {
+impl<S, C> CredentialResourceReconciler<S, C>
+where
+    S: CredentialResourceStore + 'static,
+    C: CredentialResourceClient + 'static,
+{
     pub(crate) fn new(
-        store: Arc<RedbResourceStore>,
-        client: Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+        store: Arc<S>,
+        client: Arc<C>,
         identity: ControllerIdentity,
         provider_ref: ResourceRef,
+        session_generation: ReconnectGeneration,
     ) -> Result<Self, CredentialResourceRuntimeError> {
         let provider_kind =
             provider_kind(&provider_ref).ok_or(CredentialResourceRuntimeError::InvalidResource)?;
-        Ok(Self {
+        let reconciler = Self {
             store,
             client,
             identity,
             provider_ref,
             provider_kind,
-        })
+            session_generation,
+            credential_session: Arc::new(UnavailableCredentialSession),
+        };
+        Ok(reconciler.with_credential_session(Arc::new(UnavailableCredentialSession)))
+    }
+
+    fn with_credential_session(mut self, session: Arc<dyn CredentialSession>) -> Self {
+        self.credential_session = session;
+        self
     }
 
     fn owns(&self, resource: &ResourceSnapshot) -> Result<bool, CredentialResourceRuntimeError> {
@@ -284,17 +490,18 @@ impl CredentialResourceReconciler {
         let mut resources = Vec::new();
         let mut cursor = None;
         loop {
+            let operation_id = credential_process_list_operation_id(owner);
             let page = self
                 .store
                 .list(StoreListRequest {
                     operation: StoreOperationContext {
-                        operation_id: "credential-cleanup-process-list".to_owned(),
+                        operation_id: operation_id.clone(),
                         idempotency_key: None,
-                        correlation_id: "credential-cleanup-process-list".to_owned(),
+                        correlation_id: operation_id,
                         trace_id: None,
                         deadline_ms: 5_000,
                     },
-                    zone: self.store.identity().zone().clone(),
+                    zone: owner.key().zone().clone(),
                     resource_types: vec![
                         ResourceTypeName::parse(PROCESS_RESOURCE_TYPE)
                             .expect("Process ResourceType"),
@@ -330,10 +537,7 @@ impl CredentialResourceReconciler {
         mutation.kind = protobuf::EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_DELETE);
         mutation.target = protobuf::MessageField::some(resource_identity(resource));
         mutation.precondition = protobuf::MessageField::some(exact_precondition_stored(resource));
-        let operation = format!(
-            "credential-process-delete-{}",
-            resource.resource_ref.name().as_str()
-        );
+        let operation = credential_process_delete_operation_id(resource);
         let mut request = wire::DeleteRequest::new();
         request.meta = protobuf::MessageField::some(
             d2bd_runtime::resource_runtime_support::public_request_meta(&operation),
@@ -357,10 +561,10 @@ impl CredentialResourceReconciler {
         mutation
             .remove_finalizers
             .push(CREDENTIAL_PROVIDER_REVOKE_FINALIZER.to_owned());
-        let operation = "credential-provider-revoke-finalizer";
+        let operation = credential_finalizer_release_operation_id(resource);
         let mut request = wire::UpdateFinalizersRequest::new();
         request.meta = protobuf::MessageField::some(
-            d2bd_runtime::resource_runtime_support::public_request_meta(operation),
+            d2bd_runtime::resource_runtime_support::public_request_meta(&operation),
         );
         request.mutation = protobuf::MessageField::some(mutation);
         if self.client.update_finalizers(request).await.error.is_some() {
@@ -370,7 +574,11 @@ impl CredentialResourceReconciler {
     }
 }
 
-impl ResourceReconciler for CredentialResourceReconciler {
+impl<S, C> ResourceReconciler for CredentialResourceReconciler<S, C>
+where
+    S: CredentialResourceStore + 'static,
+    C: CredentialResourceClient + 'static,
+{
     type Error = CredentialResourceRuntimeError;
 
     fn classify_error(&self, error: &Self::Error) -> HandlerFailure {
@@ -564,6 +772,7 @@ impl ResourceReconciler for CredentialResourceReconciler {
                 phase,
                 outcome,
                 false,
+                None,
             )?;
             ReconcileResult::new(
                 resource.revision(),
@@ -624,11 +833,20 @@ impl ResourceReconciler for CredentialResourceReconciler {
                 .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?;
             let lease_state = lease_state(resource);
             if matches!(lease_state.as_deref(), Some("Active" | "Unknown")) {
+                let request = CredentialRevocationRequest::new(
+                    resource,
+                    &self.provider_ref,
+                    &self.identity,
+                    self.session_generation,
+                )?;
+                let outcome = self.credential_session.revoke_credential(&request).await?;
+                let evidence = CredentialRevocationEvidence::confirmed(&request, outcome);
                 let status = credential_status_candidate(
                     resource,
-                    ResourcePhase::Degraded,
+                    ResourcePhase::Pending,
                     "credential-lease-revoked",
                     true,
+                    Some(&evidence),
                 )?;
                 return ReconcileResult::new(
                     resource.revision(),
@@ -1064,6 +1282,47 @@ fn owner_ref(resource: &StoredResource) -> Option<ResourceRef> {
         })
 }
 
+fn credential_process_list_operation_id(owner: &ResourceSnapshot) -> String {
+    let preimage = format!(
+        "{}:{}:{}:{}",
+        owner.key().resource_ref().to_canonical_string(),
+        owner.key().uid().as_str(),
+        owner.generation().get(),
+        owner.revision().get(),
+    );
+    format!(
+        "credential-process-list-{}",
+        canonical_digest("d2b:credential-process-list/v1", preimage.as_bytes())
+    )
+}
+
+fn credential_process_delete_operation_id(resource: &StoredResource) -> String {
+    let preimage = format!(
+        "{}:{}:{}:{}",
+        resource.resource_ref.to_canonical_string(),
+        resource.uid.as_str(),
+        resource.generation.get(),
+        resource.revision.get(),
+    );
+    format!(
+        "credential-process-delete-{}",
+        canonical_digest("d2b:credential-process-delete/v1", preimage.as_bytes())
+    )
+}
+
+fn credential_finalizer_release_operation_id(resource: &ResourceSnapshot) -> String {
+    let preimage = format!(
+        "{}:{}:{}",
+        resource.key().resource_ref().to_canonical_string(),
+        resource.key().uid().as_str(),
+        resource.revision().get(),
+    );
+    format!(
+        "credential-finalizer-release-{}",
+        canonical_digest("d2b:credential-finalizer-release/v1", preimage.as_bytes())
+    )
+}
+
 fn deletion_requested(resource: &StoredResource) -> bool {
     serde_json::from_slice::<serde_json::Value>(&resource.canonical_json)
         .ok()
@@ -1126,11 +1385,43 @@ fn lease_state(resource: &ResourceSnapshot) -> Option<String> {
         })
 }
 
+fn credential_lease_generation(resource: &ResourceSnapshot) -> Option<u64> {
+    serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/status/resource/credential/rotationGeneration")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|generation| *generation != 0)
+        })
+}
+
+fn credential_revoke_operation_id(
+    resource: &ResourceSnapshot,
+    provider_ref: &ResourceRef,
+    provider_generation: d2b_contracts_resource::v3::ResourceGeneration,
+    controller_generation: d2b_contracts_resource::v3::ControllerGeneration,
+) -> String {
+    let preimage = format!(
+        "{}:{}:{}:{}:{}",
+        resource.key().uid().as_str(),
+        resource.generation().get(),
+        provider_ref.to_canonical_string(),
+        provider_generation.get(),
+        controller_generation.get(),
+    );
+    format!(
+        "credential-revoke-{}",
+        canonical_digest("d2b:credential-revoke/v1", preimage.as_bytes())
+    )
+}
+
 fn credential_status_candidate(
     resource: &ResourceSnapshot,
     phase: ResourcePhase,
     outcome: &str,
     lease_revoked: bool,
+    revocation: Option<&CredentialRevocationEvidence>,
 ) -> Result<Vec<u8>, CredentialResourceRuntimeError> {
     let mut value = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
         .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?;
@@ -1170,6 +1461,16 @@ fn credential_status_candidate(
                 "leaseState".to_owned(),
                 serde_json::Value::String("Revoked".to_owned()),
             );
+            if let Some(revocation) = revocation {
+                credential.insert(
+                    "revocation".to_owned(),
+                    serde_json::json!({
+                        "operationId": revocation.operation_id,
+                        "outcome": revocation.outcome_code(),
+                        "sessionGeneration": revocation.session_generation.get(),
+                    }),
+                );
+            }
         }
     }
     let status = value
@@ -1286,6 +1587,8 @@ fn cleanup_action(
 /// already-authorized request.
 pub(crate) struct SameZoneScopedCredentialClient {
     zone: ZoneId,
+    route: d2b_session::AuthenticatedSessionRouteBinding,
+    execution_ref: ResourceRef,
     resource: Arc<dyn CredentialResourceReader>,
     delegate: Arc<dyn ScopedCredentialClient>,
 }
@@ -1293,13 +1596,6 @@ pub(crate) struct SameZoneScopedCredentialClient {
 #[async_trait]
 trait CredentialResourceReader: Send + Sync {
     async fn get(&self, request: wire::GetRequest) -> wire::GetResponse;
-}
-
-#[async_trait]
-impl CredentialResourceReader for ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher> {
-    async fn get(&self, request: wire::GetRequest) -> wire::GetResponse {
-        ResourceApiClient::get(self, request).await
-    }
 }
 
 struct ComponentSessionCredentialResourceReader {
@@ -1332,31 +1628,24 @@ impl core::fmt::Debug for SameZoneScopedCredentialClient {
 }
 
 impl SameZoneScopedCredentialClient {
-    #[allow(dead_code)]
-    pub(crate) fn new(
-        zone: ZoneId,
-        resource: Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
-        delegate: Arc<dyn ScopedCredentialClient>,
-    ) -> Self {
-        Self::with_resource_reader(zone, resource, delegate)
-    }
-
     pub(crate) fn with_component_session(
         zone: ZoneId,
         session: &d2bd_runtime::guest_component_session::GuestComponentSessionClient,
         delegate: Arc<dyn ScopedCredentialClient>,
     ) -> Result<Self, RelayCredentialError> {
+        let route = session.route_binding();
         if session.identity().zone() != &zone
             || session.generation() == 0
-            || session
-                .identity()
-                .validate_route(&session.route_binding())
-                .is_err()
+            || !route.liveness().is_live()
+            || session.identity().validate_route(&route).is_err()
+            || route.context().execution_ref() != Some(session.identity().guest_ref())
         {
             return Err(RelayCredentialError::InvalidScope);
         }
         Ok(Self::with_resource_reader(
             zone,
+            route,
+            session.identity().guest_ref().clone(),
             Arc::new(ComponentSessionCredentialResourceReader {
                 client: session.resource_service_client(),
             }),
@@ -1366,11 +1655,15 @@ impl SameZoneScopedCredentialClient {
 
     fn with_resource_reader(
         zone: ZoneId,
+        route: d2b_session::AuthenticatedSessionRouteBinding,
+        execution_ref: ResourceRef,
         resource: Arc<dyn CredentialResourceReader>,
         delegate: Arc<dyn ScopedCredentialClient>,
     ) -> Self {
         Self {
             zone,
+            route,
+            execution_ref,
             resource,
             delegate,
         }
@@ -1398,6 +1691,12 @@ impl ScopedCredentialClient for SameZoneScopedCredentialClient {
         request: &ScopedCredentialRequest,
     ) -> Result<RelayCredentialLease, RelayCredentialError> {
         Self::validate_request_scope(request, &self.zone)?;
+        if !self.route.liveness().is_live()
+            || request.execution_ref() != &self.execution_ref
+            || request.binding().reconnect_generation() != self.route.reconnect_generation().get()
+        {
+            return Err(RelayCredentialError::InvalidScope);
+        }
         let response = self.resource.get({
                 let mut get = wire::GetRequest::new();
                 get.meta = protobuf::MessageField::some(
@@ -1476,8 +1775,10 @@ mod tests {
         ZoneRevision,
     };
     use d2b_core_controller::{
-        ControllerIdentity, MutationIntent, MutationIntentKind, ResourceKey, ResourceMutationBatch,
-        ResourceSnapshot,
+        CommitOutcome, ControllerIdentity, ControllerSource, DependencySnapshot, FreshSnapshot,
+        InitialList, InitialResource, MutationIntent, MutationIntentKind, ReconcilePlan,
+        ReconcileProjection, ReconcileResult, ResourceKey, ResourceMutationBatch, ResourceSnapshot,
+        Runner, RunnerConfig, SourceError, StatusPersistence, WatchEvent, WatchFailure,
     };
     use d2b_provider_transport_azure_relay::{RelayCredentialBinding, RelayCredentialRole};
     use serde_json::json;
@@ -1618,7 +1919,7 @@ mod tests {
     #[test]
     fn status_redaction_removes_secret_bytes_but_keeps_opaque_lease_metadata() {
         let status =
-            credential_status_candidate(&resource(), ResourcePhase::Ready, "success", false)
+            credential_status_candidate(&resource(), ResourcePhase::Ready, "success", false, None)
                 .expect("status");
         let text = String::from_utf8(status).unwrap();
         assert!(!text.contains("credential-secret-canary"));
@@ -1641,6 +1942,623 @@ mod tests {
             cleanup_action(false, true, false),
             CredentialCleanupAction::DeleteProcess
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingCredentialSession {
+        operations:
+            Arc<std::sync::Mutex<std::collections::BTreeMap<String, CredentialRevocationOutcome>>>,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CredentialSession for RecordingCredentialSession {
+        async fn revoke_credential(
+            &self,
+            request: &CredentialRevocationRequest,
+        ) -> Result<CredentialRevocationOutcome, CredentialResourceRuntimeError> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut operations = self.operations.lock().unwrap();
+            if operations
+                .insert(
+                    request.operation_id.clone(),
+                    CredentialRevocationOutcome::Revoked,
+                )
+                .is_some()
+            {
+                Ok(CredentialRevocationOutcome::AlreadyRevoked)
+            } else {
+                Ok(CredentialRevocationOutcome::Revoked)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_session_deduplicates_the_fenced_operation_identity() {
+        let session = RecordingCredentialSession::default();
+        let target = resource();
+        let request = CredentialRevocationRequest::new(
+            &target,
+            &ResourceRef::parse("Provider/credential-managed-identity").unwrap(),
+            &identity(),
+            ReconnectGeneration::new(7).unwrap(),
+        )
+        .expect("revocation request");
+        assert_eq!(
+            session.revoke_credential(&request).await.unwrap(),
+            CredentialRevocationOutcome::Revoked
+        );
+        assert_eq!(
+            session.revoke_credential(&request).await.unwrap(),
+            CredentialRevocationOutcome::AlreadyRevoked
+        );
+        assert_eq!(session.operations.lock().unwrap().len(), 1);
+        assert!(!format!("{request:?}").contains(target.key().uid().as_str()));
+        let rejoined = CredentialRevocationRequest::new(
+            &target,
+            &ResourceRef::parse("Provider/credential-managed-identity").unwrap(),
+            &identity(),
+            ReconnectGeneration::new(8).unwrap(),
+        )
+        .expect("rejoined revocation request");
+        assert_eq!(request.operation_id, rejoined.operation_id);
+        assert_eq!(request.idempotency_key, rejoined.idempotency_key);
+        assert_ne!(request.session_generation, rejoined.session_generation);
+    }
+
+    #[test]
+    fn revocation_request_rejects_cross_provider_or_zero_session_identity() {
+        let target = resource();
+        let provider = ResourceRef::parse("Provider/credential-managed-identity").unwrap();
+        assert_eq!(
+            CredentialRevocationRequest::new(
+                &target,
+                &provider,
+                &identity_for_provider("Provider/credential-entra"),
+                ReconnectGeneration::new(7).unwrap(),
+            )
+            .unwrap_err(),
+            CredentialResourceRuntimeError::InvalidResource
+        );
+    }
+
+    #[derive(Default)]
+    struct TestCredentialStore {
+        resources: std::sync::Mutex<Vec<(StoredResource, Option<ResourceUid>)>>,
+    }
+
+    impl TestCredentialStore {
+        fn with_children(children: Vec<(StoredResource, ResourceUid)>) -> Self {
+            Self {
+                resources: std::sync::Mutex::new(
+                    children
+                        .into_iter()
+                        .map(|(resource, owner_uid)| (resource, Some(owner_uid)))
+                        .collect(),
+                ),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CredentialResourceStore for TestCredentialStore {
+        async fn list(&self, request: StoreListRequest) -> Result<StoreListResult, StoreError> {
+            let resource_type = request.resource_types.first().map(ResourceTypeName::as_str);
+            let owner_uid = request
+                .filters
+                .iter()
+                .find(|filter| filter.field == "owner.resourceUid")
+                .and_then(|filter| filter.values.first());
+            let resources = self
+                .resources
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(resource, stored_owner_uid)| {
+                    resource.zone == request.zone
+                        && resource_type.is_none_or(|resource_type| {
+                            resource.resource_ref.resource_type().as_str() == resource_type
+                        })
+                        && owner_uid.is_none_or(|owner_uid| {
+                            stored_owner_uid
+                                .as_ref()
+                                .is_some_and(|stored| stored.as_str() == owner_uid)
+                        })
+                })
+                .map(|(resource, _)| resource.clone())
+                .collect();
+            Ok(StoreListResult {
+                resources,
+                snapshot_revision: ZoneRevision::new(20),
+                next_cursor: None,
+                truncated: false,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct TestCredentialClient {
+        deletes: std::sync::Mutex<Vec<wire::ResourceIdentity>>,
+        finalizer_updates: std::sync::Mutex<Vec<wire::ResourceIdentity>>,
+        operations: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl CredentialResourceClient for TestCredentialClient {
+        async fn delete(&self, request: wire::DeleteRequest) -> wire::DeleteResponse {
+            if let Some(meta) = request.meta.as_ref() {
+                self.operations
+                    .lock()
+                    .unwrap()
+                    .push(meta.operation_id.clone());
+            }
+            if let Some(mutation) = request.mutation.as_ref() {
+                if let Some(target) = mutation.target.as_ref() {
+                    self.deletes.lock().unwrap().push(target.clone());
+                }
+            }
+            wire::DeleteResponse::new()
+        }
+
+        async fn update_finalizers(
+            &self,
+            request: wire::UpdateFinalizersRequest,
+        ) -> wire::UpdateFinalizersResponse {
+            if let Some(meta) = request.meta.as_ref() {
+                self.operations
+                    .lock()
+                    .unwrap()
+                    .push(meta.operation_id.clone());
+            }
+            if let Some(mutation) = request.mutation.as_ref() {
+                if let Some(target) = mutation.target.as_ref() {
+                    self.finalizer_updates.lock().unwrap().push(target.clone());
+                }
+            }
+            wire::UpdateFinalizersResponse::new()
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct TestCommit {
+        operation_id: String,
+        mutation_kind: Option<MutationIntentKind>,
+        status_candidate: Option<Vec<u8>>,
+    }
+
+    struct TestRunnerSource {
+        target: Option<ResourceSnapshot>,
+        dependencies: Vec<DependencySnapshot>,
+        events: std::sync::Mutex<std::collections::VecDeque<WatchEvent>>,
+        registered: std::sync::atomic::AtomicUsize,
+        watches: std::sync::atomic::AtomicUsize,
+        accepted_effects: std::sync::atomic::AtomicUsize,
+        completed_effects: std::sync::atomic::AtomicUsize,
+        commits: std::sync::Mutex<Vec<TestCommit>>,
+    }
+
+    impl TestRunnerSource {
+        fn new(target: Option<ResourceSnapshot>, dependencies: Vec<DependencySnapshot>) -> Self {
+            let mut events = std::collections::VecDeque::new();
+            events.push_back(WatchEvent::Closed);
+            Self {
+                target,
+                dependencies,
+                events: std::sync::Mutex::new(events),
+                registered: std::sync::atomic::AtomicUsize::new(0),
+                watches: std::sync::atomic::AtomicUsize::new(0),
+                accepted_effects: std::sync::atomic::AtomicUsize::new(0),
+                completed_effects: std::sync::atomic::AtomicUsize::new(0),
+                commits: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn commits(&self) -> Vec<TestCommit> {
+            self.commits.lock().unwrap().clone()
+        }
+    }
+
+    impl ControllerSource for TestRunnerSource {
+        fn register(
+            &self,
+            _descriptor: &ControllerDescriptor,
+        ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
+            self.registered
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(Ok(()))
+        }
+
+        fn list_initial(
+            &self,
+            _descriptor: &ControllerDescriptor,
+        ) -> impl std::future::Future<Output = Result<InitialList, SourceError>> + Send {
+            let resources = self
+                .target
+                .as_ref()
+                .map(|target| {
+                    vec![InitialResource::new(
+                        target.key().clone(),
+                        target.revision(),
+                    )]
+                })
+                .unwrap_or_default();
+            std::future::ready(Ok(InitialList {
+                resources,
+                snapshot_revision: ZoneRevision::new(20),
+            }))
+        }
+
+        fn open_watch(
+            &self,
+            _descriptor: &ControllerDescriptor,
+            _after_revision: ZoneRevision,
+        ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
+            self.watches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(Ok(()))
+        }
+
+        fn receive_watch(
+            &self,
+        ) -> impl std::future::Future<Output = Result<WatchEvent, WatchFailure>> + Send {
+            std::future::ready(Ok(self
+                .events
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(WatchEvent::Closed)))
+        }
+
+        fn read_fresh(
+            &self,
+            _key: &ResourceKey,
+        ) -> impl std::future::Future<Output = Result<FreshSnapshot, SourceError>> + Send {
+            let result = self
+                .target
+                .clone()
+                .map(|target| FreshSnapshot::Present {
+                    target,
+                    dependencies: self.dependencies.clone(),
+                })
+                .ok_or(SourceError::Unavailable);
+            std::future::ready(result)
+        }
+
+        fn write_starting(
+            &self,
+            _context: &ReconcileContext,
+        ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
+            std::future::ready(Ok(()))
+        }
+
+        fn accept_effect(
+            &self,
+            _context: &ReconcileContext,
+            _plan: &ReconcilePlan,
+        ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
+            self.accepted_effects
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(Ok(()))
+        }
+
+        fn complete_effect(
+            &self,
+            _context: &ReconcileContext,
+            _result: &ReconcileResult,
+        ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
+            self.completed_effects
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(Ok(()))
+        }
+
+        fn commit_result(
+            &self,
+            context: &ReconcileContext,
+            result: &ReconcileResult,
+        ) -> impl std::future::Future<Output = Result<CommitOutcome, SourceError>> + Send {
+            self.commits.lock().unwrap().push(TestCommit {
+                operation_id: context.operation().operation_id().to_owned(),
+                mutation_kind: result
+                    .mutation_batch()
+                    .and_then(|batch| batch.mutations().first())
+                    .map(MutationIntent::kind),
+                status_candidate: result.status_candidate().map(ToOwned::to_owned),
+            });
+            std::future::ready(Ok(CommitOutcome::Committed(result.processed_revision())))
+        }
+
+        fn complete_expedited(
+            &self,
+            _context: &ReconcileContext,
+            _projection: &ReconcileProjection,
+            _status_persistence: StatusPersistence,
+        ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
+            std::future::ready(Ok(()))
+        }
+
+        fn persist_outcome(
+            &self,
+            _projection: &ReconcileProjection,
+        ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
+            std::future::ready(Ok(()))
+        }
+
+        fn checkpoint(
+            &self,
+            _context: &ReconcileContext,
+            _revision: ZoneRevision,
+        ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
+            std::future::ready(Ok(()))
+        }
+
+        fn schedule_requeue(
+            &self,
+            _key: &ResourceKey,
+            _at_tick: u64,
+        ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
+            std::future::ready(Ok(()))
+        }
+    }
+
+    fn identity_for_provider(provider: &str) -> ControllerIdentity {
+        ControllerIdentity::new(
+            ZoneId::parse("dev").unwrap(),
+            ResourceRef::parse("Process/credential-controller").unwrap(),
+            ControllerGeneration::new(1).unwrap(),
+            ResourceRef::parse(provider).unwrap(),
+            ResourceGeneration::new(1).unwrap(),
+            ResourceRef::parse("Process/credential-controller").unwrap(),
+            ResourceRef::parse("Host/host-system").unwrap(),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn runner_config() -> RunnerConfig {
+        RunnerConfig {
+            policy_revision: 1,
+            api_revision: 1,
+            configuration_revision: d2b_contracts_resource::v3::ConfigurationGeneration::new(1)
+                .unwrap(),
+            deadline_tick: 60_000,
+            max_attempts: 3,
+        }
+    }
+
+    fn deleting_resource(lease_state: &str) -> ResourceSnapshot {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(resource().canonical_json()).unwrap();
+        value["metadata"]["finalizers"] = serde_json::json!([CREDENTIAL_PROVIDER_REVOKE_FINALIZER]);
+        value["metadata"]["deletionRequestedAt"] =
+            serde_json::Value::String("1970-01-01T00:00:01.000Z".to_owned());
+        value["metadata"]["revision"] = serde_json::json!(4);
+        value["status"]["resource"]["credential"]["leaseState"] =
+            serde_json::Value::String(lease_state.to_owned());
+        ResourceSnapshot::new(
+            resource().key().clone(),
+            ZoneRevision::new(4),
+            resource().generation(),
+            serde_json::to_vec(&value).unwrap(),
+            true,
+        )
+    }
+
+    fn process_child(owner: &ResourceSnapshot, deletion_requested: bool) -> StoredResource {
+        let child_ref = ResourceRef::parse("Process/mi-agent-relay").unwrap();
+        let canonical_json = serde_json::to_vec(&serde_json::json!({
+            "type": "Process",
+            "metadata": {
+                "name": child_ref.name().as_str(),
+                "zone": owner.key().zone().as_str(),
+                "ownerRef": owner.key().resource_ref().to_canonical_string(),
+                "deletionRequestedAt": deletion_requested
+                    .then_some("1970-01-01T00:00:02.000Z"),
+            },
+            "status": {"phase": "Ready", "observedGeneration": 1}
+        }))
+        .unwrap();
+        StoredResource {
+            resource_ref: child_ref,
+            zone: owner.key().zone().clone(),
+            uid: ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap(),
+            generation: ResourceGeneration::new(1).unwrap(),
+            revision: ZoneRevision::new(5),
+            canonical_json,
+            payload_digest:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        }
+    }
+
+    fn credential_reconciler(
+        store: Arc<TestCredentialStore>,
+        client: Arc<TestCredentialClient>,
+        session: Arc<RecordingCredentialSession>,
+    ) -> CredentialResourceReconciler<TestCredentialStore, TestCredentialClient> {
+        let provider_ref = ResourceRef::parse("Provider/credential-managed-identity").unwrap();
+        CredentialResourceReconciler::new(
+            store,
+            client,
+            identity_for_provider("Provider/credential-managed-identity"),
+            provider_ref,
+            ReconnectGeneration::new(7).unwrap(),
+        )
+        .unwrap()
+        .with_credential_session(session)
+    }
+
+    #[tokio::test]
+    async fn runner_first_pass_only_enrolls_the_exact_finalizer() {
+        let source = Arc::new(TestRunnerSource::new(Some(resource()), Vec::new()));
+        let reconciler = Arc::new(credential_reconciler(
+            Arc::new(TestCredentialStore::default()),
+            Arc::new(TestCredentialClient::default()),
+            Arc::new(RecordingCredentialSession::default()),
+        ));
+        Runner::new(reconciler, Arc::clone(&source), runner_config())
+            .run()
+            .await
+            .expect("runner");
+        let commits = source.commits();
+        assert_eq!(commits.len(), 1);
+        assert!(!commits[0].operation_id.is_empty());
+        assert_eq!(
+            commits[0].mutation_kind,
+            Some(MutationIntentKind::UpdateFinalizers)
+        );
+        assert!(commits[0].status_candidate.is_none());
+        assert_eq!(
+            source
+                .accepted_effects
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_rejoin_reuses_one_durable_revoke_operation_and_persists_evidence() {
+        let session = Arc::new(RecordingCredentialSession::default());
+        let mut operation_ids = Vec::new();
+        for _ in 0..2 {
+            let source = Arc::new(TestRunnerSource::new(
+                Some(deleting_resource("Active")),
+                Vec::new(),
+            ));
+            let reconciler = Arc::new(credential_reconciler(
+                Arc::new(TestCredentialStore::default()),
+                Arc::new(TestCredentialClient::default()),
+                Arc::clone(&session),
+            ));
+            Runner::new(reconciler, source.clone(), runner_config())
+                .run()
+                .await
+                .expect("runner");
+            let commits = source.commits();
+            assert_eq!(commits.len(), 1);
+            operation_ids.push(commits[0].operation_id.clone());
+            let status = String::from_utf8(commits[0].status_candidate.clone().unwrap()).unwrap();
+            assert!(status.contains("revocation"));
+            assert!(status.contains("revoked"));
+            assert!(!status.contains("credential-secret-canary"));
+        }
+        assert_eq!(
+            session.attempts.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(session.operations.lock().unwrap().len(), 1);
+        assert_eq!(operation_ids[0], operation_ids[1]);
+    }
+
+    #[tokio::test]
+    async fn runner_keeps_finalizer_until_revocation_and_process_child_cleanup_complete() {
+        let deleting = deleting_resource("Revoked");
+        let child = process_child(&deleting, false);
+        let client = Arc::new(TestCredentialClient::default());
+        let first_source = Arc::new(TestRunnerSource::new(Some(deleting.clone()), Vec::new()));
+        let first = Arc::new(credential_reconciler(
+            Arc::new(TestCredentialStore::with_children(vec![(
+                child.clone(),
+                deleting.key().uid().clone(),
+            )])),
+            Arc::clone(&client),
+            Arc::new(RecordingCredentialSession::default()),
+        ));
+        Runner::new(first, first_source, runner_config())
+            .run()
+            .await
+            .expect("child deletion runner");
+        assert_eq!(client.deletes.lock().unwrap().len(), 1);
+        assert!(client.finalizer_updates.lock().unwrap().is_empty());
+        assert_eq!(client.operations.lock().unwrap().len(), 1);
+
+        let second_source = Arc::new(TestRunnerSource::new(Some(deleting.clone()), Vec::new()));
+        let second = Arc::new(credential_reconciler(
+            Arc::new(TestCredentialStore::with_children(vec![(
+                process_child(&deleting, true),
+                deleting.key().uid().clone(),
+            )])),
+            Arc::clone(&client),
+            Arc::new(RecordingCredentialSession::default()),
+        ));
+        Runner::new(second, second_source, runner_config())
+            .run()
+            .await
+            .expect("finalizer release runner");
+        assert!(client.finalizer_updates.lock().unwrap().is_empty());
+
+        let third_source = Arc::new(TestRunnerSource::new(Some(deleting), Vec::new()));
+        let third = Arc::new(credential_reconciler(
+            Arc::new(TestCredentialStore::default()),
+            Arc::clone(&client),
+            Arc::new(RecordingCredentialSession::default()),
+        ));
+        Runner::new(third, third_source, runner_config())
+            .run()
+            .await
+            .expect("confirmed child removal runner");
+        assert_eq!(client.finalizer_updates.lock().unwrap().len(), 1);
+        assert_eq!(client.operations.lock().unwrap().len(), 2);
+        let operations = client.operations.lock().unwrap();
+        assert_ne!(operations[0], operations[1]);
+    }
+
+    #[tokio::test]
+    async fn empty_provider_watches_register_before_any_credential_exists() {
+        for provider in [
+            "Provider/credential-secret-service",
+            "Provider/credential-entra",
+            "Provider/credential-managed-identity",
+        ] {
+            let source = Arc::new(TestRunnerSource::new(None, Vec::new()));
+            let provider_ref = ResourceRef::parse(provider).unwrap();
+            let reconciler = Arc::new(
+                CredentialResourceReconciler::new(
+                    Arc::new(TestCredentialStore::default()),
+                    Arc::new(TestCredentialClient::default()),
+                    identity_for_provider(provider),
+                    provider_ref,
+                    ReconnectGeneration::new(7).unwrap(),
+                )
+                .unwrap(),
+            );
+            Runner::new(reconciler, Arc::clone(&source), runner_config())
+                .run()
+                .await
+                .expect("empty provider runner");
+            assert_eq!(
+                source.registered.load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+            assert_eq!(source.watches.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn confirmed_revocation_evidence_is_persisted_without_identity_or_secret_bytes() {
+        let target = resource();
+        let request = CredentialRevocationRequest::new(
+            &target,
+            &ResourceRef::parse("Provider/credential-managed-identity").unwrap(),
+            &identity(),
+            ReconnectGeneration::new(7).unwrap(),
+        )
+        .expect("revocation request");
+        let evidence =
+            CredentialRevocationEvidence::confirmed(&request, CredentialRevocationOutcome::Revoked);
+        let status = credential_status_candidate(
+            &target,
+            ResourcePhase::Pending,
+            "credential-lease-revoked",
+            true,
+            Some(&evidence),
+        )
+        .expect("status");
+        let text = String::from_utf8(status).unwrap();
+        assert!(text.contains("revocation"));
+        assert!(text.contains("revoked"));
+        assert!(text.contains("sessionGeneration"));
+        assert!(!text.contains(target.key().uid().as_str()));
+        assert!(!text.contains("credential-secret-canary"));
     }
 
     #[test]
@@ -1833,6 +2751,79 @@ mod tests {
                 &ZoneId::parse("dev").unwrap()
             )
             .is_err()
+        );
+    }
+
+    struct NeverCredentialResourceReader;
+
+    #[async_trait]
+    impl CredentialResourceReader for NeverCredentialResourceReader {
+        async fn get(&self, _request: wire::GetRequest) -> wire::GetResponse {
+            panic!("invalid scoped request reached ResourceService")
+        }
+    }
+
+    struct NeverScopedCredentialDelegate;
+
+    #[async_trait]
+    impl ScopedCredentialClient for NeverScopedCredentialDelegate {
+        async fn read_credential(
+            &self,
+            _request: &ScopedCredentialRequest,
+        ) -> Result<RelayCredentialLease, RelayCredentialError> {
+            Err(RelayCredentialError::Unavailable)
+        }
+
+        async fn revoke_credential(
+            &self,
+            _lease: RelayCredentialLease,
+        ) -> Result<(), RelayCredentialError> {
+            Err(RelayCredentialError::Unavailable)
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_resource_client_rejects_wrong_guest_or_reconnect_before_resource_read() {
+        let zone = ZoneId::parse("dev").unwrap();
+        let route = d2b_session::AuthenticatedSessionRouteBinding::for_test(
+            Some(ResourceRef::parse("Provider/relay").unwrap()),
+            "d2b.resource.v3",
+            7,
+            Some(1),
+            Some(1),
+        );
+        let client = SameZoneScopedCredentialClient::with_resource_reader(
+            zone.clone(),
+            route,
+            ResourceRef::parse("Guest/gateway").unwrap(),
+            Arc::new(NeverCredentialResourceReader),
+            Arc::new(NeverScopedCredentialDelegate),
+        );
+        let wrong_guest = ScopedCredentialRequest::new(
+            zone.clone(),
+            ResourceRef::parse("Credential/relay").unwrap(),
+            ResourceRef::parse("Guest/other").unwrap(),
+            RelayCredentialRole::Send,
+            RelayCredentialBinding::new_scoped(zone.clone(), "link", "session", 7).unwrap(),
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(
+            client.read_credential(&wrong_guest).await.unwrap_err(),
+            RelayCredentialError::InvalidScope
+        );
+        let stale_session = ScopedCredentialRequest::new(
+            zone.clone(),
+            ResourceRef::parse("Credential/relay").unwrap(),
+            ResourceRef::parse("Guest/gateway").unwrap(),
+            RelayCredentialRole::Send,
+            RelayCredentialBinding::new_scoped(zone, "link", "session", 6).unwrap(),
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(
+            client.read_credential(&stale_session).await.unwrap_err(),
+            RelayCredentialError::InvalidScope
         );
     }
 

@@ -17185,6 +17185,30 @@ mod zone_publication_order_tests {
         assert!(arm.contains("return Err(error);"));
         assert!(!arm.contains("tracing::warn!"));
     }
+
+    #[test]
+    fn credential_runners_are_not_gated_on_current_resource_rows() {
+        let source = include_str!("resource_runtime.rs");
+        assert!(!source.contains("self.credential_resources_present(&provider_ref)"));
+        assert!(source.contains("let mut provider_inputs = Vec::with_capacity(providers.len())"));
+        assert!(source.contains("new_tasks.len() == U10_PROVIDER_COUNT"));
+    }
+
+    #[test]
+    fn scoped_credential_reads_have_no_host_status_fallback() {
+        let source = include_str!("resource_runtime.rs");
+        let start = source
+            .find("pub(crate) fn scoped_credential_client(")
+            .expect("scoped credential client");
+        let end = source[start..]
+            .find("    fn status_client(")
+            .map(|offset| start + offset)
+            .expect("status client");
+        let method = &source[start..end];
+        assert!(method.contains("let Some(session) = session else"));
+        assert!(!method.contains("self.status_client()?"));
+        assert!(!method.contains("SameZoneScopedCredentialClient::new"));
+    }
 }
 
 const BROKER_AUDIT_EVIDENCE_PAGE_LIMIT: u32 = 16;
