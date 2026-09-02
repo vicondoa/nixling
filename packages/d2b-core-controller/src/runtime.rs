@@ -297,6 +297,9 @@ where
                 CoreDispatchOutcome::Coalesced
             }
         };
+        if self.watch_stream_enabled.load(Ordering::Acquire) {
+            return Ok(dispatch);
+        }
         match self.watch_signal_tx.try_send(()) {
             Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(())) => Ok(dispatch),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
