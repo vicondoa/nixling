@@ -2131,6 +2131,9 @@ mod tests {
         target: Option<ResourceSnapshot>,
         dependencies: Vec<DependencySnapshot>,
         events: std::sync::Mutex<std::collections::VecDeque<WatchEvent>>,
+        late_create: bool,
+        late_signal_sent: std::sync::atomic::AtomicBool,
+        initial_lists: std::sync::atomic::AtomicUsize,
         registered: std::sync::atomic::AtomicUsize,
         watches: std::sync::atomic::AtomicUsize,
         accepted_effects: std::sync::atomic::AtomicUsize,
@@ -2146,12 +2149,24 @@ mod tests {
                 target,
                 dependencies,
                 events: std::sync::Mutex::new(events),
+                late_create: false,
+                late_signal_sent: std::sync::atomic::AtomicBool::new(false),
+                initial_lists: std::sync::atomic::AtomicUsize::new(0),
                 registered: std::sync::atomic::AtomicUsize::new(0),
                 watches: std::sync::atomic::AtomicUsize::new(0),
                 accepted_effects: std::sync::atomic::AtomicUsize::new(0),
                 completed_effects: std::sync::atomic::AtomicUsize::new(0),
                 commits: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn late_create(
+            target: ResourceSnapshot,
+            dependencies: Vec<DependencySnapshot>,
+        ) -> Self {
+            let mut source = Self::new(Some(target), dependencies);
+            source.late_create = true;
+            source
         }
 
         fn commits(&self) -> Vec<TestCommit> {
@@ -2173,9 +2188,14 @@ mod tests {
             &self,
             _descriptor: &ControllerDescriptor,
         ) -> impl std::future::Future<Output = Result<InitialList, SourceError>> + Send {
+            let first_list =
+                self.initial_lists
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    == 0;
             let resources = self
                 .target
                 .as_ref()
+                .filter(|_| !(self.late_create && first_list))
                 .map(|target| {
                     vec![InitialResource::new(
                         target.key().clone(),
@@ -2202,6 +2222,13 @@ mod tests {
         fn receive_watch(
             &self,
         ) -> impl std::future::Future<Output = Result<WatchEvent, WatchFailure>> + Send {
+            if self.late_create
+                && !self
+                    .late_signal_sent
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                return std::future::ready(Err(WatchFailure::Disconnected));
+            }
             std::future::ready(Ok(self
                 .events
                 .lock()
@@ -2370,21 +2397,62 @@ mod tests {
         }
     }
 
-    fn credential_reconciler(
+    fn resource_for_provider(provider: &str) -> ResourceSnapshot {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(resource().canonical_json()).unwrap();
+        value["spec"]["providerRef"] = serde_json::Value::String(provider.to_owned());
+        match provider {
+            "Provider/credential-secret-service" => {
+                value["spec"]["scope"]["domainFilter"] =
+                    serde_json::Value::String("user".to_owned());
+                value["spec"]["scope"]["userRef"] =
+                    serde_json::Value::String("User/example".to_owned());
+            }
+            "Provider/credential-entra" => {
+                value["spec"]["scope"]["domainFilter"] =
+                    serde_json::Value::String("system".to_owned());
+            }
+            "Provider/credential-managed-identity" => {}
+            _ => panic!("test provider"),
+        }
+        ResourceSnapshot::new(
+            resource().key().clone(),
+            resource().revision(),
+            resource().generation(),
+            serde_json::to_vec(&value).unwrap(),
+            false,
+        )
+    }
+
+    fn credential_reconciler_for(
         store: Arc<TestCredentialStore>,
         client: Arc<TestCredentialClient>,
         session: Arc<RecordingCredentialSession>,
+        provider: &str,
     ) -> CredentialResourceReconciler<TestCredentialStore, TestCredentialClient> {
-        let provider_ref = ResourceRef::parse("Provider/credential-managed-identity").unwrap();
+        let provider_ref = ResourceRef::parse(provider).unwrap();
         CredentialResourceReconciler::new(
             store,
             client,
-            identity_for_provider("Provider/credential-managed-identity"),
+            identity_for_provider(provider),
             provider_ref,
             ReconnectGeneration::new(7).unwrap(),
         )
         .unwrap()
         .with_credential_session(session)
+    }
+
+    fn credential_reconciler(
+        store: Arc<TestCredentialStore>,
+        client: Arc<TestCredentialClient>,
+        session: Arc<RecordingCredentialSession>,
+    ) -> CredentialResourceReconciler<TestCredentialStore, TestCredentialClient> {
+        credential_reconciler_for(
+            store,
+            client,
+            session,
+            "Provider/credential-managed-identity",
+        )
     }
 
     #[tokio::test]
@@ -2530,6 +2598,41 @@ mod tests {
                 1
             );
             assert_eq!(source.watches.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_provider_watches_admit_a_later_credential_create_for_each_provider() {
+        for provider in [
+            "Provider/credential-secret-service",
+            "Provider/credential-entra",
+            "Provider/credential-managed-identity",
+        ] {
+            let source = Arc::new(TestRunnerSource::late_create(
+                resource_for_provider(provider),
+                Vec::new(),
+            ));
+            let reconciler = Arc::new(credential_reconciler_for(
+                Arc::new(TestCredentialStore::default()),
+                Arc::new(TestCredentialClient::default()),
+                Arc::new(RecordingCredentialSession::default()),
+                provider,
+            ));
+            Runner::new(reconciler, Arc::clone(&source), runner_config())
+                .run()
+                .await
+                .expect("later Credential create runner");
+            assert_eq!(source.commits().len(), 1);
+            assert_eq!(
+                source.commits()[0].mutation_kind,
+                Some(MutationIntentKind::UpdateFinalizers)
+            );
+            assert_eq!(
+                source
+                    .registered
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
         }
     }
 
