@@ -7885,7 +7885,7 @@ impl NetworkResourcePort for PublicNetworkResourceBoundary {
         Ok(())
     }
 
-    async fn write_volume_content(
+    async fn upsert_volume_content(
         &self,
         content: &NetworkConfigContent,
     ) -> Result<(), NetworkEffectError> {

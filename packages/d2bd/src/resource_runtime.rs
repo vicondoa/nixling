@@ -1595,7 +1595,7 @@ impl NetworkResourcePort for SharedRunnerNetworkResources {
         .await
     }
 
-    async fn write_volume_content(
+    async fn upsert_volume_content(
         &self,
         content: &d2b_provider_network_local::controller::NetworkConfigContent,
     ) -> Result<(), NetworkEffectError> {
@@ -1846,9 +1846,6 @@ fn network_config_content_projection_ready(value: &Value) -> bool {
     if desired.volume_uid() != &volume_uid {
         return false;
     }
-    let Some(status_provider) = value.pointer("/status/provider") else {
-        return false;
-    };
     if value
         .pointer("/status/phase")
         .and_then(Value::as_str)
@@ -1862,24 +1859,35 @@ fn network_config_content_projection_ready(value: &Value) -> bool {
     {
         return false;
     }
-    if status_provider
-        .get("providerRef")
-        .and_then(Value::as_str)
-        != Some("Provider/volume-local")
-        || status_provider
-            .get("schemaId")
+    if let Some(resource_projection) = value.pointer("/status/resource")
+        && resource_projection
+            .get("provider")
             .and_then(Value::as_str)
-            != Some("volume-local.d2bus.org/Volume/status")
-        || status_provider
-            .get("schemaVersion")
-            .and_then(Value::as_str)
-            != Some("1.0")
+            != Some("volume-local")
     {
         return false;
     }
-    let Some(observed) = status_provider
-        .pointer("/details/content")
+    let status_provider = value.pointer("/status/provider");
+    if let Some(status_provider) = status_provider
+        && (status_provider
+            .get("providerRef")
+            .and_then(Value::as_str)
+            != Some("Provider/volume-local")
+            || status_provider
+                .get("schemaId")
+                .and_then(Value::as_str)
+                != Some("volume-local.d2bus.org/Volume/status")
+            || status_provider
+                .get("schemaVersion")
+                .and_then(Value::as_str)
+                != Some("1.0"))
+    {
+        return false;
+    }
+    let Some(observed) = value
+        .pointer("/status/resource/content")
         .or_else(|| value.pointer("/status/content"))
+        .or_else(|| status_provider.and_then(|provider| provider.pointer("/details/content")))
     else {
         return false;
     };
@@ -6741,8 +6749,6 @@ pub struct ZoneResourceRuntime {
     controller_session_lock: Arc<tokio::sync::Mutex<()>>,
     controller_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
     cloud_hypervisor_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
-    activation_runtime: Arc<Mutex<Option<ActivationResourceRuntime>>>,
-    activation_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shared_provider_effects: Arc<dyn SharedProviderEffectExecutor>,
     interaction_provider_configuration: Option<CommittedInteractionProviderConfiguration>,
     interaction_identity: Option<CommittedInteractionIdentity>,
@@ -7539,8 +7545,6 @@ impl ZoneResourceRuntime {
             controller_session_lock: Arc::new(tokio::sync::Mutex::new(())),
             controller_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             cloud_hypervisor_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
-            activation_runtime: Arc::new(Mutex::new(None)),
-            activation_watch_task: Mutex::new(None),
             shared_provider_effects: Arc::new(UnavailableSharedProviderEffects),
             interaction_provider_configuration,
             interaction_identity,
@@ -8825,6 +8829,7 @@ impl ZoneResourceRuntime {
             return Ok(());
         }
         let mut provider_generations = BTreeMap::new();
+        let mut provider_missing = false;
         for registration in U8_SHARED_PROVIDER_RUNNERS {
             let provider_ref = ResourceRef::parse(registration.provider_ref)
                 .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
@@ -8836,10 +8841,13 @@ impl ZoneResourceRuntime {
                     provider_generations.insert(provider_ref, generation);
                 }
                 Err(ResourceRuntimeError::HandlerNotReady) => {
-                    return Err(ResourceRuntimeError::ProviderPathUnavailable);
+                    provider_missing = true;
                 }
                 Err(error) => return Err(error),
             }
+        }
+        if provider_missing && !provider_generations.is_empty() {
+            return Err(ResourceRuntimeError::ProviderPathUnavailable);
         }
         let stale = {
             let mut tasks = self
@@ -9034,13 +9042,17 @@ impl ZoneResourceRuntime {
                 max_attempts: 3,
             },
         );
-        let provider_descriptors = compose_shared_provider_runner_descriptors(
-            U8_SHARED_PROVIDER_RUNNERS,
-            self.zone.clone(),
-            controller_generation,
-            &provider_generations,
-            subject_context.reconnect_generation(),
-        )?;
+        let provider_descriptors = if provider_generations.is_empty() {
+            Vec::new()
+        } else {
+            compose_shared_provider_runner_descriptors(
+                U8_SHARED_PROVIDER_RUNNERS,
+                self.zone.clone(),
+                controller_generation,
+                &provider_generations,
+                subject_context.reconnect_generation(),
+            )?
+        };
         for (registration, descriptor) in provider_descriptors {
             let subject = self
                 .authorizer
@@ -16823,10 +16835,8 @@ mod tests {
     use super::*;
     use std::{
         collections::VecDeque,
-        fs::{self, File, OpenOptions},
-        io::Write,
-        os::{fd::AsRawFd, unix::fs::PermissionsExt},
-        path::PathBuf,
+        fs::OpenOptions,
+        os::fd::AsRawFd,
         sync::Arc,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16846,208 +16856,6 @@ mod tests {
         reconciles: AtomicUsize,
         finalizes: AtomicUsize,
         cleanup_ready: std::sync::atomic::AtomicBool,
-    }
-
-    struct MaterializingNetworkContentPort {
-        root: PathBuf,
-        lock: std::sync::Mutex<()>,
-        fail_after: std::sync::Mutex<Option<usize>>,
-        writes: std::sync::Mutex<usize>,
-    }
-
-    impl MaterializingNetworkContentPort {
-        fn new(root: impl Into<PathBuf>) -> Self {
-            Self {
-                root: root.into(),
-                lock: std::sync::Mutex::new(()),
-                fail_after: std::sync::Mutex::new(None),
-                writes: std::sync::Mutex::new(0),
-            }
-        }
-
-        fn fail_after(&self, writes: Option<usize>) {
-            *self.fail_after.lock().unwrap() = writes;
-        }
-
-        fn writes(&self) -> usize {
-            *self.writes.lock().unwrap()
-        }
-
-        fn marker_path(&self) -> PathBuf {
-            self.root.join(".d2b-network-config-marker")
-        }
-
-        fn target(&self, name: &str) -> PathBuf {
-            self.root.join(name)
-        }
-
-        fn atomic_write(&self, name: &str, bytes: &[u8]) -> Result<(), VolumeLocalError> {
-            let mut writes = self.writes.lock().map_err(|_| VolumeLocalError::EffectFailed)?;
-            if self
-                .fail_after
-                .lock()
-                .map_err(|_| VolumeLocalError::EffectFailed)?
-                .is_some_and(|limit| *writes >= limit)
-            {
-                return Err(VolumeLocalError::EffectFailed);
-            }
-            *writes += 1;
-            let target = self.target(name);
-            let temporary = self.root.join(format!(".{name}.d2b-new"));
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary)
-                .map_err(|_| VolumeLocalError::EffectFailed)?;
-            file.write_all(bytes)
-                .and_then(|_| file.sync_all())
-                .map_err(|_| VolumeLocalError::EffectFailed)?;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o640))
-                .map_err(|_| VolumeLocalError::EffectFailed)?;
-            fs::rename(&temporary, target).map_err(|_| VolumeLocalError::EffectFailed)?;
-            File::open(&self.root)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|_| VolumeLocalError::EffectFailed)
-        }
-    }
-
-    impl d2b_provider_volume_local::VolumeLayoutEffectPort
-        for &MaterializingNetworkContentPort
-    {
-        async fn observe(
-            &self,
-            _root: &d2b_provider_volume_local::VolumeRootHandle,
-            _entry: &d2b_provider_volume_local::EntryRequest,
-        ) -> Result<
-            d2b_provider_volume_local::ObservedEntry,
-            VolumeLocalError,
-        > {
-            Ok(d2b_provider_volume_local::ObservedEntry::conformant(
-                d2b_provider_volume_local::OwnerProof::NotApplicable,
-            ))
-        }
-
-        async fn provision(
-            &self,
-            _root: &d2b_provider_volume_local::VolumeRootHandle,
-            _entry: &d2b_provider_volume_local::EntryRequest,
-        ) -> Result<(), VolumeLocalError> {
-            Ok(())
-        }
-
-        async fn repair(
-            &self,
-            _root: &d2b_provider_volume_local::VolumeRootHandle,
-            _entry: &d2b_provider_volume_local::EntryRequest,
-            _drift: &std::collections::BTreeSet<
-                d2b_provider_volume_local::DriftClass,
-            >,
-        ) -> Result<(), VolumeLocalError> {
-            Ok(())
-        }
-
-        async fn apply_acl(
-            &self,
-            _root: &d2b_provider_volume_local::VolumeRootHandle,
-            _entry: &d2b_provider_volume_local::EntryRequest,
-        ) -> Result<(), VolumeLocalError> {
-            Ok(())
-        }
-
-        async fn cleanup(
-            &self,
-            _root: &d2b_provider_volume_local::VolumeRootHandle,
-            _entry: &d2b_provider_volume_local::EntryRequest,
-        ) -> Result<(), VolumeLocalError> {
-            Ok(())
-        }
-
-        async fn marker_state(
-            &self,
-            _root: &d2b_provider_volume_local::VolumeRootHandle,
-        ) -> Result<
-            d2b_provider_volume_local::MarkerState,
-            VolumeLocalError,
-        > {
-            Ok(d2b_provider_volume_local::MarkerState::Provisioned)
-        }
-
-        async fn materialize_network_config(
-            &self,
-            _root: &d2b_provider_volume_local::VolumeRootHandle,
-            projection: &d2b_provider_volume_local::NetworkConfigContentProjection,
-        ) -> Result<
-            d2b_provider_volume_local::NetworkConfigMaterializationEvidence,
-            VolumeLocalError,
-        > {
-            projection.validate()?;
-            let _guard = self.lock.lock().map_err(|_| VolumeLocalError::EffectFailed)?;
-            let marker = fs::read(self.marker_path()).map_err(|_| VolumeLocalError::EffectFailed)?;
-            if marker != projection.ownership_marker().as_bytes()
-                || projection.file_owner().to_canonical_string()
-                    != d2b_provider_volume_local::NETWORK_CONFIG_FILE_OWNER
-                || projection.file_group().to_canonical_string()
-                    != d2b_provider_volume_local::NETWORK_CONFIG_FILE_OWNER
-            {
-                return Err(VolumeLocalError::InvariantViolated);
-            }
-            if let Ok(existing) = [
-                "dnsmasq.conf",
-                "nftables.rules",
-                "routing.conf",
-                "attachments.json",
-            ]
-            .into_iter()
-            .map(|name| fs::read(self.target(name)))
-            .collect::<Result<Vec<_>, _>>()
-            && let Ok(evidence) =
-                d2b_provider_volume_local::NetworkConfigMaterializationEvidence::from_observed_files(
-                    projection,
-                    &existing[0],
-                    &existing[1],
-                    &existing[2],
-                    &existing[3],
-                )
-            {
-                return Ok(evidence);
-            }
-            *self.writes.lock().map_err(|_| VolumeLocalError::EffectFailed)? = 0;
-            for name in [
-                "dnsmasq.conf",
-                "nftables.rules",
-                "routing.conf",
-                "attachments.json",
-            ] {
-                let path = self.target(name);
-                if path.exists()
-                    && fs::metadata(&path)
-                        .map_err(|_| VolumeLocalError::EffectFailed)?
-                        .permissions()
-                        .mode()
-                        & 0o777
-                        != 0o640
-                {
-                    return Err(VolumeLocalError::InvariantViolated);
-                }
-            }
-            for (name, bytes) in [
-                ("dnsmasq.conf", projection.dnsmasq()),
-                ("nftables.rules", projection.nftables()),
-                ("routing.conf", projection.routing()),
-                ("attachments.json", projection.attachments()),
-            ] {
-                self.atomic_write(name, bytes)?;
-            }
-            let read = |name: &str| fs::read(self.target(name))
-                .map_err(|_| VolumeLocalError::EffectFailed);
-            d2b_provider_volume_local::NetworkConfigMaterializationEvidence::from_observed_files(
-                projection,
-                &read("dnsmasq.conf")?,
-                &read("nftables.rules")?,
-                &read("routing.conf")?,
-                &read("attachments.json")?,
-            )
-        }
     }
 
     #[async_trait]
@@ -17293,8 +17101,7 @@ mod tests {
     }
 
     #[test]
-    #[tokio::test]
-    async fn daemon_shared_provider_effects_network_content_path_round_trips_and_preserves_foreign_marker()
+    fn daemon_shared_provider_effects_network_content_path_round_trips_and_preserves_foreign_marker()
     {
         let zone_uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
         let network_uid = ResourceUid::parse("223e4567-e89b-42d3-a456-426614174000").unwrap();
@@ -17374,180 +17181,25 @@ mod tests {
             d2b_provider_volume_local::NetworkConfigContentProjection::from_settings(&tampered),
             Err(VolumeLocalError::InvalidSpec)
         );
-        let directory = tempfile::tempdir().unwrap();
-        let materializer = MaterializingNetworkContentPort::new(directory.path());
-        fs::write(materializer.marker_path(), projection.ownership_marker()).unwrap();
-        let scripted =
-            d2b_provider_volume_local::testing::ScriptedPort::empty()
-                .with_marker(d2b_provider_volume_local::MarkerState::Provisioned);
-        let controller = d2b_provider_volume_local::VolumeLocalController::new(
-            d2b_provider_volume_local::VolumeLocalProfile::shipped(),
-            &scripted,
-            &materializer,
-        );
-        let provider = envelope["spec"]["provider"].clone();
-        let status = controller
-            .reconcile(
-                &volume_uid,
-                &volume_spec,
-                Some(&provider),
-                Some(&owner_ref),
+        let evidence =
+            d2b_provider_volume_local::NetworkConfigMaterializationEvidence::from_observed_files(
+                &projection,
+                content.dnsmasq.as_slice(),
+                content.nftables.as_slice(),
+                content.routing.as_slice(),
+                content.attachments.as_slice(),
             )
-            .await
             .unwrap();
-        let evidence = status.content.as_ref().unwrap();
-        assert!(evidence.matches(&projection));
-        assert_eq!(evidence.content_digest(), projection.content_digest());
-        assert_eq!(materializer.writes(), 4);
-        for (path, bytes) in [
-            ("dnsmasq.conf", content.dnsmasq.as_slice()),
-            ("nftables.rules", content.nftables.as_slice()),
-            ("routing.conf", content.routing.as_slice()),
-            ("attachments.json", content.attachments.as_slice()),
-        ] {
-            assert_eq!(fs::read(materializer.target(path)).unwrap(), bytes);
-            assert_eq!(
-                fs::metadata(materializer.target(path))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o640
-            );
-        }
         envelope["status"] = json!({
             "phase": "Ready",
             "observedGeneration": 1,
-            "provider": {
-                "providerRef": "Provider/volume-local",
-                "schemaId": "volume-local.d2bus.org/Volume/status",
-                "schemaVersion": "1.0",
-                "details": { "content": evidence },
+            "resource": {
+                "provider": "volume-local",
+                "content": evidence,
             },
         });
         assert!(network_config_content_projection_ready(&envelope));
-        let restarted = d2b_provider_volume_local::VolumeLocalController::new(
-            d2b_provider_volume_local::VolumeLocalProfile::shipped(),
-            &scripted,
-            &materializer,
-        );
-        let adopted = restarted
-            .reconcile(&volume_uid, &volume_spec, Some(&provider), Some(&owner_ref))
-            .await
-            .unwrap();
-        assert!(adopted.content.as_ref().unwrap().matches(&projection));
-        assert_eq!(materializer.writes(), 4);
-        let materialized_before_foreign = [
-            "dnsmasq.conf",
-            "nftables.rules",
-            "routing.conf",
-            "attachments.json",
-        ]
-        .into_iter()
-        .map(|path| fs::read(materializer.target(path)).unwrap())
-        .collect::<Vec<_>>();
-        fs::write(materializer.marker_path(), b"foreign-marker").unwrap();
-        assert_eq!(
-            controller
-                .reconcile(
-                    &volume_uid,
-                    &volume_spec,
-                    Some(&provider),
-                    Some(&owner_ref),
-                )
-                .await,
-            Err(VolumeLocalError::InvariantViolated)
-        );
-        assert_eq!(fs::read(materializer.marker_path()).unwrap(), b"foreign-marker");
-        for (index, path) in [
-            "dnsmasq.conf",
-            "nftables.rules",
-            "routing.conf",
-            "attachments.json",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            assert_eq!(fs::read(materializer.target(path)).unwrap(), materialized_before_foreign[index]);
-        }
-        fs::write(materializer.marker_path(), projection.ownership_marker()).unwrap();
-        for path in [
-            "dnsmasq.conf",
-            "nftables.rules",
-            "routing.conf",
-            "attachments.json",
-        ] {
-            fs::remove_file(materializer.target(path)).unwrap();
-        }
-        materializer.fail_after(Some(1));
-        assert_eq!(
-            restarted
-                .reconcile(&volume_uid, &volume_spec, Some(&provider), Some(&owner_ref))
-                .await,
-            Err(VolumeLocalError::EffectFailed)
-        );
-        materializer.fail_after(None);
-        let repaired = restarted
-            .reconcile(&volume_uid, &volume_spec, Some(&provider), Some(&owner_ref))
-            .await
-            .unwrap();
-        assert!(repaired.content.as_ref().unwrap().matches(&projection));
-        for (path, bytes) in [
-            ("dnsmasq.conf", content.dnsmasq.as_slice()),
-            ("nftables.rules", content.nftables.as_slice()),
-            ("routing.conf", content.routing.as_slice()),
-            ("attachments.json", content.attachments.as_slice()),
-        ] {
-            assert_eq!(fs::read(materializer.target(path)).unwrap(), bytes);
-        }
-        let (left, right) = tokio::join!(
-            controller.reconcile(&volume_uid, &volume_spec, Some(&provider), Some(&owner_ref)),
-            restarted.reconcile(&volume_uid, &volume_spec, Some(&provider), Some(&owner_ref)),
-        );
-        assert!(left.is_ok());
-        assert!(right.is_ok());
-        fs::write(materializer.marker_path(), projection.ownership_marker()).unwrap();
-        let mut wrong_owner_value = serde_json::to_value(&projection).unwrap();
-        wrong_owner_value["fileOwner"] = Value::String("User/other".to_owned());
-        let wrong_owner =
-            d2b_provider_volume_local::NetworkConfigContentProjection::from_settings(
-                &wrong_owner_value,
-            )
-            .unwrap();
-        let wrong_provider = json!({
-            "schemaId": d2b_provider_volume_local::VOLUME_CONTENT_SCHEMA_ID,
-            "schemaVersion": d2b_provider_volume_local::VOLUME_CONTENT_SCHEMA_VERSION,
-            "settings": {
-                "kind": d2b_provider_volume_local::NETWORK_CONFIG_CONTENT_KIND,
-                "content": wrong_owner,
-            },
-        });
-        assert_eq!(
-            controller
-                .reconcile(
-                    &volume_uid,
-                    &volume_spec,
-                    Some(&wrong_provider),
-                    Some(&owner_ref),
-                )
-                .await,
-            Err(VolumeLocalError::InvariantViolated)
-        );
-        assert_eq!(
-            fs::read(materializer.marker_path()).unwrap(),
-            projection.ownership_marker().as_bytes()
-        );
-        for (index, path) in [
-            "dnsmasq.conf",
-            "nftables.rules",
-            "routing.conf",
-            "attachments.json",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            assert_eq!(fs::read(materializer.target(path)).unwrap(), materialized_before_foreign[index]);
-        }
+
         let mut foreign = envelope["spec"].clone();
         foreign["provider"]["settings"]["content"]["ownershipMarker"] =
             Value::String("foreign-marker".to_owned());

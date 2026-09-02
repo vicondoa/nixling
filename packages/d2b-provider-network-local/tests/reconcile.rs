@@ -147,7 +147,7 @@ impl NetworkResourcePort for FakePorts {
         self.push("volume-upsert")
     }
 
-    async fn write_volume_content(
+    async fn upsert_volume_content(
         &self,
         _: &NetworkConfigContent,
     ) -> Result<(), NetworkEffectError> {

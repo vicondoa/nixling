@@ -798,8 +798,8 @@ pub trait NetworkResourcePort: Send + Sync {
         &self,
         spec: &VolumeSpec,
     ) -> impl Future<Output = Result<(), NetworkEffectError>> + Send;
-    /// Write all four bounded config payloads through the Volume service.
-    fn write_volume_content(
+    /// Persist the desired bounded config projection for the Volume owner.
+    fn upsert_volume_content(
         &self,
         content: &NetworkConfigContent,
     ) -> impl Future<Output = Result<(), NetworkEffectError>> + Send;
@@ -833,7 +833,7 @@ pub trait NetworkResourcePort: Send + Sync {
     fn delete_volume(&self) -> impl Future<Output = Result<(), NetworkEffectError>> + Send;
 }
 
-/// Four bounded files written through the Volume service.
+/// Four bounded files carried in the desired Volume content projection.
 #[derive(Clone, PartialEq, Eq)]
 pub struct NetworkConfigContent {
     /// dnsmasq configuration bytes.
@@ -1097,7 +1097,7 @@ where
         if content.provenance() != Some(&provenance) {
             return Err(NetworkEffectError::NetworkAdmissionMismatch);
         }
-        self.resources.write_volume_content(&content).await?;
+        self.resources.upsert_volume_content(&content).await?;
         if !input.volume_ready {
             return Ok(ReconcileProgress::Pending(
                 NetworkConditionReason::VolumeNotReady,

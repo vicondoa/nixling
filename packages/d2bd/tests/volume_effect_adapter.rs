@@ -60,9 +60,12 @@ fn production_controller_materializes_and_adopts_a_marker_bound_root() {
     let uid = volume_uid();
     let spec = volume_spec();
 
-    let first = d2b_provider_volume_local::testing::block_on(controller.reconcile(&uid, &spec))
+    let first =
+        d2b_provider_volume_local::testing::block_on(controller.reconcile(&uid, &spec, None, None))
         .expect("first reconcile");
-    let restarted = d2b_provider_volume_local::testing::block_on(controller.reconcile(&uid, &spec))
+    let restarted = d2b_provider_volume_local::testing::block_on(
+        controller.reconcile(&uid, &spec, None, None),
+    )
         .expect("restart adoption");
     assert_eq!(
         first.layout_phase,
@@ -82,7 +85,7 @@ fn production_content_status_is_published_only_after_full_readback() {
     let controller = VolumeLocalController::new(VolumeLocalProfile::shipped(), &adapter, &adapter);
     let uid = volume_uid();
     let spec = volume_spec();
-    d2b_provider_volume_local::testing::block_on(controller.reconcile(&uid, &spec))
+    d2b_provider_volume_local::testing::block_on(controller.reconcile(&uid, &spec, None, None))
         .expect("layout reconcile");
     let owner = ResourceRef::parse("User/d2bd").expect("owner");
     let projection = ContentProjection::new(
@@ -125,6 +128,137 @@ fn production_content_status_is_published_only_after_full_readback() {
         std::fs::read(base.join("config")).expect("readback"),
         b"declared\n"
     );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn production_network_content_materializes_and_preserves_a_foreign_marker() {
+    let (base, adapter) = adapter_root("network-content");
+    let controller =
+        VolumeLocalController::new(VolumeLocalProfile::shipped(), &adapter, &adapter);
+    let volume_uid = volume_uid();
+    let volume_spec =
+        d2b_provider_network_local::controller::config_volume_spec("host-system", None)
+            .expect("Network Volume spec");
+    let network_ref = ResourceRef::parse("Network/work").expect("Network ref");
+    let provenance = d2b_contracts_resource::v3::network::NetworkProvenance::new(
+        ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").expect("Zone UID"),
+        ResourceUid::parse("223e4567-e89b-42d3-a456-426614174000").expect("Network UID"),
+        ResourceGeneration::new(2).expect("Network generation"),
+        ResourceGeneration::new(3).expect("Attachment generation"),
+        d2b_contracts_resource::v3::ResourceBundleGenerationId::parse(
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("bundle generation"),
+    );
+    let network_spec = d2b_contracts_resource::v3::network::NetworkSpec::minimal(
+        d2b_contracts_resource::v3::network::Ipv4Cidr::parse("10.20.0.0/24")
+            .expect("LAN CIDR"),
+        d2b_contracts_resource::v3::network::Ipv4Cidr::parse("192.0.2.0/30")
+            .expect("uplink CIDR"),
+        d2b_contracts_resource::v3::execution_policy::BoundedToken::parse("net-vm-base")
+            .expect("artifact"),
+    )
+    .expect("Network spec");
+    let content =
+        d2b_provider_network_local::controller::render_config_with_provenance(
+            &network_spec,
+            &provenance,
+        )
+        .expect("Network content");
+    let file_owner =
+        ResourceRef::parse(d2b_provider_volume_local::NETWORK_CONFIG_FILE_OWNER)
+            .expect("content owner");
+    let projection = d2b_provider_volume_local::NetworkConfigContentProjection::new(
+        volume_uid.clone(),
+        network_ref.clone(),
+        provenance,
+        d2b_contracts_resource::v3::derive_network_ownership_marker(
+            &content
+                .provenance
+                .clone()
+                .expect("content provenance"),
+            "network-config",
+        ),
+        file_owner.clone(),
+        file_owner,
+        d2b_provider_volume_local::NETWORK_CONFIG_FILE_MODE,
+        content.dnsmasq.clone(),
+        content.nftables.clone(),
+        content.routing.clone(),
+        content.attachments.clone(),
+        content.digest(),
+    )
+    .expect("typed Network content projection");
+    let provider = serde_json::json!({
+        "schemaId": d2b_provider_volume_local::VOLUME_CONTENT_SCHEMA_ID,
+        "schemaVersion": d2b_provider_volume_local::VOLUME_CONTENT_SCHEMA_VERSION,
+        "settings": {
+            "kind": d2b_provider_volume_local::NETWORK_CONFIG_CONTENT_KIND,
+            "content": projection,
+        },
+    });
+    let status = d2b_provider_volume_local::testing::block_on(controller.reconcile(
+        &volume_uid,
+        &volume_spec,
+        Some(&provider),
+        Some(&network_ref),
+    ))
+    .expect("Network content reconcile");
+    let evidence = status.content.as_ref().expect("durable content evidence");
+    assert!(evidence.matches(
+        &d2b_provider_volume_local::NetworkConfigContentProjection::from_settings(
+            &provider["settings"]["content"],
+        )
+        .expect("projection round trip")
+    ));
+    for (path, bytes) in [
+        ("dnsmasq.conf", content.dnsmasq.as_slice()),
+        ("nftables.rules", content.nftables.as_slice()),
+        ("routing.conf", content.routing.as_slice()),
+        ("attachments.json", content.attachments.as_slice()),
+    ] {
+        assert_eq!(std::fs::read(base.join(path)).expect("materialized file"), bytes);
+    }
+    let before = [
+        "dnsmasq.conf",
+        "nftables.rules",
+        "routing.conf",
+        "attachments.json",
+    ]
+    .into_iter()
+    .map(|path| std::fs::read(base.join(path)).expect("materialized file"))
+    .collect::<Vec<_>>();
+
+    std::fs::write(base.join(".d2b-volume-marker"), b"foreign-marker")
+        .expect("foreign marker");
+    assert_eq!(
+        d2b_provider_volume_local::testing::block_on(controller.reconcile(
+            &volume_uid,
+            &volume_spec,
+            Some(&provider),
+            Some(&network_ref),
+        )),
+        Err(VolumeLocalError::EffectFailed)
+    );
+    assert_eq!(
+        std::fs::read(base.join(".d2b-volume-marker")).expect("marker readback"),
+        b"foreign-marker"
+    );
+    for (index, path) in [
+        "dnsmasq.conf",
+        "nftables.rules",
+        "routing.conf",
+        "attachments.json",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            std::fs::read(base.join(path)).expect("materialized file"),
+            before[index]
+        );
+    }
     let _ = std::fs::remove_dir_all(base);
 }
 
@@ -174,7 +308,7 @@ fn foreign_marker_is_preserved_and_blocks_the_controller() {
     std::fs::write(base.join(".d2b-volume-marker"), b"foreign-marker").expect("foreign marker");
     let controller = VolumeLocalController::new(VolumeLocalProfile::shipped(), &adapter, &adapter);
     let error = d2b_provider_volume_local::testing::block_on(
-        controller.reconcile(&volume_uid(), &volume_spec()),
+        controller.reconcile(&volume_uid(), &volume_spec(), None, None),
     )
     .expect_err("foreign marker must fail closed");
     assert_eq!(error, VolumeLocalError::EffectFailed);

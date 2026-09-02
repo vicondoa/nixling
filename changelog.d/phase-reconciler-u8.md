@@ -19,3 +19,5 @@
   require its observed digest evidence before Network reports Ready.
 - Parse the typed Volume content projection during normal volume-local
   reconciliation and retain fail-closed, restart-safe materialization behavior.
+- Keep Core startup available before any U8 Provider rows exist while refusing
+  partial U8 Provider enrollment.

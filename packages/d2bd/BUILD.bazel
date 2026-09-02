@@ -469,6 +469,7 @@ rust_test(
     deps = [
         ":d2bd_lib_test_support",
         "//packages/d2b-contracts-resource:d2b_contracts_resource",
+        "//packages/d2b-provider-network-local:d2b_provider_network_local",
         "//packages/d2b-provider-volume-local:d2b_provider_volume_local_test_support",
     ] + all_crate_deps(normal = True, normal_dev = True, cargo_only = True),
 )

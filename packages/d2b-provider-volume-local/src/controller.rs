@@ -17,9 +17,6 @@ use crate::content::{
     NetworkConfigMaterializationEvidence,
 };
 use crate::error::VolumeLocalError;
-use crate::content::{
-    NetworkConfigContentProjection, NetworkConfigMaterializationEvidence,
-};
 use crate::finalization::{
     FinalizationAction, FinalizationObservation, FinalizationResult, finalization_plan,
 };
@@ -184,7 +181,7 @@ impl<S: VolumeSourceEffectPort, L: VolumeLayoutEffectPort> VolumeLocalController
                     .ok_or(VolumeLocalError::InvalidSpec)?,
             )?;
             status.content = Some(
-                self.reconcile_network_config_content(
+                self.reconcile_owned_network_config_content(
                     volume_uid,
                     spec,
                     &projection,
@@ -282,7 +279,7 @@ impl<S: VolumeSourceEffectPort, L: VolumeLayoutEffectPort> VolumeLocalController
 
     /// Materialize a typed Network configuration projection through the
     /// Volume-owned content effect port.
-    async fn reconcile_network_config_content(
+    async fn reconcile_owned_network_config_content(
         &self,
         volume_uid: &ResourceUid,
         spec: &VolumeSpec,
@@ -296,7 +293,8 @@ impl<S: VolumeSourceEffectPort, L: VolumeLayoutEffectPort> VolumeLocalController
         validate_network_config_layout(spec, projection)?;
         let root = self
             .source
-            .resolve_root(
+            .resolve_root_for(
+                volume_uid,
                 spec.source().settings().source_policy_id(),
                 spec.source().settings().system_artifact_id(),
                 kind,
@@ -371,7 +369,7 @@ impl<S: VolumeSourceEffectPort, L: VolumeLayoutEffectPort> VolumeLocalController
         if projection.volume_uid() != volume_uid {
             return Err(VolumeLocalError::InvariantViolated);
         }
-        let status = self.reconcile(volume_uid, spec).await?;
+        let status = self.reconcile(volume_uid, spec, None, None).await?;
         if status.layout_phase != LayoutPhase::Ready {
             return Err(VolumeLocalError::InvariantViolated);
         }
@@ -405,7 +403,7 @@ impl<S: VolumeSourceEffectPort, L: VolumeLayoutEffectPort> VolumeLocalController
         if projection.volume_uid() != volume_uid {
             return Err(VolumeLocalError::InvariantViolated);
         }
-        let status = self.reconcile(volume_uid, spec).await?;
+        let status = self.reconcile(volume_uid, spec, None, None).await?;
         if status.layout_phase != LayoutPhase::Ready {
             return Err(VolumeLocalError::InvariantViolated);
         }
@@ -445,37 +443,8 @@ impl<S: VolumeSourceEffectPort, L: VolumeLayoutEffectPort> VolumeLocalController
         provider: &serde_json::Value,
         owner_ref: &ResourceRef,
     ) -> Result<VolumeStatusReport, VolumeLocalError> {
-        let mut status = self.reconcile(volume_uid, spec).await?;
-        if provider.get("schemaId").and_then(serde_json::Value::as_str)
-            != Some(crate::VOLUME_CONTENT_SCHEMA_ID)
-            || provider
-                .get("schemaVersion")
-                .and_then(serde_json::Value::as_str)
-                != Some(crate::VOLUME_CONTENT_SCHEMA_VERSION)
-        {
-            return Err(VolumeLocalError::InvalidSpec);
-        }
-        let settings = provider
-            .get("settings")
-            .ok_or(VolumeLocalError::InvalidSpec)?;
-        if settings.get("kind").and_then(serde_json::Value::as_str)
-            != Some(crate::NETWORK_CONFIG_CONTENT_KIND)
-        {
-            return Err(VolumeLocalError::InvalidSpec);
-        }
-        let projection = NetworkConfigContentProjection::from_settings(
-            settings
-                .get("content")
-                .ok_or(VolumeLocalError::InvalidSpec)?,
-        )?;
-        if projection.network_ref() != owner_ref {
-            return Err(VolumeLocalError::InvariantViolated);
-        }
-        status.content = Some(
-            self.reconcile_network_config_content(volume_uid, spec, &projection)
-                .await?,
-        );
-        Ok(status)
+        self.reconcile(volume_uid, spec, Some(provider), Some(owner_ref))
+            .await
     }
 
     /// Finalize only after dependents and the store-view writer have closed.

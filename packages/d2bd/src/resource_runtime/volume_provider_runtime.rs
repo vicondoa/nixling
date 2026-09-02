@@ -267,6 +267,11 @@ enum SharedVolumeEffectPhase {
     Pending,
 }
 
+struct SharedVolumeEffectResult {
+    phase: SharedVolumeEffectPhase,
+    resource_projection: Option<Value>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SharedVolumeEffectError {
     Unavailable,
@@ -292,6 +297,20 @@ trait SharedVolumeEffectExecutor: Send + Sync {
         context: &SharedVolumeEffectContext,
         resource: &ResourceSnapshot,
     ) -> Result<SharedVolumeEffectPhase, SharedVolumeEffectError>;
+
+    async fn reconcile_with_projection(
+        &self,
+        kind: SharedVolumeResourceKind,
+        context: &SharedVolumeEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<SharedVolumeEffectResult, SharedVolumeEffectError> {
+        self.reconcile(kind, context, resource)
+            .await
+            .map(|phase| SharedVolumeEffectResult {
+                phase,
+                resource_projection: None,
+            })
+    }
 
     async fn finalize(
         &self,
@@ -586,7 +605,7 @@ impl DaemonVolumeProviderEffects {
         &self,
         context: &SharedVolumeEffectContext,
         resource: &ResourceSnapshot,
-    ) -> Result<SharedVolumeEffectPhase, SharedVolumeEffectError> {
+    ) -> Result<SharedVolumeEffectResult, SharedVolumeEffectError> {
         let value = self.validate(SharedVolumeResourceKind::Volume, context, resource)?;
         let spec = Self::volume_spec(&value)?;
         let runtime = self.runtime()?;
@@ -595,8 +614,13 @@ impl DaemonVolumeProviderEffects {
         let adapter = AnchoredVolumeEffectAdapter::new(resolver);
         let controller =
             VolumeLocalController::new(VolumeLocalProfile::shipped(), &adapter, &adapter);
+        let provider = value.pointer("/spec/provider");
+        let owner_ref = value
+            .pointer("/metadata/ownerRef")
+            .and_then(Value::as_str)
+            .and_then(|owner| ResourceRef::parse(owner).ok());
         let report = controller
-            .reconcile(resource.key().uid(), &spec)
+            .reconcile(resource.key().uid(), &spec, provider, owner_ref.as_ref())
             .await
             .map_err(|_| SharedVolumeEffectError::Unavailable)?;
         let desired = self.volume_children(&self.zone, resource.key().resource_ref(), &spec)?;
@@ -616,13 +640,19 @@ impl DaemonVolumeProviderEffects {
         )
         .await
         .map_err(|_| SharedVolumeEffectError::Unavailable)?;
-        if report.layout_phase == d2b_provider_volume_local::LayoutPhase::Ready
+        let phase = if report.layout_phase == d2b_provider_volume_local::LayoutPhase::Ready
             && converged.contains(resource.key().resource_ref())
         {
-            Ok(SharedVolumeEffectPhase::Ready)
+            SharedVolumeEffectPhase::Ready
         } else {
-            Ok(SharedVolumeEffectPhase::Pending)
-        }
+            SharedVolumeEffectPhase::Pending
+        };
+        let resource_projection =
+            serde_json::to_value(&report).map_err(|_| SharedVolumeEffectError::InvalidResource)?;
+        Ok(SharedVolumeEffectResult {
+            phase,
+            resource_projection: Some(resource_projection),
+        })
     }
 
     async fn reconcile_export(
@@ -841,8 +871,29 @@ impl SharedVolumeEffectExecutor for DaemonVolumeProviderEffects {
         resource: &ResourceSnapshot,
     ) -> Result<SharedVolumeEffectPhase, SharedVolumeEffectError> {
         match kind {
-            SharedVolumeResourceKind::Volume => self.reconcile_volume(context, resource).await,
+            SharedVolumeResourceKind::Volume => self
+                .reconcile_volume(context, resource)
+                .await
+                .map(|result| result.phase),
             SharedVolumeResourceKind::Export => self.reconcile_export(context, resource).await,
+        }
+    }
+
+    async fn reconcile_with_projection(
+        &self,
+        kind: SharedVolumeResourceKind,
+        context: &SharedVolumeEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<SharedVolumeEffectResult, SharedVolumeEffectError> {
+        match kind {
+            SharedVolumeResourceKind::Volume => self.reconcile_volume(context, resource).await,
+            SharedVolumeResourceKind::Export => self
+                .reconcile_export(context, resource)
+                .await
+                .map(|phase| SharedVolumeEffectResult {
+                    phase,
+                    resource_projection: None,
+                }),
         }
     }
 
@@ -1080,7 +1131,7 @@ impl SharedVolumeResourceReconciler {
 
     fn status_candidate(
         resource: &ResourceSnapshot,
-        phase: SharedVolumeEffectPhase,
+        result: &SharedVolumeEffectResult,
     ) -> Result<Vec<u8>, SharedVolumeReconcileError> {
         let mut value = serde_json::from_slice::<Value>(resource.canonical_json())
             .map_err(|_| SharedVolumeReconcileError::InvalidResource)?;
@@ -1091,13 +1142,16 @@ impl SharedVolumeResourceReconciler {
         status.insert(
             "phase".to_owned(),
             Value::String(
-                match phase {
+                match result.phase {
                     SharedVolumeEffectPhase::Ready => "Ready",
                     SharedVolumeEffectPhase::Pending => "Pending",
                 }
                 .to_owned(),
             ),
         );
+        if let Some(projection) = &result.resource_projection {
+            status.insert("resource".to_owned(), projection.clone());
+        }
         serde_json::to_vec(status).map_err(|_| SharedVolumeReconcileError::InvalidResource)
     }
 
@@ -1235,16 +1289,16 @@ impl ResourceReconciler for SharedVolumeResourceReconciler {
         let _permit = context.authorize_effect().map_err(|_| {
             SharedVolumeReconcileError::Effect(SharedVolumeEffectError::Unavailable)
         })?;
-        let phase = self
+        let result = self
             .effects
-            .reconcile(self.kind, &self.effect_context(context), resource)
+            .reconcile_with_projection(self.kind, &self.effect_context(context), resource)
             .await
             .map_err(SharedVolumeReconcileError::Effect)?;
         ReconcileResult::new(
             resource.revision(),
             resource.generation(),
             None,
-            Some(Self::status_candidate(resource, phase)?),
+            Some(Self::status_candidate(resource, &result)?),
             ReconcileDisposition::Pending,
             None,
             None,
@@ -1261,16 +1315,16 @@ impl ResourceReconciler for SharedVolumeResourceReconciler {
         let _permit = context.authorize_effect().map_err(|_| {
             SharedVolumeReconcileError::Effect(SharedVolumeEffectError::Unavailable)
         })?;
-        let phase = self
+        let result = self
             .effects
-            .reconcile(self.kind, &self.effect_context(context), resource)
+            .reconcile_with_projection(self.kind, &self.effect_context(context), resource)
             .await
             .map_err(SharedVolumeReconcileError::Effect)?;
         let result = ReconcileResult::new(
             resource.revision(),
             resource.generation(),
             None,
-            Some(Self::status_candidate(resource, phase)?),
+            Some(Self::status_candidate(resource, &result)?),
             ReconcileDisposition::Pending,
             None,
             None,
