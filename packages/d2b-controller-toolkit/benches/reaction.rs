@@ -2535,15 +2535,15 @@ async fn run_process_exit_profile(restart_on_exit: bool) {
         .expect("shutdown exit profile production store");
 }
 
-fn provider_catalog_descriptor() -> ControllerDescriptor {
+fn provider_descriptor(provider: &str, index: usize) -> ControllerDescriptor {
     let resource_type = ResourceTypeName::parse("Provider").expect("valid Provider ResourceType");
-    let controller_ref =
-        ResourceRef::parse("Process/d2b-core-controller").expect("valid Core controller ref");
+    let controller_ref = ResourceRef::parse(&format!("Process/provider-controller-{index}"))
+        .expect("valid Provider controller ref");
     let identity = ControllerIdentity::new(
         ZoneId::parse("dev").expect("valid Zone"),
         controller_ref.clone(),
         ControllerGeneration::new(3).expect("nonzero controller generation"),
-        ResourceRef::parse("Provider/system-core").expect("valid Provider ref"),
+        ResourceRef::parse(&format!("Provider/{provider}")).expect("valid Provider ref"),
         ResourceGeneration::new(1).expect("nonzero Provider generation"),
         controller_ref,
         ResourceRef::parse("Host/host-system").expect("valid execution target"),
@@ -2593,38 +2593,90 @@ async fn run_all_provider_composition() {
         .map(|provider| (*provider).to_owned())
         .collect::<BTreeSet<_>>();
     assert_eq!(expected.len(), 27);
-
-    let descriptor = provider_catalog_descriptor();
-    let source = CoreControllerSource::new(
-        descriptor.clone(),
-        Arc::new(fixture.core_registered_api()),
-    );
-    source
-        .register(&descriptor)
-        .await
-        .expect("Core catalog source registers");
-    let listed = source
-        .list_initial(&descriptor)
-        .await
-        .expect("Core catalog source lists Provider rows");
-    assert_eq!(listed.resources.len(), expected.len());
-    let mut listed_ids = BTreeSet::new();
-    for provider in &expected {
-        let resource_ref =
-            ResourceRef::parse(&format!("Provider/{provider}")).expect("Provider ref");
-        fixture
-            .get_resource(&resource_ref)
-            .await
-            .expect("every closed Provider row is committed");
-        listed_ids.insert(provider.clone());
+    let mut sources = Vec::with_capacity(expected.len());
+    let mut registrations = tokio::task::JoinSet::new();
+    for (index, provider) in bus_support::PROVIDER_IDS.iter().enumerate() {
+        let fixture = Arc::clone(&fixture);
+        let provider = (*provider).to_owned();
+        registrations.spawn(async move {
+            let descriptor = provider_descriptor(&provider, index);
+            let api = fixture.provider_registered_api(&provider, Vec::new());
+            let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+            retry_provider_setup(|| source.register(&descriptor)).await?;
+            let listed = retry_provider_setup(|| source.list_initial(&descriptor)).await?;
+            assert_eq!(listed.resources.len(), bus_support::PROVIDER_IDS.len());
+            retry_provider_setup(|| source.open_watch(&descriptor, listed.snapshot_revision))
+                .await?;
+            Ok::<_, SourceError>((provider, source, listed.resources.len()))
+        });
     }
-    assert_eq!(listed_ids, expected);
-    source
-        .open_watch(&descriptor, listed.snapshot_revision)
-        .await
-        .expect("Core catalog source opens one Provider watch");
-    source.close_watch().expect("close Core catalog watch");
-    drop(source);
+    while let Some(result) = registrations.join_next().await {
+        let (provider, source, listed) = result.unwrap().unwrap();
+        assert_eq!(listed, expected.len());
+        sources.push((provider, source));
+    }
+    assert_eq!(sources.len(), expected.len());
+    assert_eq!(
+        sources
+            .iter()
+            .map(|(provider, _)| provider.clone())
+            .collect::<BTreeSet<_>>(),
+        expected,
+        "all 27 Provider identities must compose exactly once"
+    );
+    let watch_signals = fixture
+        .store()
+        .watch_signals()
+        .expect("read simultaneous Provider watch signals");
+    assert_eq!(
+        watch_signals.current_registrations,
+        expected.len() as u64,
+        "all 27 Provider identities must own a live watch"
+    );
+
+    let cancelled_provider = sources
+        .first()
+        .map(|(provider, _)| provider.clone())
+        .expect("Provider composition is nonempty");
+    sources
+        .first()
+        .expect("Provider composition is nonempty")
+        .1
+        .close_watch()
+        .unwrap();
+    fixture.commit_provider_catalog_update().await;
+
+    let mut observed = BTreeSet::new();
+    let mut closed = BTreeSet::new();
+    let mut deliveries = tokio::task::JoinSet::new();
+    for (provider, source) in sources {
+        deliveries.spawn(async move {
+            let event = tokio::time::timeout(WATCH_TIMEOUT, source.receive_watch())
+                .await
+                .expect("all Provider watches remain bounded");
+            (provider, event)
+        });
+    }
+    while let Some(delivery) = deliveries.join_next().await {
+        let (provider, event) = delivery.unwrap();
+        match event.expect("Provider watch remains healthy") {
+            WatchEvent::Hint(hint) => {
+                assert_eq!(
+                    hint.key().resource_ref().resource_type().as_str(),
+                    "Provider"
+                );
+                observed.insert(provider);
+            }
+            WatchEvent::Closed => {
+                closed.insert(provider);
+            }
+        }
+    }
+    let mut expected_hints = expected.clone();
+    expected_hints.remove(&cancelled_provider);
+    assert_eq!(observed, expected_hints);
+    assert_eq!(closed, BTreeSet::from([cancelled_provider]));
+    assert_provider_failure_isolation(&fixture).await;
 
     let fixture = Arc::try_unwrap(fixture)
         .unwrap_or_else(|_| panic!("all Provider composition fixture handles released"));
@@ -2632,6 +2684,80 @@ async fn run_all_provider_composition() {
         .shutdown()
         .await
         .expect("shutdown Provider composition store");
+}
+
+async fn assert_provider_failure_isolation(fixture: &Arc<bus_support::ProductionStore>) {
+    for failure in ["panic", "cancel", "unavailable", "retry-exhausted"] {
+        let mut workers = tokio::task::JoinSet::new();
+        for (index, provider) in bus_support::PROVIDER_IDS.iter().enumerate() {
+            let fixture = Arc::clone(fixture);
+            let provider = (*provider).to_owned();
+            workers.spawn(async move {
+                let descriptor = provider_descriptor(&provider, index);
+                let api = fixture.provider_registered_api(&provider, Vec::new());
+                let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+                retry_provider_setup(|| source.register(&descriptor)).await?;
+                let listed = retry_provider_setup(|| source.list_initial(&descriptor)).await?;
+                assert_eq!(listed.resources.len(), bus_support::PROVIDER_IDS.len());
+                retry_provider_setup(|| source.open_watch(&descriptor, listed.snapshot_revision))
+                    .await?;
+                if index == 0 {
+                    match failure {
+                        "panic" => panic!("isolated Provider failure"),
+                        "cancel" => {
+                            source.close_watch().unwrap();
+                            Err(SourceError::Cancelled)
+                        }
+                        "unavailable" => Err(SourceError::Unavailable),
+                        "retry-exhausted" => {
+                            retry_provider_setup(|| async {
+                                Err::<(), SourceError>(SourceError::Backpressure)
+                            })
+                            .await
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    source.close_watch().unwrap();
+                    Ok(())
+                }
+            });
+        }
+        let mut successes = 0;
+        let mut failures = 0;
+        while let Some(result) = workers.join_next().await {
+            match result {
+                Ok(Ok(())) => {
+                    successes += 1;
+                }
+                Ok(Err(_)) | Err(_) => failures += 1,
+            }
+        }
+
+        assert_eq!(successes, bus_support::PROVIDER_IDS.len() - 1);
+        assert_eq!(failures, 1);
+    }
+}
+
+async fn retry_provider_setup<T, F, Fut>(mut operation: F) -> Result<T, SourceError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, SourceError>>,
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for attempt in 0..256 {
+            match operation().await {
+                Ok(value) => return Ok(value),
+                Err(SourceError::Backpressure) if attempt + 1 < 256 => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(SourceError::Backpressure)
+    })
+    .await
+    .unwrap_or(Err(SourceError::Timeout))
 }
 
 #[test]

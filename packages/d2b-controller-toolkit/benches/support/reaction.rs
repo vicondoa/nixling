@@ -380,6 +380,61 @@ impl ProductionStore {
         }
     }
 
+    pub async fn commit_provider_catalog_update(&self) {
+        let mut resources = Vec::with_capacity(PROVIDER_IDS.len());
+        for provider in PROVIDER_IDS {
+            resources.push(
+                self.get_resource(
+                    &ResourceRef::parse(&format!("Provider/{provider}"))
+                        .expect("fixed Provider reference"),
+                )
+                .await
+                .expect("read committed Provider resource"),
+            );
+        }
+        let mut request = wire::CommitBatchRequest::new();
+        let catalog_digest = canonical_digest(
+            "d2b:reaction-provider-catalog-update/v1",
+            PROVIDER_IDS.join("\0").as_bytes(),
+        );
+        let operation_id = format!(
+            "{}{}",
+            d2b_contracts_resource::v3::RESOURCE_BUNDLE_MATERIALIZATION_OPERATION_PREFIX,
+            catalog_digest
+        );
+        request.meta = d2b_resource_api::protobuf::MessageField::some(request_meta(&operation_id));
+        for resource in &resources {
+            request.mutations.push(wire_mutation(
+                wire::MutationKind::MUTATION_KIND_UPDATE_SPEC,
+                wire::PreconditionKind::PRECONDITION_KIND_EXACT_REVISION,
+                &resource.resource_ref,
+                Some((resource.uid.clone(), resource.revision.get())),
+                provider_spec_update_body(&resource.canonical_json),
+            ));
+        }
+        let response = loop {
+            let response = self.client.commit_batch(request.clone()).await;
+            let retryable = response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.reason.as_str() == "redb-store-backpressure");
+            if retryable {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            break response;
+        };
+        if let Some(error) = response.error.as_ref() {
+            panic!(
+                "production Provider catalog update failed: kind={:?} reason={} retry={:?}",
+                error.kind,
+                error.reason.as_str(),
+                error.retry_class
+            );
+        }
+        assert_eq!(response.resources.len(), PROVIDER_IDS.len());
+    }
+
     pub async fn commit_process_batch(
         &self,
         profile: usize,
@@ -961,6 +1016,25 @@ fn provider_body(index: usize, provider: &str) -> Vec<u8> {
         panic!("Provider metadata is an object");
     };
     metadata.remove("uid");
+    value.to_canonical_bytes()
+}
+
+fn provider_spec_update_body(canonical: &[u8]) -> Vec<u8> {
+    let mut value = CanonicalJsonValue::parse(canonical).expect("stored Provider is canonical");
+    let CanonicalJsonValue::Object(root) = &mut value else {
+        panic!("stored Provider envelope is an object");
+    };
+    let CanonicalJsonValue::Object(spec) = root
+        .get_mut("spec")
+        .expect("stored Provider spec is present")
+    else {
+        panic!("stored Provider spec is an object");
+    };
+    spec.insert(
+        "config".to_owned(),
+        CanonicalJsonValue::parse(br#"{"watch":"updated"}"#)
+            .expect("Provider update config is canonical"),
+    );
     value.to_canonical_bytes()
 }
 
