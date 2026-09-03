@@ -274,12 +274,11 @@ fn managed_identity_grant(
 ) -> Result<ManagedIdentityLeaseGrant, ManagedIdentityClientError> {
     response.clear_bytes();
     Ok(ManagedIdentityLeaseGrant {
-        lease_handle: CredentialLeaseHandle::parse(
+        lease_handle: parse_backend_lease_handle(
             response
                 .lease_handle()
                 .ok_or(ManagedIdentityClientError::Unavailable)?,
-        )
-        .map_err(|_| ManagedIdentityClientError::Unavailable)?,
+        )?,
         source_version: CredentialSourceVersion::parse(
             response
                 .source_version()
@@ -293,6 +292,14 @@ fn managed_identity_grant(
             .expires_at_unix_ms()
             .ok_or(ManagedIdentityClientError::Unavailable)?,
     })
+}
+
+fn parse_backend_lease_handle(
+    value: &str,
+) -> Result<CredentialLeaseHandle, ManagedIdentityClientError> {
+    CredentialLeaseHandle::from_opaque_digest(value.to_owned())
+        .or_else(|_| CredentialLeaseHandle::parse(value))
+        .map_err(|_| ManagedIdentityClientError::Unavailable)
 }
 
 fn managed_identity_inspection(

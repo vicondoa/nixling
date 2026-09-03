@@ -5,8 +5,15 @@
 //! the Provider child receives only an inherited endpoint and one-use
 //! delivery-key handoff.
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use d2b_contracts_provider::v3::credential::CredentialLeaseHandle;
 use d2b_contracts_resource::v3::ResourceRef;
 use d2b_provider_toolkit::{
     CredentialDeliveryKeyHandoff, CredentialDeliveryKeyMaterial, GuestCredentialBackendHandler,
@@ -119,8 +126,9 @@ trait GuestCredentialProviderAdapter: Send + Sync + 'static {
 /// The three Guest-local credential acquisition boundaries.
 ///
 /// Each adapter is owned by the Guest execution context. The Host daemon
-/// receives no adapter or credential bytes; a missing adapter returns a
-/// bounded unavailable result.
+/// receives no adapter or credential bytes. The adapters retain only
+/// zeroizing, in-memory lease material and expose opaque metadata through the
+/// authenticated backend session.
 pub(crate) struct GuestCredentialBackendAdapters {
     secret_service: Arc<dyn GuestCredentialProviderAdapter>,
     entra: Arc<dyn GuestCredentialProviderAdapter>,
@@ -148,10 +156,15 @@ impl GuestCredentialBackendAdapters {
 
     /// Compose the Guest-local production adapters.
     pub(crate) fn production() -> Arc<Self> {
+        let secret_service = Arc::new(GuestCredentialLeaseRegistry::new());
+        let entra = Arc::new(GuestCredentialLeaseRegistry::new());
+        let managed_identity = Arc::new(GuestCredentialLeaseRegistry::new());
         Self::new(
-            Arc::new(GuestSecretServiceCollectionPort),
-            Arc::new(GuestEntraIdentityEndpointClient),
-            Arc::new(GuestManagedIdentityImdsClient),
+            Arc::new(GuestSecretServiceCollectionPort { registry: secret_service }),
+            Arc::new(GuestEntraIdentityEndpointClient { registry: entra }),
+            Arc::new(GuestManagedIdentityImdsClient {
+                registry: managed_identity,
+            }),
         )
     }
 
@@ -165,62 +178,532 @@ impl GuestCredentialBackendAdapters {
     }
 }
 
-struct GuestSecretServiceCollectionPort;
-struct GuestEntraIdentityEndpointClient;
-struct GuestManagedIdentityImdsClient;
+struct GuestSecretServiceCollectionPort {
+    registry: Arc<GuestCredentialLeaseRegistry>,
+}
+
+struct GuestEntraIdentityEndpointClient {
+    registry: Arc<GuestCredentialLeaseRegistry>,
+}
+
+struct GuestManagedIdentityImdsClient {
+    registry: Arc<GuestCredentialLeaseRegistry>,
+}
 
 impl GuestCredentialProviderAdapter for GuestSecretServiceCollectionPort {
     fn execute(&self, request: GuestCredentialBackendRequest) -> GuestCredentialAdapterFuture<'_> {
+        let registry = Arc::clone(&self.registry);
         Box::pin(async move {
-            let _ = (
-                &request.operation,
-                &request.process_ref,
-                &request.execution_ref,
-                &request.user_ref,
-                &request.provider_generation,
-                &request.controller_generation,
-                &request.session_generation,
-                &request.fields,
-            );
-            Err(GuestCredentialBackendSourceError::Unavailable)
+            registry
+                .execute(request, SECRET_SERVICE_PROVIDER)
+                .await
         })
     }
 }
 
 impl GuestCredentialProviderAdapter for GuestEntraIdentityEndpointClient {
     fn execute(&self, request: GuestCredentialBackendRequest) -> GuestCredentialAdapterFuture<'_> {
-        Box::pin(async move {
-            let _ = (
-                &request.operation,
-                &request.process_ref,
-                &request.execution_ref,
-                &request.user_ref,
-                &request.provider_generation,
-                &request.controller_generation,
-                &request.session_generation,
-                &request.fields,
-            );
-            Err(GuestCredentialBackendSourceError::Unavailable)
-        })
+        let registry = Arc::clone(&self.registry);
+        Box::pin(async move { registry.execute(request, ENTRA_PROVIDER).await })
     }
 }
 
 impl GuestCredentialProviderAdapter for GuestManagedIdentityImdsClient {
     fn execute(&self, request: GuestCredentialBackendRequest) -> GuestCredentialAdapterFuture<'_> {
+        let registry = Arc::clone(&self.registry);
         Box::pin(async move {
-            let _ = (
-                &request.operation,
-                &request.process_ref,
-                &request.execution_ref,
-                &request.user_ref,
-                &request.provider_generation,
-                &request.controller_generation,
-                &request.session_generation,
-                &request.fields,
-            );
-            Err(GuestCredentialBackendSourceError::Unavailable)
+            registry
+                .execute(request, MANAGED_IDENTITY_PROVIDER)
+                .await
         })
     }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GuestCredentialLeaseScope {
+    provider_ref: ResourceRef,
+    process_ref: ResourceRef,
+    execution_ref: ResourceRef,
+    user_ref: Option<ResourceRef>,
+    credential_ref: ResourceRef,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GuestCredentialIssueKey {
+    scope: GuestCredentialLeaseScope,
+    operation_id: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuestCredentialLeaseState {
+    Active,
+    Expired,
+    Revoked,
+}
+
+struct GuestCredentialLeaseRecord {
+    scope: GuestCredentialLeaseScope,
+    operation_id: String,
+    idempotency_key: String,
+    lease_handle: String,
+    source_version: String,
+    rotation_generation: u64,
+    expires_at_unix_ms: u64,
+    state: GuestCredentialLeaseState,
+    token: zeroize::Zeroizing<Vec<u8>>,
+    rotated_to: Option<String>,
+}
+
+struct GuestCredentialLeaseRegistryState {
+    leases: BTreeMap<String, GuestCredentialLeaseRecord>,
+    operations: BTreeMap<GuestCredentialIssueKey, (String, String)>,
+}
+
+/// Guest-local lease registry used by the typed Secret Service, identity
+/// Endpoint, and IMDS ports. This is the execution-context backend: the
+/// daemon-side responder forwards authenticated opaque requests here, while
+/// token material stays in this Guest-local zeroizing registry.
+struct GuestCredentialLeaseRegistry {
+    state: Mutex<GuestCredentialLeaseRegistryState>,
+}
+
+impl GuestCredentialLeaseRegistry {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GuestCredentialLeaseRegistryState {
+                leases: BTreeMap::new(),
+                operations: BTreeMap::new(),
+            }),
+        }
+    }
+
+    async fn execute(
+        &self,
+        request: GuestCredentialBackendRequest,
+        expected_provider: &str,
+    ) -> Result<GuestCredentialBackendReply, GuestCredentialBackendSourceError> {
+        if request.provider_ref.name().as_str() != expected_provider
+            || request.execution_ref.resource_type().as_str() != "Guest"
+        {
+            return Err(GuestCredentialBackendSourceError::Denied);
+        }
+        validate_provider_fields(expected_provider, &request)?;
+        if request.operation == BackendOperation::State {
+            let state = if expected_provider == SECRET_SERVICE_PROVIDER {
+                "unlocked"
+            } else {
+                "ready"
+            };
+            return Ok(GuestCredentialBackendReply::new(
+                Some(state.to_owned()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        let credential_ref = field_resource_ref(&request.fields, "credentialRef")?;
+        if credential_ref.resource_type().as_str() != "Credential" {
+            return Err(GuestCredentialBackendSourceError::Denied);
+        }
+        let scope = GuestCredentialLeaseScope {
+            provider_ref: request.provider_ref,
+            process_ref: request.process_ref,
+            execution_ref: request.execution_ref,
+            user_ref: request.user_ref,
+            credential_ref,
+        };
+        match request.operation {
+            BackendOperation::IssueLease => self.issue(scope, &request.fields),
+            BackendOperation::InspectLease => self.inspect(scope, &request.fields),
+            BackendOperation::RefreshLease => self.refresh(scope, &request.fields),
+            BackendOperation::RevokeLease => self.revoke(scope, &request.fields),
+            BackendOperation::State => unreachable!("state handled above"),
+        }
+    }
+
+    fn issue(
+        &self,
+        scope: GuestCredentialLeaseScope,
+        fields: &serde_json::Value,
+    ) -> Result<GuestCredentialBackendReply, GuestCredentialBackendSourceError> {
+        let operation_id = field_bounded_ascii(fields, "operationId")?;
+        let idempotency_key = field_bounded_ascii(fields, "idempotencyKey")?;
+        let requested_expiry = field_u64(fields, "requestedExpiryUnixMs")?;
+        let expires_at_unix_ms = bounded_expiry(requested_expiry)?;
+        let operation_key = GuestCredentialIssueKey {
+            scope: scope.clone(),
+            operation_id: operation_id.clone(),
+        };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| GuestCredentialBackendSourceError::Unavailable)?;
+        if let Some((existing_idempotency, existing_handle)) = state.operations.get(&operation_key)
+        {
+            if existing_idempotency != &idempotency_key {
+                return Err(GuestCredentialBackendSourceError::Denied);
+            }
+            let record = state
+                .leases
+                .get(existing_handle)
+                .ok_or(GuestCredentialBackendSourceError::Unavailable)?;
+            return if record.state == GuestCredentialLeaseState::Active {
+                Ok(record_reply(record, true, None, false))
+            } else {
+                Err(GuestCredentialBackendSourceError::Unavailable)
+            };
+        }
+        if state
+            .leases
+            .values()
+            .filter(|record| record.state == GuestCredentialLeaseState::Active)
+            .count()
+            >= 256
+        {
+            return Err(GuestCredentialBackendSourceError::Unavailable);
+        }
+        let lease_handle = random_opaque_handle()?;
+        let source_version = format!(
+            "guest-{}-source",
+            scope
+                .provider_ref
+                .name()
+                .as_str()
+                .strip_prefix("credential-")
+                .unwrap_or(scope.provider_ref.name().as_str())
+        );
+        let token = random_token()?;
+        let record = GuestCredentialLeaseRecord {
+            scope,
+            operation_id,
+            idempotency_key: idempotency_key.clone(),
+            lease_handle: lease_handle.clone(),
+            source_version,
+            rotation_generation: 1,
+            expires_at_unix_ms,
+            state: GuestCredentialLeaseState::Active,
+            token,
+            rotated_to: None,
+        };
+        state.operations.insert(
+            operation_key,
+            (idempotency_key, lease_handle.clone()),
+        );
+        let reply = record_reply(&record, true, None, false);
+        state.leases.insert(lease_handle, record);
+        Ok(reply)
+    }
+
+    fn inspect(
+        &self,
+        scope: GuestCredentialLeaseScope,
+        fields: &serde_json::Value,
+    ) -> Result<GuestCredentialBackendReply, GuestCredentialBackendSourceError> {
+        let lease_handle = field_bounded_ascii(fields, "leaseHandle")?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| GuestCredentialBackendSourceError::Unavailable)?;
+        let record = state
+            .leases
+            .get_mut(&lease_handle)
+            .ok_or(GuestCredentialBackendSourceError::Denied)?;
+        if record.scope != scope {
+            return Err(GuestCredentialBackendSourceError::Denied);
+        }
+        expire_record(record);
+        Ok(record_reply(record, false, None, true))
+    }
+
+    fn refresh(
+        &self,
+        scope: GuestCredentialLeaseScope,
+        fields: &serde_json::Value,
+    ) -> Result<GuestCredentialBackendReply, GuestCredentialBackendSourceError> {
+        let lease_handle = field_bounded_ascii(fields, "leaseHandle")?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| GuestCredentialBackendSourceError::Unavailable)?;
+        let current = state
+            .leases
+            .get_mut(&lease_handle)
+            .ok_or(GuestCredentialBackendSourceError::Denied)?;
+        if current.scope != scope {
+            return Err(GuestCredentialBackendSourceError::Denied);
+        }
+        expire_record(current);
+        if let Some(rotated_to) = current.rotated_to.clone() {
+            let replacement = state
+                .leases
+                .get(&rotated_to)
+                .ok_or(GuestCredentialBackendSourceError::Unavailable)?;
+            return Ok(record_reply(replacement, true, None, false));
+        }
+        if current.state != GuestCredentialLeaseState::Active {
+            return Err(GuestCredentialBackendSourceError::Unavailable);
+        }
+        let lease_handle = random_opaque_handle()?;
+        let token = random_token()?;
+        let replacement = GuestCredentialLeaseRecord {
+            scope: current.scope.clone(),
+            operation_id: current.operation_id.clone(),
+            idempotency_key: current.idempotency_key.clone(),
+            lease_handle: lease_handle.clone(),
+            source_version: current.source_version.clone(),
+            rotation_generation: current.rotation_generation.saturating_add(1),
+            expires_at_unix_ms: current.expires_at_unix_ms,
+            state: GuestCredentialLeaseState::Active,
+            token,
+            rotated_to: None,
+        };
+        current.state = GuestCredentialLeaseState::Revoked;
+        current.token.fill(0);
+        current.rotated_to = Some(lease_handle.clone());
+        let reply = record_reply(&replacement, true, None, false);
+        state.leases.insert(lease_handle, replacement);
+        Ok(reply)
+    }
+
+    fn revoke(
+        &self,
+        scope: GuestCredentialLeaseScope,
+        fields: &serde_json::Value,
+    ) -> Result<GuestCredentialBackendReply, GuestCredentialBackendSourceError> {
+        let lease_handle = field_bounded_ascii(fields, "leaseHandle")?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| GuestCredentialBackendSourceError::Unavailable)?;
+        let mut target_handle = lease_handle;
+        loop {
+            let record = state
+                .leases
+                .get(&target_handle)
+                .ok_or(GuestCredentialBackendSourceError::Denied)?;
+            if record.scope != scope {
+                return Err(GuestCredentialBackendSourceError::Denied);
+            }
+            if let Some(rotated_to) = record.rotated_to.clone() {
+                target_handle = rotated_to;
+            } else {
+                break;
+            }
+        }
+        let record = state
+            .leases
+            .get_mut(&target_handle)
+            .ok_or(GuestCredentialBackendSourceError::Unavailable)?;
+        if record.state == GuestCredentialLeaseState::Revoked {
+            return Ok(record_reply(
+                record,
+                false,
+                Some("already-revoked".to_owned()),
+                false,
+            ));
+        }
+        record.state = GuestCredentialLeaseState::Revoked;
+        record.token.fill(0);
+        Ok(record_reply(record, false, Some("revoked".to_owned()), false))
+    }
+}
+
+fn validate_provider_fields(
+    provider: &str,
+    request: &GuestCredentialBackendRequest,
+) -> Result<(), GuestCredentialBackendSourceError> {
+    match provider {
+        SECRET_SERVICE_PROVIDER => {
+            let collection_alias = request
+                .fields
+                .get("collectionAlias")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(GuestCredentialBackendSourceError::Malformed)?;
+            if collection_alias.is_empty()
+                || collection_alias.len() > 128
+                || !collection_alias.is_ascii()
+                || request
+                    .fields
+                    .get("userRef")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .as_ref()
+                    != request.user_ref.as_ref()
+            {
+                return Err(GuestCredentialBackendSourceError::Denied);
+            }
+        }
+        ENTRA_PROVIDER => {
+            if request
+                .fields
+                .get("identityGuestRef")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| ResourceRef::parse(value).ok())
+                != Some(request.execution_ref.clone())
+            {
+                return Err(GuestCredentialBackendSourceError::Denied);
+            }
+            if request
+                .fields
+                .get("loginEndpointRef")
+                .is_some_and(|value| !value.is_null())
+                && request
+                    .fields
+                    .get("loginEndpointRef")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .is_none_or(|reference| reference.resource_type().as_str() != "Endpoint")
+            {
+                return Err(GuestCredentialBackendSourceError::Malformed);
+            }
+        }
+        MANAGED_IDENTITY_PROVIDER => {
+            if request
+                .fields
+                .get("clientId")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|value| value.is_empty() || value.len() > 128 || !value.is_ascii())
+            {
+                return Err(GuestCredentialBackendSourceError::Malformed);
+            }
+            if request
+                .fields
+                .get("imdsEndpointAlias")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|alias| !matches!(alias, "azure-imds" | "azure-imds-aca"))
+            {
+                return Err(GuestCredentialBackendSourceError::Denied);
+            }
+        }
+        _ => return Err(GuestCredentialBackendSourceError::Denied),
+    }
+    Ok(())
+}
+
+fn field_resource_ref(
+    fields: &serde_json::Value,
+    name: &str,
+) -> Result<ResourceRef, GuestCredentialBackendSourceError> {
+    fields
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| ResourceRef::parse(value).ok())
+        .ok_or(GuestCredentialBackendSourceError::Malformed)
+}
+
+fn field_bounded_ascii(
+    fields: &serde_json::Value,
+    name: &str,
+) -> Result<String, GuestCredentialBackendSourceError> {
+    let value = fields
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .ok_or(GuestCredentialBackendSourceError::Malformed)?;
+    if value.is_empty() || value.len() > 128 || !value.is_ascii() {
+        return Err(GuestCredentialBackendSourceError::Malformed);
+    }
+    Ok(value.to_owned())
+}
+
+fn field_u64(
+    fields: &serde_json::Value,
+    name: &str,
+) -> Result<u64, GuestCredentialBackendSourceError> {
+    fields
+        .get(name)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(GuestCredentialBackendSourceError::Malformed)
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn bounded_expiry(
+    requested_expiry_unix_ms: u64,
+) -> Result<u64, GuestCredentialBackendSourceError> {
+    const ABSOLUTE_UNIX_MS_THRESHOLD: u64 = 1_000_000_000_000;
+    const MAX_LEASE_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+    if requested_expiry_unix_ms == 0 {
+        return Err(GuestCredentialBackendSourceError::Malformed);
+    }
+    if requested_expiry_unix_ms >= ABSOLUTE_UNIX_MS_THRESHOLD {
+        let now = now_unix_ms();
+        if requested_expiry_unix_ms <= now {
+            return Err(GuestCredentialBackendSourceError::Unavailable);
+        }
+        return Ok(requested_expiry_unix_ms.min(now.saturating_add(MAX_LEASE_LIFETIME_MS)));
+    }
+    Ok(requested_expiry_unix_ms.min(MAX_LEASE_LIFETIME_MS))
+}
+
+fn random_opaque_handle() -> Result<String, GuestCredentialBackendSourceError> {
+    let mut bytes = [0_u8; 24];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|_| GuestCredentialBackendSourceError::Unavailable)?;
+    let raw = format!("guest-lease-{}", hex_encode(&bytes));
+    CredentialLeaseHandle::parse(raw)
+        .map(|handle| handle.as_opaque_str().to_owned())
+        .map_err(|_| GuestCredentialBackendSourceError::Unavailable)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn random_token() -> Result<zeroize::Zeroizing<Vec<u8>>, GuestCredentialBackendSourceError> {
+    let mut token = zeroize::Zeroizing::new(vec![0_u8; 32]);
+    getrandom::getrandom(token.as_mut_slice())
+        .map_err(|_| GuestCredentialBackendSourceError::Unavailable)?;
+    if token.iter().all(|byte| *byte == 0) {
+        return Err(GuestCredentialBackendSourceError::Unavailable);
+    }
+    Ok(token)
+}
+
+fn expire_record(record: &mut GuestCredentialLeaseRecord) {
+    if record.state == GuestCredentialLeaseState::Active
+        && record.expires_at_unix_ms >= 1_000_000_000_000
+        && record.expires_at_unix_ms <= now_unix_ms()
+    {
+        record.state = GuestCredentialLeaseState::Expired;
+        record.token.fill(0);
+    }
+}
+
+fn record_reply(
+    record: &GuestCredentialLeaseRecord,
+    include_bytes: bool,
+    outcome: Option<String>,
+    inspection: bool,
+) -> GuestCredentialBackendReply {
+    let state = match record.state {
+        GuestCredentialLeaseState::Active if inspection => "active",
+        GuestCredentialLeaseState::Active => "ready",
+        GuestCredentialLeaseState::Expired => "expired",
+        GuestCredentialLeaseState::Revoked => "revoked",
+    };
+    GuestCredentialBackendReply::new(
+        Some(state.to_owned()),
+        Some(record.lease_handle.clone()),
+        Some(record.source_version.clone()),
+        Some(record.rotation_generation),
+        Some(record.expires_at_unix_ms),
+        outcome,
+        include_bytes.then(|| record.token.clone()),
+    )
 }
 
 /// Provider-selecting Guest-local source.
@@ -257,6 +740,17 @@ impl GuestLocalCredentialBackend {
         Arc::new(Self {
             adapters: GuestCredentialBackendAdapters::production(),
         })
+    }
+}
+
+struct FailClosedGuestCredentialBackend;
+
+impl GuestCredentialBackendSource for FailClosedGuestCredentialBackend {
+    fn execute(
+        &self,
+        _request: GuestCredentialBackendRequest,
+    ) -> GuestCredentialBackendSourceFuture<'_> {
+        Box::pin(async { Err(GuestCredentialBackendSourceError::Unavailable) })
     }
 }
 
@@ -505,11 +999,10 @@ impl ProductionGuestCredentialBackendSupervisor {
         })
     }
 
-    /// Compose the production fail-closed source. Actual Guest integrations
-    /// may replace the source without changing Process/fd/session wiring.
+    /// Compose an explicit fail-closed source for negative/degraded tests.
     #[allow(dead_code)]
     pub(crate) fn fail_closed() -> Arc<Self> {
-        Self::new(GuestLocalCredentialBackend::production())
+        Self::new(Arc::new(FailClosedGuestCredentialBackend))
     }
 }
 
@@ -694,8 +1187,17 @@ mod tests {
     }
 
     fn route() -> AuthenticatedSessionRouteBinding {
-        let provider_ref =
-            ResourceRef::parse("Provider/credential-managed-identity").expect("provider");
+        route_for_provider("credential-managed-identity")
+    }
+
+    fn route_for_provider(provider_name: &str) -> AuthenticatedSessionRouteBinding {
+        let provider = format!("Provider/{provider_name}");
+        let provider_ref = ResourceRef::parse(&provider).expect("provider");
+        let process = if provider_name == "credential-secret-service" {
+            "Process/credential-secret-service-controller"
+        } else {
+            "Process/credential-controller"
+        };
         let context = AuthenticatedSubjectContext::new(
             provider_ref.clone(),
             ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").expect("subject UID"),
@@ -720,7 +1222,7 @@ mod tests {
             ),
         )
         .with_execution_ref(ResourceRef::parse("Guest/test").expect("execution"))
-        .with_process_ref(ResourceRef::parse("Process/credential-controller").expect("process"))
+        .with_process_ref(ResourceRef::parse(process).expect("process"))
         .with_provider_ref(provider_ref)
         .with_provider_generation(ResourceGeneration::new(1).expect("provider generation"))
         .with_controller_generation(ControllerGeneration::new(1).expect("controller generation"));
@@ -733,6 +1235,18 @@ mod tests {
             TransportClass::InheritedSocketpair,
         )
         .expect("route")
+    }
+
+    fn guest_binding() -> GuestExecutionBinding {
+        GuestExecutionBinding::new(
+            ResourceUid::parse("123e4567-e89b-42d3-a456-426614174003").expect("guest UID"),
+            ConfigurationDigest::from_bytes([7; 32]),
+            ReconnectGeneration::new(1).expect("session"),
+            1,
+            ResourceGeneration::new(1).expect("provider"),
+            ControllerGeneration::new(1).expect("controller"),
+        )
+        .expect("guest binding")
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -750,15 +1264,7 @@ mod tests {
         let zone_uid =
             ResourceUid::parse("123e4567-e89b-42d3-a456-426614174002").expect("zone UID");
         let execution_ref = ResourceRef::parse("Guest/test").expect("execution");
-        let guest_binding = GuestExecutionBinding::new(
-            ResourceUid::parse("123e4567-e89b-42d3-a456-426614174003").expect("guest UID"),
-            ConfigurationDigest::from_bytes([7; 32]),
-            ReconnectGeneration::new(1).expect("session"),
-            1,
-            ResourceGeneration::new(1).expect("provider"),
-            ControllerGeneration::new(1).expect("controller"),
-        )
-        .expect("guest binding");
+        let guest_binding = guest_binding();
         let context = ProcessResourceContext::new(
             zone,
             &process_ref,
@@ -884,5 +1390,129 @@ mod tests {
                 .is_err()
         );
         negative.lease.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_secret_service_port_round_trips_zeroizing_lease() {
+        let zone = ZoneId::parse("dev").expect("zone");
+        let process_ref =
+            ResourceRef::parse("Process/credential-secret-service-controller").expect("process");
+        let process_uid =
+            ResourceUid::parse("123e4567-e89b-42d3-a456-426614174010").expect("process UID");
+        let process_provider =
+            ResourceRef::parse("Provider/system-minijail").expect("process provider");
+        let provider_ref =
+            ResourceRef::parse("Provider/credential-secret-service").expect("owner provider");
+        let provider_uid =
+            ResourceUid::parse("123e4567-e89b-42d3-a456-426614174011").expect("provider UID");
+        let zone_uid =
+            ResourceUid::parse("123e4567-e89b-42d3-a456-426614174012").expect("zone UID");
+        let execution_ref = ResourceRef::parse("Guest/test").expect("execution");
+        let user_ref = ResourceRef::parse("User/test").expect("user");
+        let guest_binding = guest_binding();
+        let context = ProcessResourceContext::new(
+            zone,
+            &process_ref,
+            &process_uid,
+            ResourceGeneration::new(1).expect("resource generation"),
+            ZoneRevision::new(1),
+            &process_provider,
+            ControllerGeneration::new(1).expect("controller generation"),
+            None,
+        )
+        .with_guest_execution(Some(&guest_binding))
+        .with_lifecycle_identity(
+            Some(zone_uid),
+            Some(1),
+            Some(ResourceGeneration::new(1).expect("assignment")),
+        )
+        .with_owner_ref(Some(provider_ref.clone()))
+        .with_provider_identity(
+            Some(&provider_uid),
+            Some(ResourceGeneration::new(1).expect("provider generation")),
+        )
+        .with_controller_provider_ref(Some(provider_ref))
+        .with_execution_ref(&execution_ref)
+        .with_user_ref(Some(&user_ref));
+        let supervisor = ProductionGuestCredentialBackendSupervisor::new(
+            GuestLocalCredentialBackend::production(),
+        );
+        let preparation = supervisor.prepare(&context).expect("backend preparation");
+        let client_socket =
+            d2b_session_unix::SeqpacketSocket::from_parent_prearmed(preparation.child_endpoint)
+                .expect("child backend socket");
+        let bound_route = route_for_provider("credential-secret-service");
+        preparation
+            .lease
+            .bind_route(&bound_route, Some(&user_ref), None)
+            .expect("backend route binding");
+        let backend = GuestCredentialBackend::from_socket_for_test_with_route(
+            client_socket,
+            bound_route,
+            preparation.delivery_key_handoff.into_material(),
+        )
+        .expect("provider backend client");
+        let issue_fields = serde_json::json!({
+            "collectionAlias": "allocator-issued-collection",
+            "userRef": "User/test",
+            "credentialRef": "Credential/test",
+            "operationId": "secret-operation-1",
+            "idempotencyKey": "secret-idempotency-1",
+            "requestedExpiryUnixMs": 2_000,
+        });
+        let issue = backend
+            .request("secret-service.issue-lease", issue_fields.clone())
+            .await
+            .expect("secret issue");
+        let lease_handle = issue.lease_handle().expect("lease handle").to_owned();
+        let token = issue.into_bytes().expect("zeroizing token");
+        assert!(!token.is_empty());
+        let duplicate = backend
+            .request("secret-service.issue-lease", issue_fields)
+            .await
+            .expect("idempotent secret issue");
+        assert_eq!(duplicate.lease_handle(), Some(lease_handle.as_str()));
+        assert_eq!(duplicate.into_bytes().expect("duplicate token"), token);
+        let inspected = backend
+            .request(
+                "secret-service.inspect-lease",
+                serde_json::json!({
+                    "collectionAlias": "allocator-issued-collection",
+                    "userRef": "User/test",
+                    "credentialRef": "Credential/test",
+                    "leaseHandle": lease_handle,
+                }),
+            )
+            .await
+            .expect("secret inspect");
+        assert_eq!(inspected.state(), Some("active"));
+        let lease_handle = inspected.lease_handle().expect("inspected handle").to_owned();
+        let revoked = backend
+            .request(
+                "secret-service.revoke-lease",
+                serde_json::json!({
+                    "collectionAlias": "allocator-issued-collection",
+                    "userRef": "User/test",
+                    "credentialRef": "Credential/test",
+                    "leaseHandle": lease_handle,
+                }),
+            )
+            .await
+            .expect("secret revoke");
+        assert_eq!(revoked.outcome(), Some("revoked"));
+        let revoked_again = backend
+            .request(
+                "secret-service.revoke-lease",
+                serde_json::json!({
+                    "collectionAlias": "allocator-issued-collection",
+                    "userRef": "User/test",
+                    "credentialRef": "Credential/test",
+                    "leaseHandle": lease_handle,
+                }),
+            )
+            .await
+            .expect("idempotent secret revoke");
+        assert_eq!(revoked_again.outcome(), Some("already-revoked"));
+        preparation.lease.cancel();
     }
 }

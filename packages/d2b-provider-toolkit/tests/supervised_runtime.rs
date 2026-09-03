@@ -689,6 +689,8 @@ impl GuestCredentialBackendHandler for ScriptedGuestCredentialBackend {
         let operation = operation.to_owned();
         Box::pin(async move {
         const SOURCE_VERSION: &str = "backend-source";
+        const LEASE_HANDLE: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
         let response = if operation.ends_with(".state") {
             let state = if operation == "secret-service.state" {
                 "unlocked"
@@ -707,7 +709,7 @@ impl GuestCredentialBackendHandler for ScriptedGuestCredentialBackend {
         } else if operation.ends_with(".issue-lease") {
             GuestCredentialBackendReply::new(
                 Some("ready".to_owned()),
-                Some("backend-lease".to_owned()),
+                Some(LEASE_HANDLE.to_owned()),
                 Some(SOURCE_VERSION.to_owned()),
                 Some(1),
                 Some(2_000),
@@ -717,7 +719,7 @@ impl GuestCredentialBackendHandler for ScriptedGuestCredentialBackend {
         } else if operation.ends_with(".inspect-lease") {
             GuestCredentialBackendReply::new(
                 Some("active".to_owned()),
-                    Some("backend-lease".to_owned()),
+                    Some(LEASE_HANDLE.to_owned()),
                 Some(SOURCE_VERSION.to_owned()),
                     Some(1),
                     Some(2_000),
@@ -727,7 +729,7 @@ impl GuestCredentialBackendHandler for ScriptedGuestCredentialBackend {
         } else if operation.ends_with(".refresh-lease") {
             GuestCredentialBackendReply::new(
                 Some("ready".to_owned()),
-                Some("backend-lease".to_owned()),
+                Some(LEASE_HANDLE.to_owned()),
                 Some(SOURCE_VERSION.to_owned()),
                 Some(2),
                 Some(3_000),
@@ -737,7 +739,7 @@ impl GuestCredentialBackendHandler for ScriptedGuestCredentialBackend {
         } else if operation.ends_with(".revoke-lease") {
             GuestCredentialBackendReply::new(
                 Some("revoked".to_owned()),
-                Some("backend-lease".to_owned()),
+                Some(LEASE_HANDLE.to_owned()),
                 Some(SOURCE_VERSION.to_owned()),
                 Some(1),
                 Some(2_000),

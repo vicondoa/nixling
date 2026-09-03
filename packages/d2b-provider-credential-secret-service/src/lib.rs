@@ -273,12 +273,11 @@ fn secret_service_grant(
 ) -> Result<SecretServiceLeaseGrant, SecretServicePortError> {
     response.clear_bytes();
     Ok(SecretServiceLeaseGrant {
-        lease_handle: CredentialLeaseHandle::parse(
+        lease_handle: parse_backend_lease_handle(
             response
                 .lease_handle()
                 .ok_or(SecretServicePortError::Unavailable)?,
-        )
-        .map_err(|_| SecretServicePortError::Unavailable)?,
+        )?,
         source_version: CredentialSourceVersion::parse(
             response
                 .source_version()
@@ -292,6 +291,14 @@ fn secret_service_grant(
             .expires_at_unix_ms()
             .ok_or(SecretServicePortError::Unavailable)?,
     })
+}
+
+fn parse_backend_lease_handle(
+    value: &str,
+) -> Result<CredentialLeaseHandle, SecretServicePortError> {
+    CredentialLeaseHandle::from_opaque_digest(value.to_owned())
+        .or_else(|_| CredentialLeaseHandle::parse(value))
+        .map_err(|_| SecretServicePortError::Unavailable)
 }
 
 fn secret_service_inspection(

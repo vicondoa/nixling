@@ -272,12 +272,11 @@ fn entra_grant(
 ) -> Result<EntraLeaseGrant, EntraClientError> {
     response.clear_bytes();
     Ok(EntraLeaseGrant {
-        lease_handle: CredentialLeaseHandle::parse(
+        lease_handle: parse_backend_lease_handle(
             response
                 .lease_handle()
                 .ok_or(EntraClientError::Unavailable)?,
-        )
-        .map_err(|_| EntraClientError::Unavailable)?,
+        )?,
         source_version: CredentialSourceVersion::parse(
             response
                 .source_version()
@@ -291,6 +290,12 @@ fn entra_grant(
             .expires_at_unix_ms()
             .ok_or(EntraClientError::Unavailable)?,
     })
+}
+
+fn parse_backend_lease_handle(value: &str) -> Result<CredentialLeaseHandle, EntraClientError> {
+    CredentialLeaseHandle::from_opaque_digest(value.to_owned())
+        .or_else(|_| CredentialLeaseHandle::parse(value))
+        .map_err(|_| EntraClientError::Unavailable)
 }
 
 fn entra_inspection(
