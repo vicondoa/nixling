@@ -701,14 +701,17 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn random_token() -> Result<d2b_provider_toolkit::CredentialSensitiveBytes, GuestCredentialBackendSourceError> {
-    let mut token = vec![0_u8; 32];
-    getrandom::getrandom(&mut token)
+fn random_token() -> Result<
+    d2b_provider_toolkit::CredentialSensitiveBytes,
+    GuestCredentialBackendSourceError,
+> {
+    let mut token = d2b_provider_toolkit::zeroizing_bytes(vec![0_u8; 32]);
+    getrandom::getrandom(token.as_mut_slice())
         .map_err(|_| GuestCredentialBackendSourceError::Unavailable)?;
     if token.iter().all(|byte| *byte == 0) {
         return Err(GuestCredentialBackendSourceError::Unavailable);
     }
-    Ok(d2b_provider_toolkit::zeroizing_bytes(token))
+    Ok(token)
 }
 
 fn expire_record(record: &mut GuestCredentialLeaseRecord) {
