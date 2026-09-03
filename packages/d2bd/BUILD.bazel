@@ -459,8 +459,10 @@ rust_test(
     deps = [
         ":d2bd_lib_test_support",
         "//packages/d2b-provider-clipboard-wayland:d2b_provider_clipboard_wayland",
+        "//packages/d2b-provider-display-wayland:d2b_provider_display_wayland",
         "//packages/d2b-provider-notification-desktop:d2b_provider_notification_desktop",
         "//packages/d2b-contracts-resource:d2b_contracts_resource",
+        "//packages/d2b-contracts-zone-session:d2b_contracts_zone_session",
         "//packages/d2b-core-controller:d2b_core_controller_test_support",
     ] + all_crate_deps(normal = True, normal_dev = True, cargo_only = True),
 )

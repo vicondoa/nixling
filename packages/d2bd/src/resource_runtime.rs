@@ -1439,7 +1439,21 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
         context: &SharedProviderEffectContext,
         resource: &ResourceSnapshot,
     ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
-        self.reconcile_result(kind, context, resource, &[]).await
+        if matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+                | SharedProviderResourceKind::AudioService
+                | SharedProviderResourceKind::AudioBinding
+                | SharedProviderResourceKind::ShellPool
+                | SharedProviderResourceKind::ShellSession
+        ) {
+            self.reconcile_result(kind, context, resource, &[]).await
+        } else {
+            self.observe(kind, context, resource)
+                .await
+                .map(SharedProviderEffectResult::phase)
+        }
     }
 
     /// Dispatch the closed Provider kind to its typed effect port.
@@ -1522,7 +1536,7 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
         context: &SharedProviderEffectContext,
         resource: &ResourceSnapshot,
     ) -> Result<(), SharedProviderEffectError> {
-    if matches!(
+        if matches!(
             kind,
             SharedProviderResourceKind::CloudHypervisorGuest
                 | SharedProviderResourceKind::QemuMediaGuest
@@ -1835,8 +1849,8 @@ impl DaemonSharedProviderEffects {
     ) -> Result<(), SharedProviderEffectError> {
         let runtime = self.runtime()?;
         match kind {
-                SharedProviderResourceKind::DisplayWaylandPolicy => Ok(()),
-                SharedProviderResourceKind::DisplayWaylandSession => {
+            SharedProviderResourceKind::DisplayWaylandPolicy => Ok(()),
+            SharedProviderResourceKind::DisplayWaylandSession => {
                     let envelope = ResourceEnvelope::from_json(resource.canonical_json())
                         .map_err(|_| SharedProviderEffectError::InvalidResource)?;
                     let _spec = serde_json::from_slice::<WaylandSessionSpec>(
@@ -1864,8 +1878,8 @@ impl DaemonSharedProviderEffects {
                     } else {
                         Err(SharedProviderEffectError::Unavailable)
                     }
-                }
-                SharedProviderResourceKind::AudioService => {
+            }
+            SharedProviderResourceKind::AudioService => {
                     let bindings = runtime
                         .committed_resources_of_type(AUDIO_BINDING_TYPE)
                         .await
@@ -1881,8 +1895,8 @@ impl DaemonSharedProviderEffects {
                     } else {
                         Ok(())
                     }
-                }
-                SharedProviderResourceKind::AudioBinding => {
+            }
+            SharedProviderResourceKind::AudioBinding => {
                     runtime
                         .reconcile_audio_resources(Arc::clone(&self.state))
                         .await
@@ -1904,8 +1918,8 @@ impl DaemonSharedProviderEffects {
                     } else {
                         Ok(())
                     }
-                }
-                SharedProviderResourceKind::ShellPool => {
+            }
+            SharedProviderResourceKind::ShellPool => {
                     let sessions = runtime
                         .committed_resources_of_type("shell-terminal.d2bus.org.ShellSession")
                         .await
@@ -1922,8 +1936,8 @@ impl DaemonSharedProviderEffects {
                     } else {
                         Ok(())
                     }
-                }
-                SharedProviderResourceKind::ShellSession => {
+            }
+            SharedProviderResourceKind::ShellSession => {
                     let owner = crate::binding_child_resource_runtime::OwnedChildOwner {
                         resource: stored_resource_from_snapshot(resource),
                         desired: None,
@@ -1945,8 +1959,8 @@ impl DaemonSharedProviderEffects {
                     } else {
                         Err(SharedProviderEffectError::Unavailable)
                     }
-                }
-                _ => Err(SharedProviderEffectError::InvalidResource),
+            }
+            _ => Err(SharedProviderEffectError::InvalidResource),
         }
     }
 
@@ -5080,7 +5094,7 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         };
         Ok(SharedProviderEffectResult {
             phase,
-            child_mutated: true,
+            child_mutated: kind == SharedProviderResourceKind::AudioBinding,
         })
     }
 
@@ -5140,7 +5154,7 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                     resource.key().resource_ref().name().as_str()
                 );
                 let process_ref = ResourceRef::parse(&process_name)
-                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
                 let client = runtime
                     .process_resource_client()
                     .ok_or(SharedProviderEffectError::Unavailable)?;
