@@ -39,7 +39,8 @@ use d2b_provider_activation_nixos::{
 };
 use d2b_resource_api::{RedbBackend, ResourceApiClient, service::UnavailableUpgradeDispatcher};
 use d2b_resource_store::{
-    StoreErrorKind, StoreGetRequest, StoreOperationContext, StoreProjection, StoredResource,
+    StoreErrorKind, StoreGetRequest, StoreListRequest, StoreOperationContext, StoreProjection,
+    StoredResource,
 };
 use d2b_resource_store_redb::RedbResourceStore;
 
@@ -237,6 +238,7 @@ impl ActivationResourceReconciler {
         _dependencies: &[DependencySnapshot],
     ) -> Result<(), ActivationResourceRuntimeError> {
         let resource = stored_resource_from_snapshot(resource)?;
+        let resources = fresh_generation_siblings(&self.store, &resource).await?;
         let mut process_resources: Vec<StoredResource> = Vec::new();
         let runner_ref = activation_runner_ref(&resource.resource_ref);
         let runner = self
@@ -271,12 +273,97 @@ impl ActivationResourceReconciler {
         runtime
             .reconcile(
                 Arc::clone(&self.state),
-                vec![resource.clone()],
+                resources,
                 process_resources,
                 Some(&resource.resource_ref),
             )
             .await
     }
+}
+
+async fn fresh_generation_siblings(
+    store: &RedbResourceStore,
+    target: &StoredResource,
+) -> Result<Vec<StoredResource>, ActivationResourceRuntimeError> {
+    let target_spec = decode_activation_spec(target)?;
+    let execution_ref = target_spec.execution_ref().clone();
+    let mut request = StoreListRequest {
+        operation: StoreOperationContext {
+            operation_id: "activation-generation-siblings".to_owned(),
+            idempotency_key: None,
+            correlation_id: "activation-generation-siblings".to_owned(),
+            trace_id: None,
+            deadline_ms: 10_000,
+        },
+        zone: target.zone.clone(),
+        resource_types: vec![
+            ResourceTypeName::parse(ACTIVATION_TYPE)
+                .expect("activation ResourceType is canonical"),
+        ],
+        resource_names: Vec::new(),
+        filters: Vec::new(),
+        page_size: 256,
+        cursor: None,
+        projection: StoreProjection::BaseOnly,
+    };
+    let mut candidates = BTreeMap::<ResourceRef, ResourceUid>::new();
+    loop {
+        let page = store
+            .list(request.clone())
+            .await
+            .map_err(|_| ActivationResourceRuntimeError::Store)?;
+        for resource in page.resources {
+            if decode_activation_spec(&resource)?.execution_ref() == &execution_ref {
+                candidates.insert(resource.resource_ref, resource.uid);
+            }
+        }
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        request.cursor = Some(cursor);
+    }
+    candidates
+        .entry(target.resource_ref.clone())
+        .or_insert_with(|| target.uid.clone());
+
+    let mut siblings = Vec::with_capacity(candidates.len());
+    for (resource_ref, uid) in candidates {
+        let resource = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "activation-generation-sibling".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "activation-generation-sibling".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: target.zone.clone(),
+                target: resource_ref.clone(),
+                expected_uid: Some(uid.clone()),
+                projection: StoreProjection::Full,
+            })
+            .await;
+        match resource {
+            Ok(resource) => {
+                if decode_activation_spec(&resource)?.execution_ref() == &execution_ref {
+                    siblings.push(resource);
+                } else if resource_ref == target.resource_ref {
+                    return Err(ActivationResourceRuntimeError::InvalidResource);
+                }
+            }
+            Err(error)
+                if error.kind() == StoreErrorKind::ResourceNotFound
+                    && resource_ref != target.resource_ref => {}
+            Err(_) => return Err(ActivationResourceRuntimeError::Store),
+        }
+    }
+    if siblings
+        .iter()
+        .all(|resource| resource.resource_ref != target.resource_ref)
+    {
+        return Err(ActivationResourceRuntimeError::Store);
+    }
+    Ok(siblings)
 }
 
 fn stored_resource_from_snapshot(
@@ -644,7 +731,19 @@ impl ActivationResourceRuntime {
     ) -> Result<(), ActivationResourceRuntimeError> {
         let desired = decode_resources(&self.zone, resources)?;
         let desired_keys = desired.keys().cloned().collect::<BTreeSet<_>>();
-        self.records.retain(|key, _| desired_keys.contains(key));
+        let target_execution_ref = target
+            .and_then(|target| desired.get(target))
+            .map(|record| record.spec.execution_ref().clone());
+        if target.is_some() && target_execution_ref.is_none() {
+            return Err(ActivationResourceRuntimeError::InvalidResource);
+        }
+        if let Some(execution_ref) = target_execution_ref.as_ref() {
+            self.records.retain(|key, record| {
+                record.spec.execution_ref() != execution_ref || desired_keys.contains(key)
+            });
+        } else {
+            self.records.retain(|key, _| desired_keys.contains(key));
+        }
         let observations_by_target = desired.values().fold(
             BTreeMap::<ResourceRef, Vec<GenerationObservation>>::new(),
             |mut observations, record| {
@@ -866,9 +965,7 @@ impl ActivationResourceRuntime {
             return Ok(());
         }
 
-        if target.is_none() {
-            self.apply_retention().await?;
-        }
+        self.apply_retention(target_execution_ref.as_ref()).await?;
         Ok(())
     }
 
@@ -952,10 +1049,18 @@ impl ActivationResourceRuntime {
         }
     }
 
-    async fn apply_retention(&self) -> Result<(), ActivationResourceRuntimeError> {
+    async fn apply_retention(
+        &self,
+        execution_ref: Option<&ResourceRef>,
+    ) -> Result<(), ActivationResourceRuntimeError> {
         let observations = self
             .records
             .values()
+            .filter(|record| {
+                execution_ref.is_none_or(|execution_ref| {
+                    record.spec.execution_ref() == execution_ref
+                })
+            })
             .map(|record| {
                 GenerationObservation::terminal(
                     record.resource.resource_ref.name().as_str(),
@@ -971,11 +1076,18 @@ impl ActivationResourceRuntime {
             if let Some(record) = self
                 .records
                 .values()
-                .find(|record| record.resource.resource_ref.name().as_str() == name)
-                && !record.deletion_requested()
+                .find(|record| {
+                    record.resource.resource_ref.name().as_str() == name
+                        && execution_ref.is_none_or(|execution_ref| {
+                            record.spec.execution_ref() == execution_ref
+                        })
+                })
+                .cloned()
             {
-                self.request_delete(record).await?;
-                break;
+                if !record.deletion_requested() {
+                    self.request_delete(&record).await?;
+                    break;
+                }
             }
         }
         Ok(())
@@ -1315,12 +1427,7 @@ fn decode_resources(
         if resource.resource_ref.resource_type().as_str() != ACTIVATION_TYPE {
             continue;
         }
-        let envelope = ResourceEnvelope::from_json(&resource.canonical_json)
-            .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
-        let spec = serde_json::from_slice::<NixosGenerationSpec>(
-            &envelope.spec().base().to_canonical_bytes(),
-        )
-        .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
+        let spec = decode_activation_spec(&resource)?;
         let record = DesiredRecord {
             ordinal: ordinal_from_resource(&resource),
             resource,
@@ -1331,6 +1438,17 @@ fn decode_resources(
         }
     }
     Ok(desired)
+}
+
+fn decode_activation_spec(
+    resource: &StoredResource,
+) -> Result<NixosGenerationSpec, ActivationResourceRuntimeError> {
+    let envelope = ResourceEnvelope::from_json(&resource.canonical_json)
+        .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
+    serde_json::from_slice::<NixosGenerationSpec>(
+        &envelope.spec().base_with_provider_ref().to_canonical_bytes(),
+    )
+    .map_err(|_| ActivationResourceRuntimeError::InvalidResource)
 }
 
 fn phase_json(phase: ResourcePhase) -> CanonicalJsonValue {
@@ -1785,6 +1903,217 @@ fn request_meta(operation: &str) -> wire::RequestMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Default)]
+    struct RecordingActivationClient {
+        creates: Mutex<Vec<String>>,
+        deletes: Mutex<Vec<String>>,
+    }
+
+    struct AllowActivationVerifier;
+
+    impl ActivationApplicationVerifier for AllowActivationVerifier {
+        fn verify_application(
+            &self,
+            _controller: &ActivationController,
+            _request: &d2b_provider_activation_nixos::RunnerRequest,
+        ) -> Result<(), d2b_provider_activation_nixos::ActivationVerificationError> {
+            Ok(())
+        }
+    }
+
+    fn mutation_target(mutation: Option<&wire::Mutation>) -> String {
+        mutation
+            .and_then(|mutation| mutation.target.as_ref())
+            .map(|target| format!("{}/{}", target.resource_type, target.name))
+            .expect("activation mutation target")
+    }
+
+    #[async_trait::async_trait]
+    impl ActivationResourceClient for RecordingActivationClient {
+        async fn create(
+            &self,
+            request: wire::CreateRequest,
+        ) -> Result<wire::CreateResponse, ()> {
+            self.creates
+                .lock()
+                .unwrap()
+                .push(mutation_target(request.mutation.as_ref()));
+            Ok(wire::CreateResponse::new())
+        }
+
+        async fn update_status(
+            &self,
+            _request: wire::UpdateStatusRequest,
+        ) -> Result<wire::UpdateStatusResponse, ()> {
+            Ok(wire::UpdateStatusResponse::new())
+        }
+
+        async fn update_finalizers(
+            &self,
+            _request: wire::UpdateFinalizersRequest,
+        ) -> Result<wire::UpdateFinalizersResponse, ()> {
+            Ok(wire::UpdateFinalizersResponse::new())
+        }
+
+        async fn delete(
+            &self,
+            request: wire::DeleteRequest,
+        ) -> Result<wire::DeleteResponse, ()> {
+            self.deletes
+                .lock()
+                .unwrap()
+                .push(mutation_target(request.mutation.as_ref()));
+            Ok(wire::DeleteResponse::new())
+        }
+    }
+
+    fn test_server_state() -> (Arc<crate::ServerState>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("temporary activation state");
+        let broker_reap_log = d2bd_runtime::supervisor::pidfd_table::BrokerReapLog::new();
+        let state = crate::ServerState {
+            config: crate::DaemonConfig::default(),
+            daemon_uid: 0,
+            daemon_state_dir: directory.path().to_path_buf(),
+            pidfd_table: Arc::new(
+                d2bd_runtime::supervisor::pidfd_table::PidfdTable::new(
+                    directory.path().join("pidfd-table.json"),
+                )
+                .with_broker_reap_log(Arc::clone(&broker_reap_log)),
+            ),
+            broker_reap_log,
+            metrics_registry: Arc::new(d2bd_runtime::metrics::Registry::new()),
+            daemon_audit: Arc::new(d2bd_runtime::daemon_audit::DaemonAuditLog::no_op()),
+            exec_sessions: Arc::new(crate::exec_session::SessionTable::new(
+                crate::exec_session::ExecSessionCaps::default(),
+            )),
+            conn_semaphore: d2bd_runtime::concurrency::ConnSemaphore::new(8),
+            op_locks: d2bd_runtime::concurrency::OpLockManager::new(),
+            public_status_read_model: Arc::new(
+                d2bd_runtime::public_read_model::PublicStatusReadModel::new(),
+            ),
+            provider_runtime: Arc::new(crate::provider_registry::ProviderRuntime::new()),
+            resource_plane: Arc::new(Mutex::new(None)),
+            interaction_runtime: Arc::new(tokio::sync::Mutex::new(None)),
+            interaction_listeners: Arc::new(Mutex::new(None)),
+            typed_shell_session_targets: d2bd_runtime::typed_shell_targets::new_cache(),
+            zone_coordinator: d2bd_runtime::zone_authority::new_coordinator(),
+            config_staging: Arc::new(Mutex::new(Default::default())),
+            guest_component_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            guest_component_session_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            console_sessions: Arc::new(Mutex::new(
+                crate::console_session::ConsoleSessionTable::default(),
+            )),
+            security_key_sessions: Arc::new(parking_lot::Mutex::new(
+                crate::security_key::SkSessionTable::default(),
+            )),
+            unsafe_local_helpers: Arc::new(
+                d2bd_runtime::unsafe_local_helper::HelperRegistry::new(0, []),
+            ),
+        };
+        (Arc::new(state), directory)
+    }
+
+    fn generation_resource(
+        name: &str,
+        execution_ref: &str,
+        ordinal: u64,
+        prior: Option<&str>,
+        phase: &str,
+        deletion_requested: bool,
+    ) -> StoredResource {
+        let execution_ref = ResourceRef::parse(execution_ref).expect("execution ref");
+        let prior = prior.map(|name| {
+            ResourceRef::parse(&format!("{ACTIVATION_TYPE}/{name}")).expect("prior generation ref")
+        });
+        let spec = NixosGenerationSpec::new(
+            ResourceRef::parse("Provider/activation-nixos").expect("activation provider"),
+            execution_ref,
+            "system-artifact",
+            ActivationMode::Switch,
+            prior,
+        )
+        .expect("activation spec");
+        let uid = ResourceUid::parse(format!(
+            "00000000-0000-4000-8000-{ordinal:012x}"
+        ))
+        .expect("generation UID");
+        let resource_ref =
+            ResourceRef::parse(&format!("{ACTIVATION_TYPE}/{name}")).expect("generation ref");
+        let body = serde_json::json!({
+            "apiVersion": "resources.d2bus.org/v3",
+            "type": ACTIVATION_TYPE,
+            "metadata": {
+                "createdAt": "2026-09-03T00:00:00.000Z",
+                "updatedAt": "2026-09-03T00:00:00.000Z",
+                "managedBy": "controller",
+                "ownerRef": null,
+                "name": name,
+                "zone": "dev",
+                "uid": uid.as_str(),
+                "generation": 1,
+                "revision": ordinal.max(1),
+                "finalizers": [ACTIVATION_FINALIZER],
+                "deletionRequestedAt": if deletion_requested {
+                    serde_json::Value::String("2026-09-03T00:00:00.000Z".to_owned())
+                } else {
+                    serde_json::Value::Null
+                }
+            },
+            "spec": serde_json::to_value(spec).expect("activation spec JSON"),
+            "status": {
+                "phase": phase,
+                "observedGeneration": 0,
+                "lastReconciledAt": null,
+                "startedAt": null,
+                "completedAt": null,
+                "outcome": null,
+                "conditions": [],
+                "update": {
+                    "dependencies": {"count": 0, "refs": []},
+                    "disruption": "None",
+                    "lastAssessedAt": null,
+                    "observedGeneration": 0,
+                    "operationId": null,
+                    "owned": {"count": 0, "refs": []},
+                    "preserveState": true,
+                    "reasons": [],
+                    "state": "Unknown",
+                    "targetGeneration": 1
+                },
+                "resource": {}
+            }
+        });
+        let canonical = CanonicalJsonValue::parse(
+            &serde_json::to_vec(&body).expect("generation JSON"),
+        )
+        .expect("canonical generation JSON")
+        .to_canonical_bytes();
+        let payload_digest = ResourceEnvelope::from_json(&canonical)
+            .expect("generation envelope")
+            .digest()
+            .expect("generation digest");
+        StoredResource {
+            resource_ref,
+            zone: ZoneId::parse("dev").expect("generation zone"),
+            uid,
+            generation: d2b_contracts_resource::v3::ResourceGeneration::new(1)
+                .expect("generation ordinal"),
+            revision: ZoneRevision::new(ordinal.max(1)),
+            canonical_json: canonical,
+            payload_digest,
+        }
+    }
+
+    fn insert_records(runtime: &mut ActivationResourceRuntime, resources: Vec<StoredResource>) {
+        runtime
+            .records
+            .extend(decode_resources(&ZoneId::parse("dev").unwrap(), resources).unwrap());
+    }
 
     #[test]
     fn generation_ordinals_are_taken_from_bounded_names() {
@@ -1958,5 +2287,113 @@ mod tests {
         assert!(selected_target(Some(&target), &target));
         assert!(!selected_target(Some(&target), &sibling));
         assert!(selected_target(None, &sibling));
+    }
+
+    #[tokio::test]
+    async fn production_target_reconcile_uses_prior_sibling_without_touching_other_execution() {
+        let (state, _directory) = test_server_state();
+        let client = Arc::new(RecordingActivationClient::default());
+        let mut runtime = ActivationResourceRuntime::new(ZoneId::parse("dev").unwrap());
+        runtime.set_status_client(Arc::clone(&client));
+        runtime.set_verifier(Arc::new(AllowActivationVerifier));
+        let prior = generation_resource("gen-1", "Guest/dev-vm", 1, None, "Succeeded", false);
+        let target = generation_resource(
+            "gen-2",
+            "Guest/dev-vm",
+            2,
+            Some("gen-1"),
+            "Pending",
+            false,
+        );
+        let other = generation_resource(
+            "other-9",
+            "Guest/other-vm",
+            9,
+            None,
+            "Pending",
+            false,
+        );
+        insert_records(&mut runtime, vec![other.clone()]);
+        runtime
+            .reconcile(
+                state,
+                vec![prior.clone(), target.clone(), other.clone()],
+                Vec::new(),
+                Some(&target.resource_ref),
+            )
+            .await
+            .expect("target generation reconciles with its prior sibling");
+        assert_eq!(
+            client.creates.lock().unwrap().as_slice(),
+            &[format!(
+                "EphemeralProcess/{}",
+                activation_runner_ref(&target.resource_ref).name().as_str()
+            )]
+        );
+        assert!(runtime.records.contains_key(&prior.resource_ref));
+        assert!(runtime.records.contains_key(&target.resource_ref));
+        assert!(runtime.records.contains_key(&other.resource_ref));
+        assert!(client.deletes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn production_target_reconcile_rejects_missing_or_cross_execution_prior() {
+        let (state, _directory) = test_server_state();
+        let client = Arc::new(RecordingActivationClient::default());
+        let mut runtime = ActivationResourceRuntime::new(ZoneId::parse("dev").unwrap());
+        runtime.set_status_client(Arc::clone(&client));
+        runtime.set_verifier(Arc::new(AllowActivationVerifier));
+        let target = generation_resource(
+            "gen-2",
+            "Guest/dev-vm",
+            2,
+            Some("gen-1"),
+            "Pending",
+            false,
+        );
+        let wrong_execution = generation_resource(
+            "gen-1",
+            "Guest/other-vm",
+            1,
+            None,
+            "Succeeded",
+            false,
+        );
+        assert_eq!(
+            runtime
+                .reconcile(
+                    state,
+                    vec![target.clone(), wrong_execution],
+                    Vec::new(),
+                    Some(&target.resource_ref),
+                )
+                .await,
+            Err(ActivationResourceRuntimeError::Policy)
+        );
+        assert!(client.creates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn production_target_retention_deletes_only_old_terminal_same_execution_sibling() {
+        let client = Arc::new(RecordingActivationClient::default());
+        let mut runtime = ActivationResourceRuntime::new(ZoneId::parse("dev").unwrap());
+        runtime.set_status_client(Arc::clone(&client));
+        let execution_ref = ResourceRef::parse("Guest/dev-vm").unwrap();
+        let resources = vec![
+            generation_resource("gen-1", "Guest/dev-vm", 1, None, "Succeeded", false),
+            generation_resource("gen-2", "Guest/dev-vm", 2, None, "Succeeded", false),
+            generation_resource("gen-3", "Guest/dev-vm", 3, None, "Succeeded", false),
+            generation_resource("gen-4", "Guest/dev-vm", 4, None, "Ready", false),
+            generation_resource("other-1", "Guest/other-vm", 1, None, "Succeeded", false),
+        ];
+        insert_records(&mut runtime, resources);
+        runtime
+            .apply_retention(Some(&execution_ref))
+            .await
+            .expect("target-scoped retention succeeds");
+        assert_eq!(
+            client.deletes.lock().unwrap().as_slice(),
+            &["activation-nixos.d2bus.org.NixosGeneration/gen-1".to_owned()]
+        );
     }
 }
