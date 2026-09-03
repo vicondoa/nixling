@@ -38,7 +38,7 @@ pub(crate) enum BackendOperation {
 impl BackendOperation {
     fn parse(provider: &str, operation: &str) -> Option<Self> {
         let (prefix, method) = operation.rsplit_once('.')?;
-        if prefix != provider {
+        if prefix != provider.strip_prefix("credential-").unwrap_or(provider) {
             return None;
         }
         match method {
