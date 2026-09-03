@@ -12,3 +12,5 @@
 - Closed the Guest workspace mirror over the daemon's current Provider
   dependencies and synchronized its manifest and lock with the activation
   Provider's cryptographic dependency.
+- Retained support-only config-nixos and typed ComponentSession
+  stream/transport services outside the retired daemon reconciler paths.
