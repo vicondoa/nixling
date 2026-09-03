@@ -17418,7 +17418,6 @@ impl ZoneResourceRuntime {
             return Err(ResourceRuntimeError::RequestInvalid);
         }
         let operation_id = public_operation_id(request, peer_uid, method);
-        self.refresh_authorization_policy().await?;
         let resolved_user = d2bd_runtime::resource_runtime_support::resolve_zone_user(
             &self.store,
             &self.zone,
@@ -17426,6 +17425,7 @@ impl ZoneResourceRuntime {
             &format!("{}:user", operation_id),
         )
         .await?;
+        self.refresh_authorization_policy().await?;
         let context = d2bd_runtime::resource_runtime_support::local_user_subject_context(
             &self.zone,
             &resolved_user,
