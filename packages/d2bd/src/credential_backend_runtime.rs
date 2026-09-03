@@ -14,7 +14,7 @@ use std::{
 };
 
 use d2b_contracts_provider::v3::credential::CredentialLeaseHandle;
-use d2b_contracts_resource::v3::ResourceRef;
+use d2b_contracts_resource::v3::{ResourceRef, ZoneId};
 use d2b_provider_toolkit::{
     CredentialDeliveryKeyHandoff, CredentialDeliveryKeyMaterial, GuestCredentialBackendHandler,
     GuestCredentialBackendHandlerError, GuestCredentialBackendHandlerFuture,
@@ -63,6 +63,7 @@ impl BackendOperation {
 /// Typed Guest-local backend request passed to the source implementation.
 #[derive(Clone)]
 pub(crate) struct GuestCredentialBackendRequest {
+    pub(crate) zone: ZoneId,
     pub(crate) provider_ref: ResourceRef,
     pub(crate) process_ref: ResourceRef,
     pub(crate) execution_ref: ResourceRef,
@@ -221,16 +222,47 @@ impl GuestCredentialProviderAdapter for GuestManagedIdentityImdsClient {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GuestCredentialLeaseScope {
+    zone: ZoneId,
     provider_ref: ResourceRef,
     process_ref: ResourceRef,
     execution_ref: ResourceRef,
     user_ref: Option<ResourceRef>,
     credential_ref: ResourceRef,
+    provider_generation: d2b_contracts_resource::v3::ResourceGeneration,
+    controller_generation: d2b_contracts_resource::v3::ControllerGeneration,
+    session_generation: d2b_contracts_resource::v3::identity::ReconnectGeneration,
+}
+
+impl GuestCredentialLeaseScope {
+    fn operation_scope(&self) -> GuestCredentialOperationScope {
+        GuestCredentialOperationScope {
+            zone: self.zone.clone(),
+            provider_ref: self.provider_ref.clone(),
+            process_ref: self.process_ref.clone(),
+            execution_ref: self.execution_ref.clone(),
+            user_ref: self.user_ref.clone(),
+            credential_ref: self.credential_ref.clone(),
+            provider_generation: self.provider_generation,
+            controller_generation: self.controller_generation,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GuestCredentialOperationScope {
+    zone: ZoneId,
+    provider_ref: ResourceRef,
+    process_ref: ResourceRef,
+    execution_ref: ResourceRef,
+    user_ref: Option<ResourceRef>,
+    credential_ref: ResourceRef,
+    provider_generation: d2b_contracts_resource::v3::ResourceGeneration,
+    controller_generation: d2b_contracts_resource::v3::ControllerGeneration,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GuestCredentialIssueKey {
-    scope: GuestCredentialLeaseScope,
+    scope: GuestCredentialOperationScope,
     operation_id: String,
 }
 
@@ -309,11 +341,15 @@ impl GuestCredentialLeaseRegistry {
             return Err(GuestCredentialBackendSourceError::Denied);
         }
         let scope = GuestCredentialLeaseScope {
+            zone: request.zone,
             provider_ref: request.provider_ref,
             process_ref: request.process_ref,
             execution_ref: request.execution_ref,
             user_ref: request.user_ref,
             credential_ref,
+            provider_generation: request.provider_generation,
+            controller_generation: request.controller_generation,
+            session_generation: request.session_generation,
         };
         match request.operation {
             BackendOperation::IssueLease => self.issue(scope, &request.fields),
@@ -334,23 +370,25 @@ impl GuestCredentialLeaseRegistry {
         let requested_expiry = field_u64(fields, "requestedExpiryUnixMs")?;
         let expires_at_unix_ms = bounded_expiry(requested_expiry)?;
         let operation_key = GuestCredentialIssueKey {
-            scope: scope.clone(),
+            scope: scope.operation_scope(),
             operation_id: operation_id.clone(),
         };
         let mut state = self
             .state
             .lock()
             .map_err(|_| GuestCredentialBackendSourceError::Unavailable)?;
-        if let Some((existing_idempotency, existing_handle)) = state.operations.get(&operation_key)
+        if let Some((existing_idempotency, existing_handle)) =
+            state.operations.get(&operation_key).cloned()
         {
-            if existing_idempotency != &idempotency_key {
+            if existing_idempotency != idempotency_key {
                 return Err(GuestCredentialBackendSourceError::Denied);
             }
             let record = state
                 .leases
-                .get(existing_handle)
+                .get_mut(&existing_handle)
                 .ok_or(GuestCredentialBackendSourceError::Unavailable)?;
             return if record.state == GuestCredentialLeaseState::Active {
+                record.scope = scope.clone();
                 Ok(record_reply(record, true, None, false))
             } else {
                 Err(GuestCredentialBackendSourceError::Unavailable)
@@ -810,6 +848,7 @@ impl GuestCredentialBackendHandler for SourceHandler {
             })?;
             source
                 .execute(GuestCredentialBackendRequest {
+                    zone: route.zone().clone(),
                     provider_ref,
                     process_ref,
                     execution_ref,
