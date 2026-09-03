@@ -16735,7 +16735,7 @@ impl ControllerSessionCoordinator {
                 .ok_or_else(|| authentication_error("provider-delivery-key-handoff"))?;
             if let Some(backend_lease) = backend_lease.as_ref() {
                 if backend_lease
-                    .bind_route(&route, context.user_ref())
+                    .bind_route(&route, context.user_ref(), Some(credentials))
                     .is_err()
                 {
                     let _ = registrar.revoke(ingress).await;

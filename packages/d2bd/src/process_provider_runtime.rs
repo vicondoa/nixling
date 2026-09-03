@@ -41,7 +41,7 @@ use d2b_provider_system_minijail::{MinijailProcessProvider, launch::PlatformGate
 use d2b_provider_system_systemd::SystemdProcessProvider;
 use d2b_provider_toolkit::CredentialDeliveryKeyHandoff;
 use d2b_session::AuthenticatedSessionRouteBinding;
-use d2b_session_unix::prearmed_seqpacket_pair;
+use d2b_session_unix::{PeerCredentials, prearmed_seqpacket_pair};
 use d2bd_runtime::target_runtime::{ControllerProcessResource, DaemonMode};
 use d2bd_runtime::vm_start_support::{
     is_durable_wayland_process_node, is_guest_owned_process_node,
@@ -600,6 +600,7 @@ pub(crate) trait GuestCredentialBackendLease: Send + Sync {
         &self,
         route: &AuthenticatedSessionRouteBinding,
         user_ref: Option<&ResourceRef>,
+        peer: Option<PeerCredentials>,
     ) -> Result<(), String>;
 
     /// Stop the responder and revoke its session-bound backend authority.

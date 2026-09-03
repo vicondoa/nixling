@@ -713,6 +713,7 @@ pub trait GuestCredentialBackendHandler: Send + Sync + 'static {
 struct GuestCredentialBackendBinding {
     route: AuthenticatedSessionRouteBinding,
     user_ref: Option<ResourceRef>,
+    expected_peer: d2b_session_unix::PeerCredentials,
 }
 
 /// Cancellable Guest-local backend responder lease.
@@ -720,6 +721,7 @@ pub struct GuestCredentialBackendResponderLease {
     route: tokio::sync::watch::Sender<Option<GuestCredentialBackendBinding>>,
     cancel: tokio::sync::watch::Sender<bool>,
     bound: std::sync::Mutex<bool>,
+    initial_peer: d2b_session_unix::PeerCredentials,
 }
 
 impl std::fmt::Debug for GuestCredentialBackendResponderLease {
@@ -743,6 +745,17 @@ impl GuestCredentialBackendResponderLease {
         route: AuthenticatedSessionRouteBinding,
         user_ref: Option<ResourceRef>,
     ) -> Result<(), ProviderRuntimeError> {
+        self.bind_route_with_user_and_peer(route, user_ref, self.initial_peer)
+    }
+
+    /// Bind the responder with the peer credentials observed on the
+    /// authenticated fd10 bootstrap.
+    pub fn bind_route_with_user_and_peer(
+        &self,
+        route: AuthenticatedSessionRouteBinding,
+        user_ref: Option<ResourceRef>,
+        expected_peer: d2b_session_unix::PeerCredentials,
+    ) -> Result<(), ProviderRuntimeError> {
         if !validate_guest_backend_route(&route).is_ok() {
             return Err(ProviderRuntimeError::SessionUnauthenticated);
         }
@@ -761,7 +774,11 @@ impl GuestCredentialBackendResponderLease {
         }
         *bound = true;
         self.route
-            .send(Some(GuestCredentialBackendBinding { route, user_ref }))
+            .send(Some(GuestCredentialBackendBinding {
+                route,
+                user_ref,
+                expected_peer,
+            }))
             .map_err(|_| ProviderRuntimeError::SessionLoopFailed)
     }
 
@@ -993,49 +1010,24 @@ impl GuestCredentialBackend {
         })
     }
 
+    /// Establish the authenticated Guest-local backend session before the
+    /// synchronous Provider service begins dispatching operations.
+    pub async fn preconnect(&self) -> Result<(), GuestCredentialBackendError> {
+        let route = self
+            .route
+            .clone()
+            .ok_or(GuestCredentialBackendError::Unavailable)?;
+        let mut state = self.state.lock().await;
+        ensure_backend_connection(&mut state, &route).await
+    }
+
     async fn request_over_authenticated_session(
         &self,
         route: &AuthenticatedSessionRouteBinding,
         fields: serde_json::Map<String, serde_json::Value>,
     ) -> Result<GuestCredentialBackendResponse, GuestCredentialBackendError> {
         let mut state = self.state.lock().await;
-        if state.connection.is_none() {
-            let socket = state
-                .socket
-                .take()
-                .ok_or(GuestCredentialBackendError::Unavailable)?;
-            let expected_peer = socket
-                .acceptor_peer_credentials()
-                .map_err(|_| GuestCredentialBackendError::Unavailable)?;
-            let policy = credential_delivery_endpoint_policy(route.reconnect_generation().get());
-            let transport = guest_backend_transport(socket, &policy, expected_peer)
-                .map_err(|_| GuestCredentialBackendError::Unavailable)?;
-            let credentials = state
-                .delivery_keys
-                .take()
-                .ok_or(GuestCredentialBackendError::Unavailable)?
-                .into_handshake()
-                .map_err(|_| GuestCredentialBackendError::Unavailable)?;
-            let engine = match SessionEngine::establish_initiator(
-                transport,
-                policy,
-                credentials,
-                Instant::now(),
-            )
-            .await
-            {
-                Ok(engine) => engine,
-                Err(_error) => {
-                    return Err(GuestCredentialBackendError::Unavailable);
-                }
-            };
-            let driver: Arc<dyn ComponentSessionDriver> = Arc::new(engine.into_driver());
-            let client = Arc::new(SessionTtrpcClient::new(Arc::clone(&driver)));
-            state.connection = Some(GuestCredentialBackendConnection {
-                _driver: driver,
-                client,
-            });
-        }
+        ensure_backend_connection(&mut state, route).await?;
         let connection = state
             .connection
             .as_ref()
@@ -1088,7 +1080,7 @@ impl GuestCredentialBackend {
             });
         }
         let mut request = ttrpc::proto::Request::new();
-        request.set_service("d2b.guest.credential.v1.GuestCredentialBackend".to_owned());
+        request.set_service(GUEST_CREDENTIAL_BACKEND_SERVICE.to_owned());
         request.set_method("Request".to_owned());
         request.metadata = metadata;
         request.payload =
@@ -1116,6 +1108,46 @@ impl GuestCredentialBackend {
             bytes: response.bytes.map(zeroize::Zeroizing::new),
         })
     }
+}
+
+async fn ensure_backend_connection(
+    state: &mut GuestCredentialBackendState,
+    route: &AuthenticatedSessionRouteBinding,
+) -> Result<(), GuestCredentialBackendError> {
+    if state.connection.is_some() {
+        return Ok(());
+    }
+    let socket = state
+        .socket
+        .take()
+        .ok_or(GuestCredentialBackendError::Unavailable)?;
+    let expected_peer = socket
+        .acceptor_peer_credentials()
+        .map_err(|_| GuestCredentialBackendError::Unavailable)?;
+    let policy = credential_delivery_endpoint_policy(route.reconnect_generation().get());
+    let transport = guest_backend_transport(socket, &policy, expected_peer)
+        .map_err(|_| GuestCredentialBackendError::Unavailable)?;
+    let credentials = state
+        .delivery_keys
+        .take()
+        .ok_or(GuestCredentialBackendError::Unavailable)?
+        .into_handshake()
+        .map_err(|_| GuestCredentialBackendError::Unavailable)?;
+    let engine = SessionEngine::establish_initiator(
+        transport,
+        policy,
+        credentials,
+        Instant::now(),
+    )
+    .await
+    .map_err(|_| GuestCredentialBackendError::Unavailable)?;
+    let driver: Arc<dyn ComponentSessionDriver> = Arc::new(engine.into_driver());
+    let client = Arc::new(SessionTtrpcClient::new(Arc::clone(&driver)));
+    state.connection = Some(GuestCredentialBackendConnection {
+        _driver: driver,
+        client,
+    });
+    Ok(())
 }
 
 struct GuestCredentialBackendState {
@@ -1191,7 +1223,7 @@ pub fn spawn_guest_credential_backend_responder(
     delivery_keys: CredentialDeliveryKeyMaterial,
     handler: Arc<dyn GuestCredentialBackendHandler>,
 ) -> Result<Arc<GuestCredentialBackendResponderLease>, ProviderRuntimeError> {
-    let expected_peer = socket
+    let initial_peer = socket
         .acceptor_peer_credentials()
         .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
     let (route_tx, route_rx) = tokio::sync::watch::channel(None);
@@ -1199,7 +1231,6 @@ pub fn spawn_guest_credential_backend_responder(
     tokio::runtime::Handle::try_current().map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
     tokio::spawn(run_guest_credential_backend_responder(
         socket,
-        expected_peer,
         delivery_keys,
         handler,
         route_rx,
@@ -1209,12 +1240,12 @@ pub fn spawn_guest_credential_backend_responder(
         route: route_tx,
         cancel: cancel_tx,
         bound: std::sync::Mutex::new(false),
+        initial_peer,
     }))
 }
 
 async fn run_guest_credential_backend_responder(
     socket: SeqpacketSocket,
-    expected_peer: d2b_session_unix::PeerCredentials,
     delivery_keys: CredentialDeliveryKeyMaterial,
     handler: Arc<dyn GuestCredentialBackendHandler>,
     mut route_rx: tokio::sync::watch::Receiver<Option<GuestCredentialBackendBinding>>,
@@ -1223,15 +1254,15 @@ async fn run_guest_credential_backend_responder(
     let route = loop {
         if *cancel_rx.borrow() {
             return;
-    }
-    if let Some(binding) = route_rx.borrow().clone() {
-        break binding;
-    }
+        }
+        if let Some(binding) = route_rx.borrow().clone() {
+            break binding;
+        }
         tokio::select! {
             result = route_rx.changed() => {
                 if result.is_err() {
                     return;
-            }
+                }
             }
             result = cancel_rx.changed() => {
                 if result.is_err() || *cancel_rx.borrow() {
@@ -1244,17 +1275,19 @@ async fn run_guest_credential_backend_responder(
         return;
     }
     let policy = credential_delivery_endpoint_policy(route.route.reconnect_generation().get());
-    let Ok(transport) = guest_backend_transport(socket, &policy, expected_peer) else {
+    let Ok(transport) = guest_backend_transport(socket, &policy, route.expected_peer) else {
         return;
     };
     let Ok(credentials) = delivery_keys.into_handshake() else {
         return;
     };
-    let Ok(responder) =
-        SessionEngine::establish_responder(transport, policy, credentials, Instant::now()).await
-    else {
-        return;
-    };
+    let responder =
+        match SessionEngine::establish_responder(transport, policy, credentials, Instant::now())
+            .await
+        {
+            Ok(responder) => responder,
+            Err(_) => return,
+        };
     let driver: Arc<dyn ComponentSessionDriver> = Arc::new(responder.into_driver());
     let service = ttrpc::r#async::Service {
         methods: HashMap::from([(
@@ -1264,7 +1297,7 @@ async fn run_guest_credential_backend_responder(
                 user_ref: route.user_ref,
                 handler,
             })
-                as Box<dyn ttrpc::r#async::MethodHandler + Send + Sync>,
+            as Box<dyn ttrpc::r#async::MethodHandler + Send + Sync>,
         )]),
         streams: HashMap::new(),
     };
@@ -1422,7 +1455,8 @@ where
         + Send
         + 'static,
 {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
     {
@@ -1499,6 +1533,10 @@ where
         &route,
         delivery_keys,
     )?;
+    backend
+        .preconnect()
+        .await
+        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
     let bootstrap_identity = ProviderAgentBootstrap::new(
         spec.provider_ref.clone(),
         ZonePath::new(vec![

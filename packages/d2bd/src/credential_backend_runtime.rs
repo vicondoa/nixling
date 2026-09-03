@@ -15,6 +15,7 @@ use d2b_provider_toolkit::{
     spawn_guest_credential_backend_responder,
 };
 use d2b_session::{AuthenticatedSessionRouteBinding, x25519_public_key};
+use d2b_session_unix::PeerCredentials;
 
 use crate::process_provider_runtime::{
     GuestCredentialBackendLease, GuestCredentialBackendPreparation,
@@ -58,6 +59,11 @@ pub(crate) struct GuestCredentialBackendRequest {
     pub(crate) provider_ref: ResourceRef,
     pub(crate) process_ref: ResourceRef,
     pub(crate) execution_ref: ResourceRef,
+    pub(crate) user_ref: Option<ResourceRef>,
+    pub(crate) provider_generation: d2b_contracts_resource::v3::ResourceGeneration,
+    pub(crate) controller_generation: d2b_contracts_resource::v3::ControllerGeneration,
+    pub(crate) session_generation:
+        d2b_contracts_resource::v3::identity::ReconnectGeneration,
     pub(crate) operation: BackendOperation,
     pub(crate) fields: serde_json::Value,
 }
@@ -69,6 +75,10 @@ impl std::fmt::Debug for GuestCredentialBackendRequest {
             .field("provider_ref", &"<redacted>")
             .field("process_ref", &"<redacted>")
             .field("execution_ref", &"<redacted>")
+            .field("user_ref", &"<redacted>")
+            .field("provider_generation", &self.provider_generation)
+            .field("controller_generation", &self.controller_generation)
+            .field("session_generation", &self.session_generation)
             .field("operation", &self.operation)
             .field("fields", &"<redacted>")
             .finish()
@@ -166,6 +176,10 @@ impl GuestCredentialProviderAdapter for GuestSecretServiceCollectionPort {
                 &request.operation,
                 &request.process_ref,
                 &request.execution_ref,
+                &request.user_ref,
+                &request.provider_generation,
+                &request.controller_generation,
+                &request.session_generation,
                 &request.fields,
             );
             Err(GuestCredentialBackendSourceError::Unavailable)
@@ -180,6 +194,10 @@ impl GuestCredentialProviderAdapter for GuestEntraIdentityEndpointClient {
                 &request.operation,
                 &request.process_ref,
                 &request.execution_ref,
+                &request.user_ref,
+                &request.provider_generation,
+                &request.controller_generation,
+                &request.session_generation,
                 &request.fields,
             );
             Err(GuestCredentialBackendSourceError::Unavailable)
@@ -194,6 +212,10 @@ impl GuestCredentialProviderAdapter for GuestManagedIdentityImdsClient {
                 &request.operation,
                 &request.process_ref,
                 &request.execution_ref,
+                &request.user_ref,
+                &request.provider_generation,
+                &request.controller_generation,
+                &request.session_generation,
                 &request.fields,
             );
             Err(GuestCredentialBackendSourceError::Unavailable)
@@ -297,6 +319,14 @@ impl GuestCredentialBackendHandler for SourceHandler {
                     provider_ref,
                     process_ref,
                     execution_ref,
+                    user_ref,
+                    provider_generation: route
+                        .provider_generation()
+                        .ok_or(GuestCredentialBackendHandlerError::Denied)?,
+                    controller_generation: route
+                        .controller_generation()
+                        .ok_or(GuestCredentialBackendHandlerError::Denied)?,
+                    session_generation: route.reconnect_generation(),
                     operation: operation_kind,
                     fields,
                 })
@@ -409,6 +439,7 @@ struct ProductionGuestCredentialBackendLease {
     expected_user: Option<ResourceRef>,
     expected_provider_generation: d2b_contracts_resource::v3::ResourceGeneration,
     expected_controller_generation: d2b_contracts_resource::v3::ControllerGeneration,
+    fallback_peer: PeerCredentials,
     responder: Arc<GuestCredentialBackendResponderLease>,
 }
 
@@ -417,6 +448,7 @@ impl GuestCredentialBackendLease for ProductionGuestCredentialBackendLease {
         &self,
         route: &AuthenticatedSessionRouteBinding,
         user_ref: Option<&ResourceRef>,
+        peer: Option<PeerCredentials>,
     ) -> Result<(), String> {
         let route_provider = route
             .provider_ref()
@@ -442,7 +474,11 @@ impl GuestCredentialBackendLease for ProductionGuestCredentialBackendLease {
             return Err("provider-backend-route-mismatch".to_owned());
         }
         self.responder
-            .bind_route_with_user(route.clone(), user_ref.cloned())
+            .bind_route_with_user_and_peer(
+                route.clone(),
+                user_ref.cloned(),
+                peer.unwrap_or(self.fallback_peer),
+            )
             .map_err(|_| "provider-backend-route-bind-failed".to_owned())
     }
 
@@ -548,9 +584,14 @@ impl GuestCredentialBackendSupervisor for ProductionGuestCredentialBackendSuperv
         .map_err(|_| "provider-backend-key-invalid".to_owned())?;
         let (child_endpoint, responder_endpoint) = d2b_session_unix::prearmed_seqpacket_pair()
             .map_err(|_| "provider-backend-socket-unavailable".to_owned())?;
-        let responder = spawn_guest_credential_backend_responder(
+        let responder_socket =
             d2b_session_unix::SeqpacketSocket::from_parent_prearmed(responder_endpoint)
-                .map_err(|_| "provider-backend-socket-unavailable".to_owned())?,
+                .map_err(|_| "provider-backend-socket-unavailable".to_owned())?;
+        let fallback_peer = responder_socket
+            .acceptor_peer_credentials()
+            .map_err(|_| "provider-backend-socket-unavailable".to_owned())?;
+        let responder = spawn_guest_credential_backend_responder(
+            responder_socket,
             backend_keys,
             Arc::clone(&self.handler),
         )
@@ -563,6 +604,7 @@ impl GuestCredentialBackendSupervisor for ProductionGuestCredentialBackendSuperv
             expected_user: user_ref,
             expected_provider_generation: provider_generation,
             expected_controller_generation: context.controller_generation,
+            fallback_peer,
             responder,
         });
         Ok(GuestCredentialBackendPreparation {
@@ -753,7 +795,7 @@ mod tests {
         let client_socket =
             d2b_session_unix::SeqpacketSocket::from_parent_prearmed(preparation.child_endpoint)
                 .expect("child backend socket");
-        let route = route();
+        let bound_route = route();
         assert_ne!(
             preparation.delivery_key_handoff.provider_public(),
             second_preparation.delivery_key_handoff.provider_public()
@@ -761,11 +803,11 @@ mod tests {
         second_preparation.lease.cancel();
         preparation
             .lease
-            .bind_route(&route, None)
+            .bind_route(&bound_route, None, None)
             .expect("backend route binding");
         let backend = GuestCredentialBackend::from_socket_for_test_with_route(
             client_socket,
-            route,
+            bound_route,
             preparation.delivery_key_handoff.into_material(),
         )
         .expect("provider backend client");
@@ -815,7 +857,7 @@ mod tests {
         let negative_route = route();
         negative
             .lease
-            .bind_route(&negative_route, None)
+            .bind_route(&negative_route, None, None)
             .expect("negative route binding");
         let negative_client_socket =
             d2b_session_unix::SeqpacketSocket::from_parent_prearmed(negative.child_endpoint)

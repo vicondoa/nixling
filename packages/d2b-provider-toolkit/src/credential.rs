@@ -208,12 +208,11 @@ where
             .authorizer
             .authorize_with_metadata(self.method, &request, &self.route, &metadata)
             .map_err(rpc_error)?;
-        let response = dispatch_authorized_provider(
-            self.provider.as_ref(),
-            self.method,
-            &request,
-            &authorization,
-        )
+        let provider = Arc::clone(&self.provider);
+        let method = self.method;
+        let response = tokio::task::block_in_place(move || {
+            dispatch_authorized_provider(provider.as_ref(), method, &request, &authorization)
+        })
         .map_err(rpc_error)?;
         let payload = match response {
             CredentialResponse::AcquireToken(response)

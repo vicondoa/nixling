@@ -12,6 +12,9 @@ use d2b_contracts_resource::v3::{
         SessionBinding, SessionPurpose, TranscriptHash, TransportBinding,
     },
 };
+use d2b_contracts_provider::v3::credential::{
+    CredentialRequest, DeliveryResponse, MetadataResponse, decode_outer, encode_outer,
+};
 use d2b_contracts_zone_session::v3::component_session::{
     EndpointRole, EndpointRole as ComponentEndpointRole, Locality as ComponentLocality,
     PurposeClass, TransportClass,
@@ -26,7 +29,8 @@ use d2b_provider_toolkit::{
     spawn_guest_credential_backend_responder,
 };
 use d2b_session::{
-    ComponentSessionDriver, HandshakeCredentials, SessionEngine, StreamEvent, StreamId,
+    ComponentSessionDriver, HandshakeCredentials, SessionEngine, SessionTtrpcClient,
+    StreamEvent, StreamId,
     x25519_public_key,
 };
 use d2b_session_unix::{
@@ -186,6 +190,7 @@ fn run_supervised_binary(path: &str, provider: &str) {
     let (backend_peer, backend_child) = prearmed_seqpacket_pair().expect("backend pair");
     let backend_inherited =
         duplicate_to_inherited_fd(&backend_child, 201).expect("backend inherited fd");
+    drop(backend_child);
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(format!(
@@ -263,7 +268,7 @@ fn run_supervised_binary(path: &str, provider: &str) {
         )
         .expect("backend responder");
         backend_responder
-            .bind_route_with_user(route.clone(), user_ref.clone())
+            .bind_route_with_user_and_peer(route.clone(), user_ref.clone(), credentials)
             .expect("bind backend responder route");
         let key_handoff = CredentialDeliveryKeyHandoff::new(provider_private, backend_public)
             .expect("delivery key handoff");
@@ -325,6 +330,9 @@ fn run_supervised_binary(path: &str, provider: &str) {
             }
         }
         assert_eq!(ready, PROVIDER_READY_MARKER);
+        if provider.ends_with("credential-secret-service") {
+            exercise_secret_service(&route, &driver).await;
+        }
         tokio::task::yield_now().await;
         driver
     });
@@ -353,6 +361,112 @@ fn run_supervised_binary(path: &str, provider: &str) {
     child.kill().expect("stop provider");
     child.wait().expect("reap provider");
     drop(driver);
+}
+
+async fn exercise_secret_service(
+    route: &d2b_session::AuthenticatedSessionRouteBinding,
+    driver: &d2b_session::SessionDriverHandle,
+) {
+    let client = std::sync::Arc::new(SessionTtrpcClient::new(std::sync::Arc::new(
+        driver.clone(),
+    )));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as u64;
+    let expiry = now.saturating_add(60_000);
+    let request = |operation_id: &str, idempotency_key: &str| {
+        CredentialRequest::new(
+            ResourceRef::parse("Credential/subprocess").expect("credential"),
+            operation_id,
+            idempotency_key,
+            expiry,
+            expiry,
+        )
+        .expect("credential request")
+    };
+    let call = |method: &'static str, request: CredentialRequest| {
+        let client = std::sync::Arc::clone(&client);
+        let route = route.clone();
+        async move {
+            let mut rpc = ttrpc::proto::Request::new();
+            rpc.set_service("d2b.credential.v3.CredentialService".to_owned());
+            rpc.set_method(method.to_owned());
+            rpc.metadata = vec![
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.zone".to_owned(),
+                    value: route.zone().as_str().to_owned(),
+                    ..Default::default()
+                },
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.provider".to_owned(),
+                    value: route
+                        .provider_ref()
+                        .expect("provider")
+                        .to_canonical_string(),
+                    ..Default::default()
+                },
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.uid".to_owned(),
+                    value: "123e4567-e89b-42d3-a456-426614174000".to_owned(),
+                    ..Default::default()
+                },
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.generation".to_owned(),
+                    value: "1".to_owned(),
+                    ..Default::default()
+                },
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.provider-generation".to_owned(),
+                    value: route
+                        .provider_generation()
+                        .expect("provider generation")
+                        .get()
+                        .to_string(),
+                    ..Default::default()
+                },
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.controller-generation".to_owned(),
+                    value: route
+                        .controller_generation()
+                        .expect("controller generation")
+                        .get()
+                        .to_string(),
+                    ..Default::default()
+                },
+                ttrpc::proto::KeyValue {
+                    key: "d2b.credential.session-generation".to_owned(),
+                    value: route.reconnect_generation().get().to_string(),
+                    ..Default::default()
+                },
+            ];
+            rpc.payload = encode_outer(&request).expect("encode credential request");
+            client.client().request(rpc).await.expect("credential response")
+        }
+    };
+    let response = call("AcquireToken", request("subprocess-acquire", "subprocess-acquire"))
+        .await;
+    let acquired: DeliveryResponse = decode_outer(&response.payload).expect("acquire response");
+    assert_eq!(
+        acquired.metadata.state,
+        d2b_contracts_provider::v3::credential::CredentialLeaseState::Active
+    );
+    let response = call(
+        "InspectMetadata",
+        request("subprocess-inspect", "subprocess-inspect"),
+    )
+    .await;
+    let inspected: MetadataResponse = decode_outer(&response.payload).expect("inspect response");
+    assert_eq!(
+        inspected.metadata.state,
+        d2b_contracts_provider::v3::credential::CredentialLeaseState::Active
+    );
+    let response = call("RevokeToken", request("subprocess-revoke", "subprocess-revoke")).await;
+    let revoked: MetadataResponse = decode_outer(&response.payload).expect("revoke response");
+    assert_eq!(
+        revoked.metadata.state,
+        d2b_contracts_provider::v3::credential::CredentialLeaseState::Revoked
+    );
 }
 
 #[test]
@@ -426,6 +540,11 @@ fn guest_backend_round_trip_keeps_response_bytes_zeroizing() {
         responder
             .bind_route(route.clone())
             .expect("bind backend responder route");
+        let response = backend
+            .request("managed-identity.state", serde_json::json!({}))
+            .await
+            .expect("backend state response");
+        assert_eq!(response.state(), Some("ready"));
         let response = backend
             .request(
                 "managed-identity.issue-lease",
@@ -569,45 +688,65 @@ impl GuestCredentialBackendHandler for ScriptedGuestCredentialBackend {
     ) -> GuestCredentialBackendHandlerFuture<'_> {
         let operation = operation.to_owned();
         Box::pin(async move {
-            let response = match operation.as_str() {
-                "managed-identity.issue-lease" => GuestCredentialBackendReply::new(
-                    Some("ready".to_owned()),
-                    Some("backend-lease".to_owned()),
-                    Some("backend-source".to_owned()),
-                    Some(1),
-                    Some(2_000),
-                    None,
-                    Some(zeroize::Zeroizing::new(vec![1, 2, 3, 4])),
-                ),
-                "managed-identity.inspect-lease" => GuestCredentialBackendReply::new(
-                    Some("active".to_owned()),
-                    Some("backend-lease".to_owned()),
-                    Some("backend-source".to_owned()),
-                    Some(1),
-                    Some(2_000),
-                    None,
-                    None,
-                ),
-                "managed-identity.refresh-lease" => GuestCredentialBackendReply::new(
-                    Some("ready".to_owned()),
-                    Some("backend-lease".to_owned()),
-                    Some("backend-source".to_owned()),
-                    Some(2),
-                    Some(3_000),
-                    None,
-                    Some(zeroize::Zeroizing::new(vec![5, 6, 7])),
-                ),
-                "managed-identity.revoke-lease" => GuestCredentialBackendReply::new(
-                    Some("revoked".to_owned()),
-                    Some("backend-lease".to_owned()),
-                    Some("backend-source".to_owned()),
-                    Some(1),
-                    Some(2_000),
-                    Some("revoked".to_owned()),
-                    None,
-                ),
-                _ => return Err(GuestCredentialBackendHandlerError::Denied),
+        const SOURCE_VERSION: &str = "backend-source";
+        let response = if operation.ends_with(".state") {
+            let state = if operation == "secret-service.state" {
+                "unlocked"
+            } else {
+                "ready"
             };
+            GuestCredentialBackendReply::new(
+                Some(state.to_owned()),
+                None,
+                Some(SOURCE_VERSION.to_owned()),
+                Some(1),
+                Some(2_000),
+                None,
+                None,
+            )
+        } else if operation.ends_with(".issue-lease") {
+            GuestCredentialBackendReply::new(
+                Some("ready".to_owned()),
+                Some("backend-lease".to_owned()),
+                Some(SOURCE_VERSION.to_owned()),
+                Some(1),
+                Some(2_000),
+                None,
+                Some(zeroize::Zeroizing::new(vec![1, 2, 3, 4])),
+            )
+        } else if operation.ends_with(".inspect-lease") {
+            GuestCredentialBackendReply::new(
+                Some("active".to_owned()),
+                    Some("backend-lease".to_owned()),
+                Some(SOURCE_VERSION.to_owned()),
+                    Some(1),
+                    Some(2_000),
+                None,
+                    None,
+            )
+        } else if operation.ends_with(".refresh-lease") {
+            GuestCredentialBackendReply::new(
+                Some("ready".to_owned()),
+                Some("backend-lease".to_owned()),
+                Some(SOURCE_VERSION.to_owned()),
+                Some(2),
+                Some(3_000),
+                None,
+                Some(zeroize::Zeroizing::new(vec![5, 6, 7])),
+            )
+        } else if operation.ends_with(".revoke-lease") {
+            GuestCredentialBackendReply::new(
+                Some("revoked".to_owned()),
+                Some("backend-lease".to_owned()),
+                Some(SOURCE_VERSION.to_owned()),
+                Some(1),
+                Some(2_000),
+                Some("revoked".to_owned()),
+                None,
+            )
+        } else {
+            return Err(GuestCredentialBackendHandlerError::Denied);
+        };
         Ok(response)
         })
     }
