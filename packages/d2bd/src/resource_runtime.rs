@@ -1803,6 +1803,103 @@ impl DaemonSharedProviderEffects {
         Ok(stored)
     }
 
+    async fn fresh_audio_dependency(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        context: &SharedProviderEffectContext,
+        target: &ResourceRef,
+        candidate: Option<&DependencySnapshot>,
+    ) -> Result<StoredResource, SharedProviderEffectError> {
+        let authoritative = match runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: context.operation_id.clone(),
+                    idempotency_key: None,
+                    correlation_id: context.operation_id.clone(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+        {
+            Ok(resource) => resource,
+            Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+            Err(_) => return Err(SharedProviderEffectError::Unavailable),
+        };
+        validate_audio_dependency_identity(&authoritative, target, &self.zone)?;
+        self.validate_audio_assignment(runtime, context, &authoritative, false)
+            .await?;
+
+        let Some(candidate) = candidate else {
+            return Ok(authoritative);
+        };
+        let candidate = stored_resource_from_snapshot(candidate.resource());
+        if validate_audio_dependency_identity(&candidate, target, &self.zone).is_ok()
+            && candidate.uid == authoritative.uid
+            && candidate.generation == authoritative.generation
+            && candidate.revision == authoritative.revision
+        {
+            Ok(candidate)
+        } else {
+            Ok(authoritative)
+        }
+    }
+
+    async fn validate_audio_assignment(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        context: &SharedProviderEffectContext,
+        resource: &StoredResource,
+        owner: bool,
+    ) -> Result<(), SharedProviderEffectError> {
+        let Some(assignment) = runtime
+            .store
+            .assignment_fence(self.zone.clone(), resource.resource_ref.clone())
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+        else {
+            return Ok(());
+        };
+        if assignment.resource_uid != resource.uid
+            || assignment.epoch == 0
+            || assignment.provider_generation.get() == 0
+            || assignment.controller_generation.get() == 0
+            || assignment.session_generation.get() == 0
+            || !matches!(assignment.scope, ResourceAssignmentScope::Primary)
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        if owner {
+            let zone_target = ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            if assignment.provider_generation != context.identity.provider_generation()
+                || assignment.controller_generation != context.identity.controller_generation()
+                || assignment.controller_role != *context.identity.controller_ref()
+                || assignment.target != zone_target
+            {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+            let session_generation = runtime
+                .core_controller_subject
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .as_ref()
+                .map(|subject| subject.reconnect_generation())
+                .ok_or(SharedProviderEffectError::Unavailable)?;
+            if assignment.session_generation != session_generation {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+        }
+        Ok(())
+    }
+
     async fn usbip_service_port(
         &self,
         context: &SharedProviderEffectContext,
@@ -5130,6 +5227,9 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         let _ = self.validate(kind, context, resource)?;
         let runtime = self.runtime()?;
         let target = stored_resource_from_snapshot(resource);
+        validate_audio_dependency_identity(&target, resource.key().resource_ref(), &self.zone)?;
+        self.validate_audio_assignment(runtime.as_ref(), context, &target, true)
+            .await?;
         match kind {
             SharedProviderResourceKind::AudioService => {
                 let mut audio = runtime
@@ -5152,10 +5252,35 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                     .map_err(|_| SharedProviderEffectError::InvalidResource)?;
                 let service_ref = resource_ref_at(&value, "/spec/serviceRef")?;
                 let target_ref = resource_ref_at(&value, "/spec/targetRef")?;
-                let service = audio_dependency(dependencies, &service_ref)
-                    .ok_or(SharedProviderEffectError::InvalidResource)?;
-                let guest = audio_dependency(dependencies, &target_ref)
-                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let service = self
+                    .fresh_audio_dependency(
+                        &runtime,
+                        context,
+                        &service_ref,
+                        audio_dependency(dependencies, &service_ref),
+                    )
+                    .await?;
+                let guest = self
+                    .fresh_audio_dependency(
+                        &runtime,
+                        context,
+                        &target_ref,
+                        audio_dependency(dependencies, &target_ref),
+                    )
+                    .await?;
+                let service_value = serde_json::from_slice::<Value>(&service.canonical_json)
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let guest_value = serde_json::from_slice::<Value>(&guest.canonical_json)
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                if resource_phase(&service_value) != Some("Ready")
+                    || resource_phase(&guest_value) != Some("Ready")
+                {
+                    return Ok(SharedProviderEffectResult {
+                        phase: SharedProviderEffectPhase::Pending,
+                        child_mutated: false,
+                        resource_projection: None,
+                    });
+                }
                 let (status, owner) = {
                     let mut audio = runtime
                         .audio_runtime
@@ -7137,14 +7262,43 @@ fn resource_ref_at(value: &Value, path: &str) -> Result<ResourceRef, SharedProvi
         .ok_or(SharedProviderEffectError::InvalidResource)
 }
 
-fn audio_dependency(
-    dependencies: &[DependencySnapshot],
+fn audio_dependency<'a>(
+    dependencies: &'a [DependencySnapshot],
     target: &ResourceRef,
-) -> Option<StoredResource> {
+) -> Option<&'a DependencySnapshot> {
     dependencies
         .iter()
         .find(|dependency| dependency.resource().key().resource_ref() == target)
-        .map(|dependency| stored_resource_from_snapshot(dependency.resource()))
+}
+
+fn validate_audio_dependency_identity(
+    resource: &StoredResource,
+    target: &ResourceRef,
+    zone: &ZoneId,
+) -> Result<(), SharedProviderEffectError> {
+    if resource.zone != *zone
+        || resource.resource_ref != *target
+        || resource.uid.as_str().is_empty()
+        || resource.generation.get() == 0
+        || resource.revision.get() == 0
+    {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    let envelope = ResourceEnvelope::from_json(&resource.canonical_json)
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+    let metadata = envelope.metadata();
+    if metadata.zone() != zone
+        || metadata.uid() != &resource.uid
+        || metadata.generation() != resource.generation
+        || metadata.revision() != resource.revision
+        || envelope
+            .digest()
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?
+            != resource.payload_digest
+    {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    Ok(())
 }
 
 fn map_audio_effect_error(
@@ -20733,6 +20887,254 @@ mod tests {
         assert!(replacement.is_empty());
     }
 
+    #[tokio::test]
+    async fn production_audio_scheduled_observe_rereads_exact_dependencies() {
+        let zone = ZoneId::parse("work").unwrap();
+        let provider_ref = ResourceRef::parse("Provider/audio-pipewire").unwrap();
+        let service_ref =
+            ResourceRef::parse("audio.d2bus.org.AudioService/host-audio").unwrap();
+        let guest_ref = ResourceRef::parse("Guest/audio-vm").unwrap();
+        let binding_ref =
+            ResourceRef::parse("audio.d2bus.org.AudioBinding/guest-audio").unwrap();
+        let bad_binding_ref =
+            ResourceRef::parse("audio.d2bus.org.AudioBinding/bad-audio").unwrap();
+        let missing_service_ref =
+            ResourceRef::parse("audio.d2bus.org.AudioService/missing").unwrap();
+        let service_spec =
+            d2b_provider_audio_pipewire::AudioServiceSpec::projection(zone.as_str()).unwrap();
+        let binding_spec = d2b_provider_audio_pipewire::AudioBindingSpec::new(
+            service_ref.clone(),
+            guest_ref.clone(),
+            zone.as_str(),
+        )
+        .unwrap();
+        let bad_binding_spec = d2b_provider_audio_pipewire::AudioBindingSpec::new(
+            missing_service_ref,
+            guest_ref.clone(),
+            zone.as_str(),
+        )
+        .unwrap();
+        let guest_spec = r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"providerRef":"Provider/audio-pipewire","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#;
+        let (_directory, state, plane, runtime, broker_evidence) =
+            prepare_production_audio_runner_fixture(vec![
+                bundle_resource(
+                    "Provider",
+                    "audio-pipewire",
+                    &zone,
+                    r#"{"artifactId":"audio-pipewire","config":{}}"#,
+                ),
+                bundle_resource("Guest", "audio-vm", &zone, guest_spec),
+                bundle_resource(
+                    "audio.d2bus.org.AudioService",
+                    "host-audio",
+                    &zone,
+                    &serde_json::to_string(&service_spec).unwrap(),
+                ),
+                bundle_resource(
+                    "audio.d2bus.org.AudioBinding",
+                    "guest-audio",
+                    &zone,
+                    &serde_json::to_string(&binding_spec).unwrap(),
+                ),
+                bundle_resource(
+                    "audio.d2bus.org.AudioBinding",
+                    "bad-audio",
+                    &zone,
+                    &serde_json::to_string(&bad_binding_spec).unwrap(),
+                ),
+            ])
+            .await;
+        mark_test_resource_ready(&runtime, &service_ref, &broker_evidence).await;
+        mark_test_resource_ready(&runtime, &guest_ref, &broker_evidence).await;
+
+        let provider = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "u9-audio-provider".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "u9-audio-provider".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: provider_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::MetadataOnly,
+            })
+            .await
+            .unwrap();
+        let binding = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "u9-audio-binding".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "u9-audio-binding".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: binding_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let bad_binding = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "u9-audio-bad-binding".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "u9-audio-bad-binding".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: bad_binding_ref,
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let snapshot = |stored: &StoredResource| {
+            ResourceSnapshot::new(
+                ResourceKey::new(
+                    stored.zone.clone(),
+                    stored.resource_ref.clone(),
+                    stored.uid.clone(),
+                ),
+                stored.revision,
+                stored.generation,
+                stored.canonical_json.clone(),
+                false,
+            )
+        };
+        let controller_ref =
+            ResourceRef::parse("Process/audio-pipewire-controller").unwrap();
+        let identity = ControllerIdentity::new(
+            zone.clone(),
+            controller_ref.clone(),
+            ControllerGeneration::new(1).unwrap(),
+            provider_ref,
+            provider.generation,
+            controller_ref,
+            ResourceRef::parse(CORE_CONTROLLER_HOST_REF).unwrap(),
+            None,
+        )
+        .unwrap();
+        let effects =
+            DaemonSharedProviderEffects::new(Arc::clone(&state), zone.clone());
+        let context = SharedProviderEffectContext {
+            identity: identity.clone(),
+            target: snapshot(&binding).key().clone(),
+            operation_id: "process-observe:u9-audio-binding".to_owned(),
+        };
+
+        let first = effects
+            .observe_result(
+                SharedProviderResourceKind::AudioBinding,
+                &context,
+                &snapshot(&binding),
+            )
+            .await
+            .expect("scheduled observe should read exact dependencies");
+        assert!(first.child_mutated);
+        assert!(first.resource_projection.is_none());
+
+        let stale_uid =
+            ResourceUid::parse("223e4567-e89b-42d3-a456-426614174000").unwrap();
+        let stale_dependency = |stored: &StoredResource| {
+            DependencySnapshot::new(ResourceSnapshot::new(
+                ResourceKey::new(
+                    stored.zone.clone(),
+                    stored.resource_ref.clone(),
+                    stale_uid.clone(),
+                ),
+                stored.revision,
+                stored.generation,
+                stored.canonical_json.clone(),
+                false,
+            ))
+        };
+        let service = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "u9-audio-service".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "u9-audio-service".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: service_ref,
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let guest = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "u9-audio-guest".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "u9-audio-guest".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone,
+                target: guest_ref,
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let repaired = effects
+            .reconcile_audio(
+                SharedProviderResourceKind::AudioBinding,
+                &context,
+                &snapshot(&binding),
+                &[stale_dependency(&service), stale_dependency(&guest)],
+            )
+            .await
+            .expect("stale dependencies should be replaced by authoritative reads");
+        assert!(!repaired.child_mutated);
+        assert!(repaired.resource_projection.is_some());
+
+        let bad_context = SharedProviderEffectContext {
+            identity,
+            target: snapshot(&bad_binding).key().clone(),
+            operation_id: "process-observe:u9-bad-audio-binding".to_owned(),
+        };
+        assert_eq!(
+            effects
+                .observe_result(
+                    SharedProviderResourceKind::AudioBinding,
+                    &bad_context,
+                    &snapshot(&bad_binding),
+                )
+                .await,
+            Err(SharedProviderEffectError::InvalidResource)
+        );
+        let unaffected = effects
+            .observe_result(
+                SharedProviderResourceKind::AudioBinding,
+                &context,
+                &snapshot(&binding),
+            )
+            .await
+            .expect("one invalid binding must not stop its sibling");
+        assert!(!unaffected.child_mutated);
+        assert!(unaffected.resource_projection.is_some());
+
+        drop(effects);
+        drop(runtime);
+        close_production_guest_runtime_fixture(state, plane).await;
+    }
+
     #[test]
     fn every_u6_guest_runtime_descriptor_is_provider_ref_scoped() {
         for registration in U6_SHARED_PROVIDER_RUNNERS {
@@ -23517,6 +23919,88 @@ mod tests {
         plane.insert(runtime).unwrap();
         let plane = crate::install_test_resource_plane(&state, plane);
         let runtime = plane.zone(&zone).unwrap();
+        (directory, state, plane, runtime, broker_evidence)
+    }
+
+    async fn prepare_production_audio_runner_fixture(
+        resources: Vec<BundleResource>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ServerState>,
+        Arc<ResourcePlane>,
+        Arc<ZoneResourceRuntime>,
+        Arc<BrokerEvidenceIndex>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("store.redb");
+        let database = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .unwrap();
+        let zone = ZoneId::parse("work").unwrap();
+        let response_identity = "sha256:".to_owned() + &"a".repeat(64);
+        let identity = store_identity(&zone, &response_identity).unwrap();
+        let broker_evidence = Arc::new(BrokerEvidenceIndex::default());
+        let mut catalog_types = BTreeSet::new();
+        let catalog_resources = resources
+            .iter()
+            .filter(|resource| {
+                resource.resource_type().as_str().contains(".d2bus.org.")
+                    && catalog_types.insert(resource.resource_type().clone())
+            })
+            .cloned()
+            .collect();
+        let initial_bundle = ResourceBundle::new(
+            zone.clone(),
+            catalog_resources,
+            "sha256:".to_owned() + &"a".repeat(64),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Timestamp::parse("1970-01-01T00:00:00.000Z").unwrap(),
+        )
+        .unwrap()
+        .with_zone_uid(identity.zone_uid().clone());
+        let authority = ZoneAuthorityIdentity::from_bundle_and_storage(
+            &zone,
+            &initial_bundle,
+            &publication_storage_row(&zone, &identity),
+        )
+        .unwrap();
+        let runtime = ZoneResourceRuntime::open_internal(
+            zone,
+            OpenedZoneStore {
+                response: OpenZoneStoreResponse {
+                    zone_store_id: d2b_contracts_resource::v3::storage::ZoneStoreId::parse(
+                        "zone-store-work",
+                    )
+                    .unwrap(),
+                    store_identity: response_identity,
+                    disposition: ZoneStoreDisposition::Provisioned,
+                    fd_index: 0,
+                },
+                database_fd: database.into(),
+                external_inventory: None,
+            },
+            None,
+            Arc::clone(&broker_evidence),
+            None,
+            true,
+            Some(initial_bundle),
+            Some(authority),
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(crate::detached_exec_routing_tests::test_state(
+            Default::default(),
+        ));
+        let zone = runtime.zone.clone();
+        let mut plane = ResourcePlane::new();
+        plane.insert(runtime).unwrap();
+        let plane = crate::install_test_resource_plane(&state, plane);
+        let runtime = plane.zone(&zone).unwrap();
+        materialize_test_bundle(&runtime, resources).await;
         (directory, state, plane, runtime, broker_evidence)
     }
 
