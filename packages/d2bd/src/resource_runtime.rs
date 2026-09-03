@@ -20329,6 +20329,11 @@ mod tests {
             .iter()
             .map(|value| Value::String((*value).to_owned()))
             .collect::<Vec<_>>();
+        let spec = if registration.resource_type.starts_with("display-wayland.") {
+            json!({})
+        } else {
+            json!({"providerRef": registration.provider_ref})
+        };
         let body = json!({
             "apiVersion": "resources.d2bus.org/v3",
             "type": registration.resource_type,
@@ -20340,9 +20345,7 @@ mod tests {
                 "revision": 1,
                 "finalizers": finalizers,
             },
-            "spec": {
-                "providerRef": registration.provider_ref,
-            },
+            "spec": spec,
             "status": {
                 "phase": "Pending",
                 "observedGeneration": 0,
@@ -20512,6 +20515,48 @@ mod tests {
             let result = reconciler.execute_finalize_for_test(&deleting).await.unwrap();
             assert!(result.mutation_batch().is_some());
             assert_eq!(effects.finalizes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn u9_runner_enrolls_exact_finalizers_before_effects() {
+        for registration in U9_SHARED_PROVIDER_RUNNERS {
+            let (_, descriptor) = shared_provider_test_descriptor_for(registration);
+            let kind = SharedProviderResourceKind::from_registration(registration).unwrap();
+            let reconciler = SharedProviderResourceReconciler::new(
+                descriptor,
+                kind,
+                Arc::new(UnavailableSharedProviderEffects),
+            );
+            let result = reconciler
+                .first_pass_for_test(&shared_provider_test_resource_for(
+                    registration,
+                    &[],
+                    false,
+                ))
+                .expect("U9 first pass");
+            if registration.finalizer.is_empty() {
+                assert!(result.mutation_batch().is_none());
+                assert_eq!(result.disposition(), ReconcileDisposition::Pending);
+            } else {
+                let mutation = result
+                    .mutation_batch()
+                    .expect("U9 finalizer mutation")
+                    .mutations()
+                    .first()
+                    .expect("U9 finalizer");
+                assert_eq!(
+                    mutation.kind(),
+                    d2b_core_controller::MutationIntentKind::UpdateFinalizers
+                );
+                let value: Value =
+                    serde_json::from_slice(mutation.canonical_resource().unwrap())
+                        .expect("U9 finalizer candidate");
+                assert_eq!(
+                    value["metadata"]["finalizers"],
+                    serde_json::json!([registration.finalizer])
+                );
+            }
         }
     }
 

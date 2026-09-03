@@ -3020,12 +3020,6 @@ where
         }
         });
         let bytes = serde_json::to_vec(&payload).map_err(|_| WorkerEffectError::LaunchRejected)?;
-        ResourceEnvelope::from_json(
-            &CanonicalJsonValue::parse(&bytes)
-                .map_err(|_| WorkerEffectError::LaunchRejected)?
-                .to_canonical_bytes(),
-        )
-        .map_err(|_| WorkerEffectError::LaunchRejected)?;
         Ok(CanonicalJsonValue::parse(&bytes)
             .map_err(|_| WorkerEffectError::LaunchRejected)?
             .to_canonical_bytes())
@@ -6506,6 +6500,68 @@ mod tests {
             durable_display_suffix(&owner_uid, DisplayProcessRole::GuestFrontend)
         );
         assert_ne!(host, guest);
+    }
+
+    #[test]
+    fn display_runner_child_intents_keep_stream_authority_out_of_resources() {
+        let zone = ZoneId::parse("work").expect("zone");
+        let session_ref =
+            ResourceRef::parse("display-wayland.d2bus.org.WaylandSession/display-wayland")
+                .expect("session ref");
+        let session_uid =
+            ResourceUid::parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").expect("session uid");
+        let spec = WaylandSessionSpec::new(
+            ResourceRef::parse("Guest/work").expect("guest"),
+            ResourceRef::parse("Host/host-system").expect("host"),
+            ResourceRef::parse("User/alice").expect("user"),
+            ResourceRef::parse("display-wayland.d2bus.org.WaylandPolicy/default")
+                .expect("policy"),
+            d2b_provider_display_wayland::DisplayIdentity::new(
+                "work",
+                "#112233",
+                "#223344",
+                "#334455",
+            )
+            .expect("identity"),
+            true,
+        )
+        .expect("session spec");
+        let intents = display_owned_child_intents(
+            &zone,
+            &session_ref,
+            &session_uid,
+            &spec,
+            4,
+            3,
+        );
+        let intents = intents.expect("display child intents");
+        assert_eq!(intents.len(), 4);
+        assert_eq!(
+            intents
+                .iter()
+                .filter(|intent| intent.target().resource_type().as_str() == "Process")
+                .count(),
+            2
+        );
+        assert_eq!(
+            intents
+                .iter()
+                .filter(|intent| intent.target().resource_type().as_str() == "Endpoint")
+                .count(),
+            2
+        );
+        for intent in intents {
+            let value: serde_json::Value =
+                serde_json::from_slice(intent.canonical_resource()).expect("child resource");
+            assert_eq!(
+                value["metadata"]["ownerRef"],
+                session_ref.to_canonical_string()
+            );
+            assert!(
+                !value.to_string().contains("WAYLAND_DISPLAY")
+                    && !value.to_string().contains("NIRI_SOCKET")
+            );
+        }
     }
 
     #[test]
