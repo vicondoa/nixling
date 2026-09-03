@@ -5960,7 +5960,7 @@ fn resource_get_request(
     request
 }
 
-fn wayland_session_resource_projection(
+pub(crate) fn wayland_session_resource_projection(
     resource: &WaylandSessionResourceStatus,
 ) -> serde_json::Value {
     let mut projection = serde_json::Map::new();

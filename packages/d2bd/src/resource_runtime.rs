@@ -693,6 +693,7 @@ pub(crate) enum SharedProviderEffectPhase {
 pub(crate) struct SharedProviderEffectResult {
     pub(crate) phase: SharedProviderEffectPhase,
     pub(crate) child_mutated: bool,
+    pub(crate) resource_projection: Option<Value>,
 }
 
 impl SharedProviderEffectResult {
@@ -700,6 +701,7 @@ impl SharedProviderEffectResult {
         Self {
             phase,
             child_mutated: false,
+            resource_projection: None,
         }
     }
 }
@@ -3546,6 +3548,7 @@ impl DaemonSharedProviderEffects {
                         SharedProviderEffectPhase::Pending
                     },
                     child_mutated,
+                    resource_projection: None,
                 })
             }
             SharedProviderResourceKind::AzureContainerAppsGuest => {
@@ -3566,6 +3569,7 @@ impl DaemonSharedProviderEffects {
                         SharedProviderEffectPhase::Pending
                     },
                     child_mutated,
+                    resource_projection: None,
                 })
             }
             SharedProviderResourceKind::AzureVirtualMachineGuest => {
@@ -3587,6 +3591,7 @@ impl DaemonSharedProviderEffects {
                         SharedProviderEffectPhase::Pending
                     },
                     child_mutated,
+                    resource_projection: None,
                 })
             }
             _ => Err(SharedProviderEffectError::InvalidResource),
@@ -4960,6 +4965,7 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             return Ok(SharedProviderEffectResult {
                 phase: SharedProviderEffectPhase::Ready,
                 child_mutated: false,
+                resource_projection: None,
             });
         }
 
@@ -5003,6 +5009,7 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                 return Ok(SharedProviderEffectResult {
                     phase: SharedProviderEffectPhase::Pending,
                     child_mutated: false,
+                    resource_projection: None,
                 });
             }
         }
@@ -5036,6 +5043,7 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             return Ok(SharedProviderEffectResult {
                 phase: SharedProviderEffectPhase::Pending,
                 child_mutated: true,
+                resource_projection: None,
             });
         }
         let children = crate::binding_child_resource_runtime::list_binding_children(
@@ -5053,6 +5061,7 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                 SharedProviderEffectPhase::Pending
             },
             child_mutated: false,
+            resource_projection: Some(display_resource_projection(&owner, &children)),
         })
     }
 
@@ -5095,6 +5104,7 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         Ok(SharedProviderEffectResult {
             phase,
             child_mutated: kind == SharedProviderResourceKind::AudioBinding,
+            resource_projection: None,
         })
     }
 
@@ -5128,6 +5138,7 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                 Ok(SharedProviderEffectResult {
                     phase,
                     child_mutated: false,
+                    resource_projection: None,
                 })
             }
             SharedProviderResourceKind::ShellSession => {
@@ -5140,6 +5151,7 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                     return Ok(SharedProviderEffectResult {
                         phase: SharedProviderEffectPhase::Pending,
                         child_mutated: false,
+                        resource_projection: None,
                     });
                 }
                 let (execution_ref, user_ref) = shell_execution(&value)?;
@@ -5196,6 +5208,7 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                     return Ok(SharedProviderEffectResult {
                         phase: SharedProviderEffectPhase::Pending,
                         child_mutated: true,
+                        resource_projection: None,
                     });
                 }
                 let children = crate::binding_child_resource_runtime::list_binding_children(
@@ -5213,6 +5226,7 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                         SharedProviderEffectPhase::Pending
                     },
                     child_mutated: false,
+                    resource_projection: None,
                 })
             }
             _ => Err(SharedProviderEffectError::InvalidResource),
@@ -6735,10 +6749,10 @@ impl SharedProviderResourceReconciler {
             .map_err(|_| SharedProviderReconcileError::InvalidResource)
     }
 
-    fn status_candidate_for_phase(
+    fn status_candidate_for_result(
         &self,
         resource: &ResourceSnapshot,
-        phase: SharedProviderEffectPhase,
+        result: &SharedProviderEffectResult,
     ) -> Result<Option<Vec<u8>>, SharedProviderReconcileError> {
         if self.kind == SharedProviderResourceKind::CloudHypervisorGuest {
             // The live CH controller owns its layered Guest status. Do not
@@ -6756,7 +6770,7 @@ impl SharedProviderResourceReconciler {
                 .ok_or(SharedProviderReconcileError::InvalidResource)?;
             status.insert(
                 "phase".to_owned(),
-                Value::String(match phase {
+                Value::String(match result.phase {
                     SharedProviderEffectPhase::Ready => "Ready",
                     SharedProviderEffectPhase::Pending => "Pending",
                 }
@@ -6767,11 +6781,20 @@ impl SharedProviderResourceReconciler {
                 SharedProviderResourceKind::QemuMediaGuest
                     | SharedProviderResourceKind::AzureContainerAppsGuest
                     | SharedProviderResourceKind::AzureVirtualMachineGuest
+                    | SharedProviderResourceKind::DisplayWaylandPolicy
+                    | SharedProviderResourceKind::DisplayWaylandSession
+                    | SharedProviderResourceKind::AudioService
+                    | SharedProviderResourceKind::AudioBinding
+                    | SharedProviderResourceKind::ShellPool
+                    | SharedProviderResourceKind::ShellSession
             ) {
                 status.insert(
                     "observedGeneration".to_owned(),
                     Value::from(resource.generation().get()),
                 );
+            }
+            if let Some(projection) = &result.resource_projection {
+                status.insert("resource".to_owned(), projection.clone());
             }
             serde_json::to_vec(status)
                 .map(Some)
@@ -6917,6 +6940,51 @@ fn stored_resource_from_snapshot(resource: &ResourceSnapshot) -> StoredResource 
             resource.canonical_json(),
         ),
     }
+}
+
+fn display_resource_projection(
+    owner: &crate::binding_child_resource_runtime::OwnedChildOwner,
+    children: &[StoredResource],
+) -> Value {
+    let child = |resource_type: &str| {
+        owner
+            .desired
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .find(|intent| intent.target().resource_type().as_str() == resource_type)
+            .and_then(|intent| {
+                children.iter().find(|candidate| {
+                    candidate.resource_ref == *intent.target()
+                        && ResourceEnvelope::from_json(&candidate.canonical_json)
+                            .ok()
+                            .and_then(|envelope| envelope.metadata().owner_ref().cloned())
+                            == Some(owner.resource.resource_ref.clone())
+                        && !value_deletion_requested(
+                            &serde_json::from_slice::<Value>(&candidate.canonical_json)
+                                .unwrap_or_default(),
+                        )
+                })
+            })
+    };
+    let process_refs = owner
+        .desired
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter(|intent| intent.target().resource_type().as_str() == "Process")
+        .map(|intent| intent.target().to_canonical_string())
+        .collect::<Vec<_>>();
+    let endpoint_ref = child("Endpoint").map(|resource| resource.resource_ref.clone());
+    let endpoint_generation = child("Endpoint").map(|resource| resource.generation.get());
+    let resource = d2b_provider_display_wayland::WaylandSessionResourceStatus {
+        proxy_process_ref: process_refs.first().and_then(|reference| ResourceRef::parse(reference).ok()),
+        guest_frontend_process_ref: process_refs.get(1).and_then(|reference| ResourceRef::parse(reference).ok()),
+        wayland_endpoint_ref: endpoint_ref,
+        wayland_endpoint_generation: endpoint_generation,
+        policy_digest: String::new(),
+    };
+    crate::interaction_composition::wayland_session_resource_projection(&resource)
 }
 
 fn resource_phase(value: &Value) -> Option<&str> {
@@ -7294,7 +7362,7 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             .await
             .map_err(SharedProviderReconcileError::Effect)?;
         let status = (!result.child_mutated)
-            .then(|| self.status_candidate_for_phase(resource, result.phase))
+            .then(|| self.status_candidate_for_result(resource, &result))
             .transpose()?
             .flatten();
         let (disposition, next_tick) = if self.kind.resource_type() == "Guest"
@@ -7365,7 +7433,7 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             .await
             .map_err(SharedProviderReconcileError::Effect)?;
         let status = (!result.child_mutated)
-            .then(|| self.status_candidate_for_phase(resource, result.phase))
+            .then(|| self.status_candidate_for_result(resource, &result))
             .transpose()?
             .flatten();
         let (disposition, next_tick) = if self.kind.resource_type() == "Guest"
@@ -7577,7 +7645,7 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             .await
             .map_err(SharedProviderReconcileError::Effect)?;
         let status = (!result.child_mutated)
-            .then(|| self.status_candidate_for_phase(resource, result.phase))
+            .then(|| self.status_candidate_for_result(resource, &result))
             .transpose()?
             .flatten();
         let (disposition, next_tick) = if self.kind.resource_type() == "Guest"
@@ -14662,9 +14730,8 @@ impl ZoneResourceRuntime {
         reconcile_binding_children(&self.store, &client, &self.zone, &child_owners)
             .await
             .map_err(|_| ResourceRuntimeError::CapabilityUnavailable)?;
-        // Finalizer mutations advance the parent revision. Relist the
-        // authoritative Binding rows before status writes so their exact
-        // UID/revision preconditions remain current on startup.
+        // Relist authoritative Binding rows before status writes so their
+        // exact UID/revision preconditions remain current.
         let binding_resources = list_audio_resources(
             &self.store,
             &self.zone,
@@ -14682,18 +14749,37 @@ impl ZoneResourceRuntime {
                 .iter()
                 .find(|resource| resource.resource_ref == status.resource)
             else {
-                return Err(ResourceRuntimeError::StoreReadFailed);
+                continue;
             };
-            let projection =
-                audio_binding_status_projection_with_status(resource, &children, &status.status)
-                    .map_err(map_audio_runtime_error)?;
-            persist_resource_status_with_projection(
+            let projection = match audio_binding_status_projection_with_status(
+                resource,
+                &children,
+                &status.status,
+            ) {
+                Ok(projection) => projection,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        resource = %status.resource,
+                        "audio status projection construction failed"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = persist_resource_status_with_projection(
                 &client,
                 resource,
                 &audio_binding_status_value(status.status),
                 Some(&projection),
             )
-            .await?;
+            .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    resource = %status.resource,
+                    "audio status projection persistence failed"
+                );
+            }
         }
         Ok(())
     }
