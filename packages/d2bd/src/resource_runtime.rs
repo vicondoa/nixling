@@ -689,7 +689,7 @@ pub(crate) enum SharedProviderEffectPhase {
     Pending,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SharedProviderEffectResult {
     pub(crate) phase: SharedProviderEffectPhase,
     pub(crate) child_mutated: bool,
@@ -4963,6 +4963,32 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             return Err(SharedProviderEffectError::InvalidResource);
         }
         let runtime = self.runtime()?;
+        if let Some(identity) = runtime.interaction_identity.as_ref()
+            && (identity.wayland_session_ref() != resource.key().resource_ref()
+                || identity.wayland_session_uid() != resource.key().uid()
+                || identity.subject_ref() != spec.guest_ref()
+                || identity.host_execution_ref() != spec.host_ref()
+                || identity.user_ref() != spec.user_ref())
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        for dependency_ref in [
+            spec.guest_ref(),
+            spec.host_ref(),
+            spec.user_ref(),
+            spec.policy_ref(),
+        ] {
+            let dependency = runtime
+                .committed_resource_value(dependency_ref, &context.operation_id)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            if resource_phase(&dependency) != Some("Ready") {
+                return Ok(SharedProviderEffectResult {
+                    phase: SharedProviderEffectPhase::Pending,
+                    child_mutated: false,
+                });
+            }
+        }
         let client = runtime
             .process_resource_client()
             .ok_or(SharedProviderEffectError::Unavailable)?;
@@ -5066,9 +5092,24 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         let runtime = self.runtime()?;
         match kind {
             SharedProviderResourceKind::ShellPool => {
-                shell_pool_spec(&value)?;
+                let (execution_ref, user_ref) = shell_pool_spec(&value)?;
+                let target = runtime
+                    .committed_resource_value(&execution_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let user = runtime
+                    .committed_resource_value(&user_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let phase = if resource_phase(&target) == Some("Ready")
+                    && resource_phase(&user) == Some("Ready")
+                {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                };
                 Ok(SharedProviderEffectResult {
-                    phase: SharedProviderEffectPhase::Ready,
+                    phase,
                     child_mutated: false,
                 })
             }
@@ -5085,6 +5126,12 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                     });
                 }
                 let (execution_ref, user_ref) = shell_execution(&value)?;
+                let user_ref = user_ref.ok_or(SharedProviderEffectError::InvalidResource)?;
+                if resource_ref_at(&pool, "/spec/executionRef")? != execution_ref
+                    || resource_ref_at(&pool, "/spec/userRef")? != user_ref
+                {
+                    return Err(SharedProviderEffectError::InvalidResource);
+                }
                 let process_name = format!(
                     "Process/shell-session-{}",
                     resource.key().resource_ref().name().as_str()
@@ -5097,8 +5144,8 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
                 let process_spec = json!({
                     "providerRef": "Provider/system-systemd",
                     "executionRef": execution_ref.to_canonical_string(),
-                    "domain": if user_ref.is_some() { "user" } else { "system" },
-                    "userRef": user_ref.as_ref().map(ResourceRef::to_canonical_string),
+                    "domain": "user",
+                    "userRef": user_ref.to_canonical_string(),
                     "processClass": "service",
                     "template": "shell-supervisor-main",
                     "desiredLifecycle": "running",
@@ -6873,7 +6920,9 @@ fn resource_ref_at(value: &Value, path: &str) -> Result<ResourceRef, SharedProvi
         .ok_or(SharedProviderEffectError::InvalidResource)
 }
 
-fn shell_pool_spec(value: &Value) -> Result<(), SharedProviderEffectError> {
+fn shell_pool_spec(
+    value: &Value,
+) -> Result<(ResourceRef, ResourceRef), SharedProviderEffectError> {
     if value.pointer("/spec/providerRef").and_then(Value::as_str)
         != Some("Provider/shell-terminal")
     {
@@ -6886,7 +6935,8 @@ fn shell_pool_spec(value: &Value) -> Result<(), SharedProviderEffectError> {
     ) {
         return Err(SharedProviderEffectError::InvalidResource);
     }
-    if resource_ref_at(value, "/spec/userRef")?.resource_type().as_str() != "User"
+    let user_ref = resource_ref_at(value, "/spec/userRef")?;
+    if user_ref.resource_type().as_str() != "User"
         || value
             .pointer("/spec/loginShellRef")
             .and_then(Value::as_str)
@@ -6894,7 +6944,7 @@ fn shell_pool_spec(value: &Value) -> Result<(), SharedProviderEffectError> {
     {
         return Err(SharedProviderEffectError::InvalidResource);
     }
-    Ok(())
+    Ok((execution_ref, user_ref))
 }
 
 fn shell_execution(
