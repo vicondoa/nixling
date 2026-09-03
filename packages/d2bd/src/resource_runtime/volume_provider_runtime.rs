@@ -68,8 +68,6 @@ pub struct SharedVolumeRunnerRegistration {
     pub finalizer: &'static str,
     /// Bounded repair interval in seconds.
     pub repair_interval_secs: u64,
-    /// Legacy scheduler/watch is disabled.
-    pub legacy_scheduler_disabled: bool,
     /// Watched configuration is dependency-only.
     pub watched_configuration_is_dependency: bool,
 }
@@ -82,7 +80,6 @@ pub const U7_SHARED_PROVIDER_RUNNERS: [SharedVolumeRunnerRegistration; 2] = [
         resource_type: "Volume",
         finalizer: d2b_provider_volume_local::VOLUME_FINALIZER,
         repair_interval_secs: d2b_provider_local_contract().repair_interval_secs,
-        legacy_scheduler_disabled: d2b_provider_local_contract().legacy_scheduler_disabled,
         watched_configuration_is_dependency: d2b_provider_local_contract()
             .watched_configuration_is_dependency,
     },
@@ -92,7 +89,6 @@ pub const U7_SHARED_PROVIDER_RUNNERS: [SharedVolumeRunnerRegistration; 2] = [
         resource_type: d2b_provider_volume_virtiofs::EXPORT_RESOURCE_TYPE,
         finalizer: d2b_provider_volume_virtiofs::EXPORT_FINALIZER,
         repair_interval_secs: d2b_provider_virtiofs_contract().repair_interval_secs,
-        legacy_scheduler_disabled: d2b_provider_virtiofs_contract().legacy_scheduler_disabled,
         watched_configuration_is_dependency: d2b_provider_virtiofs_contract()
             .watched_configuration_is_dependency,
     },
@@ -118,8 +114,7 @@ pub fn compose_shared_volume_runner_descriptors(
     registrations
         .into_iter()
         .map(|registration| {
-            if !registration.legacy_scheduler_disabled
-                || !registration.watched_configuration_is_dependency
+            if !registration.watched_configuration_is_dependency
                 || !(30..=60).contains(&registration.repair_interval_secs)
             {
                 return Err(super::ResourceRuntimeError::HandlerNotReady);

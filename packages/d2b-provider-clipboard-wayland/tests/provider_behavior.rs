@@ -127,6 +127,5 @@ fn clipboard_component_contract_disables_legacy_scheduling_without_resource_auth
     assert_eq!(contract.service_package(), "d2b.clipboard.v3");
     assert_eq!(contract.repair_interval_secs(), 300);
     assert!(contract.component_session_only());
-    assert!(contract.legacy_scheduler_disabled());
     assert!(contract.watched_configuration_is_dependency());
 }

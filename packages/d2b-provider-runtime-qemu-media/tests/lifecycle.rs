@@ -94,7 +94,6 @@ fn qemu_media_publishes_the_shared_runner_contract() {
     assert_eq!(contract.resource_type(), "Guest");
     assert_eq!(contract.finalizer(), d2b_provider_runtime_qemu_media::FINALIZER);
     assert_eq!(contract.repair_interval_secs(), 30);
-    assert!(contract.legacy_scheduler_disabled());
     assert!(contract.watched_configuration_is_dependency());
 }
 

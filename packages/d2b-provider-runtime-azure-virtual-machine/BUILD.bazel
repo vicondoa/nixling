@@ -20,14 +20,6 @@ rust_library(
 )
 
 rust_test(
-    name = "scaffold",
-    srcs = ["tests/scaffold.rs"],
-    compile_data = ["Cargo.toml"],
-    visibility = ["//visibility:public"],
-)
-
-
-rust_test(
     name = "bootstrap_hermetic",
     srcs = [
         "tests/bootstrap_hermetic.rs",

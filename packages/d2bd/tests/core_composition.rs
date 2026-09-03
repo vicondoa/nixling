@@ -358,8 +358,6 @@ fn u9_component_contracts_keep_clipboard_and_notifications_on_typed_sessions() {
     let notification = d2b_provider_notification_desktop::notification_runner_contract();
     assert!(clipboard.component_session_only());
     assert!(notification.component_session_only());
-    assert!(clipboard.legacy_scheduler_disabled());
-    assert!(notification.legacy_scheduler_disabled());
     assert_eq!(clipboard.repair_interval_secs(), 300);
     assert_eq!(notification.repair_interval_secs(), 300);
     assert!(

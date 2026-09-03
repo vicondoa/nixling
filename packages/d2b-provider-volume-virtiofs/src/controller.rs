@@ -21,8 +21,6 @@ pub struct VirtiofsRunnerContract {
     pub finalizer: &'static str,
     /// Bounded repair interval in seconds.
     pub repair_interval_secs: u64,
-    /// Whether legacy scheduling is disabled.
-    pub legacy_scheduler_disabled: bool,
     /// Whether configuration is dependency-only.
     pub watched_configuration_is_dependency: bool,
 }
@@ -33,7 +31,6 @@ pub const fn virtiofs_runner_contract() -> VirtiofsRunnerContract {
         resource_type: EXPORT_RESOURCE_TYPE,
         finalizer: EXPORT_FINALIZER,
         repair_interval_secs: 30,
-        legacy_scheduler_disabled: true,
         watched_configuration_is_dependency: true,
     }
 }

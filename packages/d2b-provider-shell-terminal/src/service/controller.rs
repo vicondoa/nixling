@@ -27,7 +27,6 @@ pub struct ShellRunnerContract {
     pool_finalizer: &'static str,
     session_finalizer: &'static str,
     repair_interval_secs: u64,
-    legacy_scheduler_disabled: bool,
     watched_configuration_is_dependency: bool,
 }
 
@@ -58,9 +57,6 @@ impl ShellRunnerContract {
     }
 
     /// Whether legacy shell scheduling is disabled.
-    pub const fn legacy_scheduler_disabled(self) -> bool {
-        self.legacy_scheduler_disabled
-    }
 
     /// Whether watched configuration is dependency-only.
     pub const fn watched_configuration_is_dependency(self) -> bool {
@@ -76,7 +72,6 @@ pub const fn shell_runner_contract() -> ShellRunnerContract {
         pool_finalizer: SHELL_POOL_FINALIZER,
         session_finalizer: SHELL_SESSION_FINALIZER,
         repair_interval_secs: SHELL_REPAIR_INTERVAL_SECS,
-        legacy_scheduler_disabled: true,
         watched_configuration_is_dependency: true,
     }
 }

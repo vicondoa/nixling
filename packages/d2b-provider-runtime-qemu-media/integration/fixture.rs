@@ -1,4 +1,4 @@
-//! integration-target: container
+//! Fake-host integration fixture.
 
 use d2b_provider_runtime_qemu_media::{
     GuestProviderSpecSettings, ProcessSpec, RuntimeVolumeSpec, build_guest_resource_spec,

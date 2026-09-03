@@ -25,7 +25,6 @@ pub struct UsbipRunnerContract {
     service_resource_type: &'static str,
     binding_resource_type: &'static str,
     repair_interval_secs: u64,
-    legacy_scheduler_disabled: bool,
     watched_configuration_is_dependency: bool,
 }
 
@@ -45,11 +44,6 @@ impl UsbipRunnerContract {
         self.repair_interval_secs
     }
 
-    /// Whether legacy USBIP scheduling is disabled.
-    pub const fn legacy_scheduler_disabled(self) -> bool {
-        self.legacy_scheduler_disabled
-    }
-
     /// Whether watched configuration is treated as a dependency.
     pub const fn watched_configuration_is_dependency(self) -> bool {
         self.watched_configuration_is_dependency
@@ -62,7 +56,6 @@ pub const fn usbip_runner_contract() -> UsbipRunnerContract {
         service_resource_type: crate::USB_SERVICE_RESOURCE_TYPE,
         binding_resource_type: crate::USB_BINDING_RESOURCE_TYPE,
         repair_interval_secs: USBIP_REPAIR_INTERVAL_SECS,
-        legacy_scheduler_disabled: true,
         watched_configuration_is_dependency: true,
     }
 }

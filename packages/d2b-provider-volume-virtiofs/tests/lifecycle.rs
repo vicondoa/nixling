@@ -314,6 +314,5 @@ fn resource_export_spec_and_children_keep_one_qualified_owner() {
     let contract = virtiofs_runner_contract();
     assert_eq!(contract.resource_type, EXPORT_RESOURCE_TYPE);
     assert_eq!(contract.finalizer, EXPORT_FINALIZER);
-    assert!(contract.legacy_scheduler_disabled);
     assert!(contract.watched_configuration_is_dependency);
 }

@@ -36,7 +36,7 @@ use d2b_core_controller::{
 };
 use d2b_process_conformance::{AdoptionCandidate, GuestExecutionBinding};
 use d2b_resource_api::{
-    RedbBackend, ResourceApiClient, ResourceStoreBackend,
+    ResourceApiClient, ResourceStoreBackend,
     service::{UnavailableUpgradeDispatcher, UpgradeDispatcher},
     watch::ResourceWatch,
 };
@@ -64,10 +64,6 @@ const SYSTEMD_PROVIDER: &str = "system-systemd";
 const PROCESS_RUNTIME_FINALIZER: &str = "process-runtime.d2bus.org/cleanup";
 const MINIJAIL_PROCESS_FINALIZER: &str = "process.system-minijail/cleanup";
 const SYSTEMD_PROCESS_FINALIZER: &str = "process.system-systemd/cleanup";
-#[allow(dead_code)]
-const WAYLAND_SESSION_TYPE: &str = "display-wayland.d2bus.org.WaylandSession";
-#[allow(dead_code)]
-const WAYLAND_SESSION_FINALIZER: &str = "display-wayland.d2bus.org/proxy-stopped";
 pub(crate) const PROCESS_RESTART_ANNOTATION: &str = "d2b.d2bus.org/restart-generation";
 const GUEST_RUNTIME_PROCESS_TEMPLATES: &[(&str, &str)] = &[
     ("cloud-hypervisor-runner", "-vmm"),
@@ -541,15 +537,15 @@ impl ProcessResourceRuntime {
         )
     }
 
-    /// Reconcile a complete durable Process/EphemeralProcess snapshot.
+    /// Reconcile the fresh Process/EphemeralProcess targets for this pass.
     pub(crate) async fn reconcile(
         &mut self,
-        snapshot: Vec<StoredResource>,
+        resources: Vec<StoredResource>,
     ) -> Result<(), ProcessResourceRuntimeError> {
-        let mut desired = decode_snapshot(
+        let mut desired = decode_resources(
             &self.zone,
             self.target.as_ref(),
-            snapshot,
+            resources,
             self.providers.mode(),
         )?;
         let provider_assignment_generation = self
@@ -3152,7 +3148,7 @@ fn deletion_adoption(
     }
 }
 
-fn decode_snapshot(
+fn decode_resources(
     zone: &ZoneId,
     target: Option<&ResourceRef>,
     resources: Vec<StoredResource>,
@@ -3256,8 +3252,8 @@ fn restart_annotation(resource: &StoredResource) -> Option<String> {
     }
 }
 
-/// Build the generic Process relist request.
-pub(crate) fn process_list_request(zone: &ZoneId) -> StoreListRequest {
+/// Build the generic Process resource list request.
+pub(crate) fn process_resource_list_request(zone: &ZoneId) -> StoreListRequest {
     StoreListRequest {
         operation: StoreOperationContext {
             operation_id: "process-resource-reconcile".to_owned(),
@@ -3279,12 +3275,12 @@ pub(crate) fn process_list_request(zone: &ZoneId) -> StoreListRequest {
     }
 }
 
-/// Relist all generic Process resources, preserving snapshot pagination.
-pub(crate) async fn list_process_snapshot(
+/// Relist generic Process resources from the authoritative Zone store.
+pub(crate) async fn list_process_resources(
     store: &RedbResourceStore,
     zone: &ZoneId,
 ) -> Result<Vec<StoredResource>, ProcessResourceRuntimeError> {
-    let mut request = process_list_request(zone);
+    let mut request = process_resource_list_request(zone);
     let mut resources = Vec::new();
     loop {
         let result = store
@@ -3301,14 +3297,13 @@ pub(crate) async fn list_process_snapshot(
 }
 
 /// Relist generic Process resources through a session-bound Resource API
-/// backend. This mirrors the concrete Zone-store helper while preserving the
-/// backend's reconnect fence.
+/// backend while preserving the backend's reconnect fence.
 #[allow(dead_code)]
-pub(crate) async fn list_process_snapshot_backend<S: ResourceStoreBackend>(
+pub(crate) async fn list_process_resources_backend<S: ResourceStoreBackend>(
     store: &S,
     zone: &ZoneId,
 ) -> Result<Vec<StoredResource>, ProcessResourceRuntimeError> {
-    let mut request = process_list_request(zone);
+    let mut request = process_resource_list_request(zone);
     let mut resources = Vec::new();
     loop {
         let result = store
@@ -3322,316 +3317,6 @@ pub(crate) async fn list_process_snapshot_backend<S: ResourceStoreBackend>(
         request.cursor = Some(cursor);
     }
     Ok(resources)
-}
-
-/// Drain a deleted WaylandSession through its durable Process and Endpoint
-/// children before releasing the session finalizer.
-#[allow(dead_code)]
-pub(crate) async fn reconcile_wayland_session_deletion(
-    client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
-    store: &RedbResourceStore,
-    zone: &ZoneId,
-    session_ref: &ResourceRef,
-) -> Result<(), ProcessResourceRuntimeError> {
-    for _ in 0..8 {
-        let session = match store
-            .get(StoreGetRequest {
-                operation: cleanup_operation("wayland-session-get", session_ref, 0),
-                zone: zone.clone(),
-                target: session_ref.clone(),
-                expected_uid: None,
-                projection: StoreProjection::Full,
-            })
-            .await
-        {
-            Ok(resource) => resource,
-            Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => return Ok(()),
-            Err(_) => return Err(ProcessResourceRuntimeError::Store),
-        };
-        if session.resource_ref.resource_type().as_str() != WAYLAND_SESSION_TYPE
-            || !metadata_deletion_requested(&session)
-        {
-            return Ok(());
-        }
-
-        let children = list_cleanup_children(store, zone).await?;
-        let owned_processes = children
-            .iter()
-            .filter(|resource| {
-                resource.resource_ref.resource_type().as_str() == PROCESS_TYPE
-                    && metadata_owner_ref(resource).as_ref() == Some(session_ref)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let owned_endpoints = children
-            .iter()
-            .filter(|resource| {
-                resource.resource_ref.resource_type().as_str() == "Endpoint"
-                    && metadata_owner_ref(resource).as_ref() == Some(session_ref)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut changed = false;
-
-        for process in &owned_processes {
-            if !metadata_deletion_requested(process) {
-                changed |=
-                    request_cleanup_delete(client, process, "wayland-child-process-delete").await;
-            } else if matches!(
-                status_phase(process),
-                Some(ResourcePhase::Succeeded | ResourcePhase::Failed | ResourcePhase::Deleted)
-            ) && !owned_endpoints.iter().any(|endpoint| {
-                endpoint_producer_ref(endpoint).as_ref() == Some(&process.resource_ref)
-            }) {
-                changed |=
-                    request_cleanup_delete(client, process, "wayland-child-process-drain").await;
-            }
-        }
-
-        for endpoint in &owned_endpoints {
-            let producer = endpoint_producer_ref(endpoint);
-            let producer_terminal = producer.as_ref().is_none_or(|producer| {
-                owned_processes
-                    .iter()
-                    .find(|process| &process.resource_ref == producer)
-                    .is_none_or(|process| {
-                        matches!(
-                            status_phase(process),
-                            Some(
-                                ResourcePhase::Succeeded
-                                    | ResourcePhase::Failed
-                                    | ResourcePhase::Deleted
-                            )
-                        )
-                    })
-            });
-            if producer_terminal && !metadata_deletion_requested(endpoint) {
-                changed |=
-                    request_cleanup_delete(client, endpoint, "wayland-child-endpoint-delete").await;
-            } else if producer_terminal && metadata_deletion_requested(endpoint) {
-                changed |=
-                    request_cleanup_delete(client, endpoint, "wayland-child-endpoint-drain").await;
-            }
-        }
-
-        let refreshed_children = list_cleanup_children(store, zone).await?;
-        let remaining = refreshed_children.iter().any(|resource| {
-            matches!(
-                resource.resource_ref.resource_type().as_str(),
-                PROCESS_TYPE | "Endpoint"
-            ) && metadata_owner_ref(resource).as_ref() == Some(session_ref)
-        });
-        if !remaining {
-            let current = store
-                .get(StoreGetRequest {
-                    operation: cleanup_operation("wayland-session-finalizer-get", session_ref, 0),
-                    zone: zone.clone(),
-                    target: session_ref.clone(),
-                    expected_uid: None,
-                    projection: StoreProjection::Full,
-                })
-                .await
-                .map_err(|_| ProcessResourceRuntimeError::Store)?;
-            if metadata_has_finalizer(&current, WAYLAND_SESSION_FINALIZER) {
-                changed |=
-                    request_cleanup_finalizer(client, &current, WAYLAND_SESSION_FINALIZER, false)
-                        .await;
-            } else {
-                changed |= request_cleanup_delete(client, &current, "wayland-session-delete").await;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
-async fn list_cleanup_children(
-    store: &RedbResourceStore,
-    zone: &ZoneId,
-) -> Result<Vec<StoredResource>, ProcessResourceRuntimeError> {
-    let mut request = StoreListRequest {
-        operation: StoreOperationContext {
-            operation_id: "wayland-session-cleanup-list".to_owned(),
-            idempotency_key: None,
-            correlation_id: "wayland-session-cleanup-list".to_owned(),
-            trace_id: None,
-            deadline_ms: 10_000,
-        },
-        zone: zone.clone(),
-        resource_types: vec![
-            ResourceTypeName::parse(PROCESS_TYPE).expect("static Process type"),
-            ResourceTypeName::parse("Endpoint").expect("static Endpoint type"),
-        ],
-        resource_names: Vec::new(),
-        filters: Vec::new(),
-        page_size: 256,
-        cursor: None,
-        projection: StoreProjection::Full,
-    };
-    let mut resources = Vec::new();
-    loop {
-        let result = store
-            .list(request.clone())
-            .await
-            .map_err(|_| ProcessResourceRuntimeError::Store)?;
-        resources.extend(result.resources);
-        let Some(cursor) = result.next_cursor else {
-            break;
-        };
-        request.cursor = Some(cursor);
-    }
-    Ok(resources)
-}
-
-#[allow(dead_code)]
-fn cleanup_operation(
-    action: &str,
-    resource_ref: &ResourceRef,
-    revision: u64,
-) -> StoreOperationContext {
-    let operation_id = cleanup_operation_id(action, resource_ref, revision);
-    StoreOperationContext {
-        operation_id: operation_id.clone(),
-        idempotency_key: None,
-        correlation_id: operation_id,
-        trace_id: None,
-        deadline_ms: 10_000,
-    }
-}
-
-#[allow(dead_code)]
-fn cleanup_operation_id(action: &str, resource_ref: &ResourceRef, revision: u64) -> String {
-    let mut digest = Sha256::new();
-    digest.update(action.as_bytes());
-    digest.update([0]);
-    digest.update(resource_ref.to_canonical_string().as_bytes());
-    digest.update(revision.to_be_bytes());
-    let digest = digest.finalize();
-    let suffix = digest
-        .iter()
-        .take(12)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("{action}-{suffix}")
-}
-
-#[allow(dead_code)]
-fn metadata_deletion_requested(resource: &StoredResource) -> bool {
-    metadata_value(resource, "deletionRequestedAt")
-        .is_some_and(|value| !matches!(value, CanonicalJsonValue::Null))
-}
-
-#[allow(dead_code)]
-fn metadata_has_finalizer(resource: &StoredResource, expected: &str) -> bool {
-    metadata_value(resource, "finalizers").is_some_and(|value| {
-        matches!(
-            value,
-            CanonicalJsonValue::Array(values)
-                if values.iter().any(|value| {
-                    matches!(value, CanonicalJsonValue::String(value) if value == expected)
-                })
-        )
-    })
-}
-
-#[allow(dead_code)]
-fn metadata_owner_ref(resource: &StoredResource) -> Option<ResourceRef> {
-    let CanonicalJsonValue::String(value) = metadata_value(resource, "ownerRef")? else {
-        return None;
-    };
-    ResourceRef::parse(&value).ok()
-}
-
-#[allow(dead_code)]
-fn endpoint_producer_ref(resource: &StoredResource) -> Option<ResourceRef> {
-    let value = CanonicalJsonValue::parse(&resource.canonical_json).ok()?;
-    let CanonicalJsonValue::Object(root) = value else {
-        return None;
-    };
-    let CanonicalJsonValue::Object(spec) = root.get("spec")? else {
-        return None;
-    };
-    let CanonicalJsonValue::String(value) = spec.get("producerRef")? else {
-        return None;
-    };
-    ResourceRef::parse(&value).ok()
-}
-
-#[allow(dead_code)]
-fn cleanup_wire_identity(resource: &StoredResource) -> wire::ResourceIdentity {
-    let mut identity = wire::ResourceIdentity::new();
-    identity.zone = resource.zone.as_str().to_owned();
-    identity.resource_type = resource.resource_ref.resource_type().as_str().to_owned();
-    identity.name = resource.resource_ref.name().as_str().to_owned();
-    identity.uid = Some(resource.uid.as_str().to_owned());
-    identity.generation = Some(resource.generation.get());
-    identity.revision = Some(resource.revision.get());
-    identity
-}
-
-#[allow(dead_code)]
-async fn request_cleanup_delete(
-    client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
-    resource: &StoredResource,
-    action: &str,
-) -> bool {
-    let mut mutation = wire::Mutation::new();
-    mutation.kind = protobuf::EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_DELETE);
-    mutation.target = protobuf::MessageField::some(cleanup_wire_identity(resource));
-    let mut precondition = wire::Precondition::new();
-    precondition.kind =
-        protobuf::EnumOrUnknown::new(wire::PreconditionKind::PRECONDITION_KIND_EXACT_REVISION);
-    precondition.expected_revision = Some(resource.revision.get());
-    precondition.expected_uid = Some(resource.uid.as_str().to_owned());
-    mutation.precondition = protobuf::MessageField::some(precondition);
-    let mut request = wire::DeleteRequest::new();
-    request.meta = protobuf::MessageField::some(request_meta(&cleanup_operation_id(
-        action,
-        &resource.resource_ref,
-        resource.revision.get(),
-    )));
-    request.mutation = protobuf::MessageField::some(mutation);
-    client.delete(request).await.error.is_none()
-}
-
-#[allow(dead_code)]
-async fn request_cleanup_finalizer(
-    client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
-    resource: &StoredResource,
-    finalizer: &str,
-    add: bool,
-) -> bool {
-    let mut mutation = wire::Mutation::new();
-    mutation.kind =
-        protobuf::EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_FINALIZERS);
-    mutation.target = protobuf::MessageField::some(cleanup_wire_identity(resource));
-    let mut precondition = wire::Precondition::new();
-    precondition.kind =
-        protobuf::EnumOrUnknown::new(wire::PreconditionKind::PRECONDITION_KIND_EXACT_REVISION);
-    precondition.expected_revision = Some(resource.revision.get());
-    precondition.expected_uid = Some(resource.uid.as_str().to_owned());
-    mutation.precondition = protobuf::MessageField::some(precondition);
-    if add {
-        mutation.add_finalizers.push(finalizer.to_owned());
-    } else {
-        mutation.remove_finalizers.push(finalizer.to_owned());
-    }
-    let mut request = wire::UpdateFinalizersRequest::new();
-    let action = if add {
-        "wayland-session-finalizer-add"
-    } else {
-        "wayland-session-finalizer-remove"
-    };
-    request.meta = protobuf::MessageField::some(request_meta(&cleanup_operation_id(
-        action,
-        &resource.resource_ref,
-        resource.revision.get(),
-    )));
-    request.mutation = protobuf::MessageField::some(mutation);
-    client.update_finalizers(request).await.error.is_none()
 }
 
 pub(crate) fn controller_provider_refs(resources: &[StoredResource]) -> BTreeSet<ResourceRef> {
@@ -4922,7 +4607,7 @@ mod tests {
     #[test]
     fn process_requests_use_both_generic_resource_types() {
         let zone = ZoneId::parse("test").expect("valid zone");
-        let request = process_list_request(&zone);
+        let request = process_resource_list_request(&zone);
         assert_eq!(request.resource_types.len(), 2);
         assert_eq!(request.resource_types[0].as_str(), PROCESS_TYPE);
         assert_eq!(request.resource_types[1].as_str(), EPHEMERAL_PROCESS_TYPE);

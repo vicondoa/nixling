@@ -1,15 +1,15 @@
 //! integration-target: container
 //! Fake-host integration fixtures for the qemu-media Provider.
 
-mod scaffold;
+mod fixture;
 
 #[cfg(test)]
 mod tests {
-    use super::scaffold;
+    use super::fixture;
 
     #[test]
     fn fixture_contains_guest_runtime_volume_and_process() {
-        let (guest, volume, process) = scaffold::fixture();
+        let (guest, volume, process) = fixture::fixture();
         assert_eq!(
             guest.provider_ref().unwrap().to_canonical_string(),
             "Provider/runtime-qemu-media"

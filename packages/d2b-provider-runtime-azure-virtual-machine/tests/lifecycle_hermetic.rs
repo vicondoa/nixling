@@ -20,7 +20,6 @@ fn azure_vm_publishes_the_shared_runner_contract() {
         d2b_provider_runtime_azure_virtual_machine::FINALIZER
     );
     assert_eq!(contract.repair_interval_secs(), 30);
-    assert!(contract.legacy_scheduler_disabled());
     assert!(contract.watched_configuration_is_dependency());
 }
 

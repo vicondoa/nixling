@@ -21,6 +21,19 @@ fn production_binary_contains_no_peer_override_surface() {
         "relay_auth_snippet_from_config",
         "gateway_deps_from_config",
         "display_listener_from_config",
+        "run_device_binding_watch",
+        "device_binding_watch_task",
+        "reconcile_semantic_binding_resources",
+        "reconcile_wayland_session_deletion",
+        "spawn_usbip_reconcile_after_vm_start",
+        "UsbipBackgroundReconcileGuard",
+        "configure_from_host",
+        "compose_host_runtime",
+        "reconcile_snapshot",
+        "list_activation_snapshot",
+        "legacy_scheduler_disabled",
+        "CoreRegisteredSource",
+        "AcceptanceBatch",
     ] {
         assert!(
             !rendered.contains(retired),
@@ -43,4 +56,47 @@ fn production_binary_contains_no_peer_override_surface() {
         !source.contains("BrokerRequest::OpenHidrawSecurityKey"),
         "production d2bd must not own the security-key hidraw opener"
     );
+    let source_paths = [
+        "src/composition.rs",
+        "src/resource_runtime.rs",
+        "src/process_resource_runtime.rs",
+        "src/activation_resource_runtime.rs",
+        "src/audio_resource_runtime.rs",
+        "src/semantic_binding_resource_runtime.rs",
+        "src/provider_registry.rs",
+    ]
+    .into_iter()
+    .map(|relative| {
+        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_else(|| ".".into()))
+            .join(relative)
+    })
+    .filter_map(|path| fs::read_to_string(path).ok())
+    .collect::<Vec<_>>();
+    assert!(!source_paths.is_empty(), "read production d2bd source files");
+    for retired in [
+        "run_process_watch",
+        "run_activation_watch",
+        "run_audio_watch",
+        "run_semantic_binding_watch",
+        "run_device_binding_watch",
+        "device_binding_watch_task",
+        "reconcile_semantic_binding_resources",
+        "reconcile_wayland_session_deletion",
+        "spawn_usbip_reconcile_after_vm_start",
+        "UsbipBackgroundReconcileGuard",
+        "configure_from_host",
+        "compose_host_runtime",
+        "reconcile_snapshot",
+        "list_activation_snapshot",
+        "list_process_snapshot",
+        "list_process_snapshot_backend",
+        "legacy_scheduler_disabled",
+        "CoreRegisteredSource",
+        "AcceptanceBatch",
+    ] {
+        assert!(
+            !source_paths.iter().any(|source| source.contains(retired)),
+            "d2bd source retains retired cutover path {retired}"
+        );
+    }
 }

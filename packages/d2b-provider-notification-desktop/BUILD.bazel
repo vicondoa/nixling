@@ -56,14 +56,6 @@ rust_library(
 )
 
 rust_test(
-    name = "scaffold",
-    srcs = ["tests/scaffold.rs"],
-    compile_data = ["Cargo.toml"],
-    visibility = ["//visibility:public"],
-)
-
-
-rust_test(
     name = "action_nonce",
     srcs = [
         "tests/action_nonce.rs",

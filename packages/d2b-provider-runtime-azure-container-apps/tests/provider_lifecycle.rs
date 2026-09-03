@@ -26,7 +26,6 @@ fn aca_publishes_the_shared_runner_contract() {
         d2b_provider_runtime_azure_container_apps::FINALIZER
     );
     assert_eq!(contract.repair_interval_secs(), 30);
-    assert!(contract.legacy_scheduler_disabled());
     assert!(contract.watched_configuration_is_dependency());
 }
 

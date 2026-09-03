@@ -28,7 +28,6 @@ fn cloud_hypervisor_publishes_the_shared_runner_contract() {
         d2b_provider_runtime_cloud_hypervisor::GUEST_CONTROLLER_FINALIZER
     );
     assert_eq!(contract.repair_interval_secs(), 30);
-    assert!(contract.legacy_scheduler_disabled());
     assert!(contract.watched_configuration_is_dependency());
 }
 

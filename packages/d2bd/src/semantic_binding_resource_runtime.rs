@@ -2,15 +2,14 @@
 //!
 //! Provider controllers remain the authority for their Service and Binding
 //! semantics. Telemetry Service/Binding rows use the shared Runner and the
-//! authenticated ResourceService path; the remaining Device Binding
-//! compatibility lane is isolated under its explicitly named watcher.
+//! authenticated ResourceService path. USBIP and SecurityKey rows are owned
+//! by their Provider-specific shared Runner handlers.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 
 use d2b_contracts_provider::v3::semantic_services::{
     SemanticFamily, child_resources::BindingChildSet,
-    security_key::SECURITY_KEY_BINDING_RESOURCE_TYPE, telemetry::TELEMETRY_BINDING_RESOURCE_TYPE,
-    usb::USB_BINDING_RESOURCE_TYPE,
+    telemetry::TELEMETRY_BINDING_RESOURCE_TYPE,
 };
 use d2b_contracts_resource::v3::{
     CanonicalJsonValue, ResourceEnvelope, ResourceRef, ResourceTypeName, ZoneId,
@@ -23,14 +22,12 @@ use d2b_core_controller::{
     ResourceReconciler, ResourceRegistration, ResourceSnapshot, ResyncPolicy, SelectorField,
     UpdateAssessment, UpdateAssessmentState, UpgradePlan, UpgradeStage, ValidationResult,
 };
-use d2b_provider_device_security_key::SecurityKeyController;
-use d2b_provider_device_usbip::binding_child_resources;
 use d2b_provider_observability_otel::TelemetryBindingController;
 use d2b_resource_api::{
-    RedbBackend, ResourceApiClient, service::UnavailableUpgradeDispatcher, watch::ResourceWatch,
+    RedbBackend, ResourceApiClient, service::UnavailableUpgradeDispatcher,
 };
 use d2b_resource_store::{
-    StoreListRequest, StoreOperationContext, StoreProjection, StoreWatchRequest, StoredResource,
+    StoreErrorKind, StoreGetRequest, StoreOperationContext, StoreProjection, StoredResource,
 };
 use d2b_resource_store_redb::RedbResourceStore;
 
@@ -40,21 +37,6 @@ use crate::binding_child_resource_runtime::{
 };
 
 type SemanticBindingDescriptor = (&'static str, &'static str, &'static str, SemanticFamily);
-
-const SEMANTIC_BINDINGS: [SemanticBindingDescriptor; 2] = [
-    (
-        "usb.d2bus.org.UsbService",
-        USB_BINDING_RESOURCE_TYPE,
-        "Provider/device-usbip",
-        SemanticFamily::Usb,
-    ),
-    (
-        "security-key.d2bus.org.SecurityKeyService",
-        SECURITY_KEY_BINDING_RESOURCE_TYPE,
-        "Provider/device-security-key",
-        SemanticFamily::SecurityKey,
-    ),
-];
 
 const TELEMETRY_BINDING: SemanticBindingDescriptor = (
     "telemetry.d2bus.org.TelemetryService",
@@ -70,8 +52,6 @@ pub(crate) enum SemanticBindingRuntimeError {
     InvalidResource,
     /// A Binding's Service or target relationship was not admitted.
     InvalidRelationship,
-    /// The backing store could not be relisted.
-    Store,
     /// Core rejected the desired child set or a mutation failed.
     Reconcile,
 }
@@ -81,7 +61,6 @@ impl core::fmt::Display for SemanticBindingRuntimeError {
         formatter.write_str(match self {
             Self::InvalidResource => "semantic-binding-resource-invalid",
             Self::InvalidRelationship => "semantic-binding-relationship-invalid",
-            Self::Store => "semantic-binding-store-failed",
             Self::Reconcile => "semantic-binding-reconcile-failed",
         })
     }
@@ -107,9 +86,11 @@ pub(crate) fn telemetry_controller_descriptor(
             .map_err(|_| SemanticBindingRuntimeError::InvalidResource)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let provider_filter = identity.provider_ref().to_canonical_string();
     let selectors = resources
         .iter()
         .flat_map(|resource| {
+            let provider_filter = provider_filter.clone();
             [
                 SelectorField::Spec,
                 SelectorField::Status,
@@ -119,11 +100,31 @@ pub(crate) fn telemetry_controller_descriptor(
             ]
             .into_iter()
             .map(move |field| {
-                ControllerSelector::new(resource.resource_type().clone(), field, None)
+                let exact_value = (field == SelectorField::Spec)
+                    .then(|| provider_filter.clone());
+                ControllerSelector::new(resource.resource_type().clone(), field, exact_value)
                     .expect("telemetry selector is bounded")
             })
         })
         .collect::<Vec<_>>();
+    let dependency_selectors = [
+        "telemetry.d2bus.org.TelemetryService",
+        "Endpoint",
+        "Guest",
+        "User",
+        "Zone",
+    ]
+    .into_iter()
+    .map(|resource_type| {
+        ControllerSelector::new(
+            ResourceTypeName::parse(resource_type)
+                .expect("telemetry dependency type is canonical"),
+            SelectorField::Metadata,
+            None,
+        )
+        .expect("telemetry dependency selector is bounded")
+    })
+    .collect();
     ControllerDescriptor::new(
         identity,
         resources,
@@ -137,7 +138,7 @@ pub(crate) fn telemetry_controller_descriptor(
             ControllerVerb::RemoveFinalizer,
         ],
         selectors,
-        Vec::new(),
+        dependency_selectors,
         true,
         vec![crate::binding_child_resource_runtime::BINDING_CHILD_FINALIZER.to_owned()],
         vec!["telemetry.d2bus.org/telemetry-controller.v1".to_owned()],
@@ -180,16 +181,23 @@ impl TelemetryResourceReconciler {
         }
     }
 
-    async fn reconcile_snapshot(
+    async fn reconcile_target(
         &self,
-        target: &ResourceRef,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
     ) -> Result<(), SemanticBindingRuntimeError> {
         let _guard = self.reconcile_lock.lock().await;
-        reconcile_telemetry_binding_resources(
+        let resource = stored_resource_from_snapshot(resource)?;
+        let dependencies = dependencies
+            .iter()
+            .map(|dependency| stored_resource_from_snapshot(dependency.resource()))
+            .collect::<Result<Vec<_>, _>>()?;
+        reconcile_telemetry_resource(
             &self.store,
             &self.client,
             &self.store.identity().zone(),
-            Some(target),
+            &resource,
+            &dependencies,
         )
         .await
     }
@@ -224,6 +232,25 @@ impl TelemetryResourceReconciler {
             .map(Some)
             .map_err(|_| SemanticBindingRuntimeError::InvalidResource)
     }
+}
+
+fn stored_resource_from_snapshot(
+    resource: &ResourceSnapshot,
+) -> Result<StoredResource, SemanticBindingRuntimeError> {
+    let envelope = ResourceEnvelope::from_json(resource.canonical_json())
+        .map_err(|_| SemanticBindingRuntimeError::InvalidResource)?;
+    let payload_digest = envelope
+        .digest()
+        .map_err(|_| SemanticBindingRuntimeError::InvalidResource)?;
+    Ok(StoredResource {
+        resource_ref: resource.key().resource_ref().clone(),
+        zone: resource.key().zone().clone(),
+        uid: resource.key().uid().clone(),
+        generation: resource.generation(),
+        revision: resource.revision(),
+        canonical_json: resource.canonical_json().to_vec(),
+        payload_digest,
+    })
 }
 
 impl ResourceReconciler for TelemetryResourceReconciler {
@@ -309,16 +336,16 @@ impl ResourceReconciler for TelemetryResourceReconciler {
 
     fn execute_effect(
         &self,
-        context: &ReconcileContext,
-        _resource: &ResourceSnapshot,
-        _dependencies: &[DependencySnapshot],
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
         _plan: &ReconcilePlan,
     ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
         let future = async move {
-            self.reconcile_snapshot(context.target().resource_ref()).await?;
+            self.reconcile_target(resource, dependencies).await?;
             Ok(ReconcileResult::converged(
-                _resource.revision(),
-                _resource.generation(),
+                resource.revision(),
+                resource.generation(),
             ))
         };
         future
@@ -348,11 +375,11 @@ impl ResourceReconciler for TelemetryResourceReconciler {
 
     fn execute_finalize(
         &self,
-        context: &ReconcileContext,
+        _context: &ReconcileContext,
         resource: &ResourceSnapshot,
     ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
         let future = async move {
-            self.reconcile_snapshot(context.target().resource_ref()).await?;
+            self.reconcile_target(resource, &[]).await?;
             Ok(ReconcileResult::converged(
                 resource.revision(),
                 resource.generation(),
@@ -418,155 +445,6 @@ impl ResourceReconciler for TelemetryResourceReconciler {
     }
 }
 
-async fn list_binding_owners_for(
-    store: &RedbResourceStore,
-    zone: &ZoneId,
-    descriptors: &[SemanticBindingDescriptor],
-) -> Result<Vec<BindingChildOwner>, SemanticBindingRuntimeError> {
-    let mut services = BTreeSet::new();
-    let mut targets = BTreeSet::new();
-    let mut bindings = Vec::new();
-    for (service_type, binding_type, expected_provider, _) in descriptors {
-        for resource in list_resources(
-            store,
-            zone,
-            ResourceTypeName::parse(*service_type).expect("closed semantic Service type"),
-            "service",
-        )
-        .await?
-        {
-            if !deletion_requested(&resource)
-                && binding_provider_ref(&resource).ok().flatten().as_deref()
-                    == Some(*expected_provider)
-            {
-                services.insert(resource.resource_ref);
-            }
-        }
-        bindings.extend(
-            list_resources(
-                store,
-                zone,
-                ResourceTypeName::parse(*binding_type).expect("closed semantic Binding type"),
-                "binding",
-            )
-            .await?,
-        );
-    }
-    for resource_type in ["Guest", "User", "Zone"] {
-        for resource in list_resources(
-            store,
-            zone,
-            ResourceTypeName::parse(resource_type).expect("closed target ResourceType"),
-            "target",
-        )
-        .await?
-        {
-            if !deletion_requested(&resource) {
-                targets.insert(resource.resource_ref);
-            }
-        }
-    }
-
-    let mut owners = Vec::with_capacity(bindings.len());
-    for resource in bindings {
-        if resource.zone != *zone {
-            owners.push(fenced_owner(resource));
-            continue;
-        }
-        let family = match semantic_family(&resource) {
-            Ok(family) => family,
-            Err(_) => {
-                owners.push(fenced_owner(resource));
-                continue;
-            }
-        };
-        let expected_provider = descriptors
-            .iter()
-            .find(|(_, _, _, candidate)| *candidate == family)
-            .map(|(_, _, provider, _)| *provider)
-            .ok_or(SemanticBindingRuntimeError::InvalidResource)?;
-        let provider_ref = match binding_provider_ref(&resource) {
-            Ok(Some(provider_ref)) => provider_ref,
-            Ok(None) | Err(_) => {
-                owners.push(fenced_owner(resource));
-                continue;
-            }
-        };
-        if provider_ref != expected_provider {
-            continue;
-        }
-        if deletion_requested(&resource) {
-            owners.push(BindingChildOwner {
-                resource,
-                desired: None,
-                fenced: false,
-            });
-            continue;
-        }
-        let (_, service_ref, target_ref) = match binding_relationship(&resource) {
-            Ok(relationship) => relationship,
-            Err(_) => {
-                owners.push(fenced_owner(resource));
-                continue;
-            }
-        };
-        let user_ref = if family == SemanticFamily::SecurityKey {
-            match binding_user_ref(&resource) {
-                Ok(user_ref) => user_ref,
-                Err(_) => {
-                    owners.push(fenced_owner(resource));
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-        if !services.contains(&service_ref)
-            || !targets.contains(&target_ref)
-            || user_ref
-                .as_ref()
-                .is_some_and(|user_ref| !targets.contains(user_ref))
-        {
-            owners.push(fenced_owner(resource));
-            continue;
-        }
-        let children = match family {
-            SemanticFamily::Usb => {
-                binding_child_resources(&resource.resource_ref, &service_ref, &target_ref)
-                    .map_err(|_| SemanticBindingRuntimeError::InvalidRelationship)
-            }
-            SemanticFamily::SecurityKey => user_ref
-                .as_ref()
-                .ok_or(SemanticBindingRuntimeError::InvalidRelationship)
-                .and_then(|user_ref| {
-                    SecurityKeyController::child_resources_for_user(
-                        &resource.resource_ref,
-                        &service_ref,
-                        &target_ref,
-                        user_ref,
-                    )
-                    .map_err(|_| SemanticBindingRuntimeError::InvalidRelationship)
-                }),
-            SemanticFamily::Telemetry => TelemetryBindingController::child_resources(
-                &resource.resource_ref,
-                &service_ref,
-                &target_ref,
-            )
-            .map_err(|_| SemanticBindingRuntimeError::InvalidRelationship),
-            _ => Err(SemanticBindingRuntimeError::InvalidResource),
-        };
-        match children {
-            Ok(children) => owners.push(BindingChildOwner {
-                resource,
-                desired: Some(children),
-                fenced: false,
-            }),
-            Err(_) => owners.push(fenced_owner(resource)),
-        }
-    }
-    Ok(owners)
-}
-
 fn fenced_owner(resource: StoredResource) -> BindingChildOwner {
     BindingChildOwner {
         resource,
@@ -575,66 +453,131 @@ fn fenced_owner(resource: StoredResource) -> BindingChildOwner {
     }
 }
 
-/// Relist and reconcile all non-audio semantic Binding children once.
-pub(crate) async fn reconcile_semantic_binding_resources(
-    store: &RedbResourceStore,
-    client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
-    zone: &ZoneId,
-) -> Result<(), SemanticBindingRuntimeError> {
-    reconcile_binding_owner_set(store, client, zone, &SEMANTIC_BINDINGS, None).await
-}
-
-/// Relist and reconcile telemetry Service/Binding children through the
+/// Reconcile one fresh telemetry Service or Binding target through the
 /// ResourceService-backed shared controller lane.
-pub(crate) async fn reconcile_telemetry_binding_resources(
+pub(crate) async fn reconcile_telemetry_resource(
     store: &RedbResourceStore,
     client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
     zone: &ZoneId,
-    target: Option<&ResourceRef>,
+    resource: &StoredResource,
+    dependencies: &[StoredResource],
 ) -> Result<(), SemanticBindingRuntimeError> {
-    reconcile_telemetry_services(store, client, zone, target).await?;
-    reconcile_binding_owner_set(store, client, zone, &[TELEMETRY_BINDING], target).await
+    if resource.zone != *zone {
+        return Err(SemanticBindingRuntimeError::InvalidResource);
+    }
+    match resource.resource_ref.resource_type().as_str() {
+        service_type if service_type == TELEMETRY_BINDING.0 => {
+            if deletion_requested(resource) {
+                return Ok(());
+            }
+            let endpoints = fresh_telemetry_endpoints(store, zone, resource).await?;
+            let (phase, projection) = telemetry_service_status(resource, &endpoints);
+            let resource = sanitized_status_resource(resource)?;
+            crate::resource_runtime::persist_resource_status_with_projection(
+                client,
+                &resource,
+                &serde_json::json!({ "phase": phase }),
+                Some(&projection),
+            )
+            .await
+            .map_err(|_| SemanticBindingRuntimeError::Reconcile)
+        }
+        binding_type if binding_type == TELEMETRY_BINDING.1 => {
+            let owner = telemetry_binding_owner(resource, dependencies)?;
+            reconcile_telemetry_binding_owner(store, client, zone, &owner).await
+        }
+        _ => Err(SemanticBindingRuntimeError::InvalidResource),
+    }
 }
 
-async fn reconcile_telemetry_services(
+async fn fresh_telemetry_endpoints(
     store: &RedbResourceStore,
-    client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
     zone: &ZoneId,
-    target: Option<&ResourceRef>,
-) -> Result<(), SemanticBindingRuntimeError> {
-    let services = list_resources(
-        store,
-        zone,
-        ResourceTypeName::parse(TELEMETRY_BINDING.0).expect("telemetry Service type"),
-        "telemetry-service",
-    )
-    .await?;
-    let endpoints = list_resources(
-        store,
-        zone,
-        ResourceTypeName::parse("Endpoint").expect("Endpoint type"),
-        "telemetry-service-endpoints",
-    )
-    .await?;
-    for service in services {
-        if !selected_target(target, &service.resource_ref) {
-            continue;
+    service: &StoredResource,
+) -> Result<Vec<StoredResource>, SemanticBindingRuntimeError> {
+    let Some(endpoint_refs) = telemetry_endpoint_refs(service) else {
+        return Ok(Vec::new());
+    };
+    let mut endpoints = Vec::with_capacity(endpoint_refs.len());
+    for endpoint_ref in endpoint_refs {
+        match store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "telemetry-endpoint-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "telemetry-endpoint-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: endpoint_ref,
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+        {
+            Ok(endpoint) => endpoints.push(endpoint),
+            Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {}
+            Err(_) => return Err(SemanticBindingRuntimeError::Reconcile),
         }
-        if deletion_requested(&service) {
-            continue;
-        }
-        let (phase, projection) = telemetry_service_status(&service, &endpoints);
-        let resource = sanitized_status_resource(&service)?;
-        crate::resource_runtime::persist_resource_status_with_projection(
-            client,
-            &resource,
-            &serde_json::json!({ "phase": phase }),
-            Some(&projection),
-        )
-        .await
-        .map_err(|_| SemanticBindingRuntimeError::Reconcile)?;
     }
-    Ok(())
+    Ok(endpoints)
+}
+
+fn telemetry_endpoint_refs(service: &StoredResource) -> Option<Vec<ResourceRef>> {
+    let envelope = ResourceEnvelope::from_json(&service.canonical_json).ok()?;
+    let spec: serde_json::Value =
+        serde_json::from_slice(&envelope.spec().base().to_canonical_bytes()).ok()?;
+    spec.get("ingestEndpointRefs")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().and_then(|value| ResourceRef::parse(value).ok()))
+                .collect()
+        })
+}
+
+fn telemetry_binding_owner(
+    resource: &StoredResource,
+    dependencies: &[StoredResource],
+) -> Result<BindingChildOwner, SemanticBindingRuntimeError> {
+    if resource.resource_ref.resource_type().as_str() != TELEMETRY_BINDING.1 {
+        return Err(SemanticBindingRuntimeError::InvalidResource);
+    }
+    if deletion_requested(resource) {
+        return Ok(BindingChildOwner {
+            resource: resource.clone(),
+            desired: None,
+            fenced: false,
+        });
+    }
+    if binding_provider_ref(resource)?.as_deref() != Some(TELEMETRY_BINDING.2) {
+        return Ok(fenced_owner(resource.clone()));
+    }
+    let (_, service_ref, target_ref) = match binding_relationship(resource) {
+        Ok(relationship) => relationship,
+        Err(_) => return Ok(fenced_owner(resource.clone())),
+    };
+    let dependency_present = |reference: &ResourceRef| {
+        dependencies.iter().any(|dependency| {
+            dependency.resource_ref == *reference && !deletion_requested(dependency)
+        })
+    };
+    if !dependency_present(&service_ref) || !dependency_present(&target_ref) {
+        return Ok(fenced_owner(resource.clone()));
+    }
+    let desired = TelemetryBindingController::child_resources(
+        &resource.resource_ref,
+        &service_ref,
+        &target_ref,
+    )
+    .map_err(|_| SemanticBindingRuntimeError::InvalidRelationship)?;
+    Ok(BindingChildOwner {
+        resource: resource.clone(),
+        desired: Some(desired),
+        fenced: false,
+    })
 }
 
 fn telemetry_service_status(
@@ -705,90 +648,47 @@ fn status_ready(resource: &StoredResource) -> bool {
         .unwrap_or(false)
 }
 
-async fn reconcile_binding_owner_set(
+async fn reconcile_telemetry_binding_owner(
     store: &RedbResourceStore,
     client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
     zone: &ZoneId,
-    descriptors: &[SemanticBindingDescriptor],
-    target: Option<&ResourceRef>,
+    owner: &BindingChildOwner,
 ) -> Result<(), SemanticBindingRuntimeError> {
-    let owners = list_binding_owners_for(store, zone, descriptors).await?;
-    let owners = owners
-        .into_iter()
-        .filter(|owner| {
-            target.is_none_or(|target| target == &owner.resource.resource_ref)
-        })
-        .collect::<Vec<_>>();
-    for owner in &owners {
-        if owner.desired.is_some() && !owner.fenced {
-            update_binding_child_finalizer(client, &owner.resource, true)
-                .await
-                .map_err(|_| SemanticBindingRuntimeError::Reconcile)?;
-        }
+    if owner.fenced {
+        persist_fenced_binding_status(client, owner).await?;
+        return Ok(());
     }
-    let converged = reconcile_binding_children(store, client, zone, &owners)
+    if owner.desired.is_some() && !has_binding_child_finalizer(&owner.resource) {
+        update_binding_child_finalizer(client, &owner.resource, true)
+            .await
+            .map_err(|_| SemanticBindingRuntimeError::Reconcile)?;
+        return Ok(());
+    }
+    let converged = reconcile_binding_children(store, client, zone, std::slice::from_ref(owner))
         .await
         .map_err(|_| SemanticBindingRuntimeError::Reconcile)?;
     let children = list_binding_children(store, zone)
         .await
         .map_err(|_| SemanticBindingRuntimeError::Reconcile)?;
-    if target.is_some()
-        && owners
-            .iter()
-            .any(|owner| {
-                !owner.fenced && !converged.contains(&owner.resource.resource_ref)
-            })
-    {
-        return Ok(());
-    }
-
-    // Finalizer removal is deliberately a second phase: all owned children
-    // must be absent after their own finalizers have drained.
-    for owner in &owners {
-        if !owner.fenced
-            && owner.desired.is_none()
-            && converged.contains(&owner.resource.resource_ref)
+    if owner.desired.is_none() {
+        if converged.contains(&owner.resource.resource_ref)
             && has_binding_child_finalizer(&owner.resource)
         {
             update_binding_child_finalizer(client, &owner.resource, false)
                 .await
                 .map_err(|_| SemanticBindingRuntimeError::Reconcile)?;
         }
-
+        return Ok(());
     }
-
-    // Finalizer updates advance the parent revision, so relist before writing
-    // the layered Binding status with an exact UID/revision precondition.
-    let refreshed = list_binding_owners_for(store, zone, descriptors)
-        .await?
-        .into_iter()
-        .filter(|owner| {
-            target.is_none_or(|target| target == &owner.resource.resource_ref)
-        })
-        .collect::<Vec<_>>();
-    for owner in &refreshed {
-        if owner.fenced {
-            if let Err(error) = persist_fenced_binding_status(client, owner).await {
-                tracing::warn!(
-                    error = %error,
-                    binding = %owner.resource.resource_ref,
-                    "fenced semantic Binding status persistence failed"
-                );
-            }
-            continue;
-        }
-        let Some(desired) = owner.desired.as_ref() else {
-            continue;
-        };
-        let converged = converged.contains(&owner.resource.resource_ref);
-        let ready = converged && binding_children_ready(owner, &children);
-        persist_semantic_binding_status(client, owner, desired, converged, ready).await?;
+    if !converged.contains(&owner.resource.resource_ref) {
+        return Ok(());
     }
-    Ok(())
-}
-
-fn selected_target(target: Option<&ResourceRef>, candidate: &ResourceRef) -> bool {
-    target.is_none_or(|target| target == candidate)
+    let desired = owner
+        .desired
+        .as_ref()
+        .expect("non-deleting telemetry owner has desired children");
+    let ready = binding_children_ready(owner, &children);
+    persist_semantic_binding_status(client, owner, desired, true, ready).await
 }
 
 async fn persist_fenced_binding_status(
@@ -922,83 +822,10 @@ fn contains_sensitive_text(value: &serde_json::Value) -> bool {
     }
 }
 
-fn semantic_binding_status_projection(family: SemanticFamily, phase: &str) -> serde_json::Value {
+fn semantic_binding_status_projection(family: SemanticFamily, _phase: &str) -> serde_json::Value {
     match family {
-        SemanticFamily::Usb => serde_json::json!({ "attachmentPhase": phase }),
-        SemanticFamily::SecurityKey => serde_json::json!({
-            "attachment": { "phase": phase }
-        }),
         SemanticFamily::Telemetry => serde_json::json!({}),
-        SemanticFamily::Audio => serde_json::json!({}),
         _ => serde_json::json!({}),
-    }
-}
-
-/// Build a watch covering authored semantic Bindings, their Services, and
-/// Core-owned child resources.
-pub(crate) fn device_binding_watch_request(zone: &ZoneId) -> StoreWatchRequest {
-    let mut resource_types = Vec::with_capacity(9);
-    for (service_type, binding_type, _, _) in SEMANTIC_BINDINGS {
-        resource_types
-            .push(ResourceTypeName::parse(service_type).expect("closed semantic Service type"));
-        resource_types
-            .push(ResourceTypeName::parse(binding_type).expect("closed semantic Binding type"));
-    }
-    resource_types.extend(
-        ["Process", "EphemeralProcess", "Endpoint"]
-            .into_iter()
-            .map(|resource_type| {
-                ResourceTypeName::parse(resource_type).expect("closed child type")
-            }),
-    );
-    StoreWatchRequest {
-        operation: StoreOperationContext {
-            operation_id: "semantic-binding-resource-watch".to_owned(),
-            idempotency_key: None,
-            correlation_id: "semantic-binding-resource-watch".to_owned(),
-            trace_id: None,
-            deadline_ms: 10_000,
-        },
-        zone: zone.clone(),
-        resource_types,
-        resource_names: Vec::new(),
-        filters: Vec::new(),
-        after_revision: d2b_contracts_resource::v3::ZoneRevision::new(0),
-        initial_credits: 64,
-        projection: StoreProjection::Full,
-    }
-}
-
-/// Run the watch-driven Device Binding reconciliation loop.
-pub(crate) async fn run_device_binding_watch(
-    mut watch: ResourceWatch,
-    store: std::sync::Arc<RedbResourceStore>,
-    zone: ZoneId,
-    client: std::sync::Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
-) {
-    loop {
-        let Some(batch) = watch.recv().await else {
-            if watch.resume().await.is_err() {
-                return;
-            }
-            continue;
-        };
-        let revision = batch.revision();
-        if let Err(error) =
-            reconcile_semantic_binding_resources(&store, client.as_ref(), &zone).await
-        {
-            tracing::warn!(
-                error = %error,
-                "semantic Binding child reconciliation failed after watch event"
-            );
-            if watch.resume().await.is_err() {
-                return;
-            }
-            continue;
-        }
-        if watch.acknowledge(revision).await.is_err() && watch.resume().await.is_err() {
-            return;
-        }
     }
 }
 
@@ -1013,18 +840,7 @@ fn binding_relationship(
     let family = semantic_family(resource)?;
     let service_ref = value_ref(spec.get("serviceRef"))?;
     let target = match family {
-        SemanticFamily::Usb => value_ref(spec.get("guestRef"))?,
-        SemanticFamily::SecurityKey => {
-            let target = spec
-                .get("target")
-                .and_then(serde_json::Value::as_object)
-                .ok_or(SemanticBindingRuntimeError::InvalidResource)?;
-            value_ref(target.get("guestRef"))?
-        }
         SemanticFamily::Telemetry => value_ref(spec.get("producerRef"))?,
-        SemanticFamily::Audio => {
-            return Err(SemanticBindingRuntimeError::InvalidRelationship);
-        }
         _ => return Err(SemanticBindingRuntimeError::InvalidResource),
     };
     Ok((family, service_ref, target))
@@ -1033,31 +849,12 @@ fn binding_relationship(
 fn semantic_family(
     resource: &StoredResource,
 ) -> Result<SemanticFamily, SemanticBindingRuntimeError> {
-    SEMANTIC_BINDINGS
-        .iter()
-        .chain(std::iter::once(&TELEMETRY_BINDING))
+    std::iter::once(&TELEMETRY_BINDING)
         .find(|(_, binding_type, _, _)| {
             resource.resource_ref.resource_type().as_str() == *binding_type
         })
         .map(|(_, _, _, family)| *family)
         .ok_or(SemanticBindingRuntimeError::InvalidResource)
-}
-
-fn binding_user_ref(
-    resource: &StoredResource,
-) -> Result<Option<ResourceRef>, SemanticBindingRuntimeError> {
-    let envelope = ResourceEnvelope::from_json(&resource.canonical_json)
-        .map_err(|_| SemanticBindingRuntimeError::InvalidResource)?;
-    let spec: serde_json::Value =
-        serde_json::from_slice(&envelope.spec().base().to_canonical_bytes())
-            .map_err(|_| SemanticBindingRuntimeError::InvalidResource)?;
-    let Some(target) = spec.get("target").and_then(serde_json::Value::as_object) else {
-        return Ok(None);
-    };
-    let Some(value) = target.get("userRef") else {
-        return Ok(None);
-    };
-    Ok(Some(value_ref(Some(value))?))
 }
 
 fn binding_provider_ref(
@@ -1130,43 +927,6 @@ fn finalizer_payload(
     .map_err(|_| SemanticBindingRuntimeError::InvalidResource)
 }
 
-async fn list_resources(
-    store: &RedbResourceStore,
-    zone: &ZoneId,
-    resource_type: ResourceTypeName,
-    suffix: &'static str,
-) -> Result<Vec<StoredResource>, SemanticBindingRuntimeError> {
-    let mut request = StoreListRequest {
-        operation: StoreOperationContext {
-            operation_id: format!("semantic-binding-reconcile:{suffix}"),
-            idempotency_key: None,
-            correlation_id: format!("semantic-binding-reconcile:{suffix}"),
-            trace_id: None,
-            deadline_ms: 10_000,
-        },
-        zone: zone.clone(),
-        resource_types: vec![resource_type],
-        resource_names: Vec::new(),
-        filters: Vec::new(),
-        page_size: 256,
-        cursor: None,
-        projection: StoreProjection::Full,
-    };
-    let mut resources = Vec::new();
-    loop {
-        let page = store
-            .list(request.clone())
-            .await
-            .map_err(|_| SemanticBindingRuntimeError::Store)?;
-        resources.extend(page.resources);
-        let Some(cursor) = page.next_cursor else {
-            break;
-        };
-        request.cursor = Some(cursor);
-    }
-    Ok(resources)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1236,141 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn binding_relationships_use_each_family_contract() {
-        let usb = resource(
-            "usb.d2bus.org.UsbBinding/work",
-            serde_json::json!({
-                "serviceRef": "usb.d2bus.org.UsbService/work",
-                "guestRef": "Guest/work"
-            }),
-        );
-        assert_eq!(
-            binding_relationship(&usb).expect("USB relationship"),
-            (
-                SemanticFamily::Usb,
-                ResourceRef::parse("usb.d2bus.org.UsbService/work").unwrap(),
-                ResourceRef::parse("Guest/work").unwrap(),
-            )
-        );
-
-        let security = resource(
-            "security-key.d2bus.org.SecurityKeyBinding/key",
-            serde_json::json!({
-                "serviceRef": "security-key.d2bus.org.SecurityKeyService/key",
-                "target": {
-                    "guestRef": "Guest/work",
-                    "userRef": "User/operator"
-                }
-            }),
-        );
-        assert_eq!(
-            binding_relationship(&security).expect("security-key relationship"),
-            (
-                SemanticFamily::SecurityKey,
-                ResourceRef::parse("security-key.d2bus.org.SecurityKeyService/key").unwrap(),
-                ResourceRef::parse("Guest/work").unwrap(),
-            )
-        );
-
-        let telemetry = resource(
-            "telemetry.d2bus.org.TelemetryBinding/metrics",
-            serde_json::json!({
-                "serviceRef": "telemetry.d2bus.org.TelemetryService/ingest",
-                "producerRef": "Zone/dev"
-            }),
-        );
-        assert_eq!(
-            binding_relationship(&telemetry).expect("telemetry relationship"),
-            (
-                SemanticFamily::Telemetry,
-                ResourceRef::parse("telemetry.d2bus.org.TelemetryService/ingest").unwrap(),
-                ResourceRef::parse("Zone/dev").unwrap(),
-            )
-        );
-    }
-
-    #[test]
-    fn malformed_relationships_fail_closed_without_auto_binding() {
-        let service = resource(
-            "usb.d2bus.org.UsbService/work",
-            serde_json::json!({"mode": "authority"}),
-        );
-        assert!(binding_relationship(&service).is_err());
-
-        let binding = resource(
-            "usb.d2bus.org.UsbBinding/work",
-            serde_json::json!({"serviceRef": "usb.d2bus.org.UsbService/work"}),
-        );
-        assert_eq!(
-            binding_relationship(&binding),
-            Err(SemanticBindingRuntimeError::InvalidResource)
-        );
-    }
-
-    #[test]
-    fn provider_ref_is_read_from_the_reserved_spec_layer() {
-        let service = resource(
-            "usb.d2bus.org.UsbService/work",
-            serde_json::json!({
-                "providerRef": "Provider/device-usbip",
-                "mode": "authority"
-            }),
-        );
-
-        assert_eq!(
-            binding_provider_ref(&service).unwrap().as_deref(),
-            Some("Provider/device-usbip")
-        );
-    }
-
-    #[test]
-    fn status_projections_use_only_frozen_common_fields() {
-        for (family, expected) in [
-            (SemanticFamily::Usb, vec!["attachmentPhase"]),
-            (SemanticFamily::SecurityKey, vec!["attachment"]),
-            (SemanticFamily::Telemetry, Vec::new()),
-        ] {
-            let projection = semantic_binding_status_projection(family, "Ready");
-            let names = projection
-                .as_object()
-                .expect("status projection object")
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
-            assert_eq!(names, expected);
-            family
-                .contract()
-                .binding()
-                .status()
-                .validate_names(names)
-                .expect("projection matches the frozen status schema");
-        }
-    }
-
-    #[test]
-    fn watch_covers_all_semantic_bindings_and_core_children() {
-        let request = device_binding_watch_request(&ZoneId::parse("dev").unwrap());
-        let types = request
-            .resource_types
-            .iter()
-            .map(ResourceTypeName::as_str)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            types,
-            vec![
-                "usb.d2bus.org.UsbService",
-                "usb.d2bus.org.UsbBinding",
-                "security-key.d2bus.org.SecurityKeyService",
-                "security-key.d2bus.org.SecurityKeyBinding",
-                "Process",
-                "EphemeralProcess",
-                "Endpoint",
-            ]
-        );
-    }
-
-    #[test]
-    fn telemetry_descriptor_is_owned_by_the_shared_runner_not_legacy_watch() {
+    fn telemetry_descriptor_uses_the_shared_runner() {
         let identity = ControllerIdentity::new(
             ZoneId::parse("dev").unwrap(),
             ResourceRef::parse("Process/otel-controller").unwrap(),
@@ -1495,13 +1121,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn telemetry_effect_selection_never_mutates_a_sibling() {
-        let target =
-            ResourceRef::parse("telemetry.d2bus.org.TelemetryBinding/target").unwrap();
-        let sibling =
-            ResourceRef::parse("telemetry.d2bus.org.TelemetryBinding/sibling").unwrap();
-        assert!(selected_target(Some(&target), &target));
-        assert!(!selected_target(Some(&target), &sibling));
-    }
 }

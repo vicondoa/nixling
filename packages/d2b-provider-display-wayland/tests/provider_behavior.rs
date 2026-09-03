@@ -481,6 +481,5 @@ fn display_runner_contract_disables_legacy_scheduling() {
     );
     assert_eq!(contract.repair_interval_secs(), 30);
     assert_eq!(contract.max_repair_interval_secs(), 60);
-    assert!(contract.legacy_scheduler_disabled());
     assert!(contract.watched_configuration_is_dependency());
 }

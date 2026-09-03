@@ -474,7 +474,6 @@ fn gpu_runner_contract_disables_legacy_scheduling() {
         contract.finalizer(),
         d2b_provider_device_gpu::DEVICE_GPU_FINALIZER
     );
-    assert!(contract.legacy_scheduler_disabled());
     assert!(contract.watched_configuration_is_dependency());
     assert!((30..=60).contains(&contract.repair_interval_secs()));
 }

@@ -21,7 +21,6 @@ pub const NOTIFICATION_REPAIR_INTERVAL_SECS: u64 = 300;
 pub struct NotificationRunnerContract {
     service_package: &'static str,
     repair_interval_secs: u64,
-    legacy_scheduler_disabled: bool,
     watched_configuration_is_dependency: bool,
     component_session_only: bool,
 }
@@ -38,9 +37,6 @@ impl NotificationRunnerContract {
     }
 
     /// Whether legacy notification scheduling is disabled.
-    pub const fn legacy_scheduler_disabled(self) -> bool {
-        self.legacy_scheduler_disabled
-    }
 
     /// Whether configuration is dependency-only.
     pub const fn watched_configuration_is_dependency(self) -> bool {
@@ -58,7 +54,6 @@ pub const fn notification_runner_contract() -> NotificationRunnerContract {
     NotificationRunnerContract {
         service_package: crate::SERVICE_PACKAGE,
         repair_interval_secs: NOTIFICATION_REPAIR_INTERVAL_SECS,
-        legacy_scheduler_disabled: true,
         watched_configuration_is_dependency: true,
         component_session_only: true,
     }

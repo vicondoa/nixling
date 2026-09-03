@@ -530,7 +530,6 @@ fn usbip_runner_contract_keeps_service_and_binding_on_one_runner() {
         contract.binding_resource_type(),
         d2b_provider_device_usbip::USB_BINDING_RESOURCE_TYPE
     );
-    assert!(contract.legacy_scheduler_disabled());
     assert!(contract.watched_configuration_is_dependency());
     assert!((30..=60).contains(&contract.repair_interval_secs()));
 }

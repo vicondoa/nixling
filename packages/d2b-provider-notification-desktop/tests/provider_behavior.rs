@@ -142,6 +142,5 @@ fn notification_component_contract_keeps_streams_out_of_resource_authority() {
     assert_eq!(contract.service_package(), "d2b.notification.v3");
     assert_eq!(contract.repair_interval_secs(), 300);
     assert!(contract.component_session_only());
-    assert!(contract.legacy_scheduler_disabled());
     assert!(contract.watched_configuration_is_dependency());
 }

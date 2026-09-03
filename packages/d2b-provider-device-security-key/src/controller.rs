@@ -157,7 +157,6 @@ pub struct SecurityKeyRunnerContract {
     service_resource_type: &'static str,
     binding_resource_type: &'static str,
     repair_interval_secs: u64,
-    legacy_scheduler_disabled: bool,
     watched_configuration_is_dependency: bool,
 }
 
@@ -177,11 +176,6 @@ impl SecurityKeyRunnerContract {
         self.repair_interval_secs
     }
 
-    /// Whether legacy security-key scheduling is disabled.
-    pub const fn legacy_scheduler_disabled(self) -> bool {
-        self.legacy_scheduler_disabled
-    }
-
     /// Whether watched configuration is treated as a dependency.
     pub const fn watched_configuration_is_dependency(self) -> bool {
         self.watched_configuration_is_dependency
@@ -194,7 +188,6 @@ pub const fn security_key_runner_contract() -> SecurityKeyRunnerContract {
         service_resource_type: SECURITY_KEY_SERVICE_RESOURCE_TYPE,
         binding_resource_type: SECURITY_KEY_BINDING_RESOURCE_TYPE,
         repair_interval_secs: SECURITY_KEY_REPAIR_INTERVAL_SECS,
-        legacy_scheduler_disabled: true,
         watched_configuration_is_dependency: true,
     }
 }

@@ -805,6 +805,5 @@ fn shell_runner_contract_keeps_pool_and_session_on_one_cutover() {
         "shell-terminal.d2bus.org/session-finalizer"
     );
     assert_eq!(contract.repair_interval_secs(), 30);
-    assert!(contract.legacy_scheduler_disabled());
     assert!(contract.watched_configuration_is_dependency());
 }

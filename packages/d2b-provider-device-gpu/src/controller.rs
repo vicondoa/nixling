@@ -165,7 +165,6 @@ pub struct GpuRunnerContract {
     resource_type: &'static str,
     finalizer: &'static str,
     repair_interval_secs: u64,
-    legacy_scheduler_disabled: bool,
     watched_configuration_is_dependency: bool,
 }
 
@@ -185,11 +184,6 @@ impl GpuRunnerContract {
         self.repair_interval_secs
     }
 
-    /// Whether legacy GPU scheduling is disabled.
-    pub const fn legacy_scheduler_disabled(self) -> bool {
-        self.legacy_scheduler_disabled
-    }
-
     /// Whether watched configuration is treated as a dependency.
     pub const fn watched_configuration_is_dependency(self) -> bool {
         self.watched_configuration_is_dependency
@@ -202,7 +196,6 @@ pub const fn gpu_runner_contract() -> GpuRunnerContract {
         resource_type: "Device",
         finalizer: crate::DEVICE_GPU_FINALIZER,
         repair_interval_secs: GPU_REPAIR_INTERVAL_SECS,
-        legacy_scheduler_disabled: true,
         watched_configuration_is_dependency: true,
     }
 }

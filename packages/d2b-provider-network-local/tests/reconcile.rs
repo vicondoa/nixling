@@ -566,7 +566,6 @@ fn network_runner_is_the_only_scheduler_and_watches_config_as_dependency() {
     let contract = d2b_provider_network_local::controller::network_runner_contract();
     assert_eq!(contract.resource_type(), "Network");
     assert_eq!(contract.finalizer(), "network.d2bus.org/fabric-cleanup");
-    assert!(contract.legacy_scheduler_disabled());
     assert!(contract.watched_configuration_is_dependency());
     assert!((30..=60).contains(&contract.repair_interval_secs()));
 }

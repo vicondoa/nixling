@@ -43,9 +43,6 @@ pub const U6_SHARED_PROVIDER_RUNNERS: [SharedGuestRunnerRegistration; 4] = [
         finalizer: d2b_provider_runtime_cloud_hypervisor::GUEST_CONTROLLER_FINALIZER,
         repair_interval_ticks:
             d2b_provider_runtime_cloud_hypervisor::CLOUD_HYPERVISOR_REPAIR_INTERVAL_SECS * 1_000,
-        legacy_scheduler_disabled:
-            d2b_provider_runtime_cloud_hypervisor::cloud_hypervisor_runner_contract()
-                .legacy_scheduler_disabled(),
         watched_configuration_is_dependency:
             d2b_provider_runtime_cloud_hypervisor::cloud_hypervisor_runner_contract()
                 .watched_configuration_is_dependency(),
@@ -57,8 +54,6 @@ pub const U6_SHARED_PROVIDER_RUNNERS: [SharedGuestRunnerRegistration; 4] = [
         finalizer: d2b_provider_runtime_qemu_media::FINALIZER,
         repair_interval_ticks: d2b_provider_runtime_qemu_media::QEMU_MEDIA_REPAIR_INTERVAL_SECS
             * 1_000,
-        legacy_scheduler_disabled: d2b_provider_runtime_qemu_media::qemu_media_runner_contract()
-            .legacy_scheduler_disabled(),
         watched_configuration_is_dependency:
             d2b_provider_runtime_qemu_media::qemu_media_runner_contract()
                 .watched_configuration_is_dependency(),
@@ -70,9 +65,6 @@ pub const U6_SHARED_PROVIDER_RUNNERS: [SharedGuestRunnerRegistration; 4] = [
         finalizer: d2b_provider_runtime_azure_container_apps::FINALIZER,
         repair_interval_ticks: d2b_provider_runtime_azure_container_apps::ACA_REPAIR_INTERVAL_SECS
             * 1_000,
-        legacy_scheduler_disabled:
-            d2b_provider_runtime_azure_container_apps::azure_container_apps_runner_contract()
-                .legacy_scheduler_disabled(),
         watched_configuration_is_dependency:
             d2b_provider_runtime_azure_container_apps::azure_container_apps_runner_contract()
                 .watched_configuration_is_dependency(),
@@ -84,9 +76,6 @@ pub const U6_SHARED_PROVIDER_RUNNERS: [SharedGuestRunnerRegistration; 4] = [
         finalizer: d2b_provider_runtime_azure_virtual_machine::FINALIZER,
         repair_interval_ticks:
             d2b_provider_runtime_azure_virtual_machine::AZURE_VM_REPAIR_INTERVAL_SECS * 1_000,
-        legacy_scheduler_disabled:
-            d2b_provider_runtime_azure_virtual_machine::azure_virtual_machine_runner_contract()
-                .legacy_scheduler_disabled(),
         watched_configuration_is_dependency:
             d2b_provider_runtime_azure_virtual_machine::azure_virtual_machine_runner_contract()
                 .watched_configuration_is_dependency(),
@@ -328,11 +317,6 @@ mod tests {
             U6_SHARED_PROVIDER_RUNNERS
                 .iter()
                 .all(|registration| registration.resource_type == "Guest")
-        );
-        assert!(
-            U6_SHARED_PROVIDER_RUNNERS
-                .iter()
-                .all(|registration| registration.legacy_scheduler_disabled)
         );
         assert!(
             U6_SHARED_PROVIDER_RUNNERS

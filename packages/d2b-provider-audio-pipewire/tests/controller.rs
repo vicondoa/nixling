@@ -493,6 +493,5 @@ fn audio_runner_contract_keeps_service_and_binding_on_one_cutover() {
         "audio.d2bus.org/cleanup"
     );
     assert_eq!(contract.repair_interval_secs(), 300);
-    assert!(contract.legacy_scheduler_disabled());
     assert!(contract.watched_configuration_is_dependency());
 }

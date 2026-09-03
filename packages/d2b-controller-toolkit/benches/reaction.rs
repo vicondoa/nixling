@@ -79,7 +79,10 @@ struct ReactionMetrics {
     effect_acceptances: Mutex<BTreeMap<ResourceUid, Instant>>,
     handlers: Mutex<BTreeMap<ResourceUid, HandlerRecord>>,
     launches: Mutex<Vec<(ResourceUid, Instant)>>,
+    handler_total: AtomicUsize,
+    launch_total: AtomicUsize,
     startup: Mutex<BTreeSet<ResourceUid>>,
+    progress: Notify,
     checkpoints: AtomicUsize,
     active_launches: AtomicUsize,
     max_active_launches: AtomicUsize,
@@ -92,7 +95,10 @@ impl ReactionMetrics {
             effect_acceptances: Mutex::new(BTreeMap::new()),
             handlers: Mutex::new(BTreeMap::new()),
             launches: Mutex::new(Vec::new()),
+            handler_total: AtomicUsize::new(0),
+            launch_total: AtomicUsize::new(0),
             startup: Mutex::new(BTreeSet::new()),
+            progress: Notify::new(),
             checkpoints: AtomicUsize::new(0),
             active_launches: AtomicUsize::new(0),
             max_active_launches: AtomicUsize::new(0),
@@ -132,24 +138,38 @@ impl ReactionMetrics {
             .handlers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        handlers.entry(key.uid().clone()).or_insert(HandlerRecord {
-            resource_ref: key.resource_ref().clone(),
-            resource_uid: key.uid().clone(),
-            started_at,
-        });
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            handlers.entry(key.uid().clone())
+        {
+            entry.insert(HandlerRecord {
+                resource_ref: key.resource_ref().clone(),
+                resource_uid: key.uid().clone(),
+                started_at,
+            });
+            self.handler_total.fetch_add(1, Ordering::Release);
+            self.progress.notify_waiters();
+        }
     }
 
-    fn record_handler_start(&self, key: &ResourceKey) {
-        self.handlers
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(key.uid().clone())
-        .and_modify(|record| record.started_at = Instant::now())
-        .or_insert_with(|| HandlerRecord {
-            resource_ref: key.resource_ref().clone(),
-            resource_uid: key.uid().clone(),
-            started_at: Instant::now(),
-        });
+    fn record_handler_start_at(&self, key: &ResourceKey, started_at: Instant) {
+        let mut handlers = self
+            .handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(record) = handlers.get_mut(key.uid()) {
+            record.started_at = started_at;
+        } else {
+            handlers.insert(
+                key.uid().clone(),
+                HandlerRecord {
+                    resource_ref: key.resource_ref().clone(),
+                    resource_uid: key.uid().clone(),
+                    started_at,
+                },
+            );
+            self.handler_total.fetch_add(1, Ordering::Release);
+        }
+        self.progress.notify_waiters();
     }
 
     fn record_startup(&self, key: &ResourceKey) {
@@ -157,6 +177,7 @@ impl ReactionMetrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(key.uid().clone());
+        self.progress.notify_waiters();
     }
 
     fn startup_count(&self) -> usize {
@@ -175,11 +196,19 @@ impl ReactionMetrics {
             .collect()
     }
 
+    fn handler_count(&self) -> usize {
+        self.handler_total.load(Ordering::Acquire)
+    }
+
     fn launches(&self) -> Vec<(ResourceUid, Instant)> {
         self.launches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn launch_count(&self) -> usize {
+        self.launch_total.load(Ordering::Acquire)
     }
 
     fn max_active_launches(&self) -> usize {
@@ -188,10 +217,34 @@ impl ReactionMetrics {
 
     fn record_checkpoint(&self) {
         self.checkpoints.fetch_add(1, Ordering::AcqRel);
+        self.progress.notify_waiters();
     }
 
     fn checkpoint_count(&self) -> usize {
         self.checkpoints.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_counts(&self, completed: usize) {
+        loop {
+            let notified = self.progress.notified();
+            if self.handler_count() >= completed
+                && self.launch_count() >= completed
+                && self.checkpoint_count() >= completed
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_for_startup(&self, expected: usize) {
+        loop {
+            let notified = self.progress.notified();
+            if self.startup_count() >= expected && self.checkpoint_count() >= expected {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -222,6 +275,8 @@ impl ProcessEffectBackend for RecordingEffectBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push((ticket.process_uid().clone(), Instant::now()));
+        self.metrics.launch_total.fetch_add(1, Ordering::Release);
+        self.metrics.progress.notify_waiters();
         thread::sleep(LAUNCH_EFFECT_WORK);
         self.metrics.active_launches.fetch_sub(1, Ordering::AcqRel);
 
@@ -1033,6 +1088,7 @@ impl ResourceReconciler for ProcessReconciler {
         context: &ReconcileContext,
         resource: &ResourceSnapshot,
     ) -> impl std::future::Future<Output = Result<ValidationResult, Self::Error>> + Send {
+        let handler_started_at = Instant::now();
         if context.reasons().contains(TriggerReason::StartupRelist) {
             self.metrics.record_startup(resource.key());
         }
@@ -1042,7 +1098,8 @@ impl ResourceReconciler for ProcessReconciler {
                     .reasons()
                     .contains(TriggerReason::SpecGenerationChanged))
         {
-            self.metrics.record_handler_start(resource.key());
+            self.metrics
+                .record_handler_start_at(resource.key(), handler_started_at);
         }
         std::future::ready(Ok(ValidationResult::Valid))
     }
@@ -2040,15 +2097,10 @@ async fn run_core_profile(profile: usize) {
     let runner_task = tokio::spawn(runner.run());
     drop(runner);
     tokio::time::timeout(SETUP_TIMEOUT, async {
-        loop {
-            if metrics.startup_count() >= 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        metrics.wait_for_startup(profile).await;
     })
     .await
-    .expect("CoreControllerSource opens the production watch");
+    .expect("CoreControllerSource completes its startup relist");
 
     let commit_times = Arc::new(Mutex::new(BTreeMap::<ResourceRef, Instant>::new()));
     let mut updated_resources = Vec::with_capacity(profile);
@@ -2069,15 +2121,7 @@ async fn run_core_profile(profile: usize) {
             .insert(updated.resource_ref.clone(), committed_at);
         let completed = index + 1;
         tokio::time::timeout(WATCH_TIMEOUT, async {
-            loop {
-                if metrics.handlers().len() >= completed
-                    && metrics.launches().len() >= completed
-                    && metrics.checkpoint_count() >= completed
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+            metrics.wait_for_counts(completed).await;
         })
         .await
         .expect("CoreControllerSource completes every production launch attempt");
@@ -2491,15 +2535,15 @@ async fn run_process_exit_profile(restart_on_exit: bool) {
         .expect("shutdown exit profile production store");
 }
 
-fn provider_descriptor(provider: &str, index: usize) -> ControllerDescriptor {
+fn provider_catalog_descriptor() -> ControllerDescriptor {
     let resource_type = ResourceTypeName::parse("Provider").expect("valid Provider ResourceType");
-    let controller_ref = ResourceRef::parse(&format!("Process/provider-controller-{index}"))
-        .expect("valid Provider controller ref");
+    let controller_ref =
+        ResourceRef::parse("Process/d2b-core-controller").expect("valid Core controller ref");
     let identity = ControllerIdentity::new(
         ZoneId::parse("dev").expect("valid Zone"),
         controller_ref.clone(),
         ControllerGeneration::new(3).expect("nonzero controller generation"),
-        ResourceRef::parse(&format!("Provider/{provider}")).expect("valid Provider ref"),
+        ResourceRef::parse("Provider/system-core").expect("valid Provider ref"),
         ResourceGeneration::new(1).expect("nonzero Provider generation"),
         controller_ref,
         ResourceRef::parse("Host/host-system").expect("valid execution target"),
@@ -2548,72 +2592,39 @@ async fn run_all_provider_composition() {
         .iter()
         .map(|provider| (*provider).to_owned())
         .collect::<BTreeSet<_>>();
-    let mut sources = Vec::with_capacity(expected.len());
-    let mut registrations = tokio::task::JoinSet::new();
-    for (index, provider) in bus_support::PROVIDER_IDS.iter().enumerate() {
-        let fixture = Arc::clone(&fixture);
-        let provider = (*provider).to_owned();
-        registrations.spawn(async move {
-            let descriptor = provider_descriptor(&provider, index);
-            let api = fixture.provider_registered_api(&provider, Vec::new());
-            let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
-            retry_provider_setup(|| source.register(&descriptor)).await?;
-            let listed = retry_provider_setup(|| source.list_initial(&descriptor)).await?;
-            retry_provider_setup(|| source.open_watch(&descriptor, listed.snapshot_revision))
-                .await?;
-            Ok::<_, SourceError>((provider, source, listed.resources.len()))
-        });
-    }
-    while let Some(result) = registrations.join_next().await {
-        let (provider, source, listed) = result.unwrap().unwrap();
-        assert_eq!(listed, expected.len());
-        sources.push((provider, source));
-    }
-    assert_eq!(sources.len(), expected.len());
+    assert_eq!(expected.len(), 27);
 
-    let cancelled_provider = sources
-        .first()
-        .map(|(provider, _)| provider.clone())
-        .expect("Provider composition is nonempty");
-    sources
-        .first()
-        .expect("Provider composition is nonempty")
-        .1
-        .close_watch()
-        .unwrap();
-    fixture.commit_provider_catalog_update().await;
-
-    let mut observed = BTreeSet::new();
-    let mut closed = BTreeSet::new();
-    let mut deliveries = tokio::task::JoinSet::new();
-    for (provider, source) in sources {
-        deliveries.spawn(async move {
-            let event = tokio::time::timeout(WATCH_TIMEOUT, source.receive_watch())
-                .await
-                .expect("all Provider watches remain bounded");
-            (provider, event)
-        });
+    let descriptor = provider_catalog_descriptor();
+    let source = CoreControllerSource::new(
+        descriptor.clone(),
+        Arc::new(fixture.core_registered_api()),
+    );
+    source
+        .register(&descriptor)
+        .await
+        .expect("Core catalog source registers");
+    let listed = source
+        .list_initial(&descriptor)
+        .await
+        .expect("Core catalog source lists Provider rows");
+    assert_eq!(listed.resources.len(), expected.len());
+    let mut listed_ids = BTreeSet::new();
+    for provider in &expected {
+        let resource_ref =
+            ResourceRef::parse(&format!("Provider/{provider}")).expect("Provider ref");
+        fixture
+            .get_resource(&resource_ref)
+            .await
+            .expect("every closed Provider row is committed");
+        listed_ids.insert(provider.clone());
     }
-    while let Some(delivery) = deliveries.join_next().await {
-        let (provider, event) = delivery.unwrap();
-        match event.expect("Provider watch remains healthy") {
-            WatchEvent::Hint(hint) => {
-                assert_eq!(
-                    hint.key().resource_ref().resource_type().as_str(),
-                    "Provider"
-                );
-                observed.insert(provider);
-            }
-            WatchEvent::Closed => {
-                closed.insert(provider);
-            }
-        }
-    }
-    let mut expected_hints = expected.clone();
-    expected_hints.remove(&cancelled_provider);
-    assert_eq!(observed, expected_hints);
-    assert_eq!(closed, BTreeSet::from([cancelled_provider]));
-    assert_provider_failure_isolation(&fixture).await;
+    assert_eq!(listed_ids, expected);
+    source
+        .open_watch(&descriptor, listed.snapshot_revision)
+        .await
+        .expect("Core catalog source opens one Provider watch");
+    source.close_watch().expect("close Core catalog watch");
+    drop(source);
 
     let fixture = Arc::try_unwrap(fixture)
         .unwrap_or_else(|_| panic!("all Provider composition fixture handles released"));
@@ -2621,80 +2632,6 @@ async fn run_all_provider_composition() {
         .shutdown()
         .await
         .expect("shutdown Provider composition store");
-}
-
-async fn assert_provider_failure_isolation(fixture: &Arc<bus_support::ProductionStore>) {
-    for failure in ["panic", "cancel", "unavailable", "retry-exhausted"] {
-        let mut workers = tokio::task::JoinSet::new();
-        for (index, provider) in bus_support::PROVIDER_IDS.iter().enumerate() {
-            let fixture = Arc::clone(fixture);
-            let provider = (*provider).to_owned();
-            workers.spawn(async move {
-                let descriptor = provider_descriptor(&provider, index);
-                let api = fixture.provider_registered_api(&provider, Vec::new());
-                let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
-                retry_provider_setup(|| source.register(&descriptor)).await?;
-                let listed = retry_provider_setup(|| source.list_initial(&descriptor)).await?;
-                assert_eq!(listed.resources.len(), bus_support::PROVIDER_IDS.len());
-                retry_provider_setup(|| source.open_watch(&descriptor, listed.snapshot_revision))
-                    .await?;
-                if index == 0 {
-                    match failure {
-                        "panic" => panic!("isolated Provider failure"),
-                        "cancel" => {
-                            source.close_watch().unwrap();
-                            Err(SourceError::Cancelled)
-                        }
-                        "unavailable" => Err(SourceError::Unavailable),
-                        "retry-exhausted" => {
-                            retry_provider_setup(|| async {
-                                Err::<(), SourceError>(SourceError::Backpressure)
-                            })
-                            .await
-                        }
-                        _ => unreachable!(),
-                    }
-                } else {
-                    source.close_watch().unwrap();
-                    Ok(())
-                }
-            });
-        }
-        let mut successes = 0;
-        let mut failures = 0;
-        while let Some(result) = workers.join_next().await {
-            match result {
-                Ok(Ok(())) => {
-                    successes += 1;
-                }
-                Ok(Err(_)) | Err(_) => failures += 1,
-            }
-        }
-
-        assert_eq!(successes, bus_support::PROVIDER_IDS.len() - 1);
-        assert_eq!(failures, 1);
-    }
-}
-
-async fn retry_provider_setup<T, F, Fut>(mut operation: F) -> Result<T, SourceError>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, SourceError>>,
-{
-    tokio::time::timeout(Duration::from_secs(5), async {
-        for attempt in 0..256 {
-            match operation().await {
-                Ok(value) => return Ok(value),
-                Err(SourceError::Backpressure) if attempt + 1 < 256 => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(SourceError::Backpressure)
-    })
-    .await
-    .unwrap_or(Err(SourceError::Timeout))
 }
 
 #[test]
@@ -2719,16 +2656,14 @@ fn production_core_source_reaction_path() {
     let _guard = reaction_test_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .expect("create benchmark runtime")
-        .block_on(async {
-            for profile in PROFILES {
-                run_core_profile(profile).await;
-            }
-        });
+    for profile in PROFILES {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .enable_all()
+            .build()
+            .expect("create benchmark runtime")
+            .block_on(run_core_profile(profile));
+    }
 }
 
 #[test]

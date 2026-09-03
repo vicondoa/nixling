@@ -50,14 +50,6 @@ rust_test(
 )
 
 rust_test(
-    name = "scaffold",
-    srcs = ["tests/scaffold.rs"],
-    compile_data = ["Cargo.toml"],
-    visibility = ["//visibility:public"],
-)
-
-
-rust_test(
     name = "provider_lifecycle",
     srcs = [
         "tests/provider_lifecycle.rs",

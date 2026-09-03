@@ -14,7 +14,6 @@ pub const CLIPBOARD_REPAIR_INTERVAL_SECS: u64 = 300;
 pub struct ClipboardRunnerContract {
     service_package: &'static str,
     repair_interval_secs: u64,
-    legacy_scheduler_disabled: bool,
     watched_configuration_is_dependency: bool,
     component_session_only: bool,
 }
@@ -31,9 +30,6 @@ impl ClipboardRunnerContract {
     }
 
     /// Whether legacy clipboard scheduling is disabled.
-    pub const fn legacy_scheduler_disabled(self) -> bool {
-        self.legacy_scheduler_disabled
-    }
 
     /// Whether configuration is dependency-only.
     pub const fn watched_configuration_is_dependency(self) -> bool {
@@ -51,7 +47,6 @@ pub const fn clipboard_runner_contract() -> ClipboardRunnerContract {
     ClipboardRunnerContract {
         service_package: crate::MANAGEMENT_SERVICE,
         repair_interval_secs: CLIPBOARD_REPAIR_INTERVAL_SECS,
-        legacy_scheduler_disabled: true,
         watched_configuration_is_dependency: true,
         component_session_only: true,
     }
