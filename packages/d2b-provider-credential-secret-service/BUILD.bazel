@@ -145,6 +145,9 @@ rust_test(
     name = "d2b_provider_credential_secret_service_test",
     compile_data = ["Cargo.toml"],
     crate = ":d2b_provider_credential_secret_service",
+    deps = [
+        "//packages/d2b-session-unix:d2b_session_unix",
+    ],
 )
 
 rust_test(
