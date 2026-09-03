@@ -1,5 +1,22 @@
 use std::{env, fs, path::PathBuf};
 
+fn read_required_d2bd_source(relative: &str) -> String {
+    let manifest_root =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap_or_else(|| ".".into()));
+    let mut candidates = vec![manifest_root.join(relative)];
+    if let Some(repo_root) = env::var_os("D2B_REPO_ROOT") {
+        candidates.push(PathBuf::from(repo_root).join("packages/d2bd").join(relative));
+    }
+    for path in candidates {
+        match fs::read_to_string(&path) {
+            Ok(source) => return source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("read required d2bd source {}: {error}", path.display()),
+        }
+    }
+    panic!("required d2bd source is missing: {relative}");
+}
+
 #[test]
 fn production_binary_contains_no_peer_override_surface() {
     let binary = fs::read(env!("CARGO_BIN_EXE_d2bd")).expect("read production d2bd binary");
@@ -40,18 +57,7 @@ fn production_binary_contains_no_peer_override_surface() {
             "production d2bd must not retain retired component-session path {retired}"
         );
     }
-    let source = [
-        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_else(|| ".".into()))
-            .join("src/composition.rs"),
-        env::var_os("D2B_REPO_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_default()
-            .join("packages/d2bd/src/composition.rs"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .and_then(|path| fs::read_to_string(path).ok())
-    .expect("read d2bd source");
+    let source = read_required_d2bd_source("src/composition.rs");
     assert!(
         !source.contains("BrokerRequest::OpenHidrawSecurityKey"),
         "production d2bd must not own the security-key hidraw opener"
@@ -66,13 +72,8 @@ fn production_binary_contains_no_peer_override_surface() {
         "src/provider_registry.rs",
     ]
     .into_iter()
-    .map(|relative| {
-        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_else(|| ".".into()))
-            .join(relative)
-    })
-    .filter_map(|path| fs::read_to_string(path).ok())
+    .map(read_required_d2bd_source)
     .collect::<Vec<_>>();
-    assert!(!source_paths.is_empty(), "read production d2bd source files");
     for retired in [
         "run_process_watch",
         "run_activation_watch",
