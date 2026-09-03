@@ -39,6 +39,8 @@ use d2b_provider_supervisor::{
 };
 use d2b_provider_system_minijail::{MinijailProcessProvider, launch::PlatformGate};
 use d2b_provider_system_systemd::SystemdProcessProvider;
+use d2b_provider_toolkit::CredentialDeliveryKeyHandoff;
+use d2b_session::AuthenticatedSessionRouteBinding;
 use d2b_session_unix::prearmed_seqpacket_pair;
 use d2bd_runtime::target_runtime::{ControllerProcessResource, DaemonMode};
 use d2bd_runtime::vm_start_support::{
@@ -335,6 +337,8 @@ pub(crate) struct ProcessResourceContext<'a> {
     pub(crate) controller_provider_ref: Option<ResourceRef>,
     /// Optional Guest selector for a shared Host execution reference.
     pub(crate) target_ref: Option<ResourceRef>,
+    /// Exact execution reference from the Process spec.
+    pub(crate) execution_ref: Option<ResourceRef>,
     /// Catalog-bound private Guest setup descriptor digest.
     pub(crate) guest_descriptor_digest: Option<SchemaFingerprint>,
 }
@@ -368,6 +372,7 @@ impl<'a> ProcessResourceContext<'a> {
             owner_uid: None,
             controller_provider_ref: None,
             target_ref,
+            execution_ref: None,
             guest_descriptor_digest: None,
         }
     }
@@ -422,6 +427,11 @@ impl<'a> ProcessResourceContext<'a> {
         descriptor_digest: Option<&SchemaFingerprint>,
     ) -> Self {
         self.guest_descriptor_digest = descriptor_digest.cloned();
+        self
+    }
+
+    pub(crate) fn with_execution_ref(mut self, execution_ref: &ResourceRef) -> Self {
+        self.execution_ref = Some(execution_ref.clone());
         self
     }
 }
@@ -562,9 +572,34 @@ impl ControllerBootstrapContext {
     }
 }
 
+/// Lifetime handle returned by the Guest-local Credential backend supervisor.
+pub(crate) trait GuestCredentialBackendLease: Send + Sync {
+    /// Bind the responder to the exact authenticated Provider route.
+    fn bind_route(&self, route: &AuthenticatedSessionRouteBinding) -> Result<(), String>;
+
+    /// Stop the responder and revoke its session-bound backend authority.
+    fn cancel(&self);
+}
+
+/// One backend endpoint prepared by the Guest-local supervisor.
+pub(crate) struct GuestCredentialBackendPreparation {
+    pub(crate) child_endpoint: OwnedFd,
+    pub(crate) delivery_key_handoff: CredentialDeliveryKeyHandoff,
+    pub(crate) lease: Arc<dyn GuestCredentialBackendLease>,
+}
+
+/// Guest-local owner of Credential backend responders.
+pub(crate) trait GuestCredentialBackendSupervisor: Send + Sync {
+    fn prepare(
+        &self,
+        context: &ProcessResourceContext<'_>,
+    ) -> Result<GuestCredentialBackendPreparation, String>;
+}
+
 pub(crate) struct ControllerBootstrapEndpoint {
     daemon_endpoint: OwnedFd,
-    backend_endpoint: Option<Arc<OwnedFd>>,
+    delivery_key_handoff: Option<CredentialDeliveryKeyHandoff>,
+    backend_lease: Option<Arc<dyn GuestCredentialBackendLease>>,
     context: ControllerBootstrapContext,
 }
 
@@ -573,10 +608,16 @@ impl ControllerBootstrapEndpoint {
         self,
     ) -> (
         OwnedFd,
-        Option<Arc<OwnedFd>>,
+        Option<CredentialDeliveryKeyHandoff>,
+        Option<Arc<dyn GuestCredentialBackendLease>>,
         ControllerBootstrapContext,
     ) {
-        (self.daemon_endpoint, self.backend_endpoint, self.context)
+        (
+            self.daemon_endpoint,
+            self.delivery_key_handoff,
+            self.backend_lease,
+            self.context,
+        )
     }
 
     pub(crate) fn context(&self) -> &ControllerBootstrapContext {
@@ -660,6 +701,7 @@ pub struct ProductionProcessProviders {
     bundle: BundleResolver,
     mode: DaemonMode,
     fixed_effect: FixedEffectAdapter,
+    guest_backend_supervisor: Option<Arc<dyn GuestCredentialBackendSupervisor>>,
     managed: Mutex<BTreeMap<(String, String), ManagedProcess>>,
     managed_resources: Mutex<BTreeMap<ManagedResourceKey, ManagedResource>>,
     resource_waiters: Arc<Mutex<BTreeSet<ResourceWaiterKey>>>,
@@ -730,11 +772,21 @@ impl ProductionProcessProviders {
             bundle,
             mode,
             fixed_effect,
+            guest_backend_supervisor: None,
             managed: Mutex::new(BTreeMap::new()),
             managed_resources: Mutex::new(BTreeMap::new()),
             resource_waiters: Arc::new(Mutex::new(BTreeSet::new())),
             controller_bootstrap: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Bind the Guest-local Credential backend responder supervisor.
+    pub(crate) fn with_guest_backend_supervisor(
+        mut self,
+        supervisor: Arc<dyn GuestCredentialBackendSupervisor>,
+    ) -> Self {
+        self.guest_backend_supervisor = Some(supervisor);
+        self
     }
 
     /// Return the fixed daemon mode bound to these Process Providers.
@@ -925,6 +977,7 @@ impl ProductionProcessProviders {
         spec: &ProcessSpec,
         timeout: Duration,
     ) -> Result<ProviderLaunch, String> {
+        let context = context.with_execution_ref(spec.execution().execution_ref());
         self.validate_execution_target(spec.execution().execution_ref())?;
         let provider = managed_provider_from_ref(context.provider_ref)?;
         validate_resource_execution_target(self.mode, &context, spec.execution())?;
@@ -957,25 +1010,36 @@ impl ProductionProcessProviders {
         let controller_endpoints = if controller_bootstrap {
             let (daemon_endpoint, child_endpoint) = prearmed_seqpacket_pair()
                 .map_err(|_| "provider-controller-bootstrap-create".to_owned())?;
-            let (child_fds, backend_endpoint) = if ticket.inherited_fd_table().count() == 2 {
-                let (backend_peer, backend_child) = prearmed_seqpacket_pair()
-                    .map_err(|_| "provider-credential-backend-create".to_owned())?;
-                (
-                    vec![child_endpoint, backend_child],
-                    Some(Arc::new(backend_peer)),
-                )
-            } else {
-                (vec![child_endpoint], None)
-            };
-            Some((daemon_endpoint, child_fds, backend_endpoint))
+            let (child_fds, delivery_key_handoff, backend_lease) =
+                if ticket.inherited_fd_table().count() == 2 {
+                    let supervisor = self.guest_backend_supervisor.as_ref().ok_or_else(|| {
+                        "provider-credential-backend-supervisor-unavailable".to_owned()
+                    })?;
+                    let preparation = supervisor.prepare(&context)?;
+                    (
+                        vec![child_endpoint, preparation.child_endpoint],
+                        Some(preparation.delivery_key_handoff),
+                        Some(preparation.lease),
+                    )
+                } else {
+                    (vec![child_endpoint], None, None)
+                };
+            Some((
+                daemon_endpoint,
+                child_fds,
+                delivery_key_handoff,
+                backend_lease,
+            ))
         } else {
             None
         };
-        let mut backend_endpoint = None;
+        let mut delivery_key_handoff = None;
+        let mut backend_lease = None;
         let report = match provider {
             ManagedProvider::Minijail => match controller_endpoints {
-                Some((daemon_endpoint, child_fds, backend_peer)) => {
-                    backend_endpoint = backend_peer;
+                Some((daemon_endpoint, child_fds, key_handoff, lease)) => {
+                    delivery_key_handoff = key_handoff;
+                    backend_lease = lease;
                     let mut inherited_fds = child_fds;
                     inherited_fds.push(daemon_endpoint);
                     self.minijail
@@ -1053,7 +1117,8 @@ impl ProductionProcessProviders {
             };
             if let Err(error) = self.remember_controller_bootstrap(ControllerBootstrapEndpoint {
                 daemon_endpoint,
-                backend_endpoint,
+                delivery_key_handoff,
+                backend_lease,
                 context: controller_context,
             }) {
                 let _ = self
@@ -1988,7 +2053,8 @@ impl ProductionProcessProviders {
                     }
                     self.remember_controller_bootstrap(ControllerBootstrapEndpoint {
                         daemon_endpoint,
-                        backend_endpoint: None,
+                        delivery_key_handoff: None,
+                        backend_lease: None,
                         context: controller_context,
                     })?;
                 }

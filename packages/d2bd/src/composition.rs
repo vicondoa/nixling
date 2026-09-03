@@ -422,6 +422,7 @@ mod audio_dispatch;
 mod audio_host_controller;
 mod audio_resource_runtime;
 mod binding_child_resource_runtime;
+mod credential_backend_runtime;
 mod credential_resource_runtime;
 pub mod interaction_composition;
 pub mod network_effect_port;
@@ -4496,6 +4497,9 @@ pub async fn serve_guest(options: GuestServeOptions) -> Result<(), TypedError> {
                 uid: options.broker_uid,
             },
             d2bd_runtime::target_runtime::DaemonMode::Guest,
+        )
+        .with_guest_backend_supervisor(
+            credential_backend_runtime::ProductionGuestCredentialBackendSupervisor::fail_closed(),
         ),
     );
     let local_private_path =

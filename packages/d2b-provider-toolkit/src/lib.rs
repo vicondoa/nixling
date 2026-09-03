@@ -87,10 +87,16 @@ pub use d2b_session::{
 pub use dispatch::{DispatchLimiter, DispatchPermit, MAX_DISPATCH_IN_FLIGHT};
 #[cfg(feature = "unix-transport")]
 pub use fd10::{
-    GUEST_CREDENTIAL_BACKEND_FD, PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID,
-    PROVIDER_READY_MARKER, PROVIDER_READY_STREAM_CREDIT, PROVIDER_READY_STREAM_ID,
-    GuestCredentialBackend, GuestCredentialBackendError, GuestCredentialBackendResponse,
-    ProviderFd10Spec, ProviderSessionMetadata, credential_delivery_credentials, run_from_fd10,
+    CredentialDeliveryKeyHandoff, CredentialDeliveryKeyMaterial, GUEST_CREDENTIAL_BACKEND_FD,
+    GUEST_CREDENTIAL_BACKEND_PROTOCOL, GUEST_CREDENTIAL_BACKEND_SERVICE,
+    GuestCredentialBackend, GuestCredentialBackendError, GuestCredentialBackendHandler,
+    GuestCredentialBackendHandlerError, GuestCredentialBackendHandlerFuture,
+    GuestCredentialBackendReply, GuestCredentialBackendResponderLease,
+    GuestCredentialBackendResponse, PROVIDER_BOOTSTRAP_STREAM_CREDIT,
+    PROVIDER_BOOTSTRAP_STREAM_ID, PROVIDER_DELIVERY_KEY_STREAM_CREDIT,
+    PROVIDER_DELIVERY_KEY_STREAM_ID, PROVIDER_READY_MARKER, PROVIDER_READY_STREAM_CREDIT,
+    PROVIDER_READY_STREAM_ID, ProviderFd10Spec, ProviderSessionMetadata, run_from_fd10,
+    spawn_guest_credential_backend_responder,
 };
 pub use error::ProviderToolkitError;
 pub use fixture::{

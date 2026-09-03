@@ -1,7 +1,9 @@
 //! Supervised Provider binary bootstrap over the inherited fd 10 handoff.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
+    future::Future,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -34,7 +36,6 @@ use d2b_session_unix::{
     prearmed_seqpacket_pair,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::{
     AllocatorSessionBinding, ProviderAgentBootstrap, ProviderEntrypoint, ProviderRuntimeError,
@@ -52,10 +53,17 @@ pub const PROVIDER_READY_STREAM_ID: u16 = 0x0103;
 pub const PROVIDER_READY_STREAM_CREDIT: u32 = 256;
 /// Protected readiness receipt sent only after the typed service is live.
 pub const PROVIDER_READY_MARKER: &[u8] = b"d2b-provider-ready-v1";
+/// Named stream carrying one allocator-issued Credential delivery key handoff.
+pub const PROVIDER_DELIVERY_KEY_STREAM_ID: u16 = 0x0104;
+/// Initial bounded credit for the Credential delivery key handoff stream.
+pub const PROVIDER_DELIVERY_KEY_STREAM_CREDIT: u32 = 1024;
 const PROVIDER_BOOTSTRAP_MAX_BYTES: usize = 64 * 1024;
 const PROVIDER_BOOTSTRAP_PROTOCOL: &str = "d2b-provider-session-bootstrap-v1";
 const GUEST_CREDENTIAL_BACKEND_MAX_BYTES: usize = 64 * 1024;
-const GUEST_CREDENTIAL_BACKEND_PROTOCOL: &str = "d2b-guest-credential-backend-v1";
+/// Protocol marker for the Guest-local typed credential backend.
+pub const GUEST_CREDENTIAL_BACKEND_PROTOCOL: &str = "d2b-guest-credential-backend-v1";
+/// Ttrpc service name for the Guest-local typed credential backend.
+pub const GUEST_CREDENTIAL_BACKEND_SERVICE: &str = "d2b.guest.credential.v1.GuestCredentialBackend";
 
 /// Fixed inherited descriptor for the Guest-local credential backend port.
 pub const GUEST_CREDENTIAL_BACKEND_FD: i32 = 11;
@@ -244,6 +252,237 @@ impl std::fmt::Debug for ProviderSessionMetadata {
     }
 }
 
+const PROVIDER_DELIVERY_KEY_PROTOCOL: &str = "d2b-provider-delivery-key-v1";
+
+/// One allocator-issued Provider-side Credential delivery key handoff.
+///
+/// The private key is held only in a zeroizing owner until the Provider
+/// consumes this value to establish its delivery session.
+pub struct CredentialDeliveryKeyHandoff {
+    provider_private: zeroize::Zeroizing<[u8; 32]>,
+    provider_public: [u8; 32],
+    backend_public: [u8; 32],
+}
+
+impl CredentialDeliveryKeyHandoff {
+    /// Construct a handoff from already-issued key material.
+    pub fn new(
+        provider_private: [u8; 32],
+        backend_public: [u8; 32],
+    ) -> Result<Self, ProviderRuntimeError> {
+        if provider_private == [0; 32] || backend_public == [0; 32] {
+            return Err(ProviderRuntimeError::SessionUnauthenticated);
+        }
+        let provider_public = x25519_public_key(&provider_private)
+            .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+        Ok(Self {
+            provider_private: zeroize::Zeroizing::new(provider_private),
+            provider_public,
+            backend_public,
+        })
+    }
+
+    /// Encode the handoff for one exact authenticated Provider route.
+    pub fn encode_for_route(
+        &self,
+        route: &AuthenticatedSessionRouteBinding,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, ProviderRuntimeError> {
+        let provider_ref = route
+            .provider_ref()
+            .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
+        let process_ref = route
+            .context()
+            .process_ref()
+            .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
+        let execution_ref = route
+            .context()
+            .execution_ref()
+            .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire<'a> {
+            protocol: &'static str,
+            zone: &'a str,
+            provider_ref: String,
+            process_ref: String,
+            execution_ref: String,
+            provider_generation: u64,
+            controller_generation: u64,
+            session_generation: u64,
+            provider_private: &'a [u8; 32],
+            provider_public: &'a [u8; 32],
+            backend_public: &'a [u8; 32],
+        }
+        let payload = Wire {
+            protocol: PROVIDER_DELIVERY_KEY_PROTOCOL,
+            zone: route.zone().as_str(),
+            provider_ref: provider_ref.to_canonical_string(),
+            process_ref: process_ref.to_canonical_string(),
+            execution_ref: execution_ref.to_canonical_string(),
+            provider_generation: route
+                .provider_generation()
+                .ok_or(ProviderRuntimeError::SessionUnauthenticated)?
+                .get(),
+            controller_generation: route
+                .controller_generation()
+                .ok_or(ProviderRuntimeError::SessionUnauthenticated)?
+                .get(),
+            session_generation: route.reconnect_generation().get(),
+            provider_private: &self.provider_private,
+            provider_public: &self.provider_public,
+            backend_public: &self.backend_public,
+        };
+        serde_json::to_vec(&payload)
+            .map(zeroize::Zeroizing::new)
+            .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)
+    }
+
+    /// Consume the handoff for the Provider side of the delivery session.
+    pub fn into_material(self) -> CredentialDeliveryKeyMaterial {
+        CredentialDeliveryKeyMaterial {
+            local_private: self.provider_private,
+            remote_public: self.backend_public,
+        }
+    }
+
+    /// Borrow the Provider public key for Guest-supervisor enrollment.
+    pub const fn provider_public(&self) -> &[u8; 32] {
+        &self.provider_public
+    }
+
+    /// Borrow the enrolled Guest backend public key.
+    pub const fn backend_public(&self) -> &[u8; 32] {
+        &self.backend_public
+    }
+}
+
+impl std::fmt::Debug for CredentialDeliveryKeyHandoff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CredentialDeliveryKeyHandoff(<redacted>)")
+    }
+}
+
+/// Zeroizing Provider-side key material for one sensitive Credential session.
+pub struct CredentialDeliveryKeyMaterial {
+    local_private: zeroize::Zeroizing<[u8; 32]>,
+    remote_public: [u8; 32],
+}
+
+impl CredentialDeliveryKeyMaterial {
+    /// Construct explicit enrolled key material.
+    pub fn new(
+        local_private: [u8; 32],
+        remote_public: [u8; 32],
+    ) -> Result<Self, ProviderRuntimeError> {
+        if local_private == [0; 32] || remote_public == [0; 32] {
+            return Err(ProviderRuntimeError::SessionUnauthenticated);
+        }
+        Ok(Self {
+            local_private: zeroize::Zeroizing::new(local_private),
+            remote_public,
+        })
+    }
+
+    /// Convert the material into the session handshake credentials.
+    pub fn into_handshake(self) -> Result<HandshakeCredentials, ProviderRuntimeError> {
+        Ok(HandshakeCredentials::Kk {
+            local_private: Secret32::new(*self.local_private)
+                .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?,
+            remote_public: self.remote_public,
+        })
+    }
+}
+
+impl std::fmt::Debug for CredentialDeliveryKeyMaterial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CredentialDeliveryKeyMaterial(<redacted>)")
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CredentialDeliveryKeyWire {
+    protocol: String,
+    zone: String,
+    provider_ref: ResourceRef,
+    process_ref: ResourceRef,
+    execution_ref: ResourceRef,
+    provider_generation: u64,
+    controller_generation: u64,
+    session_generation: u64,
+    provider_private: Vec<u8>,
+    provider_public: Vec<u8>,
+    backend_public: Vec<u8>,
+}
+
+impl Drop for CredentialDeliveryKeyWire {
+    fn drop(&mut self) {
+        self.provider_private.fill(0);
+        self.provider_public.fill(0);
+        self.backend_public.fill(0);
+    }
+}
+
+fn decode_delivery_key_handoff(
+    bytes: &[u8],
+    route: &AuthenticatedSessionRouteBinding,
+) -> Result<CredentialDeliveryKeyMaterial, ProviderRuntimeError> {
+    let wire: CredentialDeliveryKeyWire =
+        serde_json::from_slice(bytes).map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let provider_ref = route
+        .provider_ref()
+        .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
+    let process_ref = route
+        .context()
+        .process_ref()
+        .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
+    let execution_ref = route
+        .context()
+        .execution_ref()
+        .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
+    if wire.protocol != PROVIDER_DELIVERY_KEY_PROTOCOL
+        || wire.zone != route.zone().as_str()
+        || wire.provider_ref != *provider_ref
+        || wire.process_ref != *process_ref
+        || wire.execution_ref != *execution_ref
+        || wire.provider_generation
+            != route
+                .provider_generation()
+                .ok_or(ProviderRuntimeError::SessionUnauthenticated)?
+                .get()
+        || wire.controller_generation
+            != route
+                .controller_generation()
+                .ok_or(ProviderRuntimeError::SessionUnauthenticated)?
+                .get()
+        || wire.session_generation != route.reconnect_generation().get()
+    {
+        return Err(ProviderRuntimeError::SessionUnauthenticated);
+    }
+    let provider_private = wire
+        .provider_private
+        .as_slice()
+        .try_into()
+        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let backend_public = wire
+        .backend_public
+        .as_slice()
+        .try_into()
+        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let provider_public: [u8; 32] = wire
+        .provider_public
+        .as_slice()
+        .try_into()
+        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    if provider_public
+        != x25519_public_key(&provider_private)
+            .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?
+    {
+        return Err(ProviderRuntimeError::SessionUnauthenticated);
+    }
+    CredentialDeliveryKeyMaterial::new(provider_private, backend_public)
+}
+
 /// Closed failures from the Guest-local credential backend port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestCredentialBackendError {
@@ -326,6 +565,159 @@ impl std::fmt::Debug for GuestCredentialBackendResponse {
     }
 }
 
+/// A non-secret or zeroizing response returned by one Guest backend operation.
+pub struct GuestCredentialBackendReply {
+    state: Option<String>,
+    lease_handle: Option<String>,
+    source_version: Option<String>,
+    rotation_generation: Option<u64>,
+    expires_at_unix_ms: Option<u64>,
+    outcome: Option<String>,
+    bytes: Option<zeroize::Zeroizing<Vec<u8>>>,
+}
+
+impl GuestCredentialBackendReply {
+    /// Construct a typed backend reply. Sensitive bytes remain zeroizing.
+    pub fn new(
+        state: Option<String>,
+        lease_handle: Option<String>,
+        source_version: Option<String>,
+        rotation_generation: Option<u64>,
+        expires_at_unix_ms: Option<u64>,
+        outcome: Option<String>,
+        bytes: Option<zeroize::Zeroizing<Vec<u8>>>,
+    ) -> Self {
+        Self {
+            state,
+            lease_handle,
+            source_version,
+            rotation_generation,
+            expires_at_unix_ms,
+            outcome,
+            bytes,
+        }
+    }
+
+    fn encode(self) -> Result<zeroize::Zeroizing<Vec<u8>>, GuestCredentialBackendHandlerError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire<'a> {
+            protocol: &'static str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            state: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            lease_handle: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            source_version: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            rotation_generation: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            expires_at_unix_ms: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            outcome: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            bytes: Option<&'a [u8]>,
+        }
+        let bytes = self.bytes.as_ref().map(|bytes| bytes.as_slice());
+        serde_json::to_vec(&Wire {
+            protocol: GUEST_CREDENTIAL_BACKEND_PROTOCOL,
+            state: self.state,
+            lease_handle: self.lease_handle,
+            source_version: self.source_version,
+            rotation_generation: self.rotation_generation,
+            expires_at_unix_ms: self.expires_at_unix_ms,
+            outcome: self.outcome,
+            bytes,
+        })
+        .map(zeroize::Zeroizing::new)
+        .map_err(|_| GuestCredentialBackendHandlerError::Malformed)
+    }
+}
+
+impl std::fmt::Debug for GuestCredentialBackendReply {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GuestCredentialBackendReply(<redacted>)")
+    }
+}
+
+/// Closed failures from a Guest backend responder handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestCredentialBackendHandlerError {
+    /// The request is not valid for the exact backend route.
+    Denied,
+    /// The request or response is malformed.
+    Malformed,
+    /// The Guest-local provider backend could not answer.
+    Unavailable,
+}
+
+/// Boxed future returned by a Guest backend responder handler.
+pub type GuestCredentialBackendHandlerFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<GuestCredentialBackendReply, GuestCredentialBackendHandlerError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Typed operation handler owned by the Guest credential execution context.
+pub trait GuestCredentialBackendHandler: Send + Sync + 'static {
+    /// Execute one already authenticated, route-bound operation.
+    fn handle(
+        &self,
+        route: &AuthenticatedSessionRouteBinding,
+        operation: &str,
+        fields: serde_json::Value,
+    ) -> GuestCredentialBackendHandlerFuture<'_>;
+}
+
+/// Cancellable Guest-local backend responder lease.
+pub struct GuestCredentialBackendResponderLease {
+    route: tokio::sync::watch::Sender<Option<AuthenticatedSessionRouteBinding>>,
+    cancel: tokio::sync::watch::Sender<bool>,
+    bound: std::sync::Mutex<bool>,
+}
+
+impl std::fmt::Debug for GuestCredentialBackendResponderLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GuestCredentialBackendResponderLease(<redacted>)")
+    }
+}
+
+impl GuestCredentialBackendResponderLease {
+    /// Bind the responder to one exact Provider ComponentSession route.
+    pub fn bind_route(
+        &self,
+        route: AuthenticatedSessionRouteBinding,
+    ) -> Result<(), ProviderRuntimeError> {
+        if !validate_guest_backend_route(&route).is_ok() {
+            return Err(ProviderRuntimeError::SessionUnauthenticated);
+        }
+        let mut bound = self
+            .bound
+            .lock()
+            .map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
+        if *bound {
+            return Err(ProviderRuntimeError::SessionUnauthenticated);
+        }
+        *bound = true;
+        self.route
+            .send(Some(route))
+            .map_err(|_| ProviderRuntimeError::SessionLoopFailed)
+    }
+
+    /// Cancel the responder and close its sensitive session.
+    pub fn cancel(&self) {
+        let _ = self.cancel.send(true);
+    }
+}
+
+impl Drop for GuestCredentialBackendResponderLease {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(true);
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct GuestCredentialBackendResponseWire {
@@ -368,6 +760,7 @@ impl GuestCredentialBackend {
     pub fn from_inherited_fd(
         raw_fd: i32,
         route: &AuthenticatedSessionRouteBinding,
+        delivery_keys: CredentialDeliveryKeyMaterial,
     ) -> Result<Arc<Self>, ProviderRuntimeError> {
         validate_guest_backend_route(route)?;
         let socket = SeqpacketSocket::from_inherited_fd(raw_fd)
@@ -379,6 +772,7 @@ impl GuestCredentialBackend {
             state: Arc::new(tokio::sync::Mutex::new(GuestCredentialBackendState {
                 socket: Some(socket),
                 connection: None,
+                delivery_keys: Some(delivery_keys),
             })),
             route: Some(route.clone()),
         }))
@@ -390,6 +784,7 @@ impl GuestCredentialBackend {
             state: Arc::new(tokio::sync::Mutex::new(GuestCredentialBackendState {
                 socket: Some(socket),
                 connection: None,
+                delivery_keys: None,
             })),
             route: None,
         })
@@ -400,12 +795,14 @@ impl GuestCredentialBackend {
     pub fn from_socket_for_test_with_route(
         socket: SeqpacketSocket,
         route: AuthenticatedSessionRouteBinding,
+        delivery_keys: CredentialDeliveryKeyMaterial,
     ) -> Result<Arc<Self>, ProviderRuntimeError> {
         validate_guest_backend_route(&route)?;
         Ok(Arc::new(Self {
             state: Arc::new(tokio::sync::Mutex::new(GuestCredentialBackendState {
                 socket: Some(socket),
                 connection: None,
+                delivery_keys: Some(delivery_keys),
             })),
             route: Some(route),
         }))
@@ -554,7 +951,11 @@ impl GuestCredentialBackend {
             let policy = credential_delivery_endpoint_policy(route.reconnect_generation().get());
             let transport = guest_backend_transport(socket, &policy, expected_peer)
                 .map_err(|_| GuestCredentialBackendError::Unavailable)?;
-            let credentials = credential_delivery_credentials(route, true)
+            let credentials = state
+                .delivery_keys
+                .take()
+                .ok_or(GuestCredentialBackendError::Unavailable)?
+                .into_handshake()
                 .map_err(|_| GuestCredentialBackendError::Unavailable)?;
             let engine = match SessionEngine::establish_initiator(
                 transport,
@@ -631,8 +1032,8 @@ impl GuestCredentialBackend {
         request.set_service("d2b.guest.credential.v1.GuestCredentialBackend".to_owned());
         request.set_method("Request".to_owned());
         request.metadata = metadata;
-        request.payload = serde_json::to_vec(&fields)
-            .map_err(|_| GuestCredentialBackendError::Malformed)?;
+        request.payload =
+            serde_json::to_vec(&fields).map_err(|_| GuestCredentialBackendError::Malformed)?;
         let response = tokio::time::timeout(
             Duration::from_millis(250),
             connection.client.client().request(request),
@@ -641,8 +1042,8 @@ impl GuestCredentialBackend {
         .map_err(|_| GuestCredentialBackendError::Unavailable)?
         .map_err(|_| GuestCredentialBackendError::Unavailable)?;
         let payload = zeroize::Zeroizing::new(response.payload);
-        let response: GuestCredentialBackendResponseWire = serde_json::from_slice(&payload)
-            .map_err(|_| GuestCredentialBackendError::Malformed)?;
+        let response: GuestCredentialBackendResponseWire =
+            serde_json::from_slice(&payload).map_err(|_| GuestCredentialBackendError::Malformed)?;
         if response.protocol != GUEST_CREDENTIAL_BACKEND_PROTOCOL {
             return Err(GuestCredentialBackendError::Malformed);
         }
@@ -661,6 +1062,7 @@ impl GuestCredentialBackend {
 struct GuestCredentialBackendState {
     socket: Option<SeqpacketSocket>,
     connection: Option<GuestCredentialBackendConnection>,
+    delivery_keys: Option<CredentialDeliveryKeyMaterial>,
 }
 
 struct GuestCredentialBackendConnection {
@@ -720,56 +1122,224 @@ fn guest_backend_transport(
     .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)
 }
 
-/// Derive the session-bound enrolled Noise_KK credentials used by a
-/// Guest-local Credential backend route.
+/// Start the Guest-local credential backend responder for one prearmed peer.
 ///
-/// The seed is bound to the already authenticated Provider route and is
-/// intentionally never serialized into status, audit, or request metadata.
-pub fn credential_delivery_credentials(
-    route: &AuthenticatedSessionRouteBinding,
-    initiator: bool,
-) -> Result<HandshakeCredentials, ProviderRuntimeError> {
-    let local_label = if initiator {
-        b"provider".as_slice()
-    } else {
-        b"guest".as_slice()
-    };
-    let remote_label = if initiator {
-        b"guest".as_slice()
-    } else {
-        b"provider".as_slice()
-    };
-    let local = credential_delivery_seed(route, local_label);
-    let remote = credential_delivery_seed(route, remote_label);
-    Ok(HandshakeCredentials::Kk {
-        local_private: Secret32::new(local)
-            .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?,
-        remote_public: x25519_public_key(&remote)
-            .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?,
-    })
+/// The responder remains dormant until its owning Guest supervisor binds the
+/// exact authenticated Provider route. This prevents a child from using a
+/// socket or enrolled key pair after a Process or session replacement.
+pub fn spawn_guest_credential_backend_responder(
+    socket: SeqpacketSocket,
+    delivery_keys: CredentialDeliveryKeyMaterial,
+    handler: Arc<dyn GuestCredentialBackendHandler>,
+) -> Result<Arc<GuestCredentialBackendResponderLease>, ProviderRuntimeError> {
+    let expected_peer = socket
+        .acceptor_peer_credentials()
+        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let (route_tx, route_rx) = tokio::sync::watch::channel(None);
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    tokio::runtime::Handle::try_current().map_err(|_| ProviderRuntimeError::SessionLoopFailed)?;
+    tokio::spawn(run_guest_credential_backend_responder(
+        socket,
+        expected_peer,
+        delivery_keys,
+        handler,
+        route_rx,
+        cancel_rx,
+    ));
+    Ok(Arc::new(GuestCredentialBackendResponderLease {
+        route: route_tx,
+        cancel: cancel_tx,
+        bound: std::sync::Mutex::new(false),
+    }))
 }
 
-fn credential_delivery_seed(route: &AuthenticatedSessionRouteBinding, label: &[u8]) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"d2b:v3:credential-delivery:enrolled-kk");
-    digest.update([0]);
-    digest.update(label);
-    digest.update([0]);
-    digest.update(route.zone().as_str().as_bytes());
-    digest.update([0]);
-    if let Some(provider) = route.provider_ref() {
-        digest.update(provider.to_canonical_string().as_bytes());
+async fn run_guest_credential_backend_responder(
+    socket: SeqpacketSocket,
+    expected_peer: d2b_session_unix::PeerCredentials,
+    delivery_keys: CredentialDeliveryKeyMaterial,
+    handler: Arc<dyn GuestCredentialBackendHandler>,
+    mut route_rx: tokio::sync::watch::Receiver<Option<AuthenticatedSessionRouteBinding>>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let route = loop {
+        if *cancel_rx.borrow() {
+            return;
     }
-    digest.update([0]);
-    digest.update(route.reconnect_generation().get().to_be_bytes());
-    if let Some(provider_generation) = route.provider_generation() {
-        digest.update(provider_generation.get().to_be_bytes());
+        if let Some(route) = route_rx.borrow().clone() {
+            break route;
     }
-    digest.update([0]);
-    if let Some(controller_generation) = route.controller_generation() {
-        digest.update(controller_generation.get().to_be_bytes());
+        tokio::select! {
+            result = route_rx.changed() => {
+                if result.is_err() {
+                    return;
     }
-    digest.finalize().into()
+            }
+            result = cancel_rx.changed() => {
+                if result.is_err() || *cancel_rx.borrow() {
+                    return;
+                }
+            }
+        }
+    };
+    if !validate_guest_backend_route(&route).is_ok() {
+        return;
+    }
+    let policy = credential_delivery_endpoint_policy(route.reconnect_generation().get());
+    let Ok(transport) = guest_backend_transport(socket, &policy, expected_peer) else {
+        return;
+    };
+    let Ok(credentials) = delivery_keys.into_handshake() else {
+        return;
+    };
+    let Ok(responder) =
+        SessionEngine::establish_responder(transport, policy, credentials, Instant::now()).await
+    else {
+        return;
+    };
+    let driver: Arc<dyn ComponentSessionDriver> = Arc::new(responder.into_driver());
+    let service = ttrpc::r#async::Service {
+        methods: HashMap::from([(
+            "Request".to_owned(),
+            Box::new(GuestCredentialBackendMethod { route, handler })
+                as Box<dyn ttrpc::r#async::MethodHandler + Send + Sync>,
+        )]),
+        streams: HashMap::new(),
+    };
+    tokio::select! {
+        _ = d2b_session::serve_ttrpc_services(
+            driver,
+            HashMap::from([(GUEST_CREDENTIAL_BACKEND_SERVICE.to_owned(), service)]),
+        ) => {}
+        result = cancel_rx.changed() => {
+            let _ = result;
+        }
+    }
+}
+
+struct GuestCredentialBackendMethod {
+    route: AuthenticatedSessionRouteBinding,
+    handler: Arc<dyn GuestCredentialBackendHandler>,
+}
+
+impl GuestCredentialBackendMethod {
+    async fn invoke(
+        &self,
+        request: ttrpc::Request,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, GuestCredentialBackendHandlerError> {
+        if request.service != GUEST_CREDENTIAL_BACKEND_SERVICE
+            || request.method != "Request"
+            || !self.route.liveness().is_live()
+            || metadata_value(&request, "d2b.credential.zone") != Some(self.route.zone().as_str())
+            || metadata_value(&request, "d2b.credential.provider")
+                != self
+                    .route
+                    .provider_ref()
+                    .map(|value| value.to_canonical_string())
+                    .as_deref()
+            || metadata_value(&request, "d2b.credential.session-generation")
+                .and_then(|value| value.parse::<u64>().ok())
+                != Some(self.route.reconnect_generation().get())
+            || metadata_value(&request, "d2b.credential.execution-ref")
+                != self
+                    .route
+                    .context()
+                    .execution_ref()
+                    .map(|value| value.to_canonical_string())
+                    .as_deref()
+            || metadata_value(&request, "d2b.credential.process-ref")
+                != self
+                    .route
+                    .context()
+                    .process_ref()
+                    .map(|value| value.to_canonical_string())
+                    .as_deref()
+            || metadata_value(&request, "d2b.credential.provider-generation")
+                .and_then(|value| value.parse::<u64>().ok())
+                != self.route.provider_generation().map(|value| value.get())
+            || metadata_value(&request, "d2b.credential.controller-generation")
+                .and_then(|value| value.parse::<u64>().ok())
+                != self.route.controller_generation().map(|value| value.get())
+        {
+            return Err(GuestCredentialBackendHandlerError::Denied);
+        }
+        let mut payload = zeroize::Zeroizing::new(request.payload);
+        let mut value: serde_json::Value = serde_json::from_slice(&payload)
+            .map_err(|_| GuestCredentialBackendHandlerError::Malformed)?;
+        let object = value
+            .as_object_mut()
+            .ok_or(GuestCredentialBackendHandlerError::Malformed)?;
+        if object.remove("protocol")
+            != Some(serde_json::Value::String(
+                GUEST_CREDENTIAL_BACKEND_PROTOCOL.to_owned(),
+            ))
+        {
+            return Err(GuestCredentialBackendHandlerError::Denied);
+        }
+        let operation = object
+            .remove("operation")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or(GuestCredentialBackendHandlerError::Malformed)?;
+        if !valid_guest_backend_operation(&operation) {
+            return Err(GuestCredentialBackendHandlerError::Denied);
+        }
+        let fields = serde_json::Value::Object(std::mem::take(object));
+        let reply = self.handler.handle(&self.route, &operation, fields).await?;
+        payload.fill(0);
+        reply.encode()
+    }
+}
+
+#[async_trait::async_trait]
+impl ttrpc::r#async::MethodHandler for GuestCredentialBackendMethod {
+    async fn handler(
+        &self,
+        _context: ttrpc::r#async::TtrpcContext,
+        request: ttrpc::Request,
+    ) -> ttrpc::Result<ttrpc::Response> {
+        let payload = self.invoke(request).await.map_err(backend_rpc_error)?;
+        let mut response = ttrpc::Response::new();
+        response.set_status(ttrpc::get_status(ttrpc::Code::OK, ""));
+        response.payload = payload.to_vec();
+        Ok(response)
+    }
+}
+
+fn backend_rpc_error(error: GuestCredentialBackendHandlerError) -> ttrpc::Error {
+    let code = match error {
+        GuestCredentialBackendHandlerError::Denied => ttrpc::Code::PERMISSION_DENIED,
+        GuestCredentialBackendHandlerError::Malformed => ttrpc::Code::INVALID_ARGUMENT,
+        GuestCredentialBackendHandlerError::Unavailable => ttrpc::Code::UNAVAILABLE,
+    };
+    ttrpc::Error::RpcStatus(ttrpc::get_status(code, "guest-credential-backend"))
+}
+
+fn metadata_value<'a>(request: &'a ttrpc::Request, key: &str) -> Option<&'a str> {
+    request
+        .metadata
+        .iter()
+        .find(|value| value.key == key)
+        .map(|value| value.value.as_str())
+}
+
+fn valid_guest_backend_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "secret-service.state"
+            | "secret-service.issue-lease"
+            | "secret-service.inspect-lease"
+            | "secret-service.refresh-lease"
+            | "secret-service.revoke-lease"
+            | "entra.state"
+            | "entra.issue-lease"
+            | "entra.inspect-lease"
+            | "entra.refresh-lease"
+            | "entra.revoke-lease"
+            | "managed-identity.state"
+            | "managed-identity.issue-lease"
+            | "managed-identity.inspect-lease"
+            | "managed-identity.refresh-lease"
+            | "managed-identity.revoke-lease"
+    )
 }
 
 /// Run one Provider's real supervised fd10 lifecycle.
@@ -854,7 +1424,12 @@ where
         return Err(ProviderRuntimeError::SessionUnauthenticated);
     }
     let route = metadata.route()?;
-    let backend = GuestCredentialBackend::from_inherited_fd(GUEST_CREDENTIAL_BACKEND_FD, &route)?;
+    let delivery_keys = receive_delivery_key_handoff(&driver, &route).await?;
+    let backend = GuestCredentialBackend::from_inherited_fd(
+        GUEST_CREDENTIAL_BACKEND_FD,
+        &route,
+        delivery_keys,
+    )?;
     let bootstrap_identity = ProviderAgentBootstrap::new(
         spec.provider_ref.clone(),
         ZonePath::new(vec![
@@ -1059,4 +1634,53 @@ where
         return Err(ProviderRuntimeError::SessionLoopFailed);
     }
     result
+}
+
+async fn receive_delivery_key_handoff(
+    driver: &SessionDriverHandle,
+    route: &AuthenticatedSessionRouteBinding,
+) -> Result<CredentialDeliveryKeyMaterial, ProviderRuntimeError> {
+    let stream = StreamId::new(PROVIDER_DELIVERY_KEY_STREAM_ID)
+        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    driver
+        .open_named_stream(
+            stream,
+            PROVIDER_DELIVERY_KEY_STREAM_CREDIT,
+            PROVIDER_DELIVERY_KEY_STREAM_CREDIT,
+        )
+        .await
+        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    loop {
+        match driver
+            .receive_named_stream_for(stream)
+            .await
+            .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?
+        {
+            StreamEvent::Data {
+                stream: received,
+                bytes: chunk,
+            } if received == stream => {
+                bytes.extend_from_slice(&chunk);
+                if bytes.len() > 4 * 1024 {
+                    return Err(ProviderRuntimeError::SessionUnauthenticated);
+                }
+                driver
+                    .grant_named_stream_credit(
+                        stream,
+                        u32::try_from(chunk.len())
+                            .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?,
+                    )
+                    .await
+                    .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+            }
+            StreamEvent::RemoteClosed { stream: closed } if closed == stream => {
+                return decode_delivery_key_handoff(&bytes, route);
+            }
+            StreamEvent::Reset { .. } => {
+                return Err(ProviderRuntimeError::SessionUnauthenticated);
+            }
+            _ => return Err(ProviderRuntimeError::SessionUnauthenticated),
+        }
+    }
 }

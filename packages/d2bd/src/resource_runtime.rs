@@ -125,7 +125,8 @@ use d2b_provider_network_local::{
 use d2b_provider_device_gpu::GpuLifecycleEffectPort;
 use d2b_provider_notification_desktop::{Category, GuestSourceConfig, NotificationProviderConfig};
 use d2b_provider_toolkit::{
-    PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID, PROVIDER_READY_MARKER,
+    PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID,
+    PROVIDER_DELIVERY_KEY_STREAM_CREDIT, PROVIDER_DELIVERY_KEY_STREAM_ID, PROVIDER_READY_MARKER,
     PROVIDER_READY_STREAM_CREDIT, PROVIDER_READY_STREAM_ID, ProviderSessionMetadata,
 };
 use d2b_provider_runtime_cloud_hypervisor::{
@@ -8785,11 +8786,19 @@ struct ControllerSession {
     binding: ControllerSessionBinding,
     ingress: BusIngress,
     driver: SessionDriverHandle,
-    _backend_endpoint: Option<Arc<std::os::fd::OwnedFd>>,
+    _backend_lease: Option<Arc<dyn crate::process_provider_runtime::GuestCredentialBackendLease>>,
     resource_client: Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>>,
     service_task: tokio::task::JoinHandle<Result<(), SessionServerError>>,
     assignments: BTreeMap<ResourceUid, ResourceClientLease>,
     assignment_stream_open: bool,
+}
+
+impl ControllerSession {
+    fn cancel_backend_lease(&mut self) {
+        if let Some(lease) = self._backend_lease.take() {
+            lease.cancel();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15839,9 +15848,12 @@ impl ControllerSessionCoordinator {
                     service_task,
                     _session_generation,
                     _route,
-                    _backend_endpoint,
+                    backend_lease,
                 ))) = setup.take()
                 {
+                    if let Some(backend_lease) = backend_lease {
+                        backend_lease.cancel();
+                    }
                     let _ = driver
                         .close(
                             d2b_contracts_zone_session::v3::component_session::CloseReason::RoleMismatch,
@@ -15863,7 +15875,7 @@ impl ControllerSessionCoordinator {
                     service_task,
                     session_generation,
                     route,
-                    backend_endpoint,
+                    backend_lease,
                 )) => {
                     let current = self
                         .controller_context_is_current(&providers, &context)
@@ -15905,7 +15917,7 @@ impl ControllerSessionCoordinator {
                         binding,
                         ingress,
                         driver: driver.clone(),
-                        _backend_endpoint: backend_endpoint,
+                        _backend_lease: backend_lease,
                         resource_client,
                         service_task,
                         assignments: BTreeMap::new(),
@@ -15933,7 +15945,8 @@ impl ControllerSessionCoordinator {
                             );
                         }
                         providers.fail_controller_bootstrap(&context_for_cleanup);
-                        if let Some(session) = session {
+                        if let Some(mut session) = session {
+                            session.cancel_backend_lease();
                             let _ = session
                                 .driver
                                 .close(
@@ -16512,9 +16525,12 @@ impl ControllerSessionCoordinator {
             });
             matches.then(|| sessions.remove(process_ref)).flatten()
         };
-        if let Some(session) = session {
-            self.credential_sessions
-                .remove(session.binding.provider_ref(), session.binding.session_generation());
+        if let Some(mut session) = session {
+            session.cancel_backend_lease();
+            self.credential_sessions.remove(
+                session.binding.provider_ref(),
+                session.binding.session_generation(),
+            );
             self.revoke_controller_assignments(&session.binding);
             send_controller_assignment_revocations(&session.driver, &session.assignments).await;
             let _ = session
@@ -16570,11 +16586,11 @@ impl ControllerSessionCoordinator {
             tokio::task::JoinHandle<Result<(), SessionServerError>>,
             ReconnectGeneration,
             d2b_session::AuthenticatedSessionRouteBinding,
-            Option<Arc<std::os::fd::OwnedFd>>,
+            Option<Arc<dyn crate::process_provider_runtime::GuestCredentialBackendLease>>,
         ),
         ResourceRuntimeError,
     > {
-        let (daemon_endpoint, backend_endpoint, context) = endpoint.into_parts();
+        let (daemon_endpoint, delivery_key_handoff, backend_lease, context) = endpoint.into_parts();
         let authentication_error = |stage: &'static str| {
             tracing::warn!(
                 zone = %self.zone.as_str(),
@@ -16715,6 +16731,53 @@ impl ControllerSessionCoordinator {
                 .close_named_stream(stream)
                 .await
                 .map_err(|_| authentication_error("provider-session-bootstrap-close"))?;
+            let delivery_key_handoff = delivery_key_handoff
+                .ok_or_else(|| authentication_error("provider-delivery-key-handoff"))?;
+            if let Some(backend_lease) = backend_lease.as_ref() {
+                if backend_lease.bind_route(&route).is_err() {
+                    let _ = registrar.revoke(ingress).await;
+                    let _ = driver
+                        .close(
+                            d2b_contracts_zone_session::v3::component_session::CloseReason::RoleMismatch,
+                            d2b_contracts_zone_session::v3::component_session::Remediation::ReplaceGeneration,
+                        )
+                        .await;
+                    return Err(authentication_error("provider-backend-route-bind"));
+                }
+            } else {
+                let _ = registrar.revoke(ingress).await;
+                let _ = driver
+                    .close(
+                        d2b_contracts_zone_session::v3::component_session::CloseReason::RoleMismatch,
+                        d2b_contracts_zone_session::v3::component_session::Remediation::ReplaceGeneration,
+                    )
+                    .await;
+                return Err(authentication_error("provider-backend-responder-missing"));
+            }
+            let key_stream = StreamId::new(PROVIDER_DELIVERY_KEY_STREAM_ID)
+                .map_err(|_| authentication_error("provider-delivery-key-stream"))?;
+            driver
+                .open_named_stream(
+                    key_stream,
+                    PROVIDER_DELIVERY_KEY_STREAM_CREDIT,
+                    PROVIDER_DELIVERY_KEY_STREAM_CREDIT,
+                )
+                .await
+                .map_err(|_| authentication_error("provider-delivery-key-stream-open"))?;
+            driver
+                .send_named_stream(
+                    key_stream,
+                    delivery_key_handoff
+                        .encode_for_route(&route)
+                        .map_err(|_| authentication_error("provider-delivery-key-handoff-encode"))?
+                        .to_vec(),
+                )
+                .await
+                .map_err(|_| authentication_error("provider-delivery-key-handoff-send"))?;
+            driver
+                .close_named_stream(key_stream)
+                .await
+                .map_err(|_| authentication_error("provider-delivery-key-stream-close"))?;
             let ready_stream = StreamId::new(PROVIDER_READY_STREAM_ID)
                 .map_err(|_| authentication_error("provider-session-ready-stream"))?;
             driver
@@ -16771,7 +16834,7 @@ impl ControllerSessionCoordinator {
             service_task,
             session_generation,
             route,
-            backend_endpoint,
+            backend_lease,
         ))
     }
 
@@ -17952,7 +18015,8 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .into_inner()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
-        for (_, session) in sessions {
+        for (_, mut session) in sessions {
+            session.cancel_backend_lease();
             if d2b_provider_runtime_cloud_hypervisor::is_provider_ref(
                 session.binding.provider_ref(),
             ) {
