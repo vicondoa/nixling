@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -49,6 +49,7 @@ use d2b_process::{
 use d2b_process_conformance::{AdoptionOutcome, ProcessProvider};
 use d2b_provider_supervisor::ProviderSupervisor;
 use d2b_provider_system_minijail::MinijailProcessProvider;
+use d2b_resource_api::registered::RedbRegisteredControllerApi;
 use d2b_resource_store::{
     StoreGetRequest, StoreOperationContext, StoreProjection, StoreWatchRequest, StoredResource,
 };
@@ -2585,7 +2586,241 @@ fn provider_descriptor(provider: &str, index: usize) -> ControllerDescriptor {
     .expect("Provider descriptor is valid")
 }
 
-async fn run_all_provider_composition() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderWatchFailure {
+    Panic,
+    Cancel,
+    Unavailable,
+    Backpressure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderDelivery {
+    Hint,
+    Closed,
+    Unavailable,
+    RetryExhausted,
+}
+
+/// Fault valve at the ControllerSource seam around a real Core source.
+struct FailureInjectedProviderSource {
+    inner: Arc<CoreControllerSource<RedbRegisteredControllerApi>>,
+    failure: Option<ProviderWatchFailure>,
+    injected: Arc<AtomicBool>,
+}
+
+impl FailureInjectedProviderSource {
+    fn new(
+        inner: Arc<CoreControllerSource<RedbRegisteredControllerApi>>,
+        failure: Option<ProviderWatchFailure>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            failure,
+            injected: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn close(&self) {
+        self.inner
+            .close_watch()
+            .expect("close injected Provider source");
+    }
+}
+
+impl ControllerSource for FailureInjectedProviderSource {
+    fn register(
+        &self,
+        descriptor: &ControllerDescriptor,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner.register(descriptor)
+    }
+
+    fn list_initial(
+        &self,
+        descriptor: &ControllerDescriptor,
+    ) -> impl Future<Output = Result<InitialList, SourceError>> + Send {
+        self.inner.list_initial(descriptor)
+    }
+
+    fn open_watch(
+        &self,
+        descriptor: &ControllerDescriptor,
+        after_revision: ZoneRevision,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner.open_watch(descriptor, after_revision)
+    }
+
+    fn receive_watch(&self) -> impl Future<Output = Result<WatchEvent, WatchFailure>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let failure = self.failure;
+        let injected = Arc::clone(&self.injected);
+        async move {
+            let event = inner.receive_watch().await?;
+            if failure == Some(ProviderWatchFailure::Panic)
+                && injected
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                panic!("injected live Provider source panic");
+            }
+            if failure == Some(ProviderWatchFailure::Cancel)
+                && injected
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                inner.close_watch().expect("close cancelled Provider source");
+                return Ok(WatchEvent::Closed);
+            }
+            Ok(event)
+        }
+    }
+
+    fn read_fresh(
+        &self,
+        key: &ResourceKey,
+    ) -> impl Future<Output = Result<FreshSnapshot, SourceError>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let key = key.clone();
+        let failure = self.failure;
+        let injected = Arc::clone(&self.injected);
+        async move {
+            if failure == Some(ProviderWatchFailure::Unavailable)
+                && injected
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                let _ = inner.read_fresh(&key).await;
+                return Err(SourceError::Unavailable);
+            }
+            if failure == Some(ProviderWatchFailure::Backpressure) {
+                return Err(SourceError::Backpressure);
+            }
+            inner.read_fresh(&key).await
+        }
+    }
+
+    fn write_starting(
+        &self,
+        context: &ReconcileContext,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner.write_starting(context)
+    }
+
+    fn commit_result(
+        &self,
+        context: &ReconcileContext,
+        result: &ReconcileResult,
+    ) -> impl Future<Output = Result<CommitOutcome, SourceError>> + Send {
+        self.inner.commit_result(context, result)
+    }
+
+    fn complete_expedited(
+        &self,
+        context: &ReconcileContext,
+        projection: &ReconcileProjection,
+        status_persistence: StatusPersistence,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner
+            .complete_expedited(context, projection, status_persistence)
+    }
+
+    fn persist_outcome(
+        &self,
+        projection: &ReconcileProjection,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner.persist_outcome(projection)
+    }
+
+    fn checkpoint(
+        &self,
+        context: &ReconcileContext,
+        revision: ZoneRevision,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner.checkpoint(context, revision)
+    }
+
+    fn schedule_requeue(
+        &self,
+        key: &ResourceKey,
+        at_tick: u64,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner.schedule_requeue(key, at_tick)
+    }
+}
+
+async fn open_provider_sources(
+    fixture: &Arc<bus_support::ProductionStore>,
+    failure_provider: Option<ProviderWatchFailure>,
+) -> Result<BTreeMap<String, Arc<FailureInjectedProviderSource>>, SourceError> {
+    let mut sources = BTreeMap::new();
+    let mut registrations = tokio::task::JoinSet::new();
+    for (index, provider) in bus_support::PROVIDER_IDS.iter().enumerate() {
+        let fixture = Arc::clone(fixture);
+        let provider = (*provider).to_owned();
+        let failure = (index == 0).then_some(failure_provider).flatten();
+        registrations.spawn(async move {
+            let descriptor = provider_descriptor(&provider, index);
+            let api = fixture.provider_registered_api(&provider, Vec::new());
+            let inner = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+            let source = FailureInjectedProviderSource::new(inner, failure);
+            retry_provider_setup(|| source.register(&descriptor)).await?;
+            let listed = retry_provider_setup(|| source.list_initial(&descriptor)).await?;
+            assert_eq!(listed.resources.len(), bus_support::PROVIDER_IDS.len());
+            retry_provider_setup(|| source.open_watch(&descriptor, listed.snapshot_revision))
+                .await?;
+            Ok::<_, SourceError>((provider, source))
+        });
+    }
+    while let Some(result) = registrations.join_next().await {
+        let (provider, source) = result.expect("Provider source setup task joins")?;
+        sources.insert(provider, source);
+    }
+    Ok(sources)
+}
+
+async fn receive_provider_delivery(
+    source: Arc<FailureInjectedProviderSource>,
+    failure: Option<ProviderWatchFailure>,
+) -> ProviderDelivery {
+    let event = tokio::time::timeout(WATCH_TIMEOUT, source.receive_watch())
+        .await
+        .expect("live Provider watch remains bounded");
+    match event.expect("live Provider watch remains healthy") {
+        WatchEvent::Hint(hint) => match failure {
+            Some(ProviderWatchFailure::Unavailable) => {
+                assert_eq!(
+                    source.read_fresh(hint.key()).await,
+                    Err(SourceError::Unavailable)
+                );
+                source.close();
+                ProviderDelivery::Unavailable
+            }
+            Some(ProviderWatchFailure::Backpressure) => {
+                let deadline = Instant::now() + Duration::from_millis(100);
+                loop {
+                    match source.read_fresh(hint.key()).await {
+                        Err(SourceError::Backpressure) if Instant::now() < deadline => {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(SourceError::Backpressure) => {
+                            source.close();
+                            break ProviderDelivery::RetryExhausted;
+                        }
+                        result => panic!("unexpected injected backpressure result: {result:?}"),
+                    }
+                }
+            }
+            None => ProviderDelivery::Hint,
+            Some(ProviderWatchFailure::Panic | ProviderWatchFailure::Cancel) => {
+                panic!("unexpected failure mode after live Provider delivery")
+            }
+        },
+        WatchEvent::Closed => ProviderDelivery::Closed,
+    }
+}
+
+async fn run_provider_failure_isolation(failure: ProviderWatchFailure) {
     let fixture = bus_support::ProductionStore::provision().await;
     fixture.commit_provider_catalog().await;
     let expected = bus_support::PROVIDER_IDS
@@ -2593,149 +2828,105 @@ async fn run_all_provider_composition() {
         .map(|provider| (*provider).to_owned())
         .collect::<BTreeSet<_>>();
     assert_eq!(expected.len(), 27);
-    let mut sources = Vec::with_capacity(expected.len());
-    let mut registrations = tokio::task::JoinSet::new();
-    for (index, provider) in bus_support::PROVIDER_IDS.iter().enumerate() {
-        let fixture = Arc::clone(&fixture);
-        let provider = (*provider).to_owned();
-        registrations.spawn(async move {
-            let descriptor = provider_descriptor(&provider, index);
-            let api = fixture.provider_registered_api(&provider, Vec::new());
-            let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
-            retry_provider_setup(|| source.register(&descriptor)).await?;
-            let listed = retry_provider_setup(|| source.list_initial(&descriptor)).await?;
-            assert_eq!(listed.resources.len(), bus_support::PROVIDER_IDS.len());
-            retry_provider_setup(|| source.open_watch(&descriptor, listed.snapshot_revision))
-                .await?;
-            Ok::<_, SourceError>((provider, source, listed.resources.len()))
-        });
-    }
-    while let Some(result) = registrations.join_next().await {
-        let (provider, source, listed) = result.unwrap().unwrap();
-        assert_eq!(listed, expected.len());
-        sources.push((provider, source));
-    }
-    assert_eq!(sources.len(), expected.len());
+    let mut sources = open_provider_sources(&fixture, Some(failure))
+        .await
+        .expect("all Provider source setup paths succeed");
     assert_eq!(
-        sources
-            .iter()
-            .map(|(provider, _)| provider.clone())
-            .collect::<BTreeSet<_>>(),
-        expected,
-        "all 27 Provider identities must compose exactly once"
-    );
-    let watch_signals = fixture
-        .store()
-        .watch_signals()
-        .expect("read simultaneous Provider watch signals");
-    assert_eq!(
-        watch_signals.current_registrations,
+        fixture
+            .store()
+            .watch_signals()
+            .expect("read simultaneous Provider watch signals")
+            .current_registrations,
         expected.len() as u64,
         "all 27 Provider identities must own a live watch"
     );
-
-    let cancelled_provider = sources
-        .first()
-        .map(|(provider, _)| provider.clone())
-        .expect("Provider composition is nonempty");
-    sources
-        .first()
-        .expect("Provider composition is nonempty")
-        .1
-        .close_watch()
-        .unwrap();
     fixture.commit_provider_catalog_update().await;
 
-    let mut observed = BTreeSet::new();
-    let mut closed = BTreeSet::new();
+    let failed_provider = bus_support::PROVIDER_IDS[0].to_owned();
     let mut deliveries = tokio::task::JoinSet::new();
-    for (provider, source) in sources {
+    for (provider, source) in &sources {
+        let provider = provider.clone();
+        let source = Arc::clone(source);
+        let mode = (provider == failed_provider).then_some(failure);
         deliveries.spawn(async move {
-            let event = tokio::time::timeout(WATCH_TIMEOUT, source.receive_watch())
-                .await
-                .expect("all Provider watches remain bounded");
-            (provider, event)
+            let result = tokio::spawn(receive_provider_delivery(source, mode)).await;
+            (provider, result)
         });
     }
-    while let Some(delivery) = deliveries.join_next().await {
-        let (provider, event) = delivery.unwrap();
-        match event.expect("Provider watch remains healthy") {
-            WatchEvent::Hint(hint) => {
-                assert_eq!(
-                    hint.key().resource_ref().resource_type().as_str(),
-                    "Provider"
-                );
-                observed.insert(provider);
+    let mut hints = BTreeSet::new();
+    let mut failed = BTreeSet::new();
+    let mut failure_outcomes = BTreeMap::new();
+    while let Some(result) = deliveries.join_next().await {
+        let (provider, result) = result.expect("Provider delivery task joins");
+        match result {
+            Ok(ProviderDelivery::Hint) => {
+                hints.insert(provider);
             }
-            WatchEvent::Closed => {
-                closed.insert(provider);
+            Ok(outcome @ (ProviderDelivery::Closed
+            | ProviderDelivery::Unavailable
+            | ProviderDelivery::RetryExhausted)) => {
+                failed.insert(provider.clone());
+                failure_outcomes.insert(provider, outcome);
+            }
+            Err(error) => {
+                assert_eq!(failure, ProviderWatchFailure::Panic);
+                assert!(error.is_panic());
+                failed.insert(provider);
             }
         }
     }
-    let mut expected_hints = expected.clone();
-    expected_hints.remove(&cancelled_provider);
-    assert_eq!(observed, expected_hints);
-    assert_eq!(closed, BTreeSet::from([cancelled_provider]));
-    assert_provider_failure_isolation(&fixture).await;
+    assert_eq!(hints.len(), 26);
+    assert_eq!(
+        hints,
+        expected
+            .iter()
+            .filter(|provider| *provider != &failed_provider)
+            .cloned()
+            .collect()
+    );
+    assert_eq!(failed, BTreeSet::from([failed_provider.clone()]));
+    match failure {
+        ProviderWatchFailure::Panic => {}
+        ProviderWatchFailure::Cancel => assert_eq!(
+            failure_outcomes.get(&failed_provider),
+            Some(&ProviderDelivery::Closed)
+        ),
+        ProviderWatchFailure::Unavailable => assert_eq!(
+            failure_outcomes.get(&failed_provider),
+            Some(&ProviderDelivery::Unavailable)
+        ),
+        ProviderWatchFailure::Backpressure => assert_eq!(
+            failure_outcomes.get(&failed_provider),
+            Some(&ProviderDelivery::RetryExhausted)
+        ),
+    }
 
+    drop(sources.remove(&failed_provider));
+    let watch_signals = fixture
+        .store()
+        .watch_signals()
+        .expect("read surviving Provider watch signals");
+    assert_eq!(watch_signals.current_registrations, 26);
+    for source in sources.values() {
+        source.close();
+    }
+    drop(sources);
     let fixture = Arc::try_unwrap(fixture)
-        .unwrap_or_else(|_| panic!("all Provider composition fixture handles released"));
+        .unwrap_or_else(|_| panic!("all Provider failure fixture handles released"));
     fixture
         .shutdown()
         .await
-        .expect("shutdown Provider composition store");
+        .expect("shutdown Provider failure fixture");
 }
 
-async fn assert_provider_failure_isolation(fixture: &Arc<bus_support::ProductionStore>) {
-    for failure in ["panic", "cancel", "unavailable", "retry-exhausted"] {
-        let mut workers = tokio::task::JoinSet::new();
-        for (index, provider) in bus_support::PROVIDER_IDS.iter().enumerate() {
-            let fixture = Arc::clone(fixture);
-            let provider = (*provider).to_owned();
-            workers.spawn(async move {
-                let descriptor = provider_descriptor(&provider, index);
-                let api = fixture.provider_registered_api(&provider, Vec::new());
-                let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
-                retry_provider_setup(|| source.register(&descriptor)).await?;
-                let listed = retry_provider_setup(|| source.list_initial(&descriptor)).await?;
-                assert_eq!(listed.resources.len(), bus_support::PROVIDER_IDS.len());
-                retry_provider_setup(|| source.open_watch(&descriptor, listed.snapshot_revision))
-                    .await?;
-                if index == 0 {
-                    match failure {
-                        "panic" => panic!("isolated Provider failure"),
-                        "cancel" => {
-                            source.close_watch().unwrap();
-                            Err(SourceError::Cancelled)
-                        }
-                        "unavailable" => Err(SourceError::Unavailable),
-                        "retry-exhausted" => {
-                            retry_provider_setup(|| async {
-                                Err::<(), SourceError>(SourceError::Backpressure)
-                            })
-                            .await
-                        }
-                        _ => unreachable!(),
-                    }
-                } else {
-                    source.close_watch().unwrap();
-                    Ok(())
-                }
-            });
-        }
-        let mut successes = 0;
-        let mut failures = 0;
-        while let Some(result) = workers.join_next().await {
-            match result {
-                Ok(Ok(())) => {
-                    successes += 1;
-                }
-                Ok(Err(_)) | Err(_) => failures += 1,
-            }
-        }
-
-        assert_eq!(successes, bus_support::PROVIDER_IDS.len() - 1);
-        assert_eq!(failures, 1);
+async fn run_all_provider_composition() {
+    for failure in [
+        ProviderWatchFailure::Panic,
+        ProviderWatchFailure::Cancel,
+        ProviderWatchFailure::Unavailable,
+        ProviderWatchFailure::Backpressure,
+    ] {
+        run_provider_failure_isolation(failure).await;
     }
 }
 
