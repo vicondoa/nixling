@@ -2694,6 +2694,7 @@ impl ControllerSource for FailureInjectedProviderSource {
                 return Err(SourceError::Unavailable);
             }
             if failure == Some(ProviderWatchFailure::Backpressure) {
+                let _ = inner.read_fresh(&key).await;
                 return Err(SourceError::Backpressure);
             }
             inner.read_fresh(&key).await
