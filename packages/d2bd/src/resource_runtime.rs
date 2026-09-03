@@ -29,9 +29,8 @@ use crate::ServerState;
 use d2b_contracts::types::{BundleOpId, VmId};
 use crate::audio_resource_runtime::{
     AUDIO_BINDING_TYPE, AudioBindingRuntimeStatus, AudioResourceRuntime, AudioResourceRuntimeError,
-    audio_binding_status_projection_with_status, audio_binding_status_value, audio_watch_request,
-    has_audio_finalizer, list_audio_resources, list_audio_snapshot, remove_audio_finalizer,
-    run_audio_watch, update_audio_finalizer,
+    audio_binding_status_projection_with_status, audio_binding_status_value, list_audio_resources,
+    list_audio_snapshot,
 };
 use crate::binding_child_resource_runtime::{
     OneOwnedChildProgress, OwnedChildOwner, reconcile_binding_children,
@@ -66,6 +65,7 @@ use d2b_contracts_resource::v3::{
     CanonicalJsonValue, ControllerGeneration, DesiredLifecycle,
     PlacementTargetKind, ResourceBundleGenerationId, ResourceEnvelope, ResourceGeneration,
     ResourceName, ResourcePhase, ResourceRef, ResourceTypeName, ResourceUid, ZoneId, ZoneRevision,
+    canonical_digest,
     network::NetworkProvenance,
     process::ProcessSpec,
     volume::{EntryType, VolumeSpec},
@@ -362,6 +362,88 @@ pub const U8_SHARED_PROVIDER_RUNNERS: [SharedProviderRunnerRegistration; 9] = [
     },
 ];
 
+/// The U9 interaction and shell ResourceTypes attached to the production
+/// shared Runner. Clipboard and notification delivery remain typed
+/// ComponentSession services and therefore have no ResourceType registration.
+pub const U9_SHARED_PROVIDER_RUNNERS: [SharedProviderRunnerRegistration; 6] = [
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/display-wayland-controller",
+        provider_ref: "Provider/display-wayland",
+        resource_type: "display-wayland.d2bus.org.WaylandPolicy",
+        finalizer: "",
+        repair_interval_ticks:
+            d2b_provider_display_wayland::DISPLAY_REPAIR_INTERVAL_SECS * 1_000,
+        legacy_scheduler_disabled: d2b_provider_display_wayland::display_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency:
+            d2b_provider_display_wayland::display_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/display-wayland-controller",
+        provider_ref: "Provider/display-wayland",
+        resource_type: "display-wayland.d2bus.org.WaylandSession",
+        finalizer: d2b_provider_display_wayland::FINALIZER,
+        repair_interval_ticks:
+            d2b_provider_display_wayland::DISPLAY_REPAIR_INTERVAL_SECS * 1_000,
+        legacy_scheduler_disabled: d2b_provider_display_wayland::display_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency:
+            d2b_provider_display_wayland::display_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/audio-pipewire-controller",
+        provider_ref: "Provider/audio-pipewire",
+        resource_type: "audio.d2bus.org.AudioService",
+        finalizer: d2b_provider_audio_pipewire::AUDIO_SERVICE_FINALIZER,
+        repair_interval_ticks:
+            d2b_provider_audio_pipewire::AUDIO_REPAIR_INTERVAL_SECS * 1_000,
+        legacy_scheduler_disabled: d2b_provider_audio_pipewire::audio_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency:
+            d2b_provider_audio_pipewire::audio_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/audio-pipewire-controller",
+        provider_ref: "Provider/audio-pipewire",
+        resource_type: "audio.d2bus.org.AudioBinding",
+        finalizer: d2b_provider_audio_pipewire::AUDIO_BINDING_FINALIZER,
+        repair_interval_ticks:
+            d2b_provider_audio_pipewire::AUDIO_REPAIR_INTERVAL_SECS * 1_000,
+        legacy_scheduler_disabled: d2b_provider_audio_pipewire::audio_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency:
+            d2b_provider_audio_pipewire::audio_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/shell-terminal-controller",
+        provider_ref: "Provider/shell-terminal",
+        resource_type: "shell-terminal.d2bus.org.ShellPool",
+        finalizer: d2b_provider_shell_terminal::SHELL_POOL_FINALIZER,
+        repair_interval_ticks: d2b_provider_shell_terminal::SHELL_REPAIR_INTERVAL_SECS * 1_000,
+        legacy_scheduler_disabled: d2b_provider_shell_terminal::shell_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency:
+            d2b_provider_shell_terminal::shell_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/shell-terminal-controller",
+        provider_ref: "Provider/shell-terminal",
+        resource_type: "shell-terminal.d2bus.org.ShellSession",
+        finalizer: d2b_provider_shell_terminal::SHELL_SESSION_FINALIZER,
+        repair_interval_ticks: d2b_provider_shell_terminal::SHELL_REPAIR_INTERVAL_SECS * 1_000,
+        legacy_scheduler_disabled: d2b_provider_shell_terminal::shell_runner_contract()
+            .legacy_scheduler_disabled(),
+        watched_configuration_is_dependency:
+            d2b_provider_shell_terminal::shell_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+];
+
 /// Closed Provider handler set used by the shared Runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SharedProviderResourceKind {
@@ -378,6 +460,12 @@ pub(crate) enum SharedProviderResourceKind {
     QemuMediaGuest,
     AzureContainerAppsGuest,
     AzureVirtualMachineGuest,
+    DisplayWaylandPolicy,
+    DisplayWaylandSession,
+    AudioService,
+    AudioBinding,
+    ShellPool,
+    ShellSession,
 }
 
 impl SharedProviderResourceKind {
@@ -444,6 +532,36 @@ impl SharedProviderResourceKind {
                 "Guest",
                 "Process/azure-vm-controller-process",
             ) => Ok(Self::AzureVirtualMachineGuest),
+            (
+                "Provider/display-wayland",
+                "display-wayland.d2bus.org.WaylandPolicy",
+                "Process/display-wayland-controller",
+            ) => Ok(Self::DisplayWaylandPolicy),
+            (
+                "Provider/display-wayland",
+                "display-wayland.d2bus.org.WaylandSession",
+                "Process/display-wayland-controller",
+            ) => Ok(Self::DisplayWaylandSession),
+            (
+                "Provider/audio-pipewire",
+                "audio.d2bus.org.AudioService",
+                "Process/audio-pipewire-controller",
+            ) => Ok(Self::AudioService),
+            (
+                "Provider/audio-pipewire",
+                "audio.d2bus.org.AudioBinding",
+                "Process/audio-pipewire-controller",
+            ) => Ok(Self::AudioBinding),
+            (
+                "Provider/shell-terminal",
+                "shell-terminal.d2bus.org.ShellPool",
+                "Process/shell-terminal-controller",
+            ) => Ok(Self::ShellPool),
+            (
+                "Provider/shell-terminal",
+                "shell-terminal.d2bus.org.ShellSession",
+                "Process/shell-terminal-controller",
+            ) => Ok(Self::ShellSession),
             _ => Err(ResourceRuntimeError::HandlerNotReady),
         }
     }
@@ -463,6 +581,12 @@ impl SharedProviderResourceKind {
             Self::QemuMediaGuest => "runtime-qemu-media-guest",
             Self::AzureContainerAppsGuest => "runtime-azure-container-apps-guest",
             Self::AzureVirtualMachineGuest => "runtime-azure-virtual-machine-guest",
+            Self::DisplayWaylandPolicy => "display-wayland-policy",
+            Self::DisplayWaylandSession => "display-wayland-session",
+            Self::AudioService => "audio-service",
+            Self::AudioBinding => "audio-binding",
+            Self::ShellPool => "shell-pool",
+            Self::ShellSession => "shell-session",
         }
     }
 
@@ -481,6 +605,9 @@ impl SharedProviderResourceKind {
             Self::QemuMediaGuest => "Provider/runtime-qemu-media",
             Self::AzureContainerAppsGuest => "Provider/runtime-azure-container-apps",
             Self::AzureVirtualMachineGuest => "Provider/runtime-azure-virtual-machine",
+            Self::DisplayWaylandPolicy | Self::DisplayWaylandSession => "Provider/display-wayland",
+            Self::AudioService | Self::AudioBinding => "Provider/audio-pipewire",
+            Self::ShellPool | Self::ShellSession => "Provider/shell-terminal",
         }
     }
 
@@ -503,6 +630,12 @@ impl SharedProviderResourceKind {
             | Self::QemuMediaGuest
             | Self::AzureContainerAppsGuest
             | Self::AzureVirtualMachineGuest => "Guest",
+            Self::DisplayWaylandPolicy => "display-wayland.d2bus.org.WaylandPolicy",
+            Self::DisplayWaylandSession => "display-wayland.d2bus.org.WaylandSession",
+            Self::AudioService => "audio.d2bus.org.AudioService",
+            Self::AudioBinding => "audio.d2bus.org.AudioBinding",
+            Self::ShellPool => "shell-terminal.d2bus.org.ShellPool",
+            Self::ShellSession => "shell-terminal.d2bus.org.ShellSession",
         }
     }
 
@@ -1200,6 +1333,39 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
         Err(SharedProviderEffectError::Unavailable)
     }
 
+    /// Reconcile one display-wayland ResourceType.
+    async fn reconcile_display(
+        &self,
+        _kind: SharedProviderResourceKind,
+        _context: &SharedProviderEffectContext,
+        _resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one audio-pipewire ResourceType.
+    async fn reconcile_audio(
+        &self,
+        _kind: SharedProviderResourceKind,
+        _context: &SharedProviderEffectContext,
+        _resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one shell-terminal ResourceType.
+    async fn reconcile_shell(
+        &self,
+        _kind: SharedProviderResourceKind,
+        _context: &SharedProviderEffectContext,
+        _resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
     /// Reconcile one Guest through its selected runtime Provider.
     async fn reconcile_guest(
         &self,
@@ -1240,6 +1406,26 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
         ) {
             self.reconcile_guest_result(kind, context, resource, dependencies)
                 .await
+        } else if matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+        ) {
+            self.reconcile_display(kind, context, resource, dependencies)
+                .await
+        } else if matches!(
+            kind,
+            SharedProviderResourceKind::AudioService
+                | SharedProviderResourceKind::AudioBinding
+        ) {
+            self.reconcile_audio(kind, context, resource, dependencies)
+                .await
+        } else if matches!(
+            kind,
+            SharedProviderResourceKind::ShellPool | SharedProviderResourceKind::ShellSession
+        ) {
+            self.reconcile_shell(kind, context, resource, dependencies)
+                .await
         } else {
             self.reconcile(kind, context, resource, dependencies)
                 .await
@@ -1253,9 +1439,7 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
         context: &SharedProviderEffectContext,
         resource: &ResourceSnapshot,
     ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
-        self.observe(kind, context, resource)
-            .await
-            .map(SharedProviderEffectResult::phase)
+        self.reconcile_result(kind, context, resource, &[]).await
     }
 
     /// Dispatch the closed Provider kind to its typed effect port.
@@ -1303,6 +1487,21 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
             | SharedProviderResourceKind::AzureVirtualMachineGuest => self
                 .reconcile_guest(kind, context, resource, dependencies)
                 .await,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+            | SharedProviderResourceKind::DisplayWaylandSession => self
+                .reconcile_display(kind, context, resource, dependencies)
+                .await
+                .map(|result| result.phase),
+            SharedProviderResourceKind::AudioService
+            | SharedProviderResourceKind::AudioBinding => self
+                .reconcile_audio(kind, context, resource, dependencies)
+                .await
+                .map(|result| result.phase),
+            SharedProviderResourceKind::ShellPool
+            | SharedProviderResourceKind::ShellSession => self
+                .reconcile_shell(kind, context, resource, dependencies)
+                .await
+                .map(|result| result.phase),
         }
     }
 
@@ -1323,7 +1522,7 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
         context: &SharedProviderEffectContext,
         resource: &ResourceSnapshot,
     ) -> Result<(), SharedProviderEffectError> {
-        if matches!(
+    if matches!(
             kind,
             SharedProviderResourceKind::CloudHypervisorGuest
                 | SharedProviderResourceKind::QemuMediaGuest
@@ -1331,6 +1530,17 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
                 | SharedProviderResourceKind::AzureVirtualMachineGuest
         ) {
             return self.finalize_guest(kind, context, resource).await;
+        }
+        if matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+                | SharedProviderResourceKind::AudioService
+                | SharedProviderResourceKind::AudioBinding
+                | SharedProviderResourceKind::ShellPool
+                | SharedProviderResourceKind::ShellSession
+        ) {
+            return Ok(());
         }
         let _ = (kind, context, resource);
         Err(SharedProviderEffectError::Unavailable)
@@ -1371,6 +1581,17 @@ pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
                 | SharedProviderResourceKind::QemuMediaGuest
                 | SharedProviderResourceKind::AzureContainerAppsGuest
                 | SharedProviderResourceKind::AzureVirtualMachineGuest
+        ) {
+            self.reconcile_result(kind, context, resource, dependencies)
+                .await
+        } else if matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+                | SharedProviderResourceKind::AudioService
+                | SharedProviderResourceKind::AudioBinding
+                | SharedProviderResourceKind::ShellPool
+                | SharedProviderResourceKind::ShellSession
         ) {
             self.reconcile_result(kind, context, resource, dependencies)
                 .await
@@ -1503,7 +1724,11 @@ impl DaemonSharedProviderEffects {
         }
         let value = serde_json::from_slice::<Value>(resource.canonical_json())
             .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-        if value.pointer("/spec/providerRef").and_then(Value::as_str)
+        if !matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+        ) && value.pointer("/spec/providerRef").and_then(Value::as_str)
             != Some(kind.provider_ref())
         {
             return Err(SharedProviderEffectError::InvalidResource);
@@ -1600,6 +1825,129 @@ impl DaemonSharedProviderEffects {
                 })
                 == Some(true)
         })
+    }
+
+    async fn finalize_u9(
+        &self,
+        kind: SharedProviderResourceKind,
+        _context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<(), SharedProviderEffectError> {
+        let runtime = self.runtime()?;
+        match kind {
+                SharedProviderResourceKind::DisplayWaylandPolicy => Ok(()),
+                SharedProviderResourceKind::DisplayWaylandSession => {
+                    let envelope = ResourceEnvelope::from_json(resource.canonical_json())
+                        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                    let _spec = serde_json::from_slice::<WaylandSessionSpec>(
+                        &envelope.spec().base().to_canonical_bytes(),
+                    )
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                    let owner = crate::binding_child_resource_runtime::OwnedChildOwner {
+                        resource: stored_resource_from_snapshot(resource),
+                        desired: None,
+                        fenced: false,
+                    };
+                    let client = runtime
+                        .process_resource_client()
+                        .ok_or(SharedProviderEffectError::Unavailable)?;
+                    let converged = crate::binding_child_resource_runtime::reconcile_owned_children(
+                        &runtime.store,
+                        &client,
+                        &self.zone,
+                        std::slice::from_ref(&owner),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                    if converged.contains(resource.key().resource_ref()) {
+                        Ok(())
+                    } else {
+                        Err(SharedProviderEffectError::Unavailable)
+                    }
+                }
+                SharedProviderResourceKind::AudioService => {
+                    let bindings = runtime
+                        .committed_resources_of_type(AUDIO_BINDING_TYPE)
+                        .await
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                    if bindings.iter().any(|binding| {
+                        !value_deletion_requested(binding)
+                            && binding
+                                .pointer("/spec/serviceRef")
+                                .and_then(Value::as_str)
+                                == Some(resource.key().resource_ref().to_canonical_string().as_str())
+                    }) {
+                        Err(SharedProviderEffectError::Unavailable)
+                    } else {
+                        Ok(())
+                    }
+                }
+                SharedProviderResourceKind::AudioBinding => {
+                    runtime
+                        .reconcile_audio_resources(Arc::clone(&self.state))
+                        .await
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                    let children =
+                        crate::binding_child_resource_runtime::list_binding_children(
+                            &runtime.store,
+                            &self.zone,
+                        )
+                        .await
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                    if children.iter().any(|child| {
+                        ResourceEnvelope::from_json(&child.canonical_json)
+                            .ok()
+                            .and_then(|envelope| envelope.metadata().owner_ref().cloned())
+                            == Some(resource.key().resource_ref().clone())
+                    }) {
+                        Err(SharedProviderEffectError::Unavailable)
+                    } else {
+                        Ok(())
+                    }
+                }
+                SharedProviderResourceKind::ShellPool => {
+                    let sessions = runtime
+                        .committed_resources_of_type("shell-terminal.d2bus.org.ShellSession")
+                        .await
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                    let pool_ref = resource.key().resource_ref().to_canonical_string();
+                    if sessions.iter().any(|session| {
+                        !value_deletion_requested(session)
+                            && session
+                                .pointer("/spec/poolRef")
+                                .and_then(Value::as_str)
+                                == Some(pool_ref.as_str())
+                    }) {
+                        Err(SharedProviderEffectError::Unavailable)
+                    } else {
+                        Ok(())
+                    }
+                }
+                SharedProviderResourceKind::ShellSession => {
+                    let owner = crate::binding_child_resource_runtime::OwnedChildOwner {
+                        resource: stored_resource_from_snapshot(resource),
+                        desired: None,
+                        fenced: false,
+                    };
+                    let client = runtime
+                        .process_resource_client()
+                        .ok_or(SharedProviderEffectError::Unavailable)?;
+                    let converged = crate::binding_child_resource_runtime::reconcile_owned_children(
+                        &runtime.store,
+                        &client,
+                        &self.zone,
+                        std::slice::from_ref(&owner),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                    if converged.contains(resource.key().resource_ref()) {
+                        Ok(())
+                    } else {
+                        Err(SharedProviderEffectError::Unavailable)
+                    }
+                }
+                _ => Err(SharedProviderEffectError::InvalidResource),
+        }
     }
 
     async fn network_admission(
@@ -4584,6 +4932,229 @@ type SharedRunnerUsbipPort<'a> = d2b_provider_device_usbip::ProductionPort<
 
 #[async_trait]
 impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
+    async fn reconcile_display(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        let _value = self.validate(kind, context, resource)?;
+        if kind == SharedProviderResourceKind::DisplayWaylandPolicy {
+            ResourceEnvelope::from_json(resource.canonical_json())
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            return Ok(SharedProviderEffectResult {
+                phase: SharedProviderEffectPhase::Ready,
+                child_mutated: false,
+            });
+        }
+
+        let envelope = ResourceEnvelope::from_json(resource.canonical_json())
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let spec = serde_json::from_slice::<WaylandSessionSpec>(
+            &envelope.spec().base().to_canonical_bytes(),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        if !spec.cross_domain_trusted()
+            || spec.guest_ref().resource_type().as_str() != "Guest"
+            || spec.host_ref().resource_type().as_str() != "Host"
+            || spec.user_ref().resource_type().as_str() != "User"
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let runtime = self.runtime()?;
+        let client = runtime
+            .process_resource_client()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let owner = stored_resource_from_snapshot(resource);
+        let desired = crate::interaction_composition::display_owned_child_intents(
+            &self.zone,
+            resource.key().resource_ref(),
+            resource.key().uid(),
+            &spec,
+            resource.generation().get(),
+            context.identity.controller_generation().get(),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let owner = crate::binding_child_resource_runtime::OwnedChildOwner {
+            resource: owner,
+            desired: Some(desired),
+            fenced: false,
+        };
+        let converged = crate::binding_child_resource_runtime::reconcile_owned_children(
+            &runtime.store,
+            &client,
+            &self.zone,
+            &[owner.clone()],
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if !converged.contains(resource.key().resource_ref()) {
+            return Ok(SharedProviderEffectResult {
+                phase: SharedProviderEffectPhase::Pending,
+                child_mutated: true,
+            });
+        }
+        let children = crate::binding_child_resource_runtime::list_binding_children(
+            &runtime.store,
+            &self.zone,
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        Ok(SharedProviderEffectResult {
+            phase: if crate::binding_child_resource_runtime::owned_children_ready(
+                &owner, &children,
+            ) {
+                SharedProviderEffectPhase::Ready
+            } else {
+                SharedProviderEffectPhase::Pending
+            },
+            child_mutated: false,
+        })
+    }
+
+    async fn reconcile_audio(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        let _ = self.validate(kind, context, resource)?;
+        let runtime = self.runtime()?;
+        runtime
+            .reconcile_audio_resources(Arc::clone(&self.state))
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let phase = match kind {
+            SharedProviderResourceKind::AudioService => runtime
+                .audio_runtime
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .as_ref()
+                .is_some_and(|audio| audio.service_is_ready(resource.key().resource_ref()))
+                .then_some(SharedProviderEffectPhase::Ready)
+                .unwrap_or(SharedProviderEffectPhase::Pending),
+            SharedProviderResourceKind::AudioBinding => runtime
+                .audio_runtime
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .as_ref()
+                .and_then(|audio| audio.binding_phase(resource.key().resource_ref()))
+                .map(|phase| {
+                    (phase == d2b_provider_audio_pipewire::AudioBindingPhase::Ready)
+                        .then_some(SharedProviderEffectPhase::Ready)
+                        .unwrap_or(SharedProviderEffectPhase::Pending)
+                })
+                .unwrap_or(SharedProviderEffectPhase::Pending),
+            _ => return Err(SharedProviderEffectError::InvalidResource),
+        };
+        Ok(SharedProviderEffectResult {
+            phase,
+            child_mutated: true,
+        })
+    }
+
+    async fn reconcile_shell(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        let value = self.validate(kind, context, resource)?;
+        let runtime = self.runtime()?;
+        match kind {
+            SharedProviderResourceKind::ShellPool => {
+                shell_pool_spec(&value)?;
+                Ok(SharedProviderEffectResult {
+                    phase: SharedProviderEffectPhase::Ready,
+                    child_mutated: false,
+                })
+            }
+            SharedProviderResourceKind::ShellSession => {
+                let pool_ref = resource_ref_at(&value, "/spec/poolRef")?;
+                let pool = runtime
+                    .committed_resource_value(&pool_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if resource_phase(&pool) != Some("Ready") {
+                    return Ok(SharedProviderEffectResult {
+                        phase: SharedProviderEffectPhase::Pending,
+                        child_mutated: false,
+                    });
+                }
+                let (execution_ref, user_ref) = shell_execution(&value)?;
+                let process_name = format!(
+                    "Process/shell-session-{}",
+                    resource.key().resource_ref().name().as_str()
+                );
+                let process_ref = ResourceRef::parse(&process_name)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let client = runtime
+                    .process_resource_client()
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let process_spec = json!({
+                    "providerRef": "Provider/system-systemd",
+                    "executionRef": execution_ref.to_canonical_string(),
+                    "domain": if user_ref.is_some() { "user" } else { "system" },
+                    "userRef": user_ref.as_ref().map(ResourceRef::to_canonical_string),
+                    "processClass": "service",
+                    "template": "shell-supervisor-main",
+                    "desiredLifecycle": "running",
+                    "deviceUsage": [],
+                    "networkUsage": null
+                });
+                let desired = vec![
+                    owned_child_intent(
+                        &self.zone,
+                        process_ref,
+                        resource.key().resource_ref(),
+                        process_spec,
+                        [pool_ref],
+                    )?,
+                ];
+                let owner = crate::binding_child_resource_runtime::OwnedChildOwner {
+                    resource: stored_resource_from_snapshot(resource),
+                    desired: Some(desired),
+                    fenced: false,
+                };
+                let converged =
+                    crate::binding_child_resource_runtime::reconcile_owned_children(
+                        &runtime.store,
+                        &client,
+                        &self.zone,
+                        std::slice::from_ref(&owner),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if !converged.contains(resource.key().resource_ref()) {
+                    return Ok(SharedProviderEffectResult {
+                        phase: SharedProviderEffectPhase::Pending,
+                        child_mutated: true,
+                    });
+                }
+                let children = crate::binding_child_resource_runtime::list_binding_children(
+                    &runtime.store,
+                    &self.zone,
+                )
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(SharedProviderEffectResult {
+                    phase: if crate::binding_child_resource_runtime::owned_children_ready(
+                        &owner, &children,
+                    ) {
+                        SharedProviderEffectPhase::Ready
+                    } else {
+                        SharedProviderEffectPhase::Pending
+                    },
+                    child_mutated: false,
+                })
+            }
+            _ => Err(SharedProviderEffectError::InvalidResource),
+        }
+    }
+
     async fn reconcile_guest(
         &self,
         kind: SharedProviderResourceKind,
@@ -5582,6 +6153,17 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         ) {
             return self.finalize_guest_runtime(kind, context, resource).await;
         }
+        if matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+                | SharedProviderResourceKind::AudioService
+                | SharedProviderResourceKind::AudioBinding
+                | SharedProviderResourceKind::ShellPool
+                | SharedProviderResourceKind::ShellSession
+        ) {
+            return self.finalize_u9(kind, context, resource).await;
+        }
         let value = self.validate(kind, context, resource)?;
         if kind == SharedProviderResourceKind::Network {
             let resolver = crate::load_bundle_resolver(&self.state)
@@ -6032,6 +6614,9 @@ impl SharedProviderResourceReconciler {
     }
 
     fn has_finalizer(&self, resource: &ResourceSnapshot) -> Result<bool, SharedProviderReconcileError> {
+        if self.descriptor.finalizers().is_empty() {
+            return Ok(true);
+        }
         let value = serde_json::from_slice::<Value>(resource.canonical_json())
             .map_err(|_| SharedProviderReconcileError::InvalidResource)?;
         Ok(self.descriptor.finalizers().iter().all(|expected| {
@@ -6135,11 +6720,19 @@ impl SharedProviderResourceReconciler {
         &self,
         resource: &ResourceSnapshot,
     ) -> Result<ReconcileResult, SharedProviderReconcileError> {
-        let finalizer = self
-            .descriptor
-            .finalizers()
-            .first()
-            .ok_or(SharedProviderReconcileError::InvalidResource)?;
+        let Some(finalizer) = self.descriptor.finalizers().first() else {
+            return ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                None,
+                None,
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::NotRequested,
+            )
+            .map_err(|_| SharedProviderReconcileError::InvalidResource);
+        };
         if resource.deleting() || self.has_finalizer(resource)? {
             return Ok(ReconcileResult::converged(
                 resource.revision(),
@@ -6186,6 +6779,12 @@ impl SharedProviderResourceReconciler {
             target: resource.key().clone(),
             operation_id: "test-provider-finalize".to_owned(),
         };
+        let Some(finalizer) = self.descriptor.finalizers().first() else {
+            return Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ));
+        };
         self.effects
             .finalize(self.kind, &context, resource)
             .await
@@ -6196,10 +6795,7 @@ impl SharedProviderResourceReconciler {
                 resource.generation(),
                 Some(Self::finalizer_mutation(
                     resource,
-                    self.descriptor
-                        .finalizers()
-                        .first()
-                        .ok_or(SharedProviderReconcileError::InvalidResource)?,
+                    finalizer,
                     false,
                 )?),
                 None,
@@ -6242,6 +6838,154 @@ fn finalizer_candidate(
         );
     }
     Ok(value.to_canonical_bytes())
+}
+
+fn stored_resource_from_snapshot(resource: &ResourceSnapshot) -> StoredResource {
+    StoredResource {
+        resource_ref: resource.key().resource_ref().clone(),
+        zone: resource.key().zone().clone(),
+        uid: resource.key().uid().clone(),
+        generation: resource.generation(),
+        revision: resource.revision(),
+        canonical_json: resource.canonical_json().to_vec(),
+        payload_digest: canonical_digest(
+            d2b_contracts_resource::v3::RESOURCE_ENVELOPE_DOMAIN_TAG,
+            resource.canonical_json(),
+        ),
+    }
+}
+
+fn resource_phase(value: &Value) -> Option<&str> {
+    value.pointer("/status/phase").and_then(Value::as_str)
+}
+
+fn value_deletion_requested(value: &Value) -> bool {
+    value
+        .pointer("/metadata/deletionRequestedAt")
+        .is_some_and(|value| !value.is_null())
+}
+
+fn resource_ref_at(value: &Value, path: &str) -> Result<ResourceRef, SharedProviderEffectError> {
+    value
+        .pointer(path)
+        .and_then(Value::as_str)
+        .and_then(|reference| ResourceRef::parse(reference).ok())
+        .ok_or(SharedProviderEffectError::InvalidResource)
+}
+
+fn shell_pool_spec(value: &Value) -> Result<(), SharedProviderEffectError> {
+    if value.pointer("/spec/providerRef").and_then(Value::as_str)
+        != Some("Provider/shell-terminal")
+    {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    let execution_ref = resource_ref_at(value, "/spec/executionRef")?;
+    if !matches!(
+        execution_ref.resource_type().as_str(),
+        "Host" | "Guest"
+    ) {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    if resource_ref_at(value, "/spec/userRef")?.resource_type().as_str() != "User"
+        || value
+            .pointer("/spec/loginShellRef")
+            .and_then(Value::as_str)
+            .is_none_or(|shell| !shell.starts_with("artifact://"))
+    {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    Ok(())
+}
+
+fn shell_execution(
+    value: &Value,
+) -> Result<(ResourceRef, Option<ResourceRef>), SharedProviderEffectError> {
+    if value.pointer("/spec/providerRef").and_then(Value::as_str)
+        != Some("Provider/shell-terminal")
+    {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    let execution_ref = resource_ref_at(value, "/spec/executionRef")?;
+    if !matches!(
+        execution_ref.resource_type().as_str(),
+        "Host" | "Guest"
+    ) {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    let user_ref = value
+        .pointer("/spec/userRef")
+        .and_then(Value::as_str)
+        .map(ResourceRef::parse)
+        .transpose()
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+    if user_ref
+        .as_ref()
+        .is_some_and(|reference| reference.resource_type().as_str() != "User")
+    {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    Ok((execution_ref, user_ref))
+}
+
+fn owned_child_intent(
+    zone: &ZoneId,
+    target: ResourceRef,
+    owner: &ResourceRef,
+    spec: Value,
+    dependencies: impl IntoIterator<Item = ResourceRef>,
+) -> Result<d2b_core_controller::OwnedChildIntent, SharedProviderEffectError> {
+    let value = json!({
+        "apiVersion": "resources.d2bus.org/v3",
+        "type": target.resource_type().as_str(),
+        "metadata": {
+            "name": target.name().as_str(),
+            "zone": zone.as_str(),
+            "ownerRef": owner.to_canonical_string(),
+            "annotations": {},
+            "finalizers": [],
+            "deletionRequestedAt": null,
+            "createdAt": "1970-01-01T00:00:00.000Z",
+            "updatedAt": "1970-01-01T00:00:00.000Z",
+            "generation": 1,
+            "revision": 1,
+            "managedBy": "controller"
+        },
+        "spec": spec,
+        "status": {
+            "completedAt": null,
+            "conditions": [],
+            "lastReconciledAt": null,
+            "observedGeneration": 0,
+            "outcome": null,
+            "phase": "Pending",
+            "resource": {},
+            "startedAt": null,
+            "update": {
+                "dependencies": {"count": 0, "refs": []},
+                "disruption": "None",
+                "lastAssessedAt": null,
+                "observedGeneration": 0,
+                "operationId": null,
+                "owned": {"count": 0, "refs": []},
+                "preserveState": true,
+                "reasons": [],
+                "state": "Unknown",
+                "targetGeneration": 1
+            }
+        }
+    });
+    let bytes = CanonicalJsonValue::parse(
+        &serde_json::to_vec(&value).map_err(|_| SharedProviderEffectError::InvalidResource)?,
+    )
+    .map_err(|_| SharedProviderEffectError::InvalidResource)?
+    .to_canonical_bytes();
+    let digest = canonical_digest(
+        d2b_contracts_resource::v3::RESOURCE_ENVELOPE_DOMAIN_TAG,
+        &bytes,
+    );
+    d2b_core_controller::OwnedChildIntent::new(target, bytes, digest)
+        .and_then(|intent| intent.with_dependencies(dependencies))
+        .map_err(|_| SharedProviderEffectError::InvalidResource)
 }
 
 type SharedCoreControllerSource =
@@ -6360,13 +7104,20 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             && resource.key().resource_ref().resource_type().as_str() == self.kind.resource_type()
             && serde_json::from_slice::<Value>(resource.canonical_json())
                 .ok()
-                .and_then(|value| {
-                    value
-                        .pointer("/spec/providerRef")
-                        .and_then(Value::as_str)
-                        .map(|provider| provider == self.kind.provider_ref())
-                })
-                == Some(true);
+                .is_some_and(|value| {
+                    if matches!(
+                        self.kind,
+                        SharedProviderResourceKind::DisplayWaylandPolicy
+                            | SharedProviderResourceKind::DisplayWaylandSession
+                    ) {
+                        ResourceEnvelope::from_json(resource.canonical_json()).is_ok()
+                    } else {
+                        value
+                            .pointer("/spec/providerRef")
+                            .and_then(Value::as_str)
+                            == Some(self.kind.provider_ref())
+                    }
+                });
         std::future::ready(Ok(if valid {
             ValidationResult::Valid
         } else {
@@ -6400,12 +7151,11 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
                 .map_err(|_| SharedProviderReconcileError::Effect(
                     SharedProviderEffectError::Unavailable,
                 ))?;
-            let finalizer = self
-                .descriptor
-                .finalizers()
-                .first()
-                .ok_or(SharedProviderReconcileError::InvalidResource)?;
-            if !resource.deleting() && !self.has_finalizer(resource)? {
+            let finalizer = self.descriptor.finalizers().first();
+            if let Some(finalizer) = finalizer
+                && !resource.deleting()
+                && !self.has_finalizer(resource)?
+            {
                 return Ok(ReconcileResult::new(
                     resource.revision(),
                     resource.generation(),
@@ -6417,6 +7167,19 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
                     StatusPersistence::NotRequested,
                 )
                 .map_err(|_| SharedProviderReconcileError::InvalidResource)?);
+            }
+            if finalizer.is_none() {
+                return ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    None,
+                    None,
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    StatusPersistence::NotRequested,
+                )
+                .map_err(|_| SharedProviderReconcileError::InvalidResource);
             }
             if !self.has_finalizer(resource)? {
                 return ReconcileResult::new(
@@ -6614,6 +7377,7 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
                 deleting_resource.generation(),
             ));
         }
+        let finalizer = self.descriptor.finalizers().first().cloned();
         self.effects
             .finalize(
                 self.kind,
@@ -6622,18 +7386,19 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             )
             .await
             .map_err(SharedProviderReconcileError::Effect)?;
-        let finalizer = self
-            .descriptor
-            .finalizers()
-            .first()
-            .ok_or(SharedProviderReconcileError::InvalidResource)?;
+        let Some(finalizer) = finalizer else {
+            return Ok(ReconcileResult::converged(
+                deleting_resource.revision(),
+                deleting_resource.generation(),
+            ));
+        };
         Ok(
             ReconcileResult::new(
                 deleting_resource.revision(),
                 deleting_resource.generation(),
                 Some(Self::finalizer_mutation(
                     deleting_resource,
-                    finalizer,
+                    &finalizer,
                     false,
                 )?),
                 None,
@@ -6799,7 +7564,7 @@ pub fn compose_shared_provider_runner_descriptors(
         .map(|registration| {
             if !registration.legacy_scheduler_disabled
                 || !registration.watched_configuration_is_dependency
-                || !(30_000..=60_000).contains(&registration.repair_interval_ticks)
+                || !(30_000..=300_000).contains(&registration.repair_interval_ticks)
             {
                 return Err(ResourceRuntimeError::HandlerNotReady);
             }
@@ -6832,11 +7597,17 @@ pub fn compose_shared_provider_runner_descriptors(
                 3,
             )
             .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let provider_selector = if registration.resource_type.starts_with("display-wayland.")
+            {
+                None
+            } else {
+                Some(registration.provider_ref.to_owned())
+            };
             let mut selectors = vec![
                 ControllerSelector::new(
                     resource_type.clone(),
                     SelectorField::Spec,
-                    Some(registration.provider_ref.to_owned()),
+                    provider_selector,
                 )
                 .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
             ];
@@ -6908,7 +7679,11 @@ pub fn compose_shared_provider_runner_descriptors(
                 selectors,
                 dependency_selectors,
                 true,
-                vec![registration.finalizer.to_owned()],
+                if registration.finalizer.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![registration.finalizer.to_owned()]
+                },
                 vec!["d2b.resource.v3".to_owned()],
                 vec!["resources.d2bus.org/v3".to_owned()],
                 execution,
@@ -6934,6 +7709,96 @@ async fn abort_u12_runner_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
         task.abort();
         let _ = task.await;
     }
+}
+
+async fn u9_provider_generations(
+    runtime: &ZoneResourceRuntime,
+) -> Result<
+    (
+        Vec<SharedProviderRunnerRegistration>,
+        BTreeMap<ResourceRef, ResourceGeneration>,
+    ),
+    ResourceRuntimeError,
+> {
+    let mut generations = BTreeMap::new();
+    let mut active = Vec::new();
+    let mut seen = BTreeSet::new();
+    for registration in U9_SHARED_PROVIDER_RUNNERS {
+        if !seen.insert(registration.provider_ref) {
+            active.extend(
+                U9_SHARED_PROVIDER_RUNNERS
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        candidate.provider_ref == registration.provider_ref
+                            && candidate.resource_type == registration.resource_type
+                    }),
+            );
+            continue;
+        }
+        let provider_ref = ResourceRef::parse(registration.provider_ref)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        match runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "u9-provider-generation".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "u9-provider-generation".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: runtime.zone.clone(),
+                target: provider_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::MetadataOnly,
+            })
+            .await
+        {
+            Ok(provider) if provider.zone == runtime.zone && provider.generation.get() > 0 => {
+                generations.insert(provider_ref, provider.generation);
+                active.extend(
+                    U9_SHARED_PROVIDER_RUNNERS
+                        .iter()
+                        .copied()
+                        .filter(|candidate| candidate.provider_ref == registration.provider_ref),
+                );
+            }
+            Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                let owned_resource = runtime
+                    .committed_resources_of_type(registration.resource_type)
+                    .await?
+                    .into_iter()
+                    .any(|resource| {
+                        resource
+                            .pointer("/spec/providerRef")
+                            .and_then(Value::as_str)
+                            == Some(registration.provider_ref)
+                            || registration.resource_type.starts_with("display-wayland.")
+                    });
+                if owned_resource {
+                    return Err(ResourceRuntimeError::ProviderPathUnavailable);
+                }
+            }
+            Err(_) => return Err(ResourceRuntimeError::StoreReadFailed),
+            _ => return Err(ResourceRuntimeError::HandlerNotReady),
+        }
+    }
+    active.sort_by_key(|registration| {
+        (
+            registration.provider_ref,
+            registration.resource_type,
+            registration.controller_ref,
+        )
+    });
+    active.dedup_by_key(|registration| {
+        (
+            registration.provider_ref,
+            registration.resource_type,
+            registration.controller_ref,
+        )
+    });
+    Ok((active, generations))
 }
 
 fn u12_provider_missing_with_resources(resources_present: bool) -> bool {
@@ -8909,6 +9774,10 @@ pub struct ZoneResourceRuntime {
     u6_runner_lock: Arc<tokio::sync::Mutex<()>>,
     u6_state: Mutex<Option<Arc<crate::ServerState>>>,
     u6_required: AtomicBool,
+    u9_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    u9_runner_lock: Arc<tokio::sync::Mutex<()>>,
+    u9_state: Mutex<Option<Arc<crate::ServerState>>>,
+    u9_required: AtomicBool,
     #[cfg(test)]
     core_runner_events: Arc<Mutex<Vec<&'static str>>>,
     core: Mutex<CoreProcess>,
@@ -8923,7 +9792,6 @@ pub struct ZoneResourceRuntime {
     authority_recovery: Arc<AuthorityRecoveryCoordinator>,
     zone_status: Mutex<ZoneStatusResource>,
     audio_runtime: Arc<Mutex<Option<AudioResourceRuntime>>>,
-    audio_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     device_binding_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     process_runner_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     process_runner_generation: Mutex<Option<ControllerGeneration>>,
@@ -9698,6 +10566,10 @@ impl ZoneResourceRuntime {
             u6_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
             u6_state: Mutex::new(None),
             u6_required: AtomicBool::new(false),
+            u9_runner_tasks: Mutex::new(Vec::new()),
+            u9_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
+            u9_state: Mutex::new(None),
+            u9_required: AtomicBool::new(false),
             #[cfg(test)]
             core_runner_events: Arc::new(Mutex::new(Vec::new())),
             core: Mutex::new(core),
@@ -9719,7 +10591,6 @@ impl ZoneResourceRuntime {
             authority_recovery,
             zone_status: Mutex::new(zone_status),
             audio_runtime: Arc::new(Mutex::new(None)),
-            audio_watch_task: Mutex::new(None),
             device_binding_watch_task: Mutex::new(None),
             process_runner_task: Mutex::new(None),
             process_runner_generation: Mutex::new(None),
@@ -10412,11 +11283,17 @@ impl ZoneResourceRuntime {
         } else {
             None
         };
+        let _u9_runner_guard = if rebind_core {
+            Some(self.u9_runner_lock.lock().await)
+        } else {
+            None
+        };
         if rebind_core {
             self.stop_core_controller_runners_locked().await?;
             self.stop_u12_controller_runners_locked().await?;
             self.stop_u7_controller_runners_locked().await?;
             self.stop_u6_controller_runners_locked().await?;
+            self.stop_u9_controller_runners_locked().await?;
         }
         self.authorizer
             .replace_policy(policy.clone(), &state)
@@ -10482,6 +11359,14 @@ impl ZoneResourceRuntime {
                 .clone();
             if let Some(state) = state {
                 self.start_u6_controller_runners_locked(state).await?;
+            }
+            let state = self
+                .u9_state
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .clone();
+            if let Some(state) = state {
+                self.start_u9_controller_runners_locked(state).await?;
             }
         }
         Ok(())
@@ -11544,6 +12429,243 @@ impl ZoneResourceRuntime {
         }
         let required = guest_provider_runtime::start(self, state).await?;
         self.u6_required.store(required, Ordering::Release);
+        Ok(())
+    }
+
+    async fn stop_u9_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        let tasks = {
+            let mut tasks = self
+                .u9_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        self.u9_required.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Attach interaction and shell resource owners to the production shared
+    /// Runner. Clipboard and notification streams remain ComponentSession
+    /// services and are intentionally not registered as ResourceTypes.
+    pub(crate) async fn start_u9_controller_runners(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        let _runner_guard = self.u9_runner_lock.lock().await;
+        let result = self
+            .start_u9_controller_runners_locked(Arc::clone(&state))
+            .await;
+        if result.is_ok() {
+            match self.u9_state.lock() {
+                Ok(mut current) => *current = Some(state),
+                Err(_) => {
+                    self.stop_u9_controller_runners_locked().await?;
+                    return Err(ResourceRuntimeError::AuthenticationUnavailable);
+                }
+            }
+        }
+        result
+    }
+
+    async fn start_u9_controller_runners_locked(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        if !self.readiness.resource_api_ready {
+            return Ok(());
+        }
+        {
+            let tasks = self
+                .u9_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            if tasks.iter().any(|task| !task.is_finished()) {
+                return Ok(());
+            }
+        }
+        let stale = {
+            let mut tasks = self
+                .u9_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in stale {
+            let _ = task.await;
+        }
+        let subject_context = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let authorization_state = self
+            .authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let controller_generation = self
+            .store_metadata
+            .policy_snapshot
+            .controller_generation
+            .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+        let session_generation = subject_context.reconnect_generation();
+        let (active_registrations, provider_generations) =
+            u9_provider_generations(self).await?;
+        if active_registrations.is_empty() {
+            self.u9_required.store(false, Ordering::Release);
+            return Ok(());
+        }
+        let descriptors = compose_shared_provider_runner_descriptors(
+            active_registrations,
+            self.zone.clone(),
+            controller_generation,
+            &provider_generations,
+            session_generation,
+        )?;
+        let effects: Arc<dyn SharedProviderEffectExecutor> = Arc::new(
+            DaemonSharedProviderEffects::new(Arc::clone(&state), self.zone.clone()),
+        );
+        let mut new_tasks = Vec::with_capacity(descriptors.len());
+        for (registration, descriptor) in descriptors {
+            let kind = SharedProviderResourceKind::from_registration(registration)?;
+            let provider_ref = ResourceRef::parse(registration.provider_ref)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let controller_ref = ResourceRef::parse(registration.controller_ref)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let provider_generation = *provider_generations
+                .get(&provider_ref)
+                .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+            let (assignments, authority) = self
+                .u12_controller_assignments(
+                    &descriptor,
+                    controller_ref.clone(),
+                    provider_generation,
+                    controller_generation,
+                    session_generation,
+                )
+                .await?;
+            let subject = self
+                .authorizer
+                .issue_authenticated_subject(
+                    subject_context.clone(),
+                    authorization_state.clone(),
+                )
+                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+            let api = self
+                .api
+                .registered_controller_api(subject, authorization_state.clone(), assignments)
+                .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
+            let allowed_types = descriptor
+                .resource_types()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let resolver_store = Arc::clone(&self.store);
+            let resolver_zone = self.zone.clone();
+            let resolver_authority = Arc::clone(&authority);
+            let resolver: AssignmentFenceResolver = Arc::new(move |target, uid, revision| {
+                let store = Arc::clone(&resolver_store);
+                let zone = resolver_zone.clone();
+                let authority = Arc::clone(&resolver_authority);
+                let allowed_types = allowed_types.clone();
+                Box::pin(async move {
+                    if !allowed_types.contains(target.resource_type()) {
+                        return Err(SourceError::Integrity);
+                    }
+                    if let Some(stored) = store
+                        .assignment_fence(zone, target.clone())
+                        .await
+                        .map_err(|error| match error.kind() {
+                            StoreErrorKind::Backpressure
+                            | StoreErrorKind::StoreBackpressure => SourceError::Backpressure,
+                            StoreErrorKind::Timeout => SourceError::Timeout,
+                            _ => SourceError::Unavailable,
+                        })?
+                    {
+                        if stored.resource_uid != uid
+                            || stored.epoch > authority.epoch
+                            || (stored.epoch == authority.epoch
+                                && (stored.provider_generation
+                                    != authority.provider_generation
+                                    || stored.controller_generation
+                                        != authority.controller_generation
+                                    || stored.controller_role != authority.controller_role
+                                    || stored.target != authority.target
+                                    || stored.session_generation
+                                        != authority.session_generation))
+                        {
+                            return Err(SourceError::Integrity);
+                        }
+                        if stored.epoch == authority.epoch
+                            && stored.resource_revision != revision
+                        {
+                            return Err(SourceError::Conflict(stored.resource_revision));
+                        }
+                    }
+                    Ok(ResourceAssignmentFence {
+                        resource_uid: uid,
+                        resource_revision: revision,
+                        provider_generation: authority.provider_generation,
+                        controller_generation: authority.controller_generation,
+                        controller_role: authority.controller_role.clone(),
+                        target: authority.target.clone(),
+                        session_generation: authority.session_generation,
+                        epoch: authority.epoch,
+                        scope: ResourceAssignmentScope::Primary,
+                    })
+                })
+            });
+            let api = api.with_assignment_fence_resolver(resolver);
+            let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+            let reconciler = SharedProviderResourceReconciler::new(
+                descriptor.clone(),
+                kind,
+                Arc::clone(&effects),
+            );
+            let runner = Runner::new(
+                reconciler,
+                source,
+                RunnerConfig {
+                    policy_revision: authorization_state.snapshot.policy_revision,
+                    api_revision: authorization_state.snapshot.api_catalog_revision,
+                    configuration_revision: authorization_state
+                        .snapshot
+                        .active_configuration_revision,
+                    deadline_tick: 5_000,
+                    max_attempts: 3,
+                },
+            );
+            let resource_type = registration.resource_type;
+            let controller = registration.controller_ref;
+            new_tasks.push(tokio::spawn(async move {
+                match runner.run().await {
+                    Ok(report) => tracing::debug!(
+                        controller,
+                        resource_type,
+                        dispatched = report.dispatched,
+                        relists = report.relists,
+                        "U9 interaction shared Runner stopped",
+                    ),
+                    Err(error) => tracing::warn!(
+                        controller,
+                        resource_type,
+                        error = %error,
+                        "U9 interaction shared Runner failed",
+                    ),
+                }
+            }));
+        }
+        let mut tasks = self
+            .u9_runner_tasks
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        tasks.extend(new_tasks);
+        self.u9_required.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -13462,7 +14584,6 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         let binding_resources = snapshot.bindings.clone();
         let statuses;
-        let pending_finalizers;
         let child_owners;
         {
             let mut runtime = self
@@ -13475,31 +14596,14 @@ impl ZoneResourceRuntime {
                 .reconcile(snapshot)
                 .map_err(map_audio_runtime_error)?;
             statuses = registry.statuses();
-            pending_finalizers = registry.take_pending_finalizers();
             child_owners = registry
                 .child_owners(&binding_resources)
                 .map_err(map_audio_runtime_error)?;
         }
         let client = self.status_client()?;
-        for owner in &child_owners {
-            if owner.desired.is_some() && !has_audio_finalizer(&owner.resource) {
-                update_audio_finalizer(&client, &owner.resource, true)
-                    .await
-                    .map_err(map_audio_runtime_error)?;
-            }
-        }
-        let converged_children =
-            reconcile_binding_children(&self.store, &client, &self.zone, &child_owners)
-                .await
-                .map_err(|_| ResourceRuntimeError::CapabilityUnavailable)?;
-        for resource in pending_finalizers {
-            if !converged_children.contains(&resource.resource_ref) {
-                continue;
-            }
-            remove_audio_finalizer(&client, &resource)
-                .await
-                .map_err(map_audio_runtime_error)?;
-        }
+        reconcile_binding_children(&self.store, &client, &self.zone, &child_owners)
+            .await
+            .map_err(|_| ResourceRuntimeError::CapabilityUnavailable)?;
         // Finalizer mutations advance the parent revision. Relist the
         // authoritative Binding rows before status writes so their exact
         // UID/revision preconditions remain current on startup.
@@ -13532,33 +14636,6 @@ impl ZoneResourceRuntime {
                 Some(&projection),
             )
             .await?;
-        }
-        let start_watch = {
-            let mut watch_task = self
-                .audio_watch_task
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            watch_needs_restart(&mut watch_task)
-        };
-        if start_watch {
-            let watch = d2b_resource_api::watch::WatchService::new(Arc::clone(&self.store))
-                .open(audio_watch_request(&self.zone))
-                .await
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            let store = Arc::clone(&self.store);
-            let zone = self.zone.clone();
-            let registry = Arc::clone(&self.audio_runtime);
-            let status_client = self.status_client()?;
-            let task = tokio::spawn(run_audio_watch(watch, store, zone, registry, status_client));
-            let mut watch_task = self
-                .audio_watch_task
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            if watch_task.is_none() {
-                *watch_task = Some(task);
-            } else {
-                task.abort();
-            }
         }
         Ok(())
     }
@@ -15265,6 +16342,19 @@ impl ZoneResourceRuntime {
         if !u6_ready {
             return Some(ResourceRuntimeError::HandlerNotReady);
         }
+        let u9_ready = if self.u9_required.load(Ordering::Acquire) {
+            self.u9_runner_tasks
+                .try_lock()
+                .map(|tasks| {
+                    !tasks.is_empty() && !tasks.iter().any(|task| task.is_finished())
+                })
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        if !u9_ready {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
         if !matches!(self.core_stage().ok(), Some(StartupStage::Ready)) {
             return Some(ResourceRuntimeError::HandlerNotReady);
         }
@@ -15876,7 +16966,7 @@ impl ZoneResourceRuntime {
             u12_runner_tasks,
             u7_runner_tasks,
             u6_runner_tasks,
-            audio_watch_task,
+            u9_runner_tasks,
             audio_runtime,
             device_binding_watch_task,
             process_runner_task,
@@ -15921,10 +17011,10 @@ impl ZoneResourceRuntime {
             task.abort();
             let _ = task.await;
         }
-        if let Some(task) = audio_watch_task
+        let u9_runner_tasks = u9_runner_tasks
             .into_inner()
-            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
-        {
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        for task in u9_runner_tasks {
             task.abort();
             let _ = task.await;
         }

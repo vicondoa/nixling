@@ -6,7 +6,7 @@ use d2b_contracts_resource::v3::{
 use d2b_core_controller::{ControllerIdentity, core_controller_descriptors};
 use d2bd::resource_runtime::{
     U7_SHARED_PROVIDER_RUNNERS, compose_shared_volume_runner_descriptors,
-    U8_SHARED_PROVIDER_RUNNERS, U6_SHARED_PROVIDER_RUNNERS,
+    U8_SHARED_PROVIDER_RUNNERS, U9_SHARED_PROVIDER_RUNNERS, U6_SHARED_PROVIDER_RUNNERS,
     compose_shared_guest_runner_descriptors, compose_shared_provider_runner_descriptors,
 };
 
@@ -273,6 +273,85 @@ fn provider_composition_rejects_a_missing_accepted_provider_before_runner_spawn(
         .len(),
         U8_SHARED_PROVIDER_RUNNERS.len()
     );
+}
+
+#[test]
+fn u9_composition_builds_one_fenced_runner_per_owned_interaction_resource() {
+    let generations = U9_SHARED_PROVIDER_RUNNERS
+        .iter()
+        .map(|registration| {
+            (
+                ResourceRef::parse(registration.provider_ref).unwrap(),
+                ResourceGeneration::new(7).unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let descriptors = compose_shared_provider_runner_descriptors(
+        U9_SHARED_PROVIDER_RUNNERS,
+        ZoneId::parse("work").unwrap(),
+        ControllerGeneration::new(3).unwrap(),
+        &generations,
+        ReconnectGeneration::new(5).unwrap(),
+    )
+    .expect("U9 descriptors");
+
+    assert_eq!(descriptors.len(), 6);
+    let resource_types = descriptors
+        .iter()
+        .map(|(_, descriptor)| {
+            descriptor
+                .resource_types()
+                .next()
+                .expect("one ResourceType per U9 descriptor")
+                .as_str()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        resource_types,
+        BTreeSet::from([
+            "display-wayland.d2bus.org.WaylandPolicy",
+            "display-wayland.d2bus.org.WaylandSession",
+            "audio.d2bus.org.AudioService",
+            "audio.d2bus.org.AudioBinding",
+            "shell-terminal.d2bus.org.ShellPool",
+            "shell-terminal.d2bus.org.ShellSession",
+        ])
+    );
+    for (registration, descriptor) in descriptors {
+        assert_eq!(
+            descriptor
+                .resource_types()
+                .next()
+                .expect("resource type")
+                .as_str(),
+            registration.resource_type
+        );
+        assert_eq!(
+            descriptor.execution().resync().observe_interval_ticks(),
+            Some(registration.repair_interval_ticks)
+        );
+        assert_eq!(
+            descriptor.execution().resync().resync_interval_ticks(),
+            registration.repair_interval_ticks
+        );
+        if registration.finalizer.is_empty() {
+            assert!(descriptor.finalizers().is_empty());
+        } else {
+            assert_eq!(descriptor.finalizers(), &[registration.finalizer.to_owned()]);
+        }
+    }
+}
+
+#[test]
+fn u9_component_contracts_keep_clipboard_and_notifications_on_typed_sessions() {
+    let clipboard = d2b_provider_clipboard_wayland::clipboard_runner_contract();
+    let notification = d2b_provider_notification_desktop::notification_runner_contract();
+    assert!(clipboard.component_session_only());
+    assert!(notification.component_session_only());
+    assert!(clipboard.legacy_scheduler_disabled());
+    assert!(notification.legacy_scheduler_disabled());
+    assert_eq!(clipboard.repair_interval_secs(), 300);
+    assert_eq!(notification.repair_interval_secs(), 300);
 }
 
 #[test]

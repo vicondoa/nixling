@@ -3812,6 +3812,20 @@ pub async fn serve(options: ServeOptions) -> Result<(), TypedError> {
                                 detail: "resource-plane state lock unavailable".to_owned(),
                             });
                         }
+                        for zone in plane.zone_ids() {
+                            if let Ok(resource) = plane.zone(&zone) {
+                                if let Err(error) = resource
+                                    .start_u9_controller_runners(Arc::new(state.clone()))
+                                    .await
+                                {
+                                    tracing::error!(
+                                        zone = %zone,
+                                        error = ?error,
+                                        "interaction and shell Provider runners refused during startup",
+                                    );
+                                }
+                            }
+                        }
                         let mut runtimes = InteractionRuntime::new();
                         let mut listener_set: Option<
                             interaction_composition::InteractionListenerSet,
@@ -16735,16 +16749,6 @@ async fn open_resource_plane(
             }
             return Err(error);
         }
-        if let Err(error) = runtime
-            .reconcile_audio_resources(Arc::new(state.clone()))
-            .await
-        {
-            tracing::warn!(
-                zone = %runtime.zone().as_str(),
-                error = ?error,
-                "audio reconciliation degraded during startup",
-            );
-        }
         if let Err(error) = runtime.reconcile_semantic_binding_resources().await {
             tracing::warn!(
                 zone = %runtime.zone().as_str(),
@@ -16809,12 +16813,15 @@ async fn open_resource_plane(
             }
             return Err(error);
         }
-        if let Err(error) = plane.insert(runtime) {
-            let _ = plane.shutdown().await;
-            while let Some((_, runtime, _)) = remaining.next() {
-                let _ = runtime.shutdown().await;
+        match plane.insert(runtime) {
+            Ok(_) => {}
+            Err(error) => {
+                let _ = plane.shutdown().await;
+                while let Some((_, runtime, _)) = remaining.next() {
+                    let _ = runtime.shutdown().await;
+                }
+                return Err(error);
             }
-            return Err(error);
         }
     }
     compose_gateway_zone_links(state, &mut plane, &topology).await;
