@@ -5143,6 +5143,9 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             }
             SharedProviderResourceKind::ShellSession => {
                 let pool_ref = resource_ref_at(&value, "/spec/poolRef")?;
+                if pool_ref.resource_type().as_str() != "shell-terminal.d2bus.org.ShellPool" {
+                    return Err(SharedProviderEffectError::InvalidResource);
+                }
                 let pool = runtime
                     .committed_resource_value(&pool_ref, &context.operation_id)
                     .await
@@ -7021,11 +7024,13 @@ fn shell_pool_spec(
         return Err(SharedProviderEffectError::InvalidResource);
     }
     let user_ref = resource_ref_at(value, "/spec/userRef")?;
+    let login_shell = value
+        .pointer("/spec/loginShellRef")
+        .and_then(Value::as_str)
+        .ok_or(SharedProviderEffectError::InvalidResource)?;
     if user_ref.resource_type().as_str() != "User"
-        || value
-            .pointer("/spec/loginShellRef")
-            .and_then(Value::as_str)
-            .is_none_or(|shell| !shell.starts_with("artifact://"))
+        || !login_shell.starts_with("artifact://")
+        || login_shell.len() > 255
     {
         return Err(SharedProviderEffectError::InvalidResource);
     }
@@ -7056,6 +7061,12 @@ fn shell_execution(
     if user_ref
         .as_ref()
         .is_some_and(|reference| reference.resource_type().as_str() != "User")
+        || value
+            .pointer("/spec/loginShellRef")
+            .and_then(Value::as_str)
+            .is_none_or(|shell| {
+                !shell.starts_with("artifact://") || shell.len() > 255
+            })
     {
         return Err(SharedProviderEffectError::InvalidResource);
     }
