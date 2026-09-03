@@ -1868,6 +1868,7 @@ impl DaemonSharedProviderEffects {
             return Ok(());
         };
         if assignment.resource_uid != resource.uid
+            || assignment.resource_revision != resource.revision
             || assignment.epoch == 0
             || assignment.provider_generation.get() == 0
             || assignment.controller_generation.get() == 0
