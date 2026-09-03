@@ -554,6 +554,14 @@ pub struct GuestCredentialBackendResponse {
     bytes: Option<zeroize::Zeroizing<Vec<u8>>>,
 }
 
+/// Guest-local sensitive bytes retained in a zeroizing owner.
+pub type CredentialSensitiveBytes = zeroize::Zeroizing<Vec<u8>>;
+
+/// Allocate Guest-local sensitive bytes in a zeroizing owner.
+pub fn zeroizing_bytes(bytes: Vec<u8>) -> CredentialSensitiveBytes {
+    zeroize::Zeroizing::new(bytes)
+}
+
 impl GuestCredentialBackendResponse {
     /// Borrow the optional backend state.
     pub fn state(&self) -> Option<&str> {
@@ -633,6 +641,28 @@ impl GuestCredentialBackendReply {
             outcome,
             bytes,
         }
+    }
+
+    /// Construct a typed reply while copying sensitive bytes directly into a
+    /// zeroizing owner.
+    pub fn with_sensitive_bytes(
+        state: Option<String>,
+        lease_handle: Option<String>,
+        source_version: Option<String>,
+        rotation_generation: Option<u64>,
+        expires_at_unix_ms: Option<u64>,
+        outcome: Option<String>,
+        bytes: Option<&[u8]>,
+    ) -> Self {
+        Self::new(
+            state,
+            lease_handle,
+            source_version,
+            rotation_generation,
+            expires_at_unix_ms,
+            outcome,
+            bytes.map(|bytes| zeroize::Zeroizing::new(bytes.to_vec())),
+        )
     }
 
     fn encode(self) -> Result<zeroize::Zeroizing<Vec<u8>>, GuestCredentialBackendHandlerError> {

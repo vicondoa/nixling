@@ -1821,7 +1821,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ttrpc",
- "zeroize",
 ]
 
 [[package]]

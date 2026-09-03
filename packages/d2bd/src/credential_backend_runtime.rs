@@ -282,7 +282,7 @@ struct GuestCredentialLeaseRecord {
     rotation_generation: u64,
     expires_at_unix_ms: u64,
     state: GuestCredentialLeaseState,
-    token: zeroize::Zeroizing<Vec<u8>>,
+    token: d2b_provider_toolkit::CredentialSensitiveBytes,
     rotated_to: Option<String>,
 }
 
@@ -701,14 +701,14 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn random_token() -> Result<zeroize::Zeroizing<Vec<u8>>, GuestCredentialBackendSourceError> {
-    let mut token = zeroize::Zeroizing::new(vec![0_u8; 32]);
-    getrandom::getrandom(token.as_mut_slice())
+fn random_token() -> Result<d2b_provider_toolkit::CredentialSensitiveBytes, GuestCredentialBackendSourceError> {
+    let mut token = vec![0_u8; 32];
+    getrandom::getrandom(&mut token)
         .map_err(|_| GuestCredentialBackendSourceError::Unavailable)?;
     if token.iter().all(|byte| *byte == 0) {
         return Err(GuestCredentialBackendSourceError::Unavailable);
     }
-    Ok(token)
+    Ok(d2b_provider_toolkit::zeroizing_bytes(token))
 }
 
 fn expire_record(record: &mut GuestCredentialLeaseRecord) {
@@ -733,14 +733,14 @@ fn record_reply(
         GuestCredentialLeaseState::Expired => "expired",
         GuestCredentialLeaseState::Revoked => "revoked",
     };
-    GuestCredentialBackendReply::new(
+    GuestCredentialBackendReply::with_sensitive_bytes(
         Some(state.to_owned()),
         Some(record.lease_handle.clone()),
         Some(record.source_version.clone()),
         Some(record.rotation_generation),
         Some(record.expires_at_unix_ms),
         outcome,
-        include_bytes.then(|| record.token.clone()),
+        include_bytes.then_some(record.token.as_slice()),
     )
 }
 

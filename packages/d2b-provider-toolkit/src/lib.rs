@@ -89,6 +89,7 @@ pub use dispatch::{DispatchLimiter, DispatchPermit, MAX_DISPATCH_IN_FLIGHT};
 pub use fd10::{
     CredentialDeliveryKeyHandoff, CredentialDeliveryKeyMaterial, GUEST_CREDENTIAL_BACKEND_FD,
     GUEST_CREDENTIAL_BACKEND_PROTOCOL, GUEST_CREDENTIAL_BACKEND_SERVICE,
+    CredentialSensitiveBytes,
     GuestCredentialBackend, GuestCredentialBackendError, GuestCredentialBackendHandler,
     GuestCredentialBackendHandlerError, GuestCredentialBackendHandlerFuture,
     GuestCredentialBackendReply, GuestCredentialBackendResponderLease,
@@ -96,6 +97,7 @@ pub use fd10::{
     PROVIDER_BOOTSTRAP_STREAM_ID, PROVIDER_DELIVERY_KEY_STREAM_CREDIT,
     PROVIDER_DELIVERY_KEY_STREAM_ID, PROVIDER_READY_MARKER, PROVIDER_READY_STREAM_CREDIT,
     PROVIDER_READY_STREAM_ID, ProviderFd10Spec, ProviderSessionMetadata, run_from_fd10,
+    zeroizing_bytes,
     spawn_guest_credential_backend_responder,
 };
 pub use error::ProviderToolkitError;
