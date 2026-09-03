@@ -463,3 +463,24 @@ fn audit_and_telemetry_reject_identity_bearing_surfaces() {
     assert!(!wire.contains('\n'));
     assert!(!wire.contains(":interface=bad"));
 }
+
+#[test]
+fn display_runner_contract_disables_legacy_scheduling() {
+    let contract = d2b_provider_display_wayland::display_runner_contract();
+    assert_eq!(
+        contract.session_resource_type(),
+        "display-wayland.d2bus.org.WaylandSession"
+    );
+    assert_eq!(
+        contract.policy_resource_type(),
+        "display-wayland.d2bus.org.WaylandPolicy"
+    );
+    assert_eq!(
+        contract.finalizer(),
+        "display-wayland.d2bus.org/proxy-stopped"
+    );
+    assert_eq!(contract.repair_interval_secs(), 30);
+    assert_eq!(contract.max_repair_interval_secs(), 60);
+    assert!(contract.legacy_scheduler_disabled());
+    assert!(contract.watched_configuration_is_dependency());
+}

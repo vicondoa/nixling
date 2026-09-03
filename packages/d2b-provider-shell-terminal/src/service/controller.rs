@@ -12,6 +12,75 @@ use crate::{
     session::{AdoptionDecision, SupervisorCandidate, SupervisorIdentity, adopt_supervisor},
 };
 
+/// Default shared-Runner repair interval for shell resources.
+pub const SHELL_REPAIR_INTERVAL_SECS: u64 = 30;
+/// Exact finalizer for shell pools.
+pub const SHELL_POOL_FINALIZER: &str = "shell-terminal.d2bus.org/pool-finalizer";
+/// Exact finalizer for shell sessions.
+pub const SHELL_SESSION_FINALIZER: &str = "shell-terminal.d2bus.org/session-finalizer";
+
+/// The cutover contract for ShellPool and ShellSession owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShellRunnerContract {
+    pool_resource_type: &'static str,
+    session_resource_type: &'static str,
+    pool_finalizer: &'static str,
+    session_finalizer: &'static str,
+    repair_interval_secs: u64,
+    legacy_scheduler_disabled: bool,
+    watched_configuration_is_dependency: bool,
+}
+
+impl ShellRunnerContract {
+    /// Return the ShellPool ResourceType.
+    pub const fn pool_resource_type(self) -> &'static str {
+        self.pool_resource_type
+    }
+
+    /// Return the ShellSession ResourceType.
+    pub const fn session_resource_type(self) -> &'static str {
+        self.session_resource_type
+    }
+
+    /// Return the ShellPool finalizer.
+    pub const fn pool_finalizer(self) -> &'static str {
+        self.pool_finalizer
+    }
+
+    /// Return the ShellSession finalizer.
+    pub const fn session_finalizer(self) -> &'static str {
+        self.session_finalizer
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Whether legacy shell scheduling is disabled.
+    pub const fn legacy_scheduler_disabled(self) -> bool {
+        self.legacy_scheduler_disabled
+    }
+
+    /// Whether watched configuration is dependency-only.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+}
+
+/// Return the shared-Runner contract for shell-terminal.
+pub const fn shell_runner_contract() -> ShellRunnerContract {
+    ShellRunnerContract {
+        pool_resource_type: "shell-terminal.d2bus.org.ShellPool",
+        session_resource_type: "shell-terminal.d2bus.org.ShellSession",
+        pool_finalizer: SHELL_POOL_FINALIZER,
+        session_finalizer: SHELL_SESSION_FINALIZER,
+        repair_interval_secs: SHELL_REPAIR_INTERVAL_SECS,
+        legacy_scheduler_disabled: true,
+        watched_configuration_is_dependency: true,
+    }
+}
+
 /// A validated request to create one pool-derived shell session.
 #[derive(Clone, PartialEq, Eq)]
 pub struct OpenSessionRequest {

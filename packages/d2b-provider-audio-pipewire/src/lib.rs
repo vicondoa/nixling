@@ -28,7 +28,7 @@ pub use controller::{
     AudioArbitrationState, AudioBindingChannels, AudioBindingController, AudioBindingPhase,
     AudioBindingStatus, AudioControllerError, AudioEnforcementPosture, AudioLastSetApplied,
     AudioMicrophoneStatus, AudioReconcileResult, AudioReconcileResultWithChildren,
-    AudioSpeakerStatus, register_service,
+    AudioRunnerContract, AudioSpeakerStatus, audio_runner_contract, register_service,
 };
 pub use manifest::AudioManifest;
 pub use mediator::{

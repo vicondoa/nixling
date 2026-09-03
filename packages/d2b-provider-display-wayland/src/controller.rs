@@ -15,6 +15,71 @@ use d2b_provider_toolkit::{AuthenticatedComponentSession, AuthenticatedSessionRo
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+/// Default shared-Runner repair interval for display resources.
+pub const DISPLAY_REPAIR_INTERVAL_SECS: u64 = 30;
+/// Maximum shared-Runner repair interval for display resources.
+pub const DISPLAY_MAX_REPAIR_INTERVAL_SECS: u64 = 60;
+
+/// The cutover contract for display-wayland resource ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayRunnerContract {
+    session_resource_type: &'static str,
+    policy_resource_type: &'static str,
+    finalizer: &'static str,
+    repair_interval_secs: u64,
+    legacy_scheduler_disabled: bool,
+    watched_configuration_is_dependency: bool,
+}
+
+impl DisplayRunnerContract {
+    /// Return the WaylandSession ResourceType.
+    pub const fn session_resource_type(self) -> &'static str {
+        self.session_resource_type
+    }
+
+    /// Return the WaylandPolicy ResourceType.
+    pub const fn policy_resource_type(self) -> &'static str {
+        self.policy_resource_type
+    }
+
+    /// Return the exact WaylandSession finalizer.
+    pub const fn finalizer(self) -> &'static str {
+        self.finalizer
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Return the maximum permitted repair interval.
+    pub const fn max_repair_interval_secs(self) -> u64 {
+        DISPLAY_MAX_REPAIR_INTERVAL_SECS
+    }
+
+    /// Whether the legacy display scheduler is disabled.
+    pub const fn legacy_scheduler_disabled(self) -> bool {
+        self.legacy_scheduler_disabled
+    }
+
+    /// Whether watched configuration is dependency-only.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+}
+
+/// Return the shared-Runner contract for display-wayland.
+pub const fn display_runner_contract() -> DisplayRunnerContract {
+    DisplayRunnerContract {
+        session_resource_type: "display-wayland.d2bus.org.WaylandSession",
+        policy_resource_type: "display-wayland.d2bus.org.WaylandPolicy",
+        finalizer: FINALIZER,
+        repair_interval_secs: DISPLAY_REPAIR_INTERVAL_SECS,
+        legacy_scheduler_disabled: true,
+        watched_configuration_is_dependency: true,
+    }
+}
+
 /// Closed display-session lifecycle phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {

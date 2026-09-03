@@ -19,7 +19,8 @@ pub use audit::{
     ClipboardReason, SizeBucket,
 };
 pub use controller::{
-    ClipboardController, DependencyStatus, DisplayDependencyEvidence, ProcessPlan,
+    ClipboardController, ClipboardRunnerContract, DependencyStatus, DisplayDependencyEvidence,
+    ProcessPlan, clipboard_runner_contract,
 };
 pub use descriptor::{ClipboardDescriptorError, ClipboardProviderDescriptor};
 pub use fd::{

@@ -25,8 +25,9 @@ pub use action_nonce::{ActionNonce, ActionNonceError, ActionNonceStore};
 pub use audit::{NotificationAuditKind, NotificationAuditRecord};
 pub use controller::{
     DisplayDependencyEvidence, DisplayDependencyState, GuestSourceConfig, NotificationController,
-    NotificationProviderConfig, ProcessPlan, SourceProcessEffectPort, SourceProcessEffectReceipt,
-    SourceReconcileResult,
+    NotificationProviderConfig, NotificationRunnerContract, ProcessPlan,
+    SourceProcessEffectPort, SourceProcessEffectReceipt, SourceReconcileResult,
+    notification_runner_contract,
 };
 pub use descriptor::{NotificationDescriptorError, NotificationProviderDescriptor};
 pub use error::ProviderError;

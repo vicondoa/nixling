@@ -3,7 +3,10 @@
 mod controller;
 mod supervisor;
 
-pub use controller::{OpenSessionRequest, OpenSessionResult, ShellTerminalController};
+pub use controller::{
+    OpenSessionRequest, OpenSessionResult, ShellRunnerContract, ShellTerminalController,
+    shell_runner_contract,
+};
 pub use supervisor::{
     AttachReceipt, AttachRequest, Attachment, InMemoryShellAuthority, SessionCapability,
     SessionGrant, SessionSupervisor, ShellAuthorityLedger, ShellAuthorityPort,

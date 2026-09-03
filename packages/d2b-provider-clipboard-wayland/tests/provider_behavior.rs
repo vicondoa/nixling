@@ -120,3 +120,13 @@ fn clipboard_descriptor_publishes_only_typed_attachment_classes() {
     assert_eq!(descriptor.attachment_classes().len(), 3);
     assert!(!descriptor.provider_state_volume);
 }
+
+#[test]
+fn clipboard_component_contract_disables_legacy_scheduling_without_resource_authority() {
+    let contract = d2b_provider_clipboard_wayland::clipboard_runner_contract();
+    assert_eq!(contract.service_package(), "d2b.clipboard.v3");
+    assert_eq!(contract.repair_interval_secs(), 300);
+    assert!(contract.component_session_only());
+    assert!(contract.legacy_scheduler_disabled());
+    assert!(contract.watched_configuration_is_dependency());
+}

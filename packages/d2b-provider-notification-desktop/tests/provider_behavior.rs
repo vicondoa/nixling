@@ -135,3 +135,13 @@ fn notification_descriptor_is_transient_and_stream_scoped() {
     assert_eq!(descriptor.streams().len(), 2);
     assert!(!descriptor.provider_state_volume);
 }
+
+#[test]
+fn notification_component_contract_keeps_streams_out_of_resource_authority() {
+    let contract = d2b_provider_notification_desktop::notification_runner_contract();
+    assert_eq!(contract.service_package(), "d2b.notification.v3");
+    assert_eq!(contract.repair_interval_secs(), 300);
+    assert!(contract.component_session_only());
+    assert!(contract.legacy_scheduler_disabled());
+    assert!(contract.watched_configuration_is_dependency());
+}

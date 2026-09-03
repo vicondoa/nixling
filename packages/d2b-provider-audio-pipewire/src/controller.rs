@@ -16,6 +16,75 @@ use d2b_contracts_resource::v3::{ExecutionDomain, ResourceRef};
 
 const AUDIO_PROVIDER_REF: &str = "Provider/audio-pipewire";
 
+/// Default shared-Runner repair interval for audio resources.
+pub const AUDIO_REPAIR_INTERVAL_SECS: u64 = 300;
+/// Exact finalizer for an AudioService authority.
+pub const AUDIO_SERVICE_FINALIZER: &str = "audio.d2bus.org/service-finalizer";
+/// Exact finalizer for an AudioBinding authority.
+pub const AUDIO_BINDING_FINALIZER: &str = "audio.d2bus.org/binding-finalizer";
+
+/// The cutover contract for AudioService and AudioBinding owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioRunnerContract {
+    service_resource_type: &'static str,
+    binding_resource_type: &'static str,
+    service_finalizer: &'static str,
+    binding_finalizer: &'static str,
+    repair_interval_secs: u64,
+    legacy_scheduler_disabled: bool,
+    watched_configuration_is_dependency: bool,
+}
+
+impl AudioRunnerContract {
+    /// Return the provider-neutral Service ResourceType.
+    pub const fn service_resource_type(self) -> &'static str {
+        self.service_resource_type
+    }
+
+    /// Return the provider-neutral Binding ResourceType.
+    pub const fn binding_resource_type(self) -> &'static str {
+        self.binding_resource_type
+    }
+
+    /// Return the AudioService finalizer.
+    pub const fn service_finalizer(self) -> &'static str {
+        self.service_finalizer
+    }
+
+    /// Return the AudioBinding finalizer.
+    pub const fn binding_finalizer(self) -> &'static str {
+        self.binding_finalizer
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Whether the legacy audio scheduler is disabled.
+    pub const fn legacy_scheduler_disabled(self) -> bool {
+        self.legacy_scheduler_disabled
+    }
+
+    /// Whether watched configuration is dependency-only.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+}
+
+/// Return the shared-Runner contract for audio-pipewire.
+pub const fn audio_runner_contract() -> AudioRunnerContract {
+    AudioRunnerContract {
+        service_resource_type: "audio.d2bus.org.AudioService",
+        binding_resource_type: "audio.d2bus.org.AudioBinding",
+        service_finalizer: AUDIO_SERVICE_FINALIZER,
+        binding_finalizer: AUDIO_BINDING_FINALIZER,
+        repair_interval_secs: AUDIO_REPAIR_INTERVAL_SECS,
+        legacy_scheduler_disabled: true,
+        watched_configuration_is_dependency: true,
+    }
+}
+
 const AUDIO_BINDING_CHILD_REQUESTS: [BindingChildRequest; 4] = [
     BindingChildRequest::process(
         BindingChildKind::Process,
