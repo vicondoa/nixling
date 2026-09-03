@@ -2816,6 +2816,9 @@ fn is_managed_identity_agent_context(
         && context.resource_ref.resource_type().as_str() == "Process"
         && context.resource_ref.name().as_str().starts_with("mi-agent-")
         && execution.template().as_str() == "d2b-managed-identity-agent"
+        && context.controller_provider_ref.as_ref().is_some_and(|provider| {
+            provider.to_canonical_string() == "Provider/credential-managed-identity"
+        })
 }
 
 fn controller_launch_ticket(

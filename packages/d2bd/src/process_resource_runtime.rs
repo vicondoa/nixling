@@ -485,6 +485,9 @@ impl ProcessResourceRuntime {
             &record.resource,
             "d2b.d2bus.org/controller-provider-generation",
         );
+        let committed_controller_provider_identity = controller_provider_ref
+            .as_ref()
+            .and_then(|provider| self.controller_provider_identities.get(provider));
         ProcessResourceContext::new(
             self.zone.clone(),
             &record.resource.resource_ref,
@@ -520,9 +523,16 @@ impl ProcessResourceRuntime {
             record
                 .controller_provider_uid
                 .as_ref()
+                .or(committed_controller_provider_identity
+                    .as_ref()
+                    .map(|(uid, _)| uid))
                 .or(controller_provider_uid.as_ref()),
             record
                 .controller_provider_generation
+                .or(
+                    committed_controller_provider_identity
+                        .map(|(_, generation)| *generation),
+                )
                 .or(controller_provider_generation),
         )
     }
