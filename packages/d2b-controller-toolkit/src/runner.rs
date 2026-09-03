@@ -1664,8 +1664,7 @@ where
     };
 
     let deleting = target.deleting()
-        || work.reasons().contains(TriggerReason::DeletionRequested)
-        || work.reasons().contains(TriggerReason::FinalizerRequired);
+        || work.reasons().contains(TriggerReason::DeletionRequested);
     let validation = if deleting {
         ValidationResult::Valid
     } else {

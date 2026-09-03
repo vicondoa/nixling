@@ -21,6 +21,7 @@ use d2b_resource_store::{
     ResourceAssignmentFence, ResourceAssignmentScope, StoreErrorKind, StoreGetRequest,
     StoreOperationContext, StoreProjection,
 };
+use serde_json::Value;
 
 use super::{
     DaemonSharedProviderEffects, ResourceRuntimeError, SharedProviderEffectExecutor,
@@ -292,11 +293,15 @@ async fn provider_generations(
                 active.push(registration);
             }
             Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
-                if !runtime
+                let owned_guest_exists = runtime
                     .committed_resources_of_type(registration.resource_type)
                     .await?
-                    .is_empty()
-                {
+                    .into_iter()
+                    .any(|guest| {
+                        guest.pointer("/spec/providerRef").and_then(Value::as_str)
+                            == Some(registration.provider_ref)
+                    });
+                if owned_guest_exists {
                     return Err(ResourceRuntimeError::ProviderPathUnavailable);
                 }
             }

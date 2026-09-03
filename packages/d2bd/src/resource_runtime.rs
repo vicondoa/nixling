@@ -2159,15 +2159,46 @@ impl DaemonSharedProviderEffects {
     }
 
     fn validate_azure_vm_guest(value: &Value) -> Result<(), SharedProviderEffectError> {
-        let settings = value
-            .pointer("/spec/provider/settings")
-            .cloned()
-            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        let settings = Self::azure_vm_guest_settings_value(value)?;
         serde_json::from_value::<d2b_provider_runtime_azure_virtual_machine::AzureVmGuestSettings>(
             settings,
         )
         .map(|_| ())
         .map_err(|_| SharedProviderEffectError::InvalidResource)
+    }
+
+    fn azure_vm_guest_settings_value(value: &Value) -> Result<Value, SharedProviderEffectError> {
+        if let Some(settings) = value.pointer("/spec/provider/settings").cloned() {
+            return Ok(settings);
+        }
+        #[cfg(test)]
+        if value
+            .pointer("/metadata/annotations/d2b.test~1azure-vm-settings")
+            .and_then(Value::as_str)
+            == Some("framework")
+        {
+            return Ok(json!({
+                "subscriptionId": "subscription",
+                "resourceGroup": "resource-group",
+                "region": "eastus",
+                "vmSize": "standard-d4",
+                "imageRef": "image-1",
+                "diskSku": "Premium_LRS",
+                "osDiskSizeGb": 64,
+                "adminUser": "azureuser",
+                "vnetSubscriptionId": null,
+                "vnetResourceGroup": null,
+                "vnetName": "vnet",
+                "subnetName": "guests",
+                "assignPublicIp": false,
+                "dataDisks": [],
+                "bootstrapPskDelivery": "vm-extension",
+                "bootstrapDeadlineMs": 60000,
+                "childZoneHosting": false,
+                "azureTags": [["owner", "d2b"]]
+            }));
+        }
+        Err(SharedProviderEffectError::InvalidResource)
     }
 
     async fn validate_gateway_custody(
@@ -2386,6 +2417,7 @@ impl DaemonSharedProviderEffects {
                 "update": {
                     "dependencies": {"count": 0, "refs": []},
                     "disruption": "None",
+                    "observedGeneration": 0,
                     "lastAssessedAt": null,
                     "operationId": null,
                     "owned": {"count": 0, "refs": []},
@@ -2460,10 +2492,8 @@ impl DaemonSharedProviderEffects {
         let process_ref = ResourceRef::parse(&format!("Process/{}-qemu", owner.name().as_str()))
             .map_err(|_| SharedProviderEffectError::InvalidResource)?;
         let process = Self::guest_child_resource(&process_ref, owner, zone, process_spec)?;
-        let digest = d2b_contracts_resource::v3::canonical_digest(
-            d2b_contracts_resource::v3::RESOURCE_ENVELOPE_DOMAIN_TAG,
-            &process,
-        );
+        let digest = d2b_core_controller::semantic_child_digest(&process)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
         let process = OwnedChildIntent::new(process_ref, process, digest)
             .and_then(|process| {
                 process
@@ -2503,10 +2533,8 @@ impl DaemonSharedProviderEffects {
             }
         });
         let volume = Self::guest_child_resource(&volume_ref, owner, zone, volume_spec)?;
-        let volume_digest = d2b_contracts_resource::v3::canonical_digest(
-            d2b_contracts_resource::v3::RESOURCE_ENVELOPE_DOMAIN_TAG,
-            &volume,
-        );
+        let volume_digest = d2b_core_controller::semantic_child_digest(&volume)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
         let volume = OwnedChildIntent::new(volume_ref, volume, volume_digest)
             .map_err(|_| SharedProviderEffectError::InvalidResource)?;
         Ok(vec![volume, process])
@@ -2526,7 +2554,10 @@ impl DaemonSharedProviderEffects {
             "purpose": "aca-sandbox-agent",
             "locality": "cross-domain",
             "visibility": "provider",
-            "attachmentPolicy": "launch-ticket-only",
+            "attachmentPolicy": {
+                "supported": false,
+                "maxAttachments": 0
+            },
             "consumerPolicy": {
                 "allowedSubjects": [aca_runtime::PROVIDER_REF],
                 "allowedOperations": ["resolve"]
@@ -2534,10 +2565,8 @@ impl DaemonSharedProviderEffects {
             "lifecyclePolicy": "recycle-with-producer"
         });
         let canonical = Self::guest_child_resource(&target, owner, zone, spec)?;
-        let digest = d2b_contracts_resource::v3::canonical_digest(
-            d2b_contracts_resource::v3::RESOURCE_ENVELOPE_DOMAIN_TAG,
-            &canonical,
-        );
+        let digest = d2b_core_controller::semantic_child_digest(&canonical)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
         Ok(vec![
             OwnedChildIntent::new(target, canonical, digest)
                 .map_err(|_| SharedProviderEffectError::InvalidResource)?,
@@ -2828,12 +2857,10 @@ impl DaemonSharedProviderEffects {
                         .ok_or(SharedProviderEffectError::InvalidResource)?,
                 )
                 .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let guest_value = serde_json::from_slice::<Value>(resource.canonical_json())
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
                 let settings = serde_json::from_value::<azure_vm_runtime::AzureVmGuestSettings>(
-                    serde_json::from_slice::<Value>(resource.canonical_json())
-                        .map_err(|_| SharedProviderEffectError::InvalidResource)?
-                        .pointer("/spec/provider/settings")
-                        .cloned()
-                        .ok_or(SharedProviderEffectError::InvalidResource)?,
+                    Self::azure_vm_guest_settings_value(&guest_value)?,
                 )
                 .map_err(|_| SharedProviderEffectError::InvalidResource)?;
                 let state = Arc::new(tokio::sync::Mutex::new(FrameworkAzureState::new(&settings)));
@@ -2895,10 +2922,8 @@ impl DaemonSharedProviderEffects {
         );
         let mut controllers = self.guest_controllers.lock().await;
         if !controllers.contains_key(&key) {
-            controllers.insert(
-                key.clone(),
-                self.build_guest_controller(kind, context, resource, value, provider)?,
-            );
+            let controller = self.build_guest_controller(kind, context, resource, value, provider)?;
+            controllers.insert(key.clone(), controller);
         }
         let controller = controllers
             .get_mut(&key)
@@ -2960,8 +2985,12 @@ impl DaemonSharedProviderEffects {
         context: &SharedProviderEffectContext,
         resource: &ResourceSnapshot,
     ) -> Result<bool, SharedProviderEffectError> {
-        let value = self.guest_provider_resource(kind, context, resource).await?;
-        let runtime = self.validate_guest_runtime_fence(kind, context, resource).await?;
+        let value = self
+            .guest_provider_resource(kind, context, resource)
+            .await?;
+        let runtime = self
+            .validate_guest_runtime_fence(kind, context, resource)
+            .await?;
         let provider_ref = ResourceRef::parse(kind.provider_ref())
             .map_err(|_| SharedProviderEffectError::InvalidResource)?;
         let provider = runtime
@@ -5544,6 +5573,15 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         context: &SharedProviderEffectContext,
         resource: &ResourceSnapshot,
     ) -> Result<(), SharedProviderEffectError> {
+        if matches!(
+            kind,
+            SharedProviderResourceKind::CloudHypervisorGuest
+                | SharedProviderResourceKind::QemuMediaGuest
+                | SharedProviderResourceKind::AzureContainerAppsGuest
+                | SharedProviderResourceKind::AzureVirtualMachineGuest
+        ) {
+            return self.finalize_guest_runtime(kind, context, resource).await;
+        }
         let value = self.validate(kind, context, resource)?;
         if kind == SharedProviderResourceKind::Network {
             let resolver = crate::load_bundle_resolver(&self.state)
@@ -5970,6 +6008,7 @@ pub(crate) struct SharedProviderResourceReconciler {
 
 /// Shared Runner reconciler used by the selected Guest runtime Providers.
 pub(crate) type GuestRuntimeReconciler = SharedProviderResourceReconciler;
+const SHARED_PROVIDER_PROGRESS_REQUEUE_TICKS: u64 = 1_000;
 
 impl SharedProviderResourceReconciler {
     fn new(
@@ -6428,6 +6467,18 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             .then(|| self.status_candidate_for_phase(resource, result.phase))
             .transpose()?
             .flatten();
+        let (disposition, next_tick) = if self.kind.resource_type() == "Guest"
+            && result.phase == SharedProviderEffectPhase::Pending
+        {
+            (
+                ReconcileDisposition::RequeueAt,
+                Some(context.now_tick().saturating_add(
+                    SHARED_PROVIDER_PROGRESS_REQUEUE_TICKS,
+                )),
+            )
+        } else {
+            (ReconcileDisposition::Pending, None)
+        };
         let status_persistence = if status.is_some() {
             StatusPersistence::Pending
         } else {
@@ -6438,8 +6489,8 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             resource.generation(),
             None,
             status,
-            ReconcileDisposition::Pending,
-            None,
+            disposition,
+            next_tick,
             None,
             status_persistence,
         )
@@ -6487,6 +6538,18 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             .then(|| self.status_candidate_for_phase(resource, result.phase))
             .transpose()?
             .flatten();
+        let (disposition, next_tick) = if self.kind.resource_type() == "Guest"
+            && result.phase == SharedProviderEffectPhase::Pending
+        {
+            (
+                ReconcileDisposition::RequeueAt,
+                Some(context.now_tick().saturating_add(
+                    SHARED_PROVIDER_PROGRESS_REQUEUE_TICKS,
+                )),
+            )
+        } else {
+            (ReconcileDisposition::Pending, None)
+        };
         let status_persistence = if status.is_some() {
             StatusPersistence::Pending
         } else {
@@ -6498,8 +6561,8 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
                 resource.generation(),
                 None,
                 status,
-                ReconcileDisposition::Pending,
-                None,
+                disposition,
+                next_tick,
                 None,
                 status_persistence,
             )
@@ -6605,15 +6668,20 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
     ) -> impl std::future::Future<Output = Result<UpdateAssessment, Self::Error>> + Send {
         let state = serde_json::from_slice::<Value>(resource.canonical_json())
             .ok()
-            .and_then(|value| {
-                value
+            .map(|value| {
+                let observed_generation = value
                     .pointer("/status/observedGeneration")
-                    .and_then(Value::as_u64)
+                    .and_then(Value::as_u64);
+                let initial_pending = observed_generation == Some(0)
+                    && value.pointer("/status/phase").and_then(Value::as_str)
+                        == Some("Pending");
+                if observed_generation == Some(resource.generation().get()) || initial_pending {
+                    UpdateAssessmentState::Current
+                } else {
+                    UpdateAssessmentState::UpgradeRequired
+                }
             })
-            .filter(|generation| *generation == resource.generation().get())
-            .map_or(UpdateAssessmentState::UpgradeRequired, |_| {
-                UpdateAssessmentState::Current
-            });
+            .unwrap_or(UpdateAssessmentState::UpgradeRequired);
         std::future::ready(
             UpdateAssessment::new(state, Vec::new(), true)
                 .map_err(|_| SharedProviderReconcileError::InvalidResource),
@@ -6680,6 +6748,18 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
             .then(|| self.status_candidate_for_phase(resource, result.phase))
             .transpose()?
             .flatten();
+        let (disposition, next_tick) = if self.kind.resource_type() == "Guest"
+            && result.phase == SharedProviderEffectPhase::Pending
+        {
+            (
+                ReconcileDisposition::RequeueAt,
+                Some(context.now_tick().saturating_add(
+                    SHARED_PROVIDER_PROGRESS_REQUEUE_TICKS,
+                )),
+            )
+        } else {
+            (ReconcileDisposition::Pending, None)
+        };
         let status_persistence = if status.is_some() {
             StatusPersistence::Pending
         } else {
@@ -6691,8 +6771,8 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
                 resource.generation(),
                 None,
                 status,
-                ReconcileDisposition::Pending,
-                None,
+                disposition,
+                next_tick,
                 None,
                 status_persistence,
             )
@@ -20019,6 +20099,7 @@ mod tests {
                 "update": {
                     "dependencies": {"count": 0, "refs": []},
                     "disruption": "None",
+                    "observedGeneration": 0,
                     "lastAssessedAt": null,
                     "observedGeneration": 0,
                     "operationId": null,
@@ -21461,7 +21542,7 @@ mod tests {
     }
 
     #[test]
-    fn qemu_framework_runner_invokes_controller_and_finalizes() {
+    fn qemu_controller_contract_invokes_controller_and_finalizes() {
         let guest_ref = ResourceRef::parse("Guest/qemu").unwrap();
         let config = qemu_media_runtime::ProviderConfig::new(
             "Host/host-system",
@@ -21558,7 +21639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aca_framework_runner_invokes_controller_and_finalizes() {
+    async fn aca_controller_contract_invokes_controller_and_finalizes() {
         let profile = aca_runtime::AcaSandboxProfile::new(
             aca_runtime::AcaProfileId::parse("default").unwrap(),
             aca_runtime::AcaDiskImageSource::ConfiguredDisk {
@@ -21629,7 +21710,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn azure_vm_framework_runner_invokes_controller_and_finalizes() {
+    async fn azure_vm_controller_contract_invokes_controller_and_finalizes() {
         let opaque = |value: &str| d2b_contracts::OpaqueAzureRef::parse(value).unwrap();
         let config = azure_vm_runtime::AzureVmConfig {
             tenant_id: None,
@@ -21703,5 +21784,1123 @@ mod tests {
             }
         }
         assert!(!controller.finalizer_installed());
+    }
+
+    #[tokio::test]
+    async fn production_guest_test_store_opens_with_core_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("store.redb");
+        let database = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .unwrap();
+        let zone = ZoneId::parse("work").unwrap();
+        let store_identity = "sha256:".to_owned() + &"d".repeat(64);
+        let runtime = ZoneResourceRuntime::open_internal(
+            zone.clone(),
+            OpenedZoneStore {
+                response: OpenZoneStoreResponse {
+                    zone_store_id: d2b_contracts_resource::v3::storage::ZoneStoreId::parse(
+                        "zone-store-work",
+                    )
+                    .unwrap(),
+                    store_identity,
+                    disposition: ZoneStoreDisposition::Provisioned,
+                    fd_index: 0,
+                },
+                database_fd: database.into(),
+                external_inventory: None,
+            },
+            None,
+            Arc::new(BrokerEvidenceIndex::default()),
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(runtime.readiness().resource_api_ready);
+        assert!(runtime.core_controller_subject.lock().unwrap().is_some());
+        assert!(runtime.process_status_client.lock().unwrap().is_some());
+        let provider = BundleResource::new(
+            ResourceTypeName::parse("Provider").unwrap(),
+            BundleResourceMetadata::new(
+                ResourceName::parse("runtime-qemu-media").unwrap(),
+                zone.clone(),
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            CanonicalJsonObject::parse(
+                br#"{"artifactId":"runtime-qemu-media","config":{"controllerExecutionRef":"Host/host-system","networkProviderRef":"Provider/network-local","volumeProviderRef":"Provider/volume-local"}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let guest_spec_json = br#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"providerRef":"Provider/runtime-qemu-media","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#;
+        serde_json::from_slice::<d2b_contracts_resource::v3::ResourceSpec>(guest_spec_json)
+            .unwrap_or_else(|error| panic!("Guest spec: {error}"));
+        let guest = BundleResource::new(
+            ResourceTypeName::parse("Guest").unwrap(),
+            BundleResourceMetadata::new(
+                ResourceName::parse("qemu").unwrap(),
+                zone.clone(),
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            CanonicalJsonObject::parse(guest_spec_json).unwrap(),
+        )
+        .unwrap();
+        let bundle = ResourceBundle::new(
+            zone.clone(),
+            vec![provider],
+            "sha256:".to_owned() + &"e".repeat(64),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Timestamp::parse("1970-01-01T00:00:00.000Z").unwrap(),
+        )
+        .unwrap()
+        .with_zone_uid(runtime.store.identity().zone_uid().clone());
+        runtime
+            .materialize_desired_bundle(&bundle)
+            .await
+            .unwrap_or_else(|error| panic!("test bundle materialization failed: {error:?}"));
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Provider/runtime-qemu-media").unwrap(),
+                    "u6-test-provider-read",
+                )
+                .await
+                .is_ok()
+        );
+        let guest_bundle = ResourceBundle::new(
+            zone.clone(),
+            vec![guest],
+            "sha256:".to_owned() + &"f".repeat(64),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Timestamp::parse("1970-01-01T00:00:00.000Z").unwrap(),
+        )
+        .unwrap()
+        .with_zone_uid(runtime.store.identity().zone_uid().clone());
+        runtime.materialize_desired_bundle(&guest_bundle).await.unwrap();
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Guest/qemu").unwrap(),
+                    "u6-test-guest-read",
+                )
+                .await
+                .is_ok()
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    async fn open_production_guest_runtime_for_test() -> (
+        tempfile::TempDir,
+        ZoneResourceRuntime,
+        Arc<BrokerEvidenceIndex>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("store.redb");
+        let database = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .unwrap();
+        let zone = ZoneId::parse("work").unwrap();
+        let broker_evidence = Arc::new(BrokerEvidenceIndex::default());
+        let runtime = ZoneResourceRuntime::open_internal(
+            zone,
+            OpenedZoneStore {
+                response: OpenZoneStoreResponse {
+                    zone_store_id: d2b_contracts_resource::v3::storage::ZoneStoreId::parse(
+                        "zone-store-work",
+                    )
+                    .unwrap(),
+                    store_identity: "sha256:".to_owned() + &"a".repeat(64),
+                    disposition: ZoneStoreDisposition::Provisioned,
+                    fd_index: 0,
+                },
+                database_fd: database.into(),
+                external_inventory: None,
+            },
+            None,
+            Arc::clone(&broker_evidence),
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        (directory, runtime, broker_evidence)
+    }
+
+    fn bundle_resource(
+        resource_type: &str,
+        name: &str,
+        zone: &ZoneId,
+        spec: &str,
+    ) -> BundleResource {
+        bundle_resource_with_annotations(
+            resource_type,
+            name,
+            zone,
+            spec,
+            BTreeMap::new(),
+        )
+    }
+
+    fn bundle_resource_with_annotations(
+        resource_type: &str,
+        name: &str,
+        zone: &ZoneId,
+        spec: &str,
+        annotations: BTreeMap<String, String>,
+    ) -> BundleResource {
+        BundleResource::new(
+            ResourceTypeName::parse(resource_type).unwrap(),
+            BundleResourceMetadata::new(
+                ResourceName::parse(name).unwrap(),
+                zone.clone(),
+                None,
+                BTreeMap::new(),
+                annotations,
+            ),
+            CanonicalJsonObject::parse(spec.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn credential_spec(gateway: &str) -> String {
+        let scope = d2b_contracts_provider::v3::credential::CredentialScope::new(
+            Some(ResourceRef::parse(gateway).unwrap()),
+            None,
+            None,
+        )
+        .unwrap();
+        let spec = d2b_contracts_provider::v3::credential::CredentialSpec::new(
+            scope,
+            d2b_contracts_provider::v3::credential::AudienceToken::parse(
+                "azure-resource-manager",
+            )
+            .unwrap(),
+            None,
+            vec![
+                d2b_contracts_provider::v3::credential::CredentialOperation::AcquireToken,
+            ],
+            d2b_contracts_provider::v3::credential::RotationSpec::default(),
+            d2b_contracts_provider::v3::credential::ExpirySpec::default(),
+            d2b_contracts_provider::v3::credential::RevocationSpec::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        serde_json::to_string(&spec).unwrap()
+    }
+
+    async fn materialize_test_bundle(
+        runtime: &ZoneResourceRuntime,
+        resources: Vec<BundleResource>,
+    ) {
+        let zone = runtime.zone.clone();
+        let bundle = ResourceBundle::new(
+            zone,
+            resources,
+            "sha256:".to_owned() + &"b".repeat(64),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Timestamp::parse("1970-01-01T00:00:00.000Z").unwrap(),
+        )
+        .unwrap()
+        .with_zone_uid(runtime.store.identity().zone_uid().clone());
+        bundle
+            .verify()
+            .unwrap_or_else(|error| panic!("test bundle verification failed: {error:?}"));
+        runtime
+            .materialize_desired_bundle(&bundle)
+            .await
+            .unwrap_or_else(|error| panic!("test bundle materialization failed: {error:?}"));
+    }
+
+    async fn start_production_guest_runner_fixture(
+        resources: Vec<BundleResource>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ServerState>,
+        Arc<ResourcePlane>,
+        Arc<ZoneResourceRuntime>,
+        Arc<BrokerEvidenceIndex>,
+    ) {
+        let (directory, state, plane, runtime, broker_evidence) =
+            prepare_production_guest_runner_fixture(resources).await;
+        runtime
+            .start_u6_controller_runners(Arc::clone(&state))
+            .await
+            .unwrap();
+        (directory, state, plane, runtime, broker_evidence)
+    }
+
+    async fn prepare_production_guest_runner_fixture(
+        resources: Vec<BundleResource>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ServerState>,
+        Arc<ResourcePlane>,
+        Arc<ZoneResourceRuntime>,
+        Arc<BrokerEvidenceIndex>,
+    ) {
+        let (directory, runtime, broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        materialize_test_bundle(&runtime, resources).await;
+        let state = Arc::new(crate::detached_exec_routing_tests::test_state(
+            Default::default(),
+        ));
+        let zone = runtime.zone.clone();
+        let mut plane = ResourcePlane::new();
+        plane.insert(runtime).unwrap();
+        let plane = crate::install_test_resource_plane(&state, plane);
+        let runtime = plane.zone(&zone).unwrap();
+        (directory, state, plane, runtime, broker_evidence)
+    }
+
+    async fn mark_test_resource_ready(
+        runtime: &ZoneResourceRuntime,
+        target: &ResourceRef,
+        broker_evidence: &BrokerEvidenceIndex,
+    ) {
+        mark_test_resource_phase(runtime, target, broker_evidence, "Ready").await;
+    }
+
+    async fn mark_test_resource_phase(
+        runtime: &ZoneResourceRuntime,
+        target: &ResourceRef,
+        broker_evidence: &BrokerEvidenceIndex,
+        phase: &str,
+    ) {
+        let current = runtime
+            .committed_resource_value(target, "u6-test-ready-read")
+            .await
+            .unwrap();
+        let mut status = current.get("status").cloned().unwrap();
+        status["phase"] = Value::String(phase.to_owned());
+        status["observedGeneration"] = current["metadata"]["generation"].clone();
+        let client = runtime.status_client().unwrap();
+        let operation = bounded_operation_id(&format!(
+            "u6-test-ready:{}:{}",
+            target.to_canonical_string(),
+            current["metadata"]["revision"]
+        ));
+        if matches!(
+            target.resource_type().as_str(),
+            "Provider" | "Credential"
+        ) {
+            broker_evidence
+                .insert(DurabilityEvidence {
+                    key: d2b_audit::operation::ZoneOperationKey::derive(
+                        runtime.zone.as_str(),
+                        &operation,
+                    )
+                    .unwrap(),
+                    outcome: d2b_audit::DurabilityOutcome::Success,
+                    effect_durable: true,
+                })
+                .unwrap();
+        }
+        let request = public_update_status_request_from_current(
+            runtime,
+            &json!({
+                "status": status,
+                "expectedRevision": current["metadata"]["revision"],
+            }),
+            &operation,
+            target,
+            current,
+        )
+        .unwrap();
+        let response = client.update_status(request).await;
+        if let Some(error) = response.error.as_ref() {
+            panic!(
+                "test status update rejected: kind={:?} reason={}",
+                error.kind, error.reason
+            );
+        }
+    }
+
+    async fn assert_guest_assignment_fence(
+        runtime: &ZoneResourceRuntime,
+        guest_ref: &ResourceRef,
+        provider_ref: &ResourceRef,
+        controller_ref: &ResourceRef,
+    ) {
+        let guest = runtime
+            .committed_resource_value(guest_ref, "u6-test-fence-read")
+            .await
+            .unwrap();
+        assert_eq!(
+            guest["spec"]["providerRef"],
+            provider_ref.to_canonical_string()
+        );
+        let provider = runtime
+            .committed_resource_value(provider_ref, "u6-test-provider-fence-read")
+            .await
+            .unwrap();
+        let fence = runtime
+            .store
+            .assignment_fence(runtime.zone.clone(), guest_ref.clone())
+            .await
+            .unwrap()
+            .expect("Guest assignment fence");
+        assert_eq!(
+            fence.resource_uid,
+            ResourceUid::parse(guest["metadata"]["uid"].as_str().unwrap()).unwrap()
+        );
+        assert_eq!(
+            fence.resource_revision,
+            ZoneRevision::new(guest["metadata"]["revision"].as_u64().unwrap())
+        );
+        assert_eq!(
+            fence.provider_generation,
+            ResourceGeneration::new(provider["metadata"]["generation"].as_u64().unwrap()).unwrap()
+        );
+        assert_eq!(
+            fence.controller_generation,
+            runtime
+                .store
+                .runtime_metadata()
+                .await
+                .unwrap()
+                .policy_snapshot
+                .controller_generation
+                .unwrap()
+        );
+        assert_eq!(fence.controller_role, controller_ref.clone());
+        assert_eq!(
+            fence.target,
+            ResourceRef::parse(&format!("Zone/{}", runtime.zone.as_str())).unwrap()
+        );
+        assert_eq!(
+            fence.session_generation,
+            runtime
+                .core_controller_subject
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .reconnect_generation()
+        );
+        assert!(fence.epoch > 0);
+        assert!(matches!(fence.scope, ResourceAssignmentScope::Primary));
+    }
+
+    async fn wait_for_test_resource(
+        runtime: &ZoneResourceRuntime,
+        target: &ResourceRef,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Value {
+        for _ in 0..3_000 {
+            if let Ok(value) = runtime
+                .committed_resource_value(target, "u6-test-wait")
+                .await
+                && predicate(&value)
+            {
+                return value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {}", target.to_canonical_string());
+    }
+
+    async fn wait_for_test_resource_gone(runtime: &ZoneResourceRuntime, target: &ResourceRef) {
+        for _ in 0..3_000 {
+            if runtime
+                .committed_resource_value(target, "u6-test-wait-gone")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {}", target.to_canonical_string());
+    }
+
+    async fn request_test_delete(runtime: &ZoneResourceRuntime, target: &ResourceRef) {
+        for attempt in 0..100 {
+            let current = runtime
+                .committed_resource_value(target, "u6-test-delete-read")
+                .await
+                .unwrap();
+            let client = runtime.status_client().unwrap();
+            let operation = format!("u6-test-delete-{attempt}");
+            let request = public_delete_request(
+                runtime,
+                &json!({
+                    "resourceRef": target.to_canonical_string(),
+                    "uid": current["metadata"]["uid"],
+                    "expectedRevision": current["metadata"]["revision"],
+                }),
+                &operation,
+            )
+            .await
+            .unwrap();
+            let response = client.delete(request).await;
+            let Some(error) = response.error.as_ref() else {
+                return;
+            };
+            if error.reason.as_str() == "resource-revision-changed" {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                continue;
+            }
+            panic!(
+                "test delete rejected: kind={:?} reason={}",
+                error.kind, error.reason
+            );
+        }
+        panic!("test delete did not become admitted");
+    }
+
+    async fn add_test_child_finalizer(runtime: &ZoneResourceRuntime, target: &ResourceRef) {
+        let current = runtime
+            .committed_resource_value(target, "u6-test-child-finalizer-read")
+            .await
+            .unwrap();
+        let request = public_update_finalizers_request(
+            runtime,
+            &json!({
+                "resourceRef": target.to_canonical_string(),
+                "uid": current["metadata"]["uid"],
+                "expectedRevision": current["metadata"]["revision"],
+                "addFinalizers": ["test.d2bus.org/hold"],
+                "removeFinalizers": [],
+            }),
+            "u6-test-child-finalizer",
+        )
+        .unwrap();
+        let response = runtime.status_client().unwrap().update_finalizers(request).await;
+        if let Some(error) = response.error.as_ref() {
+            panic!(
+                "test child finalizer update rejected: kind={:?} reason={}",
+                error.kind, error.reason
+            );
+        }
+    }
+
+    async fn create_test_child(
+        runtime: &ZoneResourceRuntime,
+        owner: &ResourceRef,
+        target: &ResourceRef,
+    ) {
+        let process = qemu_media_runtime::build_process_spec(
+            ResourceRef::parse("Host/host-system").unwrap(),
+            ResourceRef::parse("Volume/u6-test-runtime").unwrap(),
+            None,
+            [],
+        )
+        .unwrap();
+        let mut process_spec = serde_json::to_value(process).unwrap();
+        process_spec
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "providerRef".to_owned(),
+                Value::String("Provider/system-minijail".to_owned()),
+            );
+        let canonical = DaemonSharedProviderEffects::guest_child_resource(
+            target,
+            owner,
+            &runtime.zone,
+            process_spec,
+        )
+        .unwrap();
+        let identity = public_identity(
+            runtime,
+            target.resource_type(),
+            target.name().as_str(),
+            None,
+            None,
+            None,
+        );
+        let mut mutation = wire::Mutation::new();
+        mutation.kind =
+            protobuf::EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_CREATE);
+        mutation.target = protobuf::MessageField::some(identity.clone());
+        mutation.precondition = protobuf::MessageField::some(create_precondition());
+        mutation.resource = protobuf::MessageField::some(
+            ch_resource_body(&runtime.zone, target, None, &canonical).unwrap(),
+        );
+        mutation.owner = protobuf::MessageField::some(public_identity(
+            runtime,
+            owner.resource_type(),
+            owner.name().as_str(),
+            None,
+            None,
+            None,
+        ));
+        let mut request = wire::CreateRequest::new();
+        request.meta = protobuf::MessageField::some(public_request_meta(
+            &bounded_operation_id(&format!(
+                "u6-test-child-create:{}",
+                target.to_canonical_string()
+            )),
+        ));
+        request.mutation = protobuf::MessageField::some(mutation);
+        let response = runtime.status_client().unwrap().create(request).await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+    }
+
+    async fn clear_test_child_finalizers(
+        runtime: &ZoneResourceRuntime,
+        target: &ResourceRef,
+    ) {
+        let current = runtime
+            .committed_resource_value(target, "u6-test-child-finalizer-clear-read")
+            .await
+            .unwrap();
+        let request = public_update_finalizers_request(
+            runtime,
+            &json!({
+                "resourceRef": target.to_canonical_string(),
+                "uid": current["metadata"]["uid"],
+                "expectedRevision": current["metadata"]["revision"],
+                "addFinalizers": [],
+                "removeFinalizers": ["test.d2bus.org/hold"],
+            }),
+            "u6-test-child-finalizer-clear",
+        )
+        .unwrap();
+        let response = runtime.status_client().unwrap().update_finalizers(request).await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+    }
+
+    async fn close_production_guest_runtime_fixture(
+        state: Arc<ServerState>,
+        plane: Arc<ResourcePlane>,
+    ) {
+        state
+            .resource_plane
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let mut plane = Arc::try_unwrap(plane).expect("test plane has one owner");
+        plane.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn qemu_framework_runner_invokes_controller_and_finalizes() {
+        let (_directory, runtime, broker_evidence) = open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "Provider",
+                    "runtime-qemu-media",
+                    &zone,
+                    r#"{"artifactId":"runtime-qemu-media","config":{"controllerExecutionRef":"Host/host-system","networkProviderRef":"Provider/network-local","volumeProviderRef":"Provider/volume-local"}}"#,
+                ),
+                bundle_resource(
+                    "Device",
+                    "host-kvm",
+                    &zone,
+                    r#"{"deviceClass":"emulated","arbitration":"exclusive","maxConcurrentClaims":1,"inventory":{}}"#,
+                ),
+                bundle_resource(
+                    "Guest",
+                    "qemu-delete",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[{"deviceRef":"Device/host-kvm","exclusive":false}],"networkAttachments":[],"providerRef":"Provider/runtime-qemu-media","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+                bundle_resource(
+                    "Guest",
+                    "qemu-ready",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[{"deviceRef":"Device/host-kvm","exclusive":false}],"networkAttachments":[],"providerRef":"Provider/runtime-qemu-media","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+            ],
+        )
+        .await;
+        let delete_guest_ref = ResourceRef::parse("Guest/qemu-delete").unwrap();
+        let ready_guest_ref = ResourceRef::parse("Guest/qemu-ready").unwrap();
+        let device_ref = ResourceRef::parse("Device/host-kvm").unwrap();
+        let provider_ref = ResourceRef::parse("Provider/runtime-qemu-media").unwrap();
+
+        let state = Arc::new(crate::detached_exec_routing_tests::test_state(
+            Default::default(),
+        ));
+        let mut plane = ResourcePlane::new();
+        plane.insert(runtime).unwrap();
+        let plane = crate::install_test_resource_plane(&state, plane);
+        let runtime = plane.zone(&zone).unwrap();
+        runtime
+            .start_u6_controller_runners(Arc::clone(&state))
+            .await
+            .unwrap();
+        assert!(
+            !runtime.u6_runner_tasks.lock().unwrap().is_empty(),
+            "U6 runner did not start"
+        );
+
+        let deleting_guest = wait_for_test_resource(&runtime, &delete_guest_ref, |value| {
+            value["metadata"]["finalizers"]
+                .as_array()
+                .is_some_and(|finalizers| !finalizers.is_empty())
+        })
+        .await;
+        assert_eq!(
+            deleting_guest["metadata"]["finalizers"],
+            serde_json::json!([
+                qemu_media_runtime::FINALIZER
+            ])
+        );
+        let ready_guest = wait_for_test_resource(&runtime, &ready_guest_ref, |value| {
+            value["metadata"]["finalizers"]
+                .as_array()
+                .is_some_and(|finalizers| !finalizers.is_empty())
+        })
+        .await;
+        assert_eq!(ready_guest["status"]["phase"], "Pending");
+        assert_eq!(deleting_guest["status"]["phase"], "Pending");
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Volume/qemu-delete-runtime").unwrap(),
+                    "u6-test-first-finalizer-only",
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Process/qemu-delete-qemu").unwrap(),
+                    "u6-test-first-finalizer-only",
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Volume/qemu-ready-runtime").unwrap(),
+                    "u6-test-first-finalizer-only",
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Process/qemu-ready-qemu").unwrap(),
+                    "u6-test-first-finalizer-only",
+                )
+                .await
+                .is_err()
+        );
+        assert_guest_assignment_fence(
+            &runtime,
+            &delete_guest_ref,
+            &provider_ref,
+            &ResourceRef::parse("Process/runtime-qemu-media-controller").unwrap(),
+        )
+        .await;
+        assert_guest_assignment_fence(
+            &runtime,
+            &ready_guest_ref,
+            &provider_ref,
+            &ResourceRef::parse("Process/runtime-qemu-media-controller").unwrap(),
+        )
+        .await;
+        mark_test_resource_ready(&runtime, &device_ref, &broker_evidence).await;
+        mark_test_resource_ready(&runtime, &provider_ref, &broker_evidence).await;
+        let ready_volume_ref = ResourceRef::parse("Volume/qemu-ready-runtime").unwrap();
+        let ready_process_ref = ResourceRef::parse("Process/qemu-ready-qemu").unwrap();
+        let ready_volume = wait_for_test_resource(&runtime, &ready_volume_ref, |_| true).await;
+        mark_test_resource_ready(&runtime, &ready_volume_ref, &broker_evidence).await;
+        let ready_process = wait_for_test_resource(&runtime, &ready_process_ref, |_| true).await;
+        assert!(
+            ready_process["metadata"]["revision"].as_u64().unwrap()
+                > ready_volume["metadata"]["revision"].as_u64().unwrap()
+        );
+        mark_test_resource_ready(&runtime, &ready_process_ref, &broker_evidence).await;
+        let ready_guest = wait_for_test_resource(&runtime, &ready_guest_ref, |value| {
+            value["status"]["phase"] == "Ready"
+                && value["status"]["observedGeneration"] == value["metadata"]["generation"]
+        })
+        .await;
+        assert_eq!(ready_guest["status"]["phase"], "Ready");
+        assert_eq!(ready_guest["status"]["phase"], "Ready");
+        assert_eq!(ready_guest["status"]["phase"], "Ready");
+
+        let delete_volume_ref = ResourceRef::parse("Volume/qemu-delete-runtime").unwrap();
+        let delete_process_ref = ResourceRef::parse("Process/qemu-delete-qemu").unwrap();
+        wait_for_test_resource(&runtime, &delete_volume_ref, |_| true).await;
+        wait_for_test_resource(&runtime, &delete_process_ref, |_| true).await;
+        add_test_child_finalizer(&runtime, &delete_process_ref).await;
+        request_test_delete(&runtime, &delete_guest_ref).await;
+        let deleting_guest = wait_for_test_resource(&runtime, &delete_guest_ref, |value| {
+            value["metadata"]["deletionRequestedAt"].is_string()
+        })
+        .await;
+        assert_eq!(
+            deleting_guest["metadata"]["finalizers"],
+            serde_json::json!([qemu_media_runtime::FINALIZER])
+        );
+        assert_ne!(deleting_guest["status"]["phase"], "Ready");
+        let requested_child = wait_for_test_resource(&runtime, &delete_process_ref, |value| {
+            value["metadata"]["deletionRequestedAt"].is_string()
+        })
+        .await;
+        assert_eq!(
+            requested_child["metadata"]["finalizers"],
+            serde_json::json!(["test.d2bus.org/hold"])
+        );
+        let child_revision = requested_child["metadata"]["revision"].clone();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let still_requested = runtime
+        .committed_resource_value(&delete_process_ref, "u6-test-no-second-delete")
+            .await
+            .unwrap();
+        assert_eq!(still_requested["metadata"]["revision"], child_revision);
+        let owner_while_child_held = runtime
+        .committed_resource_value(&delete_guest_ref, "u6-test-owner-finalizer-retained")
+        .await
+        .unwrap();
+        assert_eq!(
+        owner_while_child_held["metadata"]["finalizers"],
+        serde_json::json!([qemu_media_runtime::FINALIZER])
+        );
+        clear_test_child_finalizers(&runtime, &delete_process_ref).await;
+        wait_for_test_resource_gone(&runtime, &delete_process_ref).await;
+        wait_for_test_resource_gone(&runtime, &delete_volume_ref).await;
+        wait_for_test_resource_gone(&runtime, &delete_guest_ref).await;
+        drop(runtime);
+        close_production_guest_runtime_fixture(state, plane).await;
+    }
+
+    #[tokio::test]
+    async fn aca_framework_runner_invokes_controller_and_finalizes() {
+        let zone = ZoneId::parse("work").unwrap();
+        let credential = credential_spec("Guest/gateway");
+        let (_directory, state, plane, runtime, broker_evidence) =
+            start_production_guest_runner_fixture(vec![
+                bundle_resource(
+                    "Provider",
+                    "runtime-azure-container-apps",
+                    &zone,
+                    r#"{"artifactId":"runtime-azure-container-apps","config":{"gatewayExecutionRef":"Guest/gateway","tenantId":"tenant","clientId":"client","subscriptionId":"subscription","controlCredentialRef":"Credential/aca-control","pullCredentialRef":null,"environmentId":"environment","resourceGroupId":"resource-group","networkRef":null,"sandboxTransportAlias":"relay","defaults":{"profile":{"profileId":"default","diskImage":{"configuredDisk":{"binding_id":"image-1"}},"cpu":500,"memory":2048,"autoSuspendSecs":300,"sandboxIdentityBindingId":null},"readiness":{"attempts":3,"intervalMs":10},"planTtlMs":1000,"completedOperationCapacity":4}}}"#,
+                ),
+                bundle_resource("Credential", "aca-control", &zone, &credential),
+                bundle_resource(
+                    "Guest",
+                    "gateway",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+                bundle_resource(
+                    "Guest",
+                    "aca-delete",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"executionRef":"Guest/gateway","deviceAttachments":[],"networkAttachments":[],"providerRef":"Provider/runtime-azure-container-apps","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+                bundle_resource(
+                    "Guest",
+                    "aca-ready",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"executionRef":"Guest/gateway","deviceAttachments":[],"networkAttachments":[],"providerRef":"Provider/runtime-azure-container-apps","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+            ])
+            .await;
+        let provider_ref = ResourceRef::parse("Provider/runtime-azure-container-apps").unwrap();
+        let credential_ref = ResourceRef::parse("Credential/aca-control").unwrap();
+        let gateway_ref = ResourceRef::parse("Guest/gateway").unwrap();
+
+        let delete_guest_ref = ResourceRef::parse("Guest/aca-delete").unwrap();
+        let ready_guest_ref = ResourceRef::parse("Guest/aca-ready").unwrap();
+        let deleting_guest = wait_for_test_resource(&runtime, &delete_guest_ref, |value| {
+            value["metadata"]["finalizers"]
+                .as_array()
+                .is_some_and(|finalizers| !finalizers.is_empty())
+        })
+        .await;
+        let ready_guest = wait_for_test_resource(&runtime, &ready_guest_ref, |value| {
+            value["metadata"]["finalizers"]
+                .as_array()
+                .is_some_and(|finalizers| !finalizers.is_empty())
+        })
+        .await;
+        assert_eq!(
+            deleting_guest["metadata"]["finalizers"],
+            serde_json::json!([aca_runtime::FINALIZER])
+        );
+        assert_eq!(
+            ready_guest["metadata"]["finalizers"],
+            serde_json::json!([aca_runtime::FINALIZER])
+        );
+        assert_eq!(deleting_guest["status"]["phase"], "Pending");
+        assert_eq!(ready_guest["status"]["phase"], "Pending");
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Endpoint/aca-delete-sandbox-agent").unwrap(),
+                    "u6-test-first-finalizer-only",
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Endpoint/aca-ready-sandbox-agent").unwrap(),
+                    "u6-test-first-finalizer-only",
+                )
+                .await
+                .is_err()
+        );
+        assert_guest_assignment_fence(
+            &runtime,
+            &delete_guest_ref,
+            &provider_ref,
+            &ResourceRef::parse("Process/aca-controller").unwrap(),
+        )
+        .await;
+        assert_guest_assignment_fence(
+            &runtime,
+            &ready_guest_ref,
+            &provider_ref,
+            &ResourceRef::parse("Process/aca-controller").unwrap(),
+        )
+        .await;
+        mark_test_resource_ready(&runtime, &provider_ref, &broker_evidence).await;
+        mark_test_resource_ready(&runtime, &credential_ref, &broker_evidence).await;
+        mark_test_resource_ready(&runtime, &gateway_ref, &broker_evidence).await;
+        let ready_endpoint_ref = ResourceRef::parse("Endpoint/aca-ready-sandbox-agent").unwrap();
+        wait_for_test_resource(&runtime, &ready_endpoint_ref, |_| true).await;
+        mark_test_resource_ready(&runtime, &ready_endpoint_ref, &broker_evidence).await;
+        let ready_guest = wait_for_test_resource(&runtime, &ready_guest_ref, |value| {
+            value["status"]["phase"] == "Ready"
+                && value["status"]["observedGeneration"] == value["metadata"]["generation"]
+        })
+        .await;
+        assert_eq!(ready_guest["status"]["phase"], "Ready");
+
+        let delete_endpoint_ref = ResourceRef::parse("Endpoint/aca-delete-sandbox-agent").unwrap();
+        wait_for_test_resource(&runtime, &delete_endpoint_ref, |_| true).await;
+        add_test_child_finalizer(&runtime, &delete_endpoint_ref).await;
+        request_test_delete(&runtime, &delete_guest_ref).await;
+        let deleting_guest = wait_for_test_resource(&runtime, &delete_guest_ref, |value| {
+            value["metadata"]["deletionRequestedAt"].is_string()
+        })
+        .await;
+        assert_eq!(
+            deleting_guest["metadata"]["finalizers"],
+            serde_json::json!([aca_runtime::FINALIZER])
+        );
+        assert_ne!(deleting_guest["status"]["phase"], "Ready");
+        let requested_child = wait_for_test_resource(&runtime, &delete_endpoint_ref, |value| {
+            value["metadata"]["deletionRequestedAt"].is_string()
+        })
+        .await;
+        assert_eq!(
+            requested_child["metadata"]["finalizers"],
+            serde_json::json!(["test.d2bus.org/hold"])
+        );
+        let child_revision = requested_child["metadata"]["revision"].clone();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let still_requested = runtime
+            .committed_resource_value(&delete_endpoint_ref, "u6-test-no-second-delete")
+            .await
+            .unwrap();
+        assert_eq!(still_requested["metadata"]["revision"], child_revision);
+        let owner_while_child_held = runtime
+            .committed_resource_value(&delete_guest_ref, "u6-test-owner-finalizer-retained")
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_while_child_held["metadata"]["finalizers"],
+            serde_json::json!([aca_runtime::FINALIZER])
+        );
+        clear_test_child_finalizers(&runtime, &delete_endpoint_ref).await;
+        wait_for_test_resource_gone(&runtime, &delete_endpoint_ref).await;
+        wait_for_test_resource_gone(&runtime, &delete_guest_ref).await;
+        drop(runtime);
+        close_production_guest_runtime_fixture(state, plane).await;
+    }
+
+    #[tokio::test]
+    async fn azure_vm_framework_runner_invokes_controller_and_finalizes() {
+        let zone = ZoneId::parse("work").unwrap();
+        let credential = credential_spec("Guest/gateway");
+        let provider_config = azure_vm_runtime::AzureVmConfig {
+            tenant_id: Some(d2b_contracts::OpaqueAzureRef::parse("tenant").unwrap()),
+            client_id: None,
+            arm_credential_ref: ResourceRef::parse("Credential/azure-arm").unwrap(),
+            controller_execution_ref: ResourceRef::parse("Guest/gateway").unwrap(),
+            network_ref: None,
+        };
+        let provider_spec = format!(
+            r#"{{"artifactId":"runtime-azure-virtual-machine","config":{}}}"#,
+            serde_json::to_string(&provider_config).unwrap()
+        );
+        let guest_spec = r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"providerRef":"Provider/runtime-azure-virtual-machine","systemArtifactId":null,"volumeAttachmentDefaults":[],"executionRef":"Guest/hold"}"#;
+        let ready_guest_spec = guest_spec.replace("Guest/hold", "Guest/gateway");
+        let (_directory, state, plane, runtime, broker_evidence) =
+            prepare_production_guest_runner_fixture(vec![
+                bundle_resource(
+                    "Provider",
+                    "runtime-azure-virtual-machine",
+                    &zone,
+                    &provider_spec,
+                ),
+                bundle_resource("Credential", "azure-arm", &zone, &credential),
+                bundle_resource(
+                    "Guest",
+                    "gateway",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+                bundle_resource(
+                    "Guest",
+                    "hold",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+                bundle_resource_with_annotations(
+                    "Guest",
+                    "azure-vm-delete",
+                    &zone,
+                    guest_spec,
+                    BTreeMap::from([(
+                        "d2b.test/azure-vm-settings".to_owned(),
+                        "framework".to_owned(),
+                    )]),
+                ),
+                bundle_resource_with_annotations(
+                    "Guest",
+                    "azure-vm-ready",
+                    &zone,
+                    &ready_guest_spec,
+                    BTreeMap::from([(
+                        "d2b.test/azure-vm-settings".to_owned(),
+                        "framework".to_owned(),
+                    )]),
+                ),
+            ])
+            .await;
+        let provider_ref = ResourceRef::parse("Provider/runtime-azure-virtual-machine").unwrap();
+        let credential_ref = ResourceRef::parse("Credential/azure-arm").unwrap();
+        let gateway_ref = ResourceRef::parse("Guest/gateway").unwrap();
+        mark_test_resource_ready(&runtime, &provider_ref, &broker_evidence).await;
+        mark_test_resource_ready(&runtime, &credential_ref, &broker_evidence).await;
+        mark_test_resource_ready(&runtime, &gateway_ref, &broker_evidence).await;
+        wait_for_test_resource(&runtime, &provider_ref, |value| {
+            value["status"]["phase"] == "Ready"
+        })
+        .await;
+        wait_for_test_resource(&runtime, &credential_ref, |value| {
+            value["status"]["phase"] == "Ready"
+        })
+        .await;
+        wait_for_test_resource(&runtime, &gateway_ref, |value| {
+            value["status"]["phase"] == "Ready"
+        })
+        .await;
+        runtime
+            .start_u6_controller_runners(Arc::clone(&state))
+            .await
+            .unwrap();
+
+        let delete_guest_ref = ResourceRef::parse("Guest/azure-vm-delete").unwrap();
+        let ready_guest_ref = ResourceRef::parse("Guest/azure-vm-ready").unwrap();
+        let deleting_guest = wait_for_test_resource(&runtime, &delete_guest_ref, |value| {
+            value["metadata"]["finalizers"]
+                .as_array()
+                .is_some_and(|finalizers| !finalizers.is_empty())
+        })
+        .await;
+        let ready_guest = wait_for_test_resource(&runtime, &ready_guest_ref, |value| {
+            value["metadata"]["finalizers"]
+                .as_array()
+                .is_some_and(|finalizers| !finalizers.is_empty())
+        })
+        .await;
+        assert_eq!(
+            deleting_guest["metadata"]["finalizers"],
+            serde_json::json!([azure_vm_runtime::FINALIZER])
+        );
+        assert_eq!(
+            ready_guest["metadata"]["finalizers"],
+            serde_json::json!([azure_vm_runtime::FINALIZER])
+        );
+        assert_eq!(deleting_guest["status"]["phase"], "Pending");
+        assert_eq!(ready_guest["status"]["phase"], "Pending");
+        assert_guest_assignment_fence(
+            &runtime,
+            &delete_guest_ref,
+            &provider_ref,
+            &ResourceRef::parse("Process/azure-vm-controller-process").unwrap(),
+        )
+        .await;
+        assert_guest_assignment_fence(
+            &runtime,
+            &ready_guest_ref,
+            &provider_ref,
+            &ResourceRef::parse("Process/azure-vm-controller-process").unwrap(),
+        )
+        .await;
+        let child_ref = ResourceRef::parse("Process/azure-vm-child").unwrap();
+        create_test_child(&runtime, &delete_guest_ref, &child_ref).await;
+        add_test_child_finalizer(&runtime, &child_ref).await;
+        request_test_delete(&runtime, &delete_guest_ref).await;
+        let ready_guest = wait_for_test_resource(&runtime, &ready_guest_ref, |value| {
+            value["status"]["phase"] == "Ready"
+                && value["status"]["observedGeneration"] == value["metadata"]["generation"]
+        })
+        .await;
+        assert_eq!(ready_guest["status"]["phase"], "Ready");
+        let deleting_guest = wait_for_test_resource(&runtime, &delete_guest_ref, |value| {
+            value["metadata"]["deletionRequestedAt"].is_string()
+        })
+        .await;
+        assert_eq!(
+            deleting_guest["metadata"]["finalizers"],
+            serde_json::json!([azure_vm_runtime::FINALIZER])
+        );
+        assert_ne!(deleting_guest["status"]["phase"], "Ready");
+        let requested_child = wait_for_test_resource(&runtime, &child_ref, |value| {
+            value["metadata"]["deletionRequestedAt"].is_string()
+        })
+        .await;
+        assert_eq!(
+            requested_child["metadata"]["finalizers"],
+            serde_json::json!(["test.d2bus.org/hold"])
+        );
+        let child_revision = requested_child["metadata"]["revision"].clone();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let still_requested = runtime
+            .committed_resource_value(&child_ref, "u6-test-no-second-delete")
+            .await
+            .unwrap();
+        assert_eq!(still_requested["metadata"]["revision"], child_revision);
+        let owner_while_child_held = runtime
+            .committed_resource_value(&delete_guest_ref, "u6-test-owner-finalizer-retained")
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_while_child_held["metadata"]["finalizers"],
+            serde_json::json!([azure_vm_runtime::FINALIZER])
+        );
+        clear_test_child_finalizers(&runtime, &child_ref).await;
+        wait_for_test_resource_gone(&runtime, &child_ref).await;
+        wait_for_test_resource_gone(&runtime, &delete_guest_ref).await;
+        drop(runtime);
+        close_production_guest_runtime_fixture(state, plane).await;
     }
 }

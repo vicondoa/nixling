@@ -656,6 +656,19 @@ struct ServerState {
     unsafe_local_helpers: Arc<d2bd_runtime::unsafe_local_helper::HelperRegistry>,
 }
 
+#[cfg(test)]
+pub(crate) fn install_test_resource_plane(
+    state: &Arc<ServerState>,
+    plane: resource_runtime::ResourcePlane,
+) -> Arc<resource_runtime::ResourcePlane> {
+    let plane = Arc::new(plane);
+    *state
+        .resource_plane
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&plane));
+    plane
+}
+
 /// Closed failures while composing one Zone-owned Gateway Guest route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZoneLinkGatewayCompositionError {
@@ -25965,7 +25978,7 @@ fn dispatch_auth_status(state: &ServerState, peer: &PeerIdentity) -> Value {
 }
 
 #[cfg(test)]
-mod detached_exec_routing_tests {
+pub(crate) mod detached_exec_routing_tests {
     use super::*;
     use d2bd_runtime::supervisor::pidfd_table::{BrokerReapLog, PidfdTable};
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
@@ -26362,7 +26375,7 @@ mod detached_exec_routing_tests {
         );
     }
 
-    fn test_state(caps: exec_session::ExecSessionCaps) -> ServerState {
+    pub(crate) fn test_state(caps: exec_session::ExecSessionCaps) -> ServerState {
         let broker_reap_log = BrokerReapLog::new();
         let temp_root = tempfile::Builder::new()
             .prefix("d2bd-detached-tests.")
