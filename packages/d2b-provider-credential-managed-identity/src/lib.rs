@@ -724,6 +724,7 @@ impl ManagedIdentityCredentialProviderFactory {
             client: self.client,
             leases: Mutex::new(BTreeMap::new()),
             mutation_gate: Mutex::new(()),
+            async_mutation_gate: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -804,6 +805,7 @@ pub struct ManagedIdentityCredentialProvider {
     client: Arc<dyn ManagedIdentityCredentialClient>,
     leases: Mutex<BTreeMap<String, Vec<LeaseRecord>>>,
     mutation_gate: Mutex<()>,
+    async_mutation_gate: tokio::sync::Mutex<()>,
 }
 
 impl ManagedIdentityCredentialProvider {
@@ -904,6 +906,11 @@ impl ManagedIdentityCredentialProvider {
             .authenticated_subject_context()
             .is_some_and(|authorized_subject| authorized_subject != subject)
         {
+            return Err(CredentialServiceError::new(
+                CredentialServiceErrorCode::OperationDenied,
+            ));
+        }
+        if authorization.user_ref().is_some() {
             return Err(CredentialServiceError::new(
                 CredentialServiceErrorCode::OperationDenied,
             ));
@@ -1080,43 +1087,10 @@ impl ManagedIdentityCredentialProvider {
         Ok(bounded)
     }
 
-    pub(crate) fn poll_client<T: Send>(
+    pub(crate) fn poll_client_sync<T: Send>(
         mut future: ManagedIdentityFuture<'_, T>,
         deadline: Instant,
     ) -> Result<T, CredentialServiceError> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            let remaining = deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
-                CredentialServiceError::new(CredentialServiceErrorCode::DeadlineExceeded)
-            })?;
-            return std::thread::scope(|scope| {
-                let task = scope.spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|_| {
-                            CredentialServiceError::new(
-                                CredentialServiceErrorCode::InvariantFailure,
-                            )
-                        })?;
-                    runtime.block_on(async {
-                        tokio::time::timeout(remaining, future)
-                            .await
-                            .map_err(|_| {
-                                CredentialServiceError::new(
-                                    CredentialServiceErrorCode::DeadlineExceeded,
-                                )
-                            })?
-                            .map_err(Self::map_client_error)
-                    })
-                });
-                match task.join() {
-                    Ok(result) => result,
-                    Err(_) => Err(CredentialServiceError::new(
-                        CredentialServiceErrorCode::InvariantFailure,
-                    )),
-                }
-            });
-        }
         struct ThreadWake(Thread);
         impl Wake for ThreadWake {
             fn wake(self: Arc<Self>) {
@@ -1391,7 +1365,7 @@ impl ManagedIdentityCredentialProvider {
                 })?,
                 metadata: metadata.clone(),
             };
-            let _ = Self::poll_client(self.client.revoke_lease(&lease), deadline)?;
+            let _ = Self::poll_client_sync(self.client.revoke_lease(&lease), deadline)?;
             let mut leases = self.leases.lock().map_err(|_| {
                 CredentialServiceError::new(CredentialServiceErrorCode::InvariantFailure)
             })?;
@@ -1458,7 +1432,7 @@ mod tests {
     fn poll_client_accepts_ready_result_at_deadline() {
         let future: ManagedIdentityFuture<'_, u8> = Box::pin(async { Ok(7) });
         assert_eq!(
-            ManagedIdentityCredentialProvider::poll_client(future, Instant::now()).unwrap(),
+            ManagedIdentityCredentialProvider::poll_client_sync(future, Instant::now()).unwrap(),
             7
         );
     }

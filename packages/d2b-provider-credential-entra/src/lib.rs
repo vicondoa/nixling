@@ -764,6 +764,7 @@ impl EntraCredentialProviderFactory {
             cleanup_leases: Mutex::new(BTreeMap::new()),
             lifecycle: Mutex::new(BTreeMap::new()),
             mutation_gate: Mutex::new(()),
+            async_mutation_gate: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -819,6 +820,7 @@ pub struct EntraCredentialProvider {
     cleanup_leases: Mutex<BTreeMap<String, Vec<LeaseRecord>>>,
     lifecycle: Mutex<BTreeMap<String, EntraLifecycleState>>,
     mutation_gate: Mutex<()>,
+    async_mutation_gate: tokio::sync::Mutex<()>,
 }
 
 impl EntraCredentialProvider {
@@ -994,7 +996,7 @@ impl EntraCredentialProvider {
                 metadata: record.metadata.clone(),
                 endpoint_generation: self.placement.endpoint_generation(),
             };
-            if let Err(error) = Self::poll_client(self.client.revoke_lease(&lease), deadline)
+            if let Err(error) = Self::poll_client_sync(self.client.revoke_lease(&lease), deadline)
                 && !matches!(
                     error.code(),
                     CredentialServiceErrorCode::LeaseExpired
@@ -1114,43 +1116,10 @@ impl EntraCredentialProvider {
         }
     }
 
-    pub(crate) fn poll_client<T: Send>(
+    pub(crate) fn poll_client_sync<T: Send>(
         mut future: EntraFuture<'_, T>,
         deadline: Instant,
     ) -> Result<T, CredentialServiceError> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            let remaining = deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
-                CredentialServiceError::new(CredentialServiceErrorCode::DeadlineExceeded)
-            })?;
-            return std::thread::scope(|scope| {
-                let task = scope.spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|_| {
-                            CredentialServiceError::new(
-                                CredentialServiceErrorCode::InvariantFailure,
-                            )
-                        })?;
-                    runtime.block_on(async {
-                        tokio::time::timeout(remaining, future)
-                            .await
-                            .map_err(|_| {
-                                CredentialServiceError::new(
-                                    CredentialServiceErrorCode::DeadlineExceeded,
-                                )
-                            })?
-                            .map_err(Self::map_client_error)
-                    })
-                });
-                match task.join() {
-                    Ok(result) => result,
-                    Err(_) => Err(CredentialServiceError::new(
-                        CredentialServiceErrorCode::InvariantFailure,
-                    )),
-                }
-            });
-        }
         struct ThreadWake(Thread);
         impl Wake for ThreadWake {
             fn wake(self: Arc<Self>) {

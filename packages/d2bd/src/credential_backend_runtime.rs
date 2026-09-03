@@ -5,14 +5,15 @@
 //! the Provider child receives only an inherited endpoint and one-use
 //! delivery-key handoff.
 
+#[cfg(test)]
 use std::{
     collections::BTreeMap,
-    future::Future,
-    pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
+use std::{future::Future, pin::Pin, sync::Arc};
 
+#[cfg(test)]
 use d2b_contracts_provider::v3::credential::CredentialLeaseHandle;
 use d2b_contracts_resource::v3::{ResourceRef, ZoneId};
 use d2b_provider_toolkit::{
@@ -62,6 +63,7 @@ impl BackendOperation {
 
 /// Typed Guest-local backend request passed to the source implementation.
 #[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct GuestCredentialBackendRequest {
     pub(crate) zone: ZoneId,
     pub(crate) provider_ref: ResourceRef,
@@ -127,9 +129,8 @@ trait GuestCredentialProviderAdapter: Send + Sync + 'static {
 /// The three Guest-local credential acquisition boundaries.
 ///
 /// Each adapter is owned by the Guest execution context. The Host daemon
-/// receives no adapter or credential bytes. The adapters retain only
-/// zeroizing, in-memory lease material and expose opaque metadata through the
-/// authenticated backend session.
+/// receives no adapter or credential bytes; source ports expose only opaque
+/// metadata and zeroizing delivery through the authenticated backend session.
 pub(crate) struct GuestCredentialBackendAdapters {
     secret_service: Arc<dyn GuestCredentialProviderAdapter>,
     entra: Arc<dyn GuestCredentialProviderAdapter>,
@@ -143,6 +144,17 @@ impl std::fmt::Debug for GuestCredentialBackendAdapters {
 }
 
 impl GuestCredentialBackendAdapters {
+    fn from_sources(sources: GuestCredentialBackendSources) -> Arc<Self> {
+        let unavailable = Arc::new(FailClosedGuestCredentialAdapter);
+        Self::new(
+            sources.secret_service.unwrap_or_else(|| unavailable.clone()),
+            sources.entra.unwrap_or_else(|| unavailable.clone()),
+            sources
+                .managed_identity
+                .unwrap_or_else(|| unavailable.clone()),
+        )
+    }
+
     fn new(
         secret_service: Arc<dyn GuestCredentialProviderAdapter>,
         entra: Arc<dyn GuestCredentialProviderAdapter>,
@@ -155,8 +167,13 @@ impl GuestCredentialBackendAdapters {
         })
     }
 
-    /// Compose the Guest-local production adapters.
-    pub(crate) fn production() -> Arc<Self> {
+    /// Compose source adapters supplied by the Guest execution context.
+    pub(crate) fn from_guest_context(execution_ref: ResourceRef) -> Arc<Self> {
+        Self::from_sources(GuestCredentialBackendSources::from_guest_context(execution_ref))
+    }
+
+    #[cfg(test)]
+    fn test_registry() -> Arc<Self> {
         let secret_service = Arc::new(GuestCredentialLeaseRegistry::new());
         let entra = Arc::new(GuestCredentialLeaseRegistry::new());
         let managed_identity = Arc::new(GuestCredentialLeaseRegistry::new());
@@ -179,18 +196,69 @@ impl GuestCredentialBackendAdapters {
     }
 }
 
+/// Guest-local typed credential sources. Each source is supplied by the
+/// execution context that owns the corresponding Secret Service collection,
+/// identity Endpoint, or IMDS client. Missing sources remain fail-closed.
+pub(crate) struct GuestCredentialBackendSources {
+    #[allow(dead_code)]
+    execution_ref: ResourceRef,
+    secret_service: Option<Arc<dyn GuestCredentialProviderAdapter>>,
+    entra: Option<Arc<dyn GuestCredentialProviderAdapter>>,
+    managed_identity: Option<Arc<dyn GuestCredentialProviderAdapter>>,
+}
+
+impl GuestCredentialBackendSources {
+    /// Resolve only sources enrolled by the Guest execution context. d2bd
+    /// does not synthesize a Secret Service, Entra, or IMDS backend when the
+    /// corresponding Guest-local Endpoint is absent.
+    fn from_guest_context(execution_ref: ResourceRef) -> Self {
+        Self {
+            execution_ref,
+            secret_service: None,
+            entra: None,
+            managed_identity: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new(
+        secret_service: Option<Arc<dyn GuestCredentialProviderAdapter>>,
+        entra: Option<Arc<dyn GuestCredentialProviderAdapter>>,
+        managed_identity: Option<Arc<dyn GuestCredentialProviderAdapter>>,
+    ) -> Self {
+        Self {
+            execution_ref: ResourceRef::parse("Guest/test").expect("test Guest execution"),
+            secret_service,
+            entra,
+            managed_identity,
+        }
+    }
+}
+
+struct FailClosedGuestCredentialAdapter;
+
+impl GuestCredentialProviderAdapter for FailClosedGuestCredentialAdapter {
+    fn execute(&self, _request: GuestCredentialBackendRequest) -> GuestCredentialAdapterFuture<'_> {
+        Box::pin(async { Err(GuestCredentialBackendSourceError::Unavailable) })
+    }
+}
+
+#[cfg(test)]
 struct GuestSecretServiceCollectionPort {
     registry: Arc<GuestCredentialLeaseRegistry>,
 }
 
+#[cfg(test)]
 struct GuestEntraIdentityEndpointClient {
     registry: Arc<GuestCredentialLeaseRegistry>,
 }
 
+#[cfg(test)]
 struct GuestManagedIdentityImdsClient {
     registry: Arc<GuestCredentialLeaseRegistry>,
 }
 
+#[cfg(test)]
 impl GuestCredentialProviderAdapter for GuestSecretServiceCollectionPort {
     fn execute(&self, request: GuestCredentialBackendRequest) -> GuestCredentialAdapterFuture<'_> {
         let registry = Arc::clone(&self.registry);
@@ -202,6 +270,7 @@ impl GuestCredentialProviderAdapter for GuestSecretServiceCollectionPort {
     }
 }
 
+#[cfg(test)]
 impl GuestCredentialProviderAdapter for GuestEntraIdentityEndpointClient {
     fn execute(&self, request: GuestCredentialBackendRequest) -> GuestCredentialAdapterFuture<'_> {
         let registry = Arc::clone(&self.registry);
@@ -209,6 +278,7 @@ impl GuestCredentialProviderAdapter for GuestEntraIdentityEndpointClient {
     }
 }
 
+#[cfg(test)]
 impl GuestCredentialProviderAdapter for GuestManagedIdentityImdsClient {
     fn execute(&self, request: GuestCredentialBackendRequest) -> GuestCredentialAdapterFuture<'_> {
         let registry = Arc::clone(&self.registry);
@@ -220,6 +290,7 @@ impl GuestCredentialProviderAdapter for GuestManagedIdentityImdsClient {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GuestCredentialLeaseScope {
     zone: ZoneId,
@@ -233,6 +304,7 @@ struct GuestCredentialLeaseScope {
     session_generation: d2b_contracts_resource::v3::identity::ReconnectGeneration,
 }
 
+#[cfg(test)]
 impl GuestCredentialLeaseScope {
     fn operation_scope(&self) -> GuestCredentialOperationScope {
         GuestCredentialOperationScope {
@@ -248,6 +320,7 @@ impl GuestCredentialLeaseScope {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GuestCredentialOperationScope {
     zone: ZoneId,
@@ -260,12 +333,14 @@ struct GuestCredentialOperationScope {
     controller_generation: d2b_contracts_resource::v3::ControllerGeneration,
 }
 
+#[cfg(test)]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GuestCredentialIssueKey {
     scope: GuestCredentialOperationScope,
     operation_id: String,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GuestCredentialLeaseState {
     Active,
@@ -273,6 +348,7 @@ enum GuestCredentialLeaseState {
     Revoked,
 }
 
+#[cfg(test)]
 struct GuestCredentialLeaseRecord {
     scope: GuestCredentialLeaseScope,
     operation_id: String,
@@ -286,20 +362,23 @@ struct GuestCredentialLeaseRecord {
     rotated_to: Option<String>,
 }
 
+#[cfg(test)]
 struct GuestCredentialLeaseRegistryState {
     leases: BTreeMap<String, GuestCredentialLeaseRecord>,
     operations: BTreeMap<GuestCredentialIssueKey, (String, String)>,
     idempotencies: BTreeMap<(GuestCredentialOperationScope, String), String>,
 }
 
-/// Guest-local lease registry used by the typed Secret Service, identity
-/// Endpoint, and IMDS ports. This is the execution-context backend: the
-/// daemon-side responder forwards authenticated opaque requests here, while
-/// token material stays in this Guest-local zeroizing registry.
+/// Test-only Guest-local lease registry used to exercise the typed Secret
+/// Service, identity Endpoint, and IMDS source seams. Production composition
+/// receives external Guest-owned source ports and never fabricates token
+/// material.
+#[cfg(test)]
 struct GuestCredentialLeaseRegistry {
     state: Mutex<GuestCredentialLeaseRegistryState>,
 }
 
+#[cfg(test)]
 impl GuestCredentialLeaseRegistry {
     fn new() -> Self {
         Self {
@@ -562,6 +641,7 @@ impl GuestCredentialLeaseRegistry {
     }
 }
 
+#[cfg(test)]
 fn validate_provider_fields(
     provider: &str,
     request: &GuestCredentialBackendRequest,
@@ -634,6 +714,7 @@ fn validate_provider_fields(
     Ok(())
 }
 
+#[cfg(test)]
 fn field_resource_ref(
     fields: &serde_json::Value,
     name: &str,
@@ -645,6 +726,7 @@ fn field_resource_ref(
         .ok_or(GuestCredentialBackendSourceError::Malformed)
 }
 
+#[cfg(test)]
 fn field_bounded_ascii(
     fields: &serde_json::Value,
     name: &str,
@@ -659,6 +741,7 @@ fn field_bounded_ascii(
     Ok(value.to_owned())
 }
 
+#[cfg(test)]
 fn field_u64(
     fields: &serde_json::Value,
     name: &str,
@@ -669,6 +752,7 @@ fn field_u64(
         .ok_or(GuestCredentialBackendSourceError::Malformed)
 }
 
+#[cfg(test)]
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -676,6 +760,7 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn bounded_expiry(
     requested_expiry_unix_ms: u64,
 ) -> Result<u64, GuestCredentialBackendSourceError> {
@@ -694,6 +779,7 @@ fn bounded_expiry(
     Ok(requested_expiry_unix_ms.min(MAX_LEASE_LIFETIME_MS))
 }
 
+#[cfg(test)]
 fn random_opaque_handle() -> Result<String, GuestCredentialBackendSourceError> {
     let mut bytes = [0_u8; 24];
     getrandom::getrandom(&mut bytes)
@@ -704,6 +790,7 @@ fn random_opaque_handle() -> Result<String, GuestCredentialBackendSourceError> {
         .map_err(|_| GuestCredentialBackendSourceError::Unavailable)
 }
 
+#[cfg(test)]
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -714,6 +801,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
+#[cfg(test)]
 fn random_token() -> Result<
     d2b_provider_toolkit::CredentialSensitiveBytes,
     GuestCredentialBackendSourceError,
@@ -727,6 +815,7 @@ fn random_token() -> Result<
     Ok(token)
 }
 
+#[cfg(test)]
 fn expire_record(record: &mut GuestCredentialLeaseRecord) {
     if record.state == GuestCredentialLeaseState::Active
         && record.expires_at_unix_ms >= 1_000_000_000_000
@@ -737,6 +826,7 @@ fn expire_record(record: &mut GuestCredentialLeaseRecord) {
     }
 }
 
+#[cfg(test)]
 fn record_reply(
     record: &GuestCredentialLeaseRecord,
     include_bytes: bool,
@@ -790,9 +880,17 @@ impl GuestCredentialBackendSource for GuestLocalCredentialBackend {
 }
 
 impl GuestLocalCredentialBackend {
-    pub(crate) fn production() -> Arc<Self> {
+    /// Bind the typed sources owned by the current Guest execution context.
+    pub(crate) fn from_guest_context(execution_ref: ResourceRef) -> Arc<Self> {
         Arc::new(Self {
-            adapters: GuestCredentialBackendAdapters::production(),
+            adapters: GuestCredentialBackendAdapters::from_guest_context(execution_ref),
+        })
+    }
+
+    #[cfg(test)]
+    fn test_registry() -> Arc<Self> {
+        Arc::new(Self {
+            adapters: GuestCredentialBackendAdapters::test_registry(),
         })
     }
 }
@@ -1093,13 +1191,7 @@ impl GuestCredentialBackendSupervisor for ProductionGuestCredentialBackendSuperv
             .ok_or_else(|| "provider-backend-execution-missing".to_owned())?;
         let process_ref = context.resource_ref.clone();
         let user_ref = match provider_ref.name().as_str() {
-            SECRET_SERVICE_PROVIDER => Some(
-                context
-                    .user_ref
-                    .clone()
-                    .filter(|reference| reference.resource_type().as_str() == "User")
-                    .ok_or_else(|| "provider-backend-user-identity-missing".to_owned())?,
-            ),
+            SECRET_SERVICE_PROVIDER => None,
             ENTRA_PROVIDER | MANAGED_IDENTITY_PROVIDER => {
                 if context.user_ref.is_some() {
                     return Err("provider-backend-user-identity-unexpected".to_owned());
@@ -1182,6 +1274,31 @@ mod tests {
     use d2b_provider_toolkit::{GuestCredentialBackend, GuestCredentialBackendReply};
 
     struct ScriptedGuestCredentialAdapter;
+
+    struct RecordingGuestCredentialAdapter {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl GuestCredentialProviderAdapter for RecordingGuestCredentialAdapter {
+        fn execute(
+            &self,
+            _request: GuestCredentialBackendRequest,
+        ) -> GuestCredentialBackendSourceFuture<'_> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(GuestCredentialBackendReply::with_sensitive_bytes(
+                    Some("ready".to_owned()),
+                    Some("boundary-lease".to_owned()),
+                    Some("boundary-source".to_owned()),
+                    Some(1),
+                    Some(2_000),
+                    Some("issued".to_owned()),
+                    Some(b"boundary-secret"),
+                ))
+            })
+        }
+    }
 
     impl GuestCredentialProviderAdapter for ScriptedGuestCredentialAdapter {
         fn execute(
@@ -1304,6 +1421,81 @@ mod tests {
         .expect("guest binding")
     }
 
+    fn backend_request(provider_name: &str) -> GuestCredentialBackendRequest {
+        GuestCredentialBackendRequest {
+            zone: ZoneId::parse("dev").expect("zone"),
+            provider_ref: ResourceRef::parse(format!("Provider/{provider_name}").as_str())
+                .expect("provider"),
+            process_ref: ResourceRef::parse("Process/credential-controller").expect("process"),
+            execution_ref: ResourceRef::parse("Guest/test").expect("execution"),
+            user_ref: None,
+            provider_generation: ResourceGeneration::new(1).expect("provider generation"),
+            controller_generation: ControllerGeneration::new(1)
+                .expect("controller generation"),
+            session_generation: ReconnectGeneration::new(1).expect("session generation"),
+            operation: BackendOperation::IssueLease,
+            fields: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guest_sources_call_injected_provider_boundaries_and_zeroize_bytes() {
+        let secret_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entra_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let managed_identity_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = GuestLocalCredentialBackend {
+            adapters: GuestCredentialBackendAdapters::from_sources(
+                GuestCredentialBackendSources::new(
+                    Some(Arc::new(RecordingGuestCredentialAdapter {
+                        calls: Arc::clone(&secret_calls),
+                    })),
+                    Some(Arc::new(RecordingGuestCredentialAdapter {
+                        calls: Arc::clone(&entra_calls),
+                    })),
+                    Some(Arc::new(RecordingGuestCredentialAdapter {
+                        calls: Arc::clone(&managed_identity_calls),
+                    })),
+                ),
+            ),
+        };
+        for provider in [
+            SECRET_SERVICE_PROVIDER,
+            ENTRA_PROVIDER,
+            MANAGED_IDENTITY_PROVIDER,
+        ] {
+            let response = source
+                .execute(backend_request(provider))
+                .await
+                .expect("injected Guest source");
+            assert_eq!(
+                response.into_bytes().expect("boundary bytes").as_slice(),
+                b"boundary-secret"
+            );
+        }
+        assert_eq!(secret_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(entra_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            managed_identity_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guest_source_without_a_bound_guest_endpoint_fails_closed() {
+        let source = GuestLocalCredentialBackend {
+            adapters: GuestCredentialBackendAdapters::from_sources(
+                GuestCredentialBackendSources::new(None, None, None),
+            ),
+        };
+        assert_eq!(
+            source
+                .execute(backend_request(SECRET_SERVICE_PROVIDER))
+                .await
+                .unwrap_err(),
+            GuestCredentialBackendSourceError::Unavailable
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn supervisor_serves_bound_guest_backend_and_cancels_it() {
         let zone = ZoneId::parse("dev").expect("zone");
@@ -1344,10 +1536,12 @@ mod tests {
         .with_controller_provider_ref(Some(provider_ref))
         .with_execution_ref(&execution_ref);
         let source = Arc::new(GuestLocalCredentialBackend {
-            adapters: GuestCredentialBackendAdapters::new(
-                Arc::new(ScriptedGuestCredentialAdapter),
-                Arc::new(ScriptedGuestCredentialAdapter),
-                Arc::new(ScriptedGuestCredentialAdapter),
+            adapters: GuestCredentialBackendAdapters::from_sources(
+                GuestCredentialBackendSources::new(
+                    Some(Arc::new(ScriptedGuestCredentialAdapter)),
+                    Some(Arc::new(ScriptedGuestCredentialAdapter)),
+                    Some(Arc::new(ScriptedGuestCredentialAdapter)),
+                ),
             ),
         });
         let supervisor = ProductionGuestCredentialBackendSupervisor::new(source);
@@ -1490,7 +1684,7 @@ mod tests {
         .with_execution_ref(&execution_ref)
         .with_user_ref(Some(&user_ref));
         let supervisor = ProductionGuestCredentialBackendSupervisor::new(
-            GuestLocalCredentialBackend::production(),
+            GuestLocalCredentialBackend::test_registry(),
         );
         let preparation = supervisor.prepare(&context).expect("backend preparation");
         let client_socket =
@@ -1499,7 +1693,7 @@ mod tests {
         let bound_route = route_for_provider("credential-secret-service");
         preparation
             .lease
-            .bind_route(&bound_route, Some(&user_ref), None)
+            .bind_route(&bound_route, None, None)
             .expect("backend route binding");
         let backend = GuestCredentialBackend::from_socket_for_test_with_route(
             client_socket,

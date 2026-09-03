@@ -584,10 +584,6 @@ impl ControllerBootstrapContext {
         &self.execution_ref
     }
 
-    pub(crate) fn user_ref(&self) -> Option<&ResourceRef> {
-        self.user_ref.as_ref()
-    }
-
     pub(crate) const fn controller_generation(&self) -> ControllerGeneration {
         self.controller_generation
     }

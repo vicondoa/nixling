@@ -119,6 +119,7 @@ pub(crate) struct CredentialRevocationRequest {
     credential_ref: ResourceRef,
     credential_uid: d2b_contracts_resource::v3::ResourceUid,
     credential_generation: d2b_contracts_resource::v3::ResourceGeneration,
+    user_ref: Option<ResourceRef>,
     provider_ref: ResourceRef,
     provider_generation: d2b_contracts_resource::v3::ResourceGeneration,
     controller_generation: d2b_contracts_resource::v3::ControllerGeneration,
@@ -135,6 +136,7 @@ impl core::fmt::Debug for CredentialRevocationRequest {
             .field("credential_ref", &"<redacted>")
             .field("credential_uid", &"<redacted>")
             .field("credential_generation", &self.credential_generation)
+            .field("user_ref", &"<redacted>")
             .field("provider_ref", &"<redacted>")
             .field("provider_generation", &self.provider_generation)
             .field("controller_generation", &self.controller_generation)
@@ -160,6 +162,11 @@ impl CredentialRevocationRequest {
             return Err(CredentialResourceRuntimeError::InvalidResource);
         }
         let rotation_generation = credential_lease_generation(resource).unwrap_or(1);
+        let user_ref = credential_spec(resource)
+            .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?
+            .scope()
+            .user_ref()
+            .cloned();
         let operation_id = credential_revoke_operation_id(
             resource,
             provider_ref,
@@ -178,6 +185,7 @@ impl CredentialRevocationRequest {
             credential_ref: resource.key().resource_ref().clone(),
             credential_uid: resource.key().uid().clone(),
             credential_generation: resource.generation(),
+            user_ref,
             provider_ref: provider_ref.clone(),
             provider_generation: identity.provider_generation(),
             controller_generation: identity.controller_generation(),
@@ -376,6 +384,13 @@ impl CredentialSession for ComponentCredentialSession {
                 ..Default::default()
             },
         ];
+        if let Some(user_ref) = request.user_ref.as_ref() {
+            rpc.metadata.push(ttrpc::proto::KeyValue {
+                key: "d2b.credential.user-ref".to_owned(),
+                value: user_ref.to_canonical_string(),
+                ..Default::default()
+            });
+        }
         rpc.payload = encode_outer(&typed)
             .map_err(|_| CredentialResourceRuntimeError::Revocation)?;
         let response = match self.client.client().request(rpc).await {

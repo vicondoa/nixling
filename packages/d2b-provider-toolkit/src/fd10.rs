@@ -665,6 +665,11 @@ impl GuestCredentialBackendReply {
         )
     }
 
+    /// Consume the reply and return sensitive bytes in a zeroizing owner.
+    pub fn into_bytes(self) -> Option<CredentialSensitiveBytes> {
+        self.bytes
+    }
+
     fn encode(self) -> Result<zeroize::Zeroizing<Vec<u8>>, GuestCredentialBackendHandlerError> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
@@ -1095,6 +1100,13 @@ impl GuestCredentialBackend {
                 ..Default::default()
             });
         }
+        if let Some(user_ref) = fields.get("userRef").and_then(serde_json::Value::as_str) {
+            metadata.push(ttrpc::proto::KeyValue {
+                key: "d2b.credential.user-ref".to_owned(),
+                value: user_ref.to_owned(),
+                ..Default::default()
+            });
+        }
         if let Some(provider_generation) = route.provider_generation() {
             metadata.push(ttrpc::proto::KeyValue {
                 key: "d2b.credential.provider-generation".to_owned(),
@@ -1389,6 +1401,25 @@ impl GuestCredentialBackendMethod {
         {
             return Err(GuestCredentialBackendHandlerError::Denied);
         }
+        let claimed_user = metadata_value(&request, "d2b.credential.user-ref")
+            .map(|value| {
+                ResourceRef::parse(value)
+                    .map_err(|_| GuestCredentialBackendHandlerError::Denied)
+            })
+            .transpose()?;
+        if claimed_user
+            .as_ref()
+            .is_some_and(|reference| reference.resource_type().as_str() != "User")
+        {
+            return Err(GuestCredentialBackendHandlerError::Denied);
+        }
+        if self
+            .user_ref
+            .as_ref()
+            .is_some_and(|bound| claimed_user.as_ref() != Some(bound))
+        {
+            return Err(GuestCredentialBackendHandlerError::Denied);
+        }
         let mut payload = zeroize::Zeroizing::new(request.payload);
         let mut value: serde_json::Value = serde_json::from_slice(&payload)
             .map_err(|_| GuestCredentialBackendHandlerError::Malformed)?;
@@ -1412,7 +1443,12 @@ impl GuestCredentialBackendMethod {
         let fields = serde_json::Value::Object(std::mem::take(object));
         let reply = self
             .handler
-            .handle(&self.route, self.user_ref.as_ref(), &operation, fields)
+            .handle(
+                &self.route,
+                claimed_user.as_ref().or(self.user_ref.as_ref()),
+                &operation,
+                fields,
+            )
             .await?;
         payload.fill(0);
         reply.encode()

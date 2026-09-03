@@ -231,10 +231,7 @@ fn run_supervised_binary(path: &str, provider: &str) {
         .expect("provider handshake");
         let driver = responder.into_driver();
         let route = route(provider);
-        let user_ref = provider
-            .ends_with("credential-secret-service")
-            .then(|| ResourceRef::parse("User/provider-scope").expect("User reference"));
-        let metadata = ProviderSessionMetadata::from_route_with_user(&route, user_ref.as_ref())
+        let metadata = ProviderSessionMetadata::from_route(&route)
             .expect("route metadata")
             .encode()
             .expect("metadata encoding");
@@ -268,7 +265,7 @@ fn run_supervised_binary(path: &str, provider: &str) {
         )
         .expect("backend responder");
         backend_responder
-            .bind_route_with_user_and_peer(route.clone(), user_ref.clone(), credentials)
+            .bind_route_with_user_and_peer(route.clone(), None, credentials)
             .expect("bind backend responder route");
         let key_handoff = CredentialDeliveryKeyHandoff::new(provider_private, backend_public)
             .expect("delivery key handoff");
@@ -385,7 +382,7 @@ async fn exercise_secret_service(
         )
         .expect("credential request")
     };
-    let call = |method: &'static str, request: CredentialRequest| {
+    let call = |method: &'static str, request: CredentialRequest, user_ref: &'static str| {
         let client = std::sync::Arc::clone(&client);
         let route = route.clone();
         async move {
@@ -440,20 +437,42 @@ async fn exercise_secret_service(
                     ..Default::default()
                 },
             ];
+            rpc.metadata.push(ttrpc::proto::KeyValue {
+                key: "d2b.credential.user-ref".to_owned(),
+                value: user_ref.to_owned(),
+                ..Default::default()
+            });
             rpc.payload = encode_outer(&request).expect("encode credential request");
             client.client().request(rpc).await.expect("credential response")
         }
     };
-    let response = call("AcquireToken", request("subprocess-acquire", "subprocess-acquire"))
-        .await;
+    let response = call(
+        "AcquireToken",
+        request("subprocess-alice-acquire", "subprocess-alice-acquire"),
+        "User/alice",
+    )
+    .await;
     let acquired: DeliveryResponse = decode_outer(&response.payload).expect("acquire response");
     assert_eq!(
         acquired.metadata.state,
         d2b_contracts_provider::v3::credential::CredentialLeaseState::Active
     );
     let response = call(
+        "AcquireToken",
+        request("subprocess-bob-acquire", "subprocess-bob-acquire"),
+        "User/bob",
+    )
+    .await;
+    let bob_acquired: DeliveryResponse =
+        decode_outer(&response.payload).expect("Bob acquire response");
+    assert_eq!(
+        bob_acquired.metadata.state,
+        d2b_contracts_provider::v3::credential::CredentialLeaseState::Active
+    );
+    let response = call(
         "InspectMetadata",
-        request("subprocess-inspect", "subprocess-inspect"),
+        request("subprocess-alice-inspect", "subprocess-alice-inspect"),
+        "User/alice",
     )
     .await;
     let inspected: MetadataResponse = decode_outer(&response.payload).expect("inspect response");
@@ -461,11 +480,28 @@ async fn exercise_secret_service(
         inspected.metadata.state,
         d2b_contracts_provider::v3::credential::CredentialLeaseState::Active
     );
-    let response = call("RevokeToken", request("subprocess-revoke", "subprocess-revoke")).await;
+    let response = call(
+        "RevokeToken",
+        request("subprocess-alice-revoke", "subprocess-alice-revoke"),
+        "User/alice",
+    )
+    .await;
     let revoked: MetadataResponse = decode_outer(&response.payload).expect("revoke response");
     assert_eq!(
         revoked.metadata.state,
         d2b_contracts_provider::v3::credential::CredentialLeaseState::Revoked
+    );
+    let response = call(
+        "InspectMetadata",
+        request("subprocess-bob-inspect", "subprocess-bob-inspect"),
+        "User/bob",
+    )
+    .await;
+    let bob_inspected: MetadataResponse =
+        decode_outer(&response.payload).expect("Bob inspect response");
+    assert_eq!(
+        bob_inspected.metadata.state,
+        d2b_contracts_provider::v3::credential::CredentialLeaseState::Active
     );
 }
 

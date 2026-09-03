@@ -9,19 +9,17 @@ use d2b_contracts_provider::v3::credential::{
     AudienceToken, CredentialAuthorization, CredentialMethod, CredentialProvider,
     CredentialRequest, CredentialResponse, CredentialServiceError, CredentialServiceErrorCode,
     CredentialSessionBinding, DeliveryResponse, DeliveryRouteDigest, DeliverySessionParams,
-    MetadataResponse, MAX_DELIVERY_RECORD_BYTES, decode_outer, dispatch_authorized_provider,
+    MetadataResponse, MAX_DELIVERY_RECORD_BYTES, decode_outer, dispatch_authorized_provider_async,
     encode_outer,
 };
 use d2b_contracts_resource::v3::{
-    ControllerGeneration, ResourceGeneration, ResourceUid,
+    ControllerGeneration, ResourceGeneration, ResourceRef, ResourceUid,
 };
 use d2b_session::{AuthenticatedComponentSession, AuthenticatedSessionRouteBinding, Cancellation};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{
-    ProviderAdmission, ProviderEntrypoint, ProviderRuntimeError, ProviderSessionAdmission,
-};
+use crate::{ProviderAdmission, ProviderEntrypoint, ProviderRuntimeError, ProviderSessionAdmission};
 
 const CREDENTIAL_SERVICE: &str = "d2b.credential.v3.CredentialService";
 
@@ -108,6 +106,7 @@ impl CredentialAuthorizationSource for RouteCredentialAuthorization {
             None
         };
         CredentialAuthorization::new_for_subject(method, delivery, route.context().clone())?
+            .with_user_ref(metadata.user_ref.clone())?
             .with_authenticated_session(session)
     }
 }
@@ -119,6 +118,8 @@ pub struct CredentialRequestMetadata {
     pub credential_uid: ResourceUid,
     /// Credential resource generation.
     pub credential_generation: ResourceGeneration,
+    /// Optional exact User scope claim for this Credential operation.
+    pub user_ref: Option<ResourceRef>,
     /// Provider component generation.
     pub provider_generation: ResourceGeneration,
     /// Controller generation.
@@ -149,6 +150,10 @@ fn delivery_route_digest(
     digest.update(request.credential_ref().to_canonical_string().as_bytes());
     digest.update([0]);
     digest.update(metadata.credential_uid.as_str().as_bytes());
+    digest.update([0]);
+    if let Some(user_ref) = &metadata.user_ref {
+        digest.update(user_ref.to_canonical_string().as_bytes());
+    }
     digest.update(metadata.credential_generation.get().to_be_bytes());
     digest.update(metadata.provider_generation.get().to_be_bytes());
     digest.update(metadata.controller_generation.get().to_be_bytes());
@@ -208,23 +213,13 @@ where
             .authorizer
             .authorize_with_metadata(self.method, &request, &self.route, &metadata)
             .map_err(rpc_error)?;
-        let response = if matches!(
-            tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
-        ) {
-            let provider = Arc::clone(&self.provider);
-            let method = self.method;
-            tokio::task::block_in_place(move || {
-                dispatch_authorized_provider(provider.as_ref(), method, &request, &authorization)
-            })
-        } else {
-            dispatch_authorized_provider(
-                self.provider.as_ref(),
-                self.method,
-                &request,
-                &authorization,
-            )
-        }
+        let response = dispatch_authorized_provider_async(
+            self.provider.as_ref(),
+            self.method,
+            &request,
+            &authorization,
+        )
+        .await
         .map_err(rpc_error)?;
         let payload = match response {
             CredentialResponse::AcquireToken(response)
@@ -269,6 +264,23 @@ fn request_metadata(
             ))
         })
     };
+    let user_ref = metadata_value(request, "d2b.credential.user-ref")
+        .map(|value| {
+            ResourceRef::parse(value).map_err(|_| {
+                rpc_error(CredentialServiceError::new(
+                    CredentialServiceErrorCode::OperationDenied,
+                ))
+            })
+        })
+        .transpose()?;
+    if user_ref
+        .as_ref()
+        .is_some_and(|reference| reference.resource_type().as_str() != "User")
+    {
+        return Err(rpc_error(CredentialServiceError::new(
+            CredentialServiceErrorCode::OperationDenied,
+        )));
+    }
     Ok(CredentialRequestMetadata {
         credential_uid: ResourceUid::parse(parse("d2b.credential.uid")?.to_owned()).map_err(
             |_| {
@@ -283,6 +295,7 @@ fn request_metadata(
                     CredentialServiceErrorCode::OperationDenied,
                 ))
             })?,
+        user_ref,
         provider_generation: ResourceGeneration::new(parse_u64(
             "d2b.credential.provider-generation",
         )?)
@@ -546,6 +559,7 @@ mod tests {
         let metadata = CredentialRequestMetadata {
             credential_uid: ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap(),
             credential_generation: ResourceGeneration::new(2).unwrap(),
+            user_ref: None,
             provider_generation: ResourceGeneration::new(1).unwrap(),
             controller_generation: ControllerGeneration::new(1).unwrap(),
         };

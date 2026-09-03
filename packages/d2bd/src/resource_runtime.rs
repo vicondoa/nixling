@@ -16710,7 +16710,7 @@ impl ControllerSessionCoordinator {
             .await
             .map_err(|_| authentication_error("service-registration"))?;
         let (resource_client, service_task) = if credential_session {
-            let metadata = ProviderSessionMetadata::from_route_with_user(&route, context.user_ref())
+            let metadata = ProviderSessionMetadata::from_route(&route)
                 .and_then(|metadata| metadata.encode())
                 .map_err(|_| authentication_error("provider-session-bootstrap"))?;
             let stream = StreamId::new(PROVIDER_BOOTSTRAP_STREAM_ID)
@@ -16735,7 +16735,7 @@ impl ControllerSessionCoordinator {
                 .ok_or_else(|| authentication_error("provider-delivery-key-handoff"))?;
             if let Some(backend_lease) = backend_lease.as_ref() {
                 if backend_lease
-                    .bind_route(&route, context.user_ref(), Some(credentials))
+                    .bind_route(&route, None, Some(credentials))
                     .is_err()
                 {
                     let _ = registrar.revoke(ingress).await;

@@ -4500,7 +4500,9 @@ pub async fn serve_guest(options: GuestServeOptions) -> Result<(), TypedError> {
         )
         .with_guest_backend_supervisor(
             credential_backend_runtime::ProductionGuestCredentialBackendSupervisor::new(
-                credential_backend_runtime::GuestLocalCredentialBackend::production(),
+                credential_backend_runtime::GuestLocalCredentialBackend::from_guest_context(
+                    identity.guest_ref().clone(),
+                ),
             ),
         ),
     );
