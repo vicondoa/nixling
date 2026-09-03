@@ -1214,6 +1214,7 @@ dependencies = [
  "d2b-contracts-zone-session",
  "d2b-provider-toolkit",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1225,6 +1226,7 @@ dependencies = [
  "d2b-contracts-zone-session",
  "d2b-provider-toolkit",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1236,6 +1238,7 @@ dependencies = [
  "d2b-contracts-zone-session",
  "d2b-provider-toolkit",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1494,6 +1497,7 @@ dependencies = [
  "sha2",
  "tokio",
  "ttrpc",
+ "zeroize",
 ]
 
 [[package]]
@@ -1690,6 +1694,7 @@ dependencies = [
  "tokio",
  "tokio-vsock",
  "uapi",
+ "zeroize",
 ]
 
 [[package]]

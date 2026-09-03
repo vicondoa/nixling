@@ -442,6 +442,21 @@ impl BundleBackedLaunchResolver {
             ticket.template().as_str(),
             None,
         );
+        let provider_component_intent = ticket
+            .owner_ref()
+            .filter(|owner| owner.resource_type().as_str() == "Credential")
+            .filter(|_| process_role_id.starts_with("mi-agent-"))
+            .filter(|_| ticket.template().as_str() == "d2b-managed-identity-agent"
+                || ticket.template().as_str().starts_with("mi-agent-"))
+            .and_then(|_| {
+                self.bundle.find_provider_component_intent_for_template(
+                    &expected_execution_ref,
+                    expected_execution_domain,
+                    expected_user_ref.as_deref(),
+                    ticket.template().as_str(),
+                    Some("Provider/credential-managed-identity"),
+                )
+            });
         let generic_intent = if let Some(owner) = ticket
             .owner_ref()
             .filter(|owner| owner.resource_type().as_str() == "Guest")
@@ -474,6 +489,7 @@ impl BundleBackedLaunchResolver {
             ),
             "process-controller" => (
                 static_controller_intent
+                    .or(provider_component_intent)
                     .or(generic_intent)
                     .ok_or(ProcessEffectError::UnsupportedProvider)?,
                 false,
@@ -513,7 +529,9 @@ impl BundleBackedLaunchResolver {
             }
         }
         let inherited_fd_count = ticket.inherited_fd_table().count();
-        if (role == RunnerRole::ProviderController) != (inherited_fd_count == 1) {
+        if (role == RunnerRole::ProviderController && !(1..=2).contains(&inherited_fd_count))
+            || (role != RunnerRole::ProviderController && inherited_fd_count != 0)
+        {
             return Err(ProcessEffectError::IdentityChanged);
         }
         if intent.execution_ref != expected_execution_ref {

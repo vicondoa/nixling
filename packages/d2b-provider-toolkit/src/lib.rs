@@ -77,8 +77,8 @@ pub use bootstrap::{
     AllocatorSessionBinding, PROVIDER_RESOURCE_TYPE, ProviderAgentBootstrap, ProviderAgentIdentity,
 };
 pub use credential::{
-    CredentialAuthorizationSource, RouteCredentialAuthorization, credential_service,
-    run_authenticated_credential_provider,
+    CredentialAuthorizationSource, CredentialRequestMetadata, RouteCredentialAuthorization,
+    credential_service, run_authenticated_credential_provider,
 };
 pub use d2b_session::{
     AuthenticatedComponentSession, AuthenticatedSessionRouteBinding, Cancellation,
@@ -87,9 +87,10 @@ pub use d2b_session::{
 pub use dispatch::{DispatchLimiter, DispatchPermit, MAX_DISPATCH_IN_FLIGHT};
 #[cfg(feature = "unix-transport")]
 pub use fd10::{
-    PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID, PROVIDER_READY_MARKER,
-    PROVIDER_READY_STREAM_CREDIT, PROVIDER_READY_STREAM_ID, ProviderFd10Spec,
-    ProviderSessionMetadata, run_from_fd10,
+    GUEST_CREDENTIAL_BACKEND_FD, PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID,
+    PROVIDER_READY_MARKER, PROVIDER_READY_STREAM_CREDIT, PROVIDER_READY_STREAM_ID,
+    GuestCredentialBackend, GuestCredentialBackendError, GuestCredentialBackendResponse,
+    ProviderFd10Spec, ProviderSessionMetadata, credential_delivery_credentials, run_from_fd10,
 };
 pub use error::ProviderToolkitError;
 pub use fixture::{

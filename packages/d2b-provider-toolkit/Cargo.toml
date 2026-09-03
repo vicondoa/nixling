@@ -23,8 +23,10 @@ d2b-session-unix = { path = "../d2b-session-unix", version = "0.0.0-bootstrap", 
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 ttrpc = { version = "0.9.0", default-features = false, features = ["async", "sync"] }
 tokio = { workspace = true, features = ["sync", "time"] }
+zeroize = "1"
 
 [dev-dependencies]
 d2b-session = { path = "../d2b-session", version = "0.0.0-bootstrap", features = ["test-support"] }

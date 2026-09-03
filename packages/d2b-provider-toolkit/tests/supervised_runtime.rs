@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{BufRead, BufReader, Read},
     process::{Command, Stdio},
     sync::mpsc,
@@ -17,8 +18,9 @@ use d2b_contracts_zone_session::v3::component_session::{
     PurposeClass, TransportClass,
 };
 use d2b_provider_toolkit::{
-    PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID, PROVIDER_READY_MARKER,
-    PROVIDER_READY_STREAM_CREDIT, PROVIDER_READY_STREAM_ID, ProviderSessionMetadata,
+    GUEST_CREDENTIAL_BACKEND_FD, GuestCredentialBackend, PROVIDER_BOOTSTRAP_STREAM_CREDIT,
+    PROVIDER_BOOTSTRAP_STREAM_ID, PROVIDER_READY_MARKER, PROVIDER_READY_STREAM_CREDIT,
+    PROVIDER_READY_STREAM_ID, ProviderSessionMetadata, credential_delivery_credentials,
 };
 use d2b_session::{
     ComponentSessionDriver, HandshakeCredentials, SessionEngine, StreamEvent, StreamId,
@@ -27,14 +29,27 @@ use d2b_session_unix::{
     AncillaryCapacity, CreditPool, CreditScopeSet, DescriptorPolicyResolver, PeerIdentityPolicy,
     SeqpacketSocket, UnixSeqpacketTransport, UnixSessionError,
     controller_bootstrap_attachment_policy, controller_credit_scopes,
-    credential_provider_endpoint_policy, duplicate_to_inherited_fd, prearmed_seqpacket_pair,
+    credential_delivery_endpoint_policy, credential_provider_endpoint_policy,
+    duplicate_to_inherited_fd, prearmed_seqpacket_pair,
 };
 
 fn route(provider: &str) -> d2b_session::AuthenticatedSessionRouteBinding {
+    route_with_execution(provider, "Guest/test")
+}
+
+fn route_with_execution(
+    provider: &str,
+    execution: &str,
+) -> d2b_session::AuthenticatedSessionRouteBinding {
     let provider_ref = ResourceRef::parse(provider).expect("Provider reference");
+    let subject_ref = if provider.ends_with("secret-service") {
+        ResourceRef::parse("User/provider-controller").expect("User reference")
+    } else {
+        provider_ref.clone()
+    };
     let digest = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
     let context = AuthenticatedSubjectContext::new(
-        provider_ref.clone(),
+        subject_ref,
         ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").expect("UID"),
         ResourceRef::parse("Zone/dev").expect("Zone reference"),
         EvidenceClass::UnixPeer,
@@ -54,7 +69,7 @@ fn route(provider: &str) -> d2b_session::AuthenticatedSessionRouteBinding {
             TranscriptHash::from_bytes([0x5a; 32]),
         ),
     )
-    .with_execution_ref(ResourceRef::parse("Host/test").expect("Host reference"))
+    .with_execution_ref(ResourceRef::parse(execution).expect("execution reference"))
     .with_provider_ref(provider_ref)
     .with_process_ref(ResourceRef::parse("Process/credential-controller").expect("Process"))
     .with_provider_generation(ResourceGeneration::new(1).expect("Provider generation"))
@@ -68,6 +83,29 @@ fn route(provider: &str) -> d2b_session::AuthenticatedSessionRouteBinding {
         TransportClass::InheritedSocketpair,
     )
     .expect("route")
+}
+
+#[test]
+fn guest_backend_rejects_a_host_execution_route() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let (client_fd, _server_fd) = prearmed_seqpacket_pair().expect("backend pair");
+        let client_socket =
+            SeqpacketSocket::from_parent_prearmed(client_fd).expect("backend socket");
+        assert!(
+            GuestCredentialBackend::from_socket_for_test_with_route(
+                client_socket,
+                route_with_execution(
+                    "Provider/credential-managed-identity",
+                    "Host/test",
+                ),
+            )
+            .is_err()
+        );
+    });
 }
 
 async fn receive_bootstrap(
@@ -122,12 +160,37 @@ fn provider_transport(
     .expect("provider transport")
 }
 
+fn delivery_transport(
+    socket: SeqpacketSocket,
+    credentials: d2b_session_unix::PeerCredentials,
+) -> UnixSeqpacketTransport {
+    let policy = credential_delivery_endpoint_policy(1);
+    let resolver: DescriptorPolicyResolver =
+        std::sync::Arc::new(|_| Err(UnixSessionError::DescriptorMismatch));
+    UnixSeqpacketTransport::new(
+        socket,
+        policy.transport_binding.locality,
+        policy.limits,
+        policy.attachment_policy,
+        controller_credit_scopes().expect("credit scopes"),
+        resolver,
+        PeerIdentityPolicy::inherited_socketpair(credentials),
+    )
+    .expect("delivery transport")
+}
+
 fn run_supervised_binary(path: &str, provider: &str) {
     let (bootstrap_fd, child_fd) = prearmed_seqpacket_pair().expect("bootstrap pair");
     let inherited = duplicate_to_inherited_fd(&child_fd, 200).expect("inherited fd");
+    let (_backend_peer, backend_child) = prearmed_seqpacket_pair().expect("backend pair");
+    let backend_inherited =
+        duplicate_to_inherited_fd(&backend_child, 201).expect("backend inherited fd");
     let mut child = Command::new("sh")
         .arg("-c")
-        .arg("exec 10<&200; exec \"$1\"")
+        .arg(format!(
+            "exec 10<&200; exec {}<&201; exec \"$1\"",
+            GUEST_CREDENTIAL_BACKEND_FD
+        ))
         .arg("d2b-provider-supervised-test")
         .arg(path)
         .stdin(Stdio::null())
@@ -136,6 +199,7 @@ fn run_supervised_binary(path: &str, provider: &str) {
         .spawn()
         .expect("provider binary");
     drop(inherited);
+    drop(backend_inherited);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -261,5 +325,129 @@ fn provider_binaries_complete_the_supervised_fd10_session_lifecycle() {
     for (path, provider) in binaries {
         let path = path.expect("binary path supplied by Bazel");
         run_supervised_binary(path, provider);
+    }
+}
+
+#[test]
+fn guest_backend_round_trip_keeps_response_bytes_zeroizing() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let (client_fd, server_fd) = prearmed_seqpacket_pair().expect("backend pair");
+        let client_socket =
+            SeqpacketSocket::from_parent_prearmed(client_fd).expect("backend client socket");
+        let server_socket =
+            SeqpacketSocket::from_parent_prearmed(server_fd).expect("backend server socket");
+        let route = route("Provider/credential-managed-identity");
+        let backend =
+            GuestCredentialBackend::from_socket_for_test_with_route(client_socket, route.clone())
+                .expect("Guest route");
+        let credentials = server_socket
+            .acceptor_peer_credentials()
+            .expect("backend peer credentials");
+        let policy = credential_delivery_endpoint_policy(route.reconnect_generation().get());
+        let serving = tokio::spawn(async move {
+            let responder = SessionEngine::establish_responder(
+                delivery_transport(server_socket, credentials),
+                policy,
+                credential_delivery_credentials(&route, false).expect("delivery credentials"),
+                std::time::Instant::now(),
+            )
+            .await
+            .expect("delivery handshake");
+            let driver = std::sync::Arc::new(responder.into_driver());
+            let handler = BackendHandler;
+            let service = ttrpc::r#async::Service {
+                methods: HashMap::from([(
+                    "Request".to_owned(),
+                    Box::new(handler)
+                        as Box<dyn ttrpc::r#async::MethodHandler + Send + Sync>,
+                )]),
+                streams: HashMap::new(),
+            };
+            d2b_session::serve_ttrpc_services(
+                driver,
+                HashMap::from([(
+                    "d2b.guest.credential.v1.GuestCredentialBackend".to_owned(),
+                    service,
+                )]),
+            )
+            .await
+        });
+        let response = backend
+            .request(
+                "managed-identity.issue-lease",
+                serde_json::json!({"credentialRef": "Credential/test"}),
+            )
+            .await
+            .expect("backend response");
+        assert_eq!(response.state(), Some("ready"));
+        assert!(!format!("{response:?}").contains("1, 2, 3, 4"));
+        assert_eq!(response.into_bytes().expect("response bytes").as_slice(), [1, 2, 3, 4]);
+        let response = backend
+            .request(
+                "managed-identity.inspect-lease",
+                serde_json::json!({"credentialRef": "Credential/test"}),
+            )
+            .await
+            .expect("inspection response");
+        assert_eq!(response.state(), Some("active"));
+        assert!(response.into_bytes().is_none());
+        let response = backend
+            .request(
+                "managed-identity.revoke-lease",
+                serde_json::json!({"credentialRef": "Credential/test"}),
+            )
+            .await
+            .expect("revocation response");
+        assert_eq!(response.outcome(), Some("revoked"));
+        assert!(response.into_bytes().is_none());
+        serving.abort();
+        let _ = serving.await;
+    });
+}
+
+struct BackendHandler;
+
+#[async_trait::async_trait]
+impl ttrpc::r#async::MethodHandler for BackendHandler {
+    async fn handler(
+        &self,
+        _context: ttrpc::r#async::TtrpcContext,
+        request: ttrpc::Request,
+    ) -> ttrpc::Result<ttrpc::Response> {
+        let request: serde_json::Value =
+            serde_json::from_slice(&request.payload).expect("backend request");
+        let operation = request
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .expect("operation");
+        let mut response = serde_json::json!({
+            "protocol": "d2b-guest-credential-backend-v1",
+            "state": "ready",
+            "leaseHandle": "backend-lease",
+            "sourceVersion": "backend-source",
+            "rotationGeneration": 1,
+            "expiresAtUnixMs": 2_000,
+        });
+        match operation {
+            "managed-identity.issue-lease" => {
+                response["bytes"] = serde_json::json!([1, 2, 3, 4]);
+            }
+            "managed-identity.inspect-lease" => {
+                response["state"] = serde_json::json!("active");
+            }
+            "managed-identity.revoke-lease" => {
+                response["outcome"] = serde_json::json!("revoked");
+            }
+            other => panic!("unexpected operation {other}"),
+        }
+        let payload = serde_json::to_vec(&response).expect("backend response");
+        let mut response = ttrpc::Response::new();
+        response.set_status(ttrpc::get_status(ttrpc::Code::OK, ""));
+        response.payload = payload;
+        Ok(response)
     }
 }

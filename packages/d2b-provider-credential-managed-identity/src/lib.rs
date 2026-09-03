@@ -31,8 +31,9 @@ use d2b_contracts_provider::v3::credential::{
 use d2b_contracts_resource::v3::ResourceRef;
 use d2b_contracts_resource::v3::identity::{AuthenticatedSubjectContext, Locality};
 use d2b_provider_toolkit::{
-    AuthenticatedSessionRouteBinding, ProviderFd10Spec, ProviderRuntimeError,
-    RouteCredentialAuthorization, run_from_fd10 as run_provider_from_fd10,
+    AuthenticatedSessionRouteBinding, GuestCredentialBackend, GuestCredentialBackendResponse,
+    ProviderFd10Spec, ProviderRuntimeError, RouteCredentialAuthorization,
+    run_from_fd10 as run_provider_from_fd10,
 };
 
 pub use agent::ManagedIdentityAgent;
@@ -111,13 +112,8 @@ pub fn agent_binary_entrypoint() -> i32 {
 
 fn runtime_provider(
     route: &AuthenticatedSessionRouteBinding,
-) -> Result<
-    (
-        Arc<ManagedIdentityAgent>,
-        Arc<RouteCredentialAuthorization>,
-    ),
-    ProviderRuntimeError,
-> {
+    backend: Arc<GuestCredentialBackend>,
+) -> Result<(Arc<ManagedIdentityAgent>, Arc<RouteCredentialAuthorization>), ProviderRuntimeError> {
     let provider_ref = route
         .provider_ref()
         .cloned()
@@ -128,24 +124,24 @@ fn runtime_provider(
         .execution_ref()
         .filter(|reference| reference.resource_type().as_str() == "Guest")
         .cloned()
-        .unwrap_or_else(|| ResourceRef::parse("Guest/credential-agent").expect("fixed Guest"));
-    let placement = ManagedIdentityPlacement::new(
-        PlacementBinding::GuestAgent,
-        execution_ref,
-        zone_ref,
-    )
-    .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
-    let config = ManagedIdentityClientConfig::new(
-        "allocator-issued-client",
-        "azure-imds",
-        MAX_LOCAL_LEASES,
-    )
-    .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+        .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
+    let placement =
+        ManagedIdentityPlacement::new(PlacementBinding::GuestAgent, execution_ref, zone_ref)
+            .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let config =
+        ManagedIdentityClientConfig::new("allocator-issued-client", "azure-imds", MAX_LOCAL_LEASES)
+            .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let client_id = config.client_id().as_str().to_owned();
+    let endpoint_alias = config.endpoint_alias().as_str().to_owned();
     let provider = ManagedIdentityCredentialProviderFactory::new(
         config,
         placement,
         provider_ref,
-        Arc::new(UnavailableManagedIdentityClient),
+        Arc::new(GuestManagedIdentityClient {
+            backend,
+            client_id,
+            endpoint_alias,
+        }),
     )
     .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?
     .construct();
@@ -155,40 +151,171 @@ fn runtime_provider(
     ))
 }
 
-struct UnavailableManagedIdentityClient;
+struct GuestManagedIdentityClient {
+    backend: Arc<GuestCredentialBackend>,
+    client_id: String,
+    endpoint_alias: String,
+}
 
-impl ManagedIdentityCredentialClient for UnavailableManagedIdentityClient {
+impl ManagedIdentityCredentialClient for GuestManagedIdentityClient {
     fn state(&self) -> ManagedIdentityFuture<'_, ManagedIdentityClientState> {
-        Box::pin(async { Ok(ManagedIdentityClientState::Unavailable) })
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "clientId": self.client_id,
+            "imdsEndpointAlias": self.endpoint_alias,
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("managed-identity.state", fields)
+                .await
+                .map_err(|_| ManagedIdentityClientError::Unavailable)?;
+            match response.state() {
+                Some("ready") => Ok(ManagedIdentityClientState::Ready),
+                Some("unavailable") => Ok(ManagedIdentityClientState::Unavailable),
+                _ => Err(ManagedIdentityClientError::Unavailable),
+            }
+        })
     }
 
     fn issue_lease(
         &self,
-        _request: &ManagedIdentityLeaseRequest,
+        request: &ManagedIdentityLeaseRequest,
     ) -> ManagedIdentityFuture<'_, ManagedIdentityLeaseGrant> {
-        Box::pin(async { Err(ManagedIdentityClientError::Unavailable) })
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "clientId": self.client_id,
+            "imdsEndpointAlias": self.endpoint_alias,
+            "credentialRef": request.credential_ref().to_canonical_string(),
+            "operationId": request.operation_id(),
+            "idempotencyKey": request.idempotency_key(),
+            "requestedExpiryUnixMs": request.requested_expiry_unix_ms(),
+            "rotationGeneration": request.rotation_generation(),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("managed-identity.issue-lease", fields)
+                .await
+                .map_err(|_| ManagedIdentityClientError::Unavailable)?;
+            managed_identity_grant(response)
+        })
     }
 
     fn inspect_lease(
         &self,
-        _lease: &ManagedIdentityLeaseRef,
+        lease: &ManagedIdentityLeaseRef,
     ) -> ManagedIdentityFuture<'_, ManagedIdentityLeaseInspection> {
-        Box::pin(async { Err(ManagedIdentityClientError::Unavailable) })
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "clientId": self.client_id,
+            "imdsEndpointAlias": self.endpoint_alias,
+            "credentialRef": lease.credential_ref().to_canonical_string(),
+            "leaseHandle": lease.metadata().lease_handle.as_opaque_str(),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("managed-identity.inspect-lease", fields)
+                .await
+                .map_err(|_| ManagedIdentityClientError::Unavailable)?;
+            managed_identity_inspection(response)
+        })
     }
 
     fn refresh_lease(
         &self,
-        _lease: &ManagedIdentityLeaseRef,
+        lease: &ManagedIdentityLeaseRef,
     ) -> ManagedIdentityFuture<'_, ManagedIdentityLeaseRenewal> {
-        Box::pin(async { Err(ManagedIdentityClientError::Unavailable) })
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "clientId": self.client_id,
+            "imdsEndpointAlias": self.endpoint_alias,
+            "credentialRef": lease.credential_ref().to_canonical_string(),
+            "leaseHandle": lease.metadata().lease_handle.as_opaque_str(),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("managed-identity.refresh-lease", fields)
+                .await
+                .map_err(|_| ManagedIdentityClientError::Unavailable)?;
+            managed_identity_grant(response)
+        })
     }
 
     fn revoke_lease(
         &self,
-        _lease: &ManagedIdentityLeaseRef,
+        lease: &ManagedIdentityLeaseRef,
     ) -> ManagedIdentityFuture<'_, ManagedIdentityLeaseRevocation> {
-        Box::pin(async { Err(ManagedIdentityClientError::Unavailable) })
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "clientId": self.client_id,
+            "imdsEndpointAlias": self.endpoint_alias,
+            "credentialRef": lease.credential_ref().to_canonical_string(),
+            "leaseHandle": lease.metadata().lease_handle.as_opaque_str(),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("managed-identity.revoke-lease", fields)
+                .await
+                .map_err(|_| ManagedIdentityClientError::Unavailable)?;
+            match response.outcome() {
+                Some("revoked") => Ok(ManagedIdentityLeaseRevocation::Revoked),
+                Some("already-revoked") => Ok(ManagedIdentityLeaseRevocation::AlreadyRevoked),
+                _ => Err(ManagedIdentityClientError::Unavailable),
+            }
+        })
     }
+}
+
+fn managed_identity_grant(
+    mut response: GuestCredentialBackendResponse,
+) -> Result<ManagedIdentityLeaseGrant, ManagedIdentityClientError> {
+    response.clear_bytes();
+    Ok(ManagedIdentityLeaseGrant {
+        lease_handle: CredentialLeaseHandle::parse(
+            response
+                .lease_handle()
+                .ok_or(ManagedIdentityClientError::Unavailable)?,
+        )
+        .map_err(|_| ManagedIdentityClientError::Unavailable)?,
+        source_version: CredentialSourceVersion::parse(
+            response
+                .source_version()
+                .ok_or(ManagedIdentityClientError::Unavailable)?,
+        )
+        .map_err(|_| ManagedIdentityClientError::Unavailable)?,
+        rotation_generation: response
+            .rotation_generation()
+            .ok_or(ManagedIdentityClientError::Unavailable)?,
+        expires_at_unix_ms: response
+            .expires_at_unix_ms()
+            .ok_or(ManagedIdentityClientError::Unavailable)?,
+    })
+}
+
+fn managed_identity_inspection(
+    response: GuestCredentialBackendResponse,
+) -> Result<ManagedIdentityLeaseInspection, ManagedIdentityClientError> {
+    let state = match response.state() {
+        Some("active") => CredentialLeaseState::Active,
+        Some("expired") => CredentialLeaseState::Expired,
+        Some("revoked") => CredentialLeaseState::Revoked,
+        Some("unknown") => CredentialLeaseState::Unknown,
+        _ => return Err(ManagedIdentityClientError::Unavailable),
+    };
+    Ok(ManagedIdentityLeaseInspection {
+        state,
+        source_version: CredentialSourceVersion::parse(
+            response
+                .source_version()
+                .ok_or(ManagedIdentityClientError::Unavailable)?,
+        )
+        .map_err(|_| ManagedIdentityClientError::Unavailable)?,
+        rotation_generation: response
+            .rotation_generation()
+            .ok_or(ManagedIdentityClientError::Unavailable)?,
+        expires_at_unix_ms: response
+            .expires_at_unix_ms()
+            .ok_or(ManagedIdentityClientError::Unavailable)?,
+    })
 }
 
 /// Boxed asynchronous result returned by the injected IMDS client.
@@ -756,10 +883,7 @@ impl ManagedIdentityCredentialProvider {
         }
 
         let subject = session.authenticated_subject();
-        let controller_session = matches!(
-            method,
-            CredentialMethod::RevokeToken | CredentialMethod::InspectMetadata
-        ) && self.context_matches_controller(subject);
+        let controller_session = self.context_matches_controller(subject);
         if !self.context_matches_provider(subject) && !controller_session {
             return Err(CredentialServiceError::new(
                 CredentialServiceErrorCode::OperationDenied,
@@ -945,10 +1069,43 @@ impl ManagedIdentityCredentialProvider {
         Ok(bounded)
     }
 
-    pub(crate) fn poll_client<T>(
+    pub(crate) fn poll_client<T: Send>(
         mut future: ManagedIdentityFuture<'_, T>,
         deadline: Instant,
     ) -> Result<T, CredentialServiceError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let remaining = deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
+                CredentialServiceError::new(CredentialServiceErrorCode::DeadlineExceeded)
+            })?;
+            return std::thread::scope(|scope| {
+                let task = scope.spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|_| {
+                            CredentialServiceError::new(
+                                CredentialServiceErrorCode::InvariantFailure,
+                            )
+                        })?;
+                    runtime.block_on(async {
+                        tokio::time::timeout(remaining, future)
+                            .await
+                            .map_err(|_| {
+                                CredentialServiceError::new(
+                                    CredentialServiceErrorCode::DeadlineExceeded,
+                                )
+                            })?
+                            .map_err(Self::map_client_error)
+                    })
+                });
+                match task.join() {
+                    Ok(result) => result,
+                    Err(_) => Err(CredentialServiceError::new(
+                        CredentialServiceErrorCode::InvariantFailure,
+                    )),
+                }
+            });
+        }
         struct ThreadWake(Thread);
         impl Wake for ThreadWake {
             fn wake(self: Arc<Self>) {

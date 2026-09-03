@@ -331,6 +331,8 @@ pub(crate) struct ProcessResourceContext<'a> {
     pub(crate) owner_ref: Option<ResourceRef>,
     /// Immutable identity of the semantic owner.
     pub(crate) owner_uid: Option<ResourceUid>,
+    /// Provider that owns the supervised controller route.
+    pub(crate) controller_provider_ref: Option<ResourceRef>,
     /// Optional Guest selector for a shared Host execution reference.
     pub(crate) target_ref: Option<ResourceRef>,
     /// Catalog-bound private Guest setup descriptor digest.
@@ -364,6 +366,7 @@ impl<'a> ProcessResourceContext<'a> {
             provider_assignment_generation: None,
             owner_ref: None,
             owner_uid: None,
+            controller_provider_ref: None,
             target_ref,
             guest_descriptor_digest: None,
         }
@@ -393,6 +396,14 @@ impl<'a> ProcessResourceContext<'a> {
 
     pub(crate) fn with_owner_uid(mut self, owner_uid: Option<ResourceUid>) -> Self {
         self.owner_uid = owner_uid;
+        self
+    }
+
+    pub(crate) fn with_controller_provider_ref(
+        mut self,
+        provider_ref: Option<ResourceRef>,
+    ) -> Self {
+        self.controller_provider_ref = provider_ref;
         self
     }
 
@@ -472,10 +483,16 @@ impl ControllerBootstrapContext {
         process_identity: ProcessIdentityDigest,
     ) -> Result<Self, String> {
         let provider_owner_ref = context
-            .owner_ref
-            .as_ref()
+            .controller_provider_ref
+            .clone()
+            .or_else(|| {
+                context
+                    .owner_ref
+                    .as_ref()
+                    .filter(|owner| owner.resource_type().as_str() == "Provider")
+                    .cloned()
+            })
             .filter(|owner| owner.resource_type().as_str() == "Provider")
-            .cloned()
             .ok_or_else(|| "provider-controller-owner-missing".to_owned())?;
         let provider_uid = context
             .provider_uid
@@ -547,12 +564,19 @@ impl ControllerBootstrapContext {
 
 pub(crate) struct ControllerBootstrapEndpoint {
     daemon_endpoint: OwnedFd,
+    backend_endpoint: Option<Arc<OwnedFd>>,
     context: ControllerBootstrapContext,
 }
 
 impl ControllerBootstrapEndpoint {
-    pub(crate) fn into_parts(self) -> (OwnedFd, ControllerBootstrapContext) {
-        (self.daemon_endpoint, self.context)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        OwnedFd,
+        Option<Arc<OwnedFd>>,
+        ControllerBootstrapContext,
+    ) {
+        (self.daemon_endpoint, self.backend_endpoint, self.context)
     }
 
     pub(crate) fn context(&self) -> &ControllerBootstrapContext {
@@ -923,7 +947,7 @@ impl ProductionProcessProviders {
             ticket.runtime_scope(),
         )
         .await?;
-        let controller_bootstrap = ticket.inherited_fd_table().count() == 1;
+        let controller_bootstrap = ticket.inherited_fd_table().count() != 0;
         if controller_bootstrap && provider != ManagedProvider::Minijail {
             return Err("provider-controller-bootstrap-unsupported".to_owned());
         }
@@ -931,20 +955,34 @@ impl ProductionProcessProviders {
             self.forget_controller_bootstrap_for_resource_context(&context);
         }
         let controller_endpoints = if controller_bootstrap {
-            Some(
-                prearmed_seqpacket_pair()
-                    .map_err(|_| "provider-controller-bootstrap-create".to_owned())?,
-            )
+            let (daemon_endpoint, child_endpoint) = prearmed_seqpacket_pair()
+                .map_err(|_| "provider-controller-bootstrap-create".to_owned())?;
+            let (child_fds, backend_endpoint) = if ticket.inherited_fd_table().count() == 2 {
+                let (backend_peer, backend_child) = prearmed_seqpacket_pair()
+                    .map_err(|_| "provider-credential-backend-create".to_owned())?;
+                (
+                    vec![child_endpoint, backend_child],
+                    Some(Arc::new(backend_peer)),
+                )
+            } else {
+                (vec![child_endpoint], None)
+            };
+            Some((daemon_endpoint, child_fds, backend_endpoint))
         } else {
             None
         };
+        let mut backend_endpoint = None;
         let report = match provider {
             ManagedProvider::Minijail => match controller_endpoints {
-                Some((daemon_endpoint, child_endpoint)) => self
-                    .minijail
-                    .launch_with_inherited_fds(&ticket, vec![child_endpoint, daemon_endpoint])
-                    .await
-                    .map_err(provider_error),
+                Some((daemon_endpoint, child_fds, backend_peer)) => {
+                    backend_endpoint = backend_peer;
+                    let mut inherited_fds = child_fds;
+                    inherited_fds.push(daemon_endpoint);
+                    self.minijail
+                        .launch_with_inherited_fds(&ticket, inherited_fds)
+                        .await
+                        .map_err(provider_error)
+                }
                 None => self.minijail.launch(&ticket).await.map_err(provider_error),
             },
             ManagedProvider::Systemd => self.systemd.launch(&ticket).await.map_err(provider_error),
@@ -1015,6 +1053,7 @@ impl ProductionProcessProviders {
             };
             if let Err(error) = self.remember_controller_bootstrap(ControllerBootstrapEndpoint {
                 daemon_endpoint,
+                backend_endpoint,
                 context: controller_context,
             }) {
                 let _ = self
@@ -1903,7 +1942,7 @@ impl ProductionProcessProviders {
                 self.systemd.adopt(&ticket).await.map_err(provider_error)?
             }
         };
-        let controller_bootstrap = ticket.inherited_fd_table().count() == 1;
+        let controller_bootstrap = ticket.inherited_fd_table().count() != 0;
         match outcome {
             AdoptionOutcome::Absent => {
                 self.finalize_resource(context.clone()).await?;
@@ -1944,8 +1983,12 @@ impl ProductionProcessProviders {
                     else {
                         return Ok(ProviderAdoption::ControllerBootstrapMissing);
                     };
+                    if ticket.inherited_fd_table().count() == 2 {
+                        return Ok(ProviderAdoption::ControllerBootstrapMissing);
+                    }
                     self.remember_controller_bootstrap(ControllerBootstrapEndpoint {
                         daemon_endpoint,
+                        backend_endpoint: None,
                         context: controller_context,
                     })?;
                 }
@@ -2751,6 +2794,30 @@ fn managed_provider_from_ref(provider_ref: &ResourceRef) -> Result<ManagedProvid
     }
 }
 
+fn is_credential_provider_ref(provider_ref: &ResourceRef) -> bool {
+    provider_ref.resource_type().as_str() == "Provider"
+        && matches!(
+            provider_ref.name().as_str(),
+            "credential-secret-service"
+                | "credential-entra"
+                | "credential-managed-identity"
+        )
+}
+
+fn is_managed_identity_agent_context(
+    context: &ProcessResourceContext<'_>,
+    execution: &d2b_contracts_resource::v3::process::ExecutionSpec,
+) -> bool {
+    context.provider_ref.name().as_str() == "system-minijail"
+        && context
+            .owner_ref
+            .as_ref()
+            .is_some_and(|owner| owner.resource_type().as_str() == "Credential")
+        && context.resource_ref.resource_type().as_str() == "Process"
+        && context.resource_ref.name().as_str().starts_with("mi-agent-")
+        && execution.template().as_str() == "d2b-managed-identity-agent"
+}
+
 fn controller_launch_ticket(
     bundle_content_identity: &str,
     resource: &ControllerProcessResource,
@@ -2972,8 +3039,21 @@ fn resource_ticket(
             .owner_ref
             .as_ref()
             .is_some_and(|owner| owner.resource_type().as_str() == "Provider");
+    let managed_identity_agent = is_managed_identity_agent_context(context, execution);
+    if exact_static_controller
+        && context
+            .owner_ref
+            .as_ref()
+            .is_some_and(is_credential_provider_ref)
+        && execution.execution_ref().resource_type().as_str() != "Guest"
+    {
+        return Err("provider-ticket:credential-provider-guest-required".to_owned());
+    }
     if execution.process_class() == ProcessClass::Controller && !exact_static_controller {
         return Err("provider-ticket:controller-owner-invalid".to_owned());
+    }
+    if managed_identity_agent && execution.execution_ref().resource_type().as_str() != "Guest" {
+        return Err("provider-ticket:credential-agent-guest-required".to_owned());
     }
     let static_intent = exact_static_controller.then(|| {
         bundle.find_provider_controller_intent(
@@ -2987,6 +3067,14 @@ fn resource_ticket(
     });
     let generic_intent = if exact_static_controller {
         None
+    } else if managed_identity_agent {
+        bundle.find_provider_component_intent_for_template(
+            &execution_ref,
+            execution_domain,
+            user_ref.as_deref(),
+            execution.template().as_str(),
+            Some("Provider/credential-managed-identity"),
+        )
     } else if let Some(owner) = context
         .owner_ref
         .as_ref()
@@ -3024,7 +3112,7 @@ fn resource_ticket(
         .flatten()
         .or(generic_intent)
         .ok_or_else(|| "provider-ticket:template-not-found".to_owned())?;
-    let ticket_template = if exact_static_controller {
+    let ticket_template = if exact_static_controller || managed_identity_agent {
         execution.template().clone()
     } else {
         BoundedToken::parse(trusted_intent.role_id.clone())
@@ -3078,7 +3166,20 @@ fn resource_ticket(
     )
     .map_err(|error| format!("provider-ticket:{}", error.code()))?;
     ticket = ticket
-        .with_inherited_fd_count(if exact_static_controller { 1 } else { 0 })
+        .with_inherited_fd_count(if exact_static_controller || managed_identity_agent {
+            if managed_identity_agent
+                || context
+                .owner_ref
+                .as_ref()
+                .is_some_and(|owner| is_credential_provider_ref(&owner))
+            {
+                2
+            } else {
+                1
+            }
+        } else {
+            0
+        })
         .map_err(|error| format!("provider-ticket:{}", error.code()))?;
     if execution.execution_ref().resource_type().as_str() == "Host"
         && let Some(target_ref) = context.target_ref.as_ref()

@@ -24,10 +24,7 @@ impl CredentialProvider for SecretServiceCredentialProvider {
         let session_key = self
             .authorize_session_locked(authorization)
             .or_else(|_| {
-                matches!(
-                    method,
-                    CredentialMethod::RevokeToken | CredentialMethod::InspectMetadata
-                )
+                self.authorizes_controller_session(authorization)
                 .then(|| self.authorize_controller_session_locked(authorization))
                 .unwrap_or_else(|| {
                     Err(CredentialServiceError::new(

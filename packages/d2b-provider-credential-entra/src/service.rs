@@ -59,10 +59,7 @@ impl EntraCredentialProvider {
         if session.authenticated_subject() != subject {
             return Err(denied());
         }
-        let controller_session = matches!(
-            method,
-            CredentialMethod::RevokeToken | CredentialMethod::InspectMetadata
-        ) && self.is_controller_session(subject);
+        let controller_session = self.is_controller_session(subject);
         let consumer_session = subject.transport_binding().locality() == Locality::Local
             && subject.subject_ref() == self.consumer_ref()
             && subject.execution_ref() == Some(self.placement.execution_ref())

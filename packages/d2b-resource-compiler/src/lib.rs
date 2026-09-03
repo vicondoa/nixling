@@ -674,6 +674,14 @@ where
         }
     }
 
+    append_managed_identity_agent_templates(
+        &zone_id,
+        resources,
+        &artifacts,
+        &mut generated_identities,
+        &mut templates,
+    )?;
+
     projected_resources
         .sort_by(|left, right| resource_sort_key(left).cmp(&resource_sort_key(right)));
     templates.sort_by(|left, right| {
@@ -685,6 +693,118 @@ where
         resources: projected_resources,
         templates,
     })
+}
+
+fn append_managed_identity_agent_templates<'a>(
+    zone: &ZoneId,
+    resources: &[serde_json::Value],
+    artifacts: &BTreeMap<String, &'a VerifiedProviderArtifact>,
+    generated_identities: &mut BTreeSet<(String, String)>,
+    templates: &mut Vec<ProcessTemplateBinding>,
+) -> Result<(), StaticControllerProjectionError> {
+    let Some(provider) = resources.iter().find(|resource| {
+        resource.get("type").and_then(Value::as_str) == Some("Provider")
+            && resource
+                .get("metadata")
+                .and_then(|metadata| metadata.get("zone"))
+                .and_then(Value::as_str)
+                == Some(zone.as_str())
+            && resource
+                .get("metadata")
+                .and_then(|metadata| metadata.get("name"))
+                .and_then(Value::as_str)
+                == Some("credential-managed-identity")
+    }) else {
+        return Ok(());
+    };
+    let provider_ref = ResourceRef::parse("Provider/credential-managed-identity")
+        .map_err(|_| StaticControllerProjectionError::InvalidProviderResource)?;
+    let artifact_id = provider
+        .get("spec")
+        .and_then(|spec| spec.get("artifactId"))
+        .and_then(Value::as_str)
+        .ok_or(StaticControllerProjectionError::InvalidProviderResource)?;
+    let Some(artifact) = artifacts.get(artifact_id) else {
+        return Ok(());
+    };
+    let binary_ref = BinaryRef::parse("d2b-managed-identity-agent")
+        .map_err(|_| StaticControllerProjectionError::TemplateArtifactMissing)?;
+    let Some(artifact_digest) = artifact.compiled().executable_digests().get(binary_ref.as_str())
+    else {
+        return Ok(());
+    };
+    let template = BoundedToken::parse("d2b-managed-identity-agent")
+        .map_err(|_| StaticControllerProjectionError::InvalidTemplate)?;
+    let target_refs = resources
+        .iter()
+        .filter_map(|resource| {
+            let kind = resource.get("type").and_then(Value::as_str)?;
+            if !matches!(kind, "Host" | "Guest")
+                || resource
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("zone"))
+                    .and_then(Value::as_str)
+                    != Some(zone.as_str())
+            {
+                return None;
+            }
+            let name = resource
+                .get("metadata")
+                .and_then(|metadata| metadata.get("name"))
+                .and_then(Value::as_str)?;
+            ResourceRef::parse(&format!("{kind}/{name}")).ok()
+        })
+        .collect::<BTreeSet<_>>();
+    for execution_ref in &target_refs {
+        let process_ref = dynamic_agent_template_ref(execution_ref)?;
+        let identity = ("Process".to_owned(), process_ref.name().as_str().to_owned());
+        if !generated_identities.insert(identity.clone())
+            || resources.iter().any(|candidate| {
+                resource_identity(candidate).as_ref() == Some(&identity)
+            })
+        {
+            return Err(StaticControllerProjectionError::DuplicateProcessName);
+        }
+        let binary_path = artifact
+            .store_path()
+            .join(EXECUTABLE_DIR)
+            .join(binary_ref.as_str());
+        templates.push(
+            ProcessTemplateBinding::new_dynamic(
+                process_ref,
+                provider_ref.clone(),
+                execution_ref.clone(),
+                template.clone(),
+                artifact.artifact_id().clone(),
+                binary_ref.clone(),
+                artifact_digest.clone(),
+                binary_path.to_string_lossy().into_owned(),
+            )
+            .map_err(|_| StaticControllerProjectionError::TemplateBindingInvalid)?,
+        );
+    }
+    Ok(())
+}
+
+fn dynamic_agent_template_ref(
+    execution_ref: &ResourceRef,
+) -> Result<ResourceRef, StaticControllerProjectionError> {
+    let candidate = format!(
+        "Process/d2b-mi-agent-template-{}-{}",
+        execution_ref.resource_type().as_str().to_ascii_lowercase(),
+        execution_ref.name().as_str()
+    );
+    if let Ok(process_ref) = ResourceRef::parse(&candidate) {
+        return Ok(process_ref);
+    }
+    let digest = Sha256::digest(candidate.as_bytes());
+    let suffix = digest
+        .iter()
+        .take(12)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    ResourceRef::parse(&format!("Process/d2b-mi-agent-template-{suffix}"))
+        .map_err(|_| StaticControllerProjectionError::InvalidTemplate)
 }
 
 fn resource_identity(resource: &serde_json::Value) -> Option<(String, String)> {

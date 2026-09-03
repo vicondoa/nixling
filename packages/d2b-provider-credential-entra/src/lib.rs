@@ -26,8 +26,9 @@ use d2b_contracts_provider::v3::credential::{
 };
 use d2b_contracts_resource::v3::ResourceRef;
 use d2b_provider_toolkit::{
-    AuthenticatedSessionRouteBinding, ProviderFd10Spec, ProviderRuntimeError,
-    RouteCredentialAuthorization, run_from_fd10 as run_provider_from_fd10,
+    AuthenticatedSessionRouteBinding, GuestCredentialBackend, GuestCredentialBackendResponse,
+    ProviderFd10Spec, ProviderRuntimeError, RouteCredentialAuthorization,
+    run_from_fd10 as run_provider_from_fd10,
 };
 
 pub use controller::{
@@ -94,6 +95,7 @@ pub fn controller_binary_entrypoint() -> i32 {
 
 fn runtime_provider(
     route: &AuthenticatedSessionRouteBinding,
+    backend: Arc<GuestCredentialBackend>,
 ) -> Result<
     (
         Arc<EntraCredentialProvider>,
@@ -111,21 +113,16 @@ fn runtime_provider(
         .execution_ref()
         .filter(|reference| reference.resource_type().as_str() == "Guest")
         .cloned()
-        .unwrap_or_else(|| ResourceRef::parse("Guest/credential-identity").expect("fixed Guest"));
-    let identity_guest_ref =
-        ResourceRef::parse("Guest/credential-identity").expect("fixed identity Guest");
-    let login_endpoint_ref =
-        ResourceRef::parse("Endpoint/credential-entra-login").expect("fixed Endpoint");
+        .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
     let endpoint_generation = route
         .provider_generation()
         .ok_or(ProviderRuntimeError::SessionUnauthenticated)?
         .get();
-    let placement = EntraPlacement::new_in_zone(
+    let identity_guest_ref = execution_ref.clone();
+    let placement = EntraPlacement::new_runtime_in_zone(
         zone_ref,
         PlacementBinding::GuestAgent,
         execution_ref,
-        identity_guest_ref,
-        login_endpoint_ref,
         endpoint_generation,
     )
     .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
@@ -135,35 +132,188 @@ fn runtime_provider(
         config,
         placement,
         provider_ref,
-        Arc::new(UnavailableEntraClient),
+        Arc::new(GuestEntraClient {
+            backend,
+            identity_guest_ref,
+            login_endpoint_ref: None,
+        }),
     )
     .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?
     .construct();
     Ok((Arc::new(provider), Arc::new(RouteCredentialAuthorization)))
 }
 
-struct UnavailableEntraClient;
+struct GuestEntraClient {
+    backend: Arc<GuestCredentialBackend>,
+    identity_guest_ref: ResourceRef,
+    login_endpoint_ref: Option<ResourceRef>,
+}
 
-impl EntraCredentialClient for UnavailableEntraClient {
+impl EntraCredentialClient for GuestEntraClient {
     fn state(&self) -> EntraFuture<'_, EntraClientState> {
-        Box::pin(async { Ok(EntraClientState::InteractionRequired) })
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "identityGuestRef": self.identity_guest_ref.to_canonical_string(),
+            "loginEndpointRef": self
+                .login_endpoint_ref
+                .as_ref()
+                .map(ResourceRef::to_canonical_string),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("entra.state", fields)
+                .await
+                .map_err(|_| EntraClientError::Unavailable)?;
+            match response.state() {
+                Some("ready") => Ok(EntraClientState::Ready),
+                Some("interaction-required") => Ok(EntraClientState::InteractionRequired),
+                _ => Err(EntraClientError::Unavailable),
+            }
+        })
     }
 
-    fn issue_lease(&self, _request: &EntraLeaseRequest) -> EntraFuture<'_, EntraLeaseGrant> {
-        Box::pin(async { Err(EntraClientError::Unavailable) })
+    fn issue_lease(&self, request: &EntraLeaseRequest) -> EntraFuture<'_, EntraLeaseGrant> {
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "identityGuestRef": self.identity_guest_ref.to_canonical_string(),
+            "loginEndpointRef": self
+                .login_endpoint_ref
+                .as_ref()
+                .map(ResourceRef::to_canonical_string),
+            "credentialRef": request.credential_ref().to_canonical_string(),
+            "operationId": request.operation_id(),
+            "idempotencyKey": request.idempotency_key(),
+            "requestedExpiryUnixMs": request.requested_expiry_unix_ms(),
+            "endpointGeneration": request.endpoint_generation(),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("entra.issue-lease", fields)
+                .await
+                .map_err(|_| EntraClientError::Unavailable)?;
+            entra_grant(response)
+        })
     }
 
-    fn inspect_lease(&self, _lease: &EntraLeaseRef) -> EntraFuture<'_, EntraLeaseInspection> {
-        Box::pin(async { Err(EntraClientError::Unavailable) })
+    fn inspect_lease(&self, lease: &EntraLeaseRef) -> EntraFuture<'_, EntraLeaseInspection> {
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "identityGuestRef": self.identity_guest_ref.to_canonical_string(),
+            "loginEndpointRef": self
+                .login_endpoint_ref
+                .as_ref()
+                .map(ResourceRef::to_canonical_string),
+            "credentialRef": lease.credential_ref().to_canonical_string(),
+            "leaseHandle": lease.metadata().lease_handle.as_opaque_str(),
+            "endpointGeneration": lease.endpoint_generation(),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("entra.inspect-lease", fields)
+                .await
+                .map_err(|_| EntraClientError::Unavailable)?;
+            entra_inspection(response)
+        })
     }
 
-    fn refresh_lease(&self, _lease: &EntraLeaseRef) -> EntraFuture<'_, EntraLeaseRenewal> {
-        Box::pin(async { Err(EntraClientError::Unavailable) })
+    fn refresh_lease(&self, lease: &EntraLeaseRef) -> EntraFuture<'_, EntraLeaseRenewal> {
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "identityGuestRef": self.identity_guest_ref.to_canonical_string(),
+            "loginEndpointRef": self
+                .login_endpoint_ref
+                .as_ref()
+                .map(ResourceRef::to_canonical_string),
+            "credentialRef": lease.credential_ref().to_canonical_string(),
+            "leaseHandle": lease.metadata().lease_handle.as_opaque_str(),
+            "endpointGeneration": lease.endpoint_generation(),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("entra.refresh-lease", fields)
+                .await
+                .map_err(|_| EntraClientError::Unavailable)?;
+            entra_grant(response)
+        })
     }
 
-    fn revoke_lease(&self, _lease: &EntraLeaseRef) -> EntraFuture<'_, EntraLeaseRevocation> {
-        Box::pin(async { Err(EntraClientError::Unavailable) })
+    fn revoke_lease(&self, lease: &EntraLeaseRef) -> EntraFuture<'_, EntraLeaseRevocation> {
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "identityGuestRef": self.identity_guest_ref.to_canonical_string(),
+            "loginEndpointRef": self
+                .login_endpoint_ref
+                .as_ref()
+                .map(ResourceRef::to_canonical_string),
+            "credentialRef": lease.credential_ref().to_canonical_string(),
+            "leaseHandle": lease.metadata().lease_handle.as_opaque_str(),
+            "endpointGeneration": lease.endpoint_generation(),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("entra.revoke-lease", fields)
+                .await
+                .map_err(|_| EntraClientError::Unavailable)?;
+            match response.outcome() {
+                Some("revoked") => Ok(EntraLeaseRevocation::Revoked),
+                Some("already-revoked") => Ok(EntraLeaseRevocation::AlreadyRevoked),
+                _ => Err(EntraClientError::Unavailable),
+            }
+        })
     }
+}
+
+fn entra_grant(
+    mut response: GuestCredentialBackendResponse,
+) -> Result<EntraLeaseGrant, EntraClientError> {
+    response.clear_bytes();
+    Ok(EntraLeaseGrant {
+        lease_handle: CredentialLeaseHandle::parse(
+            response
+                .lease_handle()
+                .ok_or(EntraClientError::Unavailable)?,
+        )
+        .map_err(|_| EntraClientError::Unavailable)?,
+        source_version: CredentialSourceVersion::parse(
+            response
+                .source_version()
+                .ok_or(EntraClientError::Unavailable)?,
+        )
+        .map_err(|_| EntraClientError::Unavailable)?,
+        rotation_generation: response
+            .rotation_generation()
+            .ok_or(EntraClientError::Unavailable)?,
+        expires_at_unix_ms: response
+            .expires_at_unix_ms()
+            .ok_or(EntraClientError::Unavailable)?,
+    })
+}
+
+fn entra_inspection(
+    response: GuestCredentialBackendResponse,
+) -> Result<EntraLeaseInspection, EntraClientError> {
+    let state = match response.state() {
+        Some("active") => CredentialLeaseState::Active,
+        Some("expired") => CredentialLeaseState::Expired,
+        Some("revoked") => CredentialLeaseState::Revoked,
+        Some("unknown") => CredentialLeaseState::Unknown,
+        _ => return Err(EntraClientError::Unavailable),
+    };
+    Ok(EntraLeaseInspection {
+        state,
+        source_version: CredentialSourceVersion::parse(
+            response
+                .source_version()
+                .ok_or(EntraClientError::Unavailable)?,
+        )
+        .map_err(|_| EntraClientError::Unavailable)?,
+        rotation_generation: response
+            .rotation_generation()
+            .ok_or(EntraClientError::Unavailable)?,
+        expires_at_unix_ms: response
+            .expires_at_unix_ms()
+            .ok_or(EntraClientError::Unavailable)?,
+    })
 }
 
 /// Boxed asynchronous result returned by the injected identity-Guest client.
@@ -294,7 +444,7 @@ pub struct EntraPlacement {
     zone_ref: Option<ResourceRef>,
     execution_ref: ResourceRef,
     identity_guest_ref: ResourceRef,
-    login_endpoint_ref: ResourceRef,
+    login_endpoint_ref: Option<ResourceRef>,
     endpoint_generation: u64,
 }
 
@@ -325,7 +475,7 @@ impl EntraPlacement {
             zone_ref: None,
             execution_ref,
             identity_guest_ref,
-            login_endpoint_ref,
+            login_endpoint_ref: Some(login_endpoint_ref),
             endpoint_generation,
         })
     }
@@ -351,6 +501,34 @@ impl EntraPlacement {
         )?;
         placement.zone_ref = Some(zone_ref);
         Ok(placement)
+    }
+
+    /// Bind a runtime controller to the exact Guest execution while leaving
+    /// Endpoint resolution to the Guest-local typed client.
+    pub fn new_runtime_in_zone(
+        zone_ref: ResourceRef,
+        binding: PlacementBinding,
+        execution_ref: ResourceRef,
+        endpoint_generation: u64,
+    ) -> Result<Self, EntraProviderError> {
+        if zone_ref.resource_type().as_str() != "Zone"
+            || !matches!(
+                binding,
+                PlacementBinding::UserAgent | PlacementBinding::GuestAgent
+            )
+            || execution_ref.resource_type().as_str() != "Guest"
+            || endpoint_generation == 0
+        {
+            return Err(EntraProviderError::InvalidEndpoint);
+        }
+        Ok(Self {
+            binding,
+            zone_ref: Some(zone_ref),
+            identity_guest_ref: execution_ref.clone(),
+            execution_ref,
+            login_endpoint_ref: None,
+            endpoint_generation,
+        })
     }
 
     /// Return the placement binding.
@@ -382,8 +560,8 @@ impl EntraPlacement {
     }
 
     /// Borrow the login Endpoint.
-    pub const fn login_endpoint_ref(&self) -> &ResourceRef {
-        &self.login_endpoint_ref
+    pub const fn login_endpoint_ref(&self) -> Option<&ResourceRef> {
+        self.login_endpoint_ref.as_ref()
     }
 
     /// Return the admitted Endpoint generation.
@@ -927,10 +1105,43 @@ impl EntraCredentialProvider {
         }
     }
 
-    pub(crate) fn poll_client<T>(
+    pub(crate) fn poll_client<T: Send>(
         mut future: EntraFuture<'_, T>,
         deadline: Instant,
     ) -> Result<T, CredentialServiceError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let remaining = deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
+                CredentialServiceError::new(CredentialServiceErrorCode::DeadlineExceeded)
+            })?;
+            return std::thread::scope(|scope| {
+                let task = scope.spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|_| {
+                            CredentialServiceError::new(
+                                CredentialServiceErrorCode::InvariantFailure,
+                            )
+                        })?;
+                    runtime.block_on(async {
+                        tokio::time::timeout(remaining, future)
+                            .await
+                            .map_err(|_| {
+                                CredentialServiceError::new(
+                                    CredentialServiceErrorCode::DeadlineExceeded,
+                                )
+                            })?
+                            .map_err(Self::map_client_error)
+                    })
+                });
+                match task.join() {
+                    Ok(result) => result,
+                    Err(_) => Err(CredentialServiceError::new(
+                        CredentialServiceErrorCode::InvariantFailure,
+                    )),
+                }
+            });
+        }
         struct ThreadWake(Thread);
         impl Wake for ThreadWake {
             fn wake(self: Arc<Self>) {

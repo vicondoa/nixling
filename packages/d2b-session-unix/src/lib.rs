@@ -154,6 +154,44 @@ pub fn credential_provider_endpoint_policy()
     }
 }
 
+/// Exact enrolled ComponentSession policy for Guest-local sensitive
+/// Credential delivery.
+#[cfg(feature = "host-socket")]
+pub fn credential_delivery_endpoint_policy(
+    reconnect_generation: u64,
+) -> d2b_contracts_zone_session::v3::component_session::EndpointPolicy {
+    use d2b_contracts_zone_session::v3::component_session::{
+        AttachmentPolicy, EndpointPolicy, EndpointPurpose, EndpointRole,
+        IdentityEvidenceRequirement, LimitProfile, Locality, NoiseProfile, PurposeClass,
+        ServicePackage, TransportBinding, TransportClass,
+    };
+    EndpointPolicy {
+        purpose: EndpointPurpose::SensitiveCredential,
+        purpose_class: PurposeClass::Enrolled,
+        initiator_role: EndpointRole::Provider,
+        responder_role: EndpointRole::GuestAgent,
+        service: ServicePackage::CredentialV3,
+        schema_fingerprint: [0x55; 32],
+        noise_profile: NoiseProfile::Kk25519ChaChaPolySha256,
+        limits: LimitProfile::local_default(),
+        transport_binding: TransportBinding {
+            transport: TransportClass::InheritedSocketpair,
+            locality: Locality::GuestLocal,
+            channel_binding: [0x56; 32],
+            identity_evidence: IdentityEvidenceRequirement::EnrolledStaticKeys,
+        },
+        reconnect_generation,
+        attachment_policy: AttachmentPolicy {
+            kind: d2b_contracts_zone_session::v3::component_session::AttachmentPolicyKind::PacketAtomic,
+            max_per_packet: 1,
+            max_per_request: 1,
+            max_per_operation: 1,
+            max_per_session: 1,
+            credentials_allowed: false,
+        },
+    }
+}
+
 #[cfg(feature = "host-socket")]
 pub use adapter::{
     DescriptorPolicyResolver, NoopUnixTransportObserver, OwnedUnixAttachment, PathnamePeerVerifier,

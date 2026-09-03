@@ -28,6 +28,7 @@ rustix.workspace = true
 tokio = { workspace = true, optional = true, features = ["io-util", "net"] }
 tokio-vsock = { version = "0.7.2", optional = true }
 uapi = "0.2"
+zeroize = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "test-util", "time"] }

@@ -51,7 +51,7 @@ impl ProcessLaunchRequest {
         let count = u16::try_from(inherited_fds.len())
             .map_err(|_| ProcessConformanceError::InvalidTicket)?;
         let expected = request.ticket().inherited_fd_table().count();
-        let broker_escrowed_controller = count == 2 && expected == 1;
+        let broker_escrowed_controller = expected > 0 && count == expected + 1;
         if count > MAX_INHERITED_FDS || (count != expected && !broker_escrowed_controller) {
             return Err(ProcessConformanceError::InvalidTicket);
         }

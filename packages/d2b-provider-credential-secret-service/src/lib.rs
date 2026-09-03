@@ -27,8 +27,9 @@ use d2b_contracts_provider::v3::credential::{
 };
 use d2b_contracts_resource::v3::{ResourceGeneration, ResourceRef, ZoneId};
 use d2b_provider_toolkit::{
-    AuthenticatedSessionRouteBinding, ProviderFd10Spec, ProviderRuntimeError,
-    RouteCredentialAuthorization, run_from_fd10 as run_provider_from_fd10,
+    AuthenticatedSessionRouteBinding, GuestCredentialBackend, GuestCredentialBackendResponse,
+    ProviderFd10Spec, ProviderRuntimeError, RouteCredentialAuthorization,
+    run_from_fd10 as run_provider_from_fd10,
 };
 
 pub use controller::{
@@ -91,6 +92,7 @@ pub fn controller_binary_entrypoint() -> i32 {
 
 fn runtime_provider(
     route: &AuthenticatedSessionRouteBinding,
+    backend: Arc<GuestCredentialBackend>,
 ) -> Result<
     (
         Arc<SecretServiceCredentialProvider>,
@@ -105,15 +107,18 @@ fn runtime_provider(
     let execution_ref = route
         .context()
         .execution_ref()
+        .filter(|reference| reference.resource_type().as_str() == "Guest")
         .cloned()
         .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
-    let user_ref = ResourceRef::parse("User/provider-controller")
-        .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let user_ref = route.subject_ref().clone();
+    if user_ref.resource_type().as_str() != "User" {
+        return Err(ProviderRuntimeError::SessionUnauthenticated);
+    }
     let placement = SecretServicePlacement::new(
         route.zone().clone(),
         PlacementBinding::UserAgent,
         execution_ref,
-        user_ref,
+        user_ref.clone(),
     )
     .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
     let config = SecretServiceConfig::new(
@@ -122,11 +127,16 @@ fn runtime_provider(
         LockPolicy::FailClosed,
     )
     .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?;
+    let collection_alias = config.collection_alias().to_owned();
     let provider = SecretServiceCredentialProviderFactory::new(
         config,
         placement,
         Some(provider_ref),
-        Arc::new(UnavailableSecretServicePort),
+        Arc::new(GuestSecretServicePort {
+            backend,
+            collection_alias,
+            user_ref,
+        }),
     )
     .map_err(|_| ProviderRuntimeError::SessionUnauthenticated)?
     .with_generation(
@@ -139,40 +149,169 @@ fn runtime_provider(
     Ok((Arc::new(provider), Arc::new(RouteCredentialAuthorization)))
 }
 
-struct UnavailableSecretServicePort;
+struct GuestSecretServicePort {
+    backend: Arc<GuestCredentialBackend>,
+    collection_alias: String,
+    user_ref: ResourceRef,
+}
 
-impl Oo7SecretServicePort for UnavailableSecretServicePort {
+impl Oo7SecretServicePort for GuestSecretServicePort {
     fn state(&self) -> SecretServiceFuture<'_, SecretServiceState> {
-        Box::pin(async { Ok(SecretServiceState::Locked) })
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "collectionAlias": self.collection_alias,
+            "userRef": self.user_ref.to_canonical_string(),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("secret-service.state", fields)
+                .await
+                .map_err(|_| SecretServicePortError::Unavailable)?;
+            Ok(match response.state() {
+                Some("unlocked") => SecretServiceState::Unlocked,
+                _ => SecretServiceState::Locked,
+            })
+        })
     }
 
     fn issue_lease(
         &self,
-        _request: &SecretServiceLeaseRequest,
+        request: &SecretServiceLeaseRequest,
     ) -> SecretServiceFuture<'_, SecretServiceLeaseGrant> {
-        Box::pin(async { Err(SecretServicePortError::Unavailable) })
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "collectionAlias": self.collection_alias,
+            "userRef": self.user_ref.to_canonical_string(),
+            "credentialRef": request.credential_ref().to_canonical_string(),
+            "operationId": request.operation_id(),
+            "idempotencyKey": request.idempotency_key(),
+            "requestedExpiryUnixMs": request.requested_expiry_unix_ms(),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("secret-service.issue-lease", fields)
+                .await
+                .map_err(|_| SecretServicePortError::Unavailable)?;
+            secret_service_grant(response)
+        })
     }
 
     fn inspect_lease(
         &self,
-        _lease: &SecretServiceLeaseRef,
+        lease: &SecretServiceLeaseRef,
     ) -> SecretServiceFuture<'_, SecretServiceLeaseInspection> {
-        Box::pin(async { Err(SecretServicePortError::Unavailable) })
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "collectionAlias": self.collection_alias,
+            "userRef": self.user_ref.to_canonical_string(),
+            "credentialRef": lease.credential_ref().to_canonical_string(),
+            "leaseHandle": lease.metadata().lease_handle.as_opaque_str(),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("secret-service.inspect-lease", fields)
+                .await
+                .map_err(|_| SecretServicePortError::Unavailable)?;
+            secret_service_inspection(response)
+        })
     }
 
     fn refresh_lease(
         &self,
-        _lease: &SecretServiceLeaseRef,
+        lease: &SecretServiceLeaseRef,
     ) -> SecretServiceFuture<'_, SecretServiceLeaseRenewal> {
-        Box::pin(async { Err(SecretServicePortError::Unavailable) })
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "collectionAlias": self.collection_alias,
+            "userRef": self.user_ref.to_canonical_string(),
+            "credentialRef": lease.credential_ref().to_canonical_string(),
+            "leaseHandle": lease.metadata().lease_handle.as_opaque_str(),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("secret-service.refresh-lease", fields)
+                .await
+                .map_err(|_| SecretServicePortError::Unavailable)?;
+            secret_service_grant(response)
+        })
     }
 
     fn revoke_lease(
         &self,
-        _lease: &SecretServiceLeaseRef,
+        lease: &SecretServiceLeaseRef,
     ) -> SecretServiceFuture<'_, SecretServiceLeaseRevocation> {
-        Box::pin(async { Err(SecretServicePortError::Unavailable) })
+        let backend = Arc::clone(&self.backend);
+        let fields = serde_json::json!({
+            "collectionAlias": self.collection_alias,
+            "userRef": self.user_ref.to_canonical_string(),
+            "credentialRef": lease.credential_ref().to_canonical_string(),
+            "leaseHandle": lease.metadata().lease_handle.as_opaque_str(),
+        });
+        Box::pin(async move {
+            let response = backend
+                .request("secret-service.revoke-lease", fields)
+                .await
+                .map_err(|_| SecretServicePortError::Unavailable)?;
+            match response.outcome() {
+                Some("revoked") => Ok(SecretServiceLeaseRevocation::Revoked),
+                Some("already-revoked") => Ok(SecretServiceLeaseRevocation::AlreadyRevoked),
+                _ => Err(SecretServicePortError::Unavailable),
+            }
+        })
     }
+}
+
+fn secret_service_grant(
+    mut response: GuestCredentialBackendResponse,
+) -> Result<SecretServiceLeaseGrant, SecretServicePortError> {
+    response.clear_bytes();
+    Ok(SecretServiceLeaseGrant {
+        lease_handle: CredentialLeaseHandle::parse(
+            response
+                .lease_handle()
+                .ok_or(SecretServicePortError::Unavailable)?,
+        )
+        .map_err(|_| SecretServicePortError::Unavailable)?,
+        source_version: CredentialSourceVersion::parse(
+            response
+                .source_version()
+                .ok_or(SecretServicePortError::Unavailable)?,
+        )
+        .map_err(|_| SecretServicePortError::Unavailable)?,
+        rotation_generation: response
+            .rotation_generation()
+            .ok_or(SecretServicePortError::Unavailable)?,
+        expires_at_unix_ms: response
+            .expires_at_unix_ms()
+            .ok_or(SecretServicePortError::Unavailable)?,
+    })
+}
+
+fn secret_service_inspection(
+    response: GuestCredentialBackendResponse,
+) -> Result<SecretServiceLeaseInspection, SecretServicePortError> {
+    let state = match response.state() {
+        Some("active") => CredentialLeaseState::Active,
+        Some("expired") => CredentialLeaseState::Expired,
+        Some("revoked") => CredentialLeaseState::Revoked,
+        Some("unknown") => CredentialLeaseState::Unknown,
+        _ => return Err(SecretServicePortError::Unavailable),
+    };
+    Ok(SecretServiceLeaseInspection {
+        state,
+        source_version: CredentialSourceVersion::parse(
+            response
+                .source_version()
+                .ok_or(SecretServicePortError::Unavailable)?,
+        )
+        .map_err(|_| SecretServicePortError::Unavailable)?,
+        rotation_generation: response
+            .rotation_generation()
+            .ok_or(SecretServicePortError::Unavailable)?,
+        expires_at_unix_ms: response
+            .expires_at_unix_ms()
+            .ok_or(SecretServicePortError::Unavailable)?,
+    })
 }
 
 /// A boxed asynchronous result returned by the injected port.
@@ -994,7 +1133,10 @@ impl SecretServiceCredentialProvider {
         };
         let subject = session.authenticated_subject();
         authorization.authenticated_subject_context() == Some(subject)
-            && subject.subject_ref().to_canonical_string() == PROVIDER_REF
+            && matches!(
+                subject.subject_ref().resource_type().as_str(),
+                "Provider" | "User"
+            )
             && subject
                 .provider_ref()
                 .is_some_and(|provider| provider.to_canonical_string() == PROVIDER_REF)
@@ -1116,7 +1258,7 @@ impl SecretServiceCredentialProvider {
             })
     }
 
-    pub(crate) fn poll_port<T>(
+    pub(crate) fn poll_port<T: Send>(
         future: SecretServiceFuture<'_, T>,
         deadline: Instant,
     ) -> Result<T, CredentialServiceError> {
@@ -1128,10 +1270,35 @@ impl SecretServiceCredentialProvider {
         })
     }
 
-    pub(crate) fn poll_port_raw<T>(
+    pub(crate) fn poll_port_raw<T: Send>(
         mut future: SecretServiceFuture<'_, T>,
         deadline: Instant,
     ) -> Result<T, SecretServicePollError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(SecretServicePollError::Deadline)?;
+            return std::thread::scope(|scope| {
+                let task = scope.spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|_| SecretServicePollError::Deadline)?;
+                    runtime.block_on(async {
+                        tokio::time::timeout(remaining, future)
+                            .await
+                            .map_err(|_| SecretServicePollError::Deadline)?
+                            .map_err(SecretServicePollError::Port)
+                    })
+                });
+                match task.join() {
+                    Ok(result) => result,
+                    Err(_) => Err(SecretServicePollError::Port(
+                        SecretServicePortError::CompletionUnknown,
+                    )),
+                }
+            });
+        }
         struct ThreadWake(Thread);
         impl Wake for ThreadWake {
             fn wake(self: Arc<Self>) {

@@ -8785,6 +8785,7 @@ struct ControllerSession {
     binding: ControllerSessionBinding,
     ingress: BusIngress,
     driver: SessionDriverHandle,
+    _backend_endpoint: Option<Arc<std::os::fd::OwnedFd>>,
     resource_client: Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>>,
     service_task: tokio::task::JoinHandle<Result<(), SessionServerError>>,
     assignments: BTreeMap<ResourceUid, ResourceClientLease>,
@@ -15838,6 +15839,7 @@ impl ControllerSessionCoordinator {
                     service_task,
                     _session_generation,
                     _route,
+                    _backend_endpoint,
                 ))) = setup.take()
                 {
                     let _ = driver
@@ -15854,7 +15856,15 @@ impl ControllerSessionCoordinator {
                 return Err(ResourceRuntimeError::AuthenticationUnavailable);
             }
             match setup.expect("controller setup result present") {
-                Ok((ingress, driver, resource_client, service_task, session_generation, route)) => {
+                Ok((
+                    ingress,
+                    driver,
+                    resource_client,
+                    service_task,
+                    session_generation,
+                    route,
+                    backend_endpoint,
+                )) => {
                     let current = self
                         .controller_context_is_current(&providers, &context)
                         .await
@@ -15895,6 +15905,7 @@ impl ControllerSessionCoordinator {
                         binding,
                         ingress,
                         driver: driver.clone(),
+                        _backend_endpoint: backend_endpoint,
                         resource_client,
                         service_task,
                         assignments: BTreeMap::new(),
@@ -16559,10 +16570,11 @@ impl ControllerSessionCoordinator {
             tokio::task::JoinHandle<Result<(), SessionServerError>>,
             ReconnectGeneration,
             d2b_session::AuthenticatedSessionRouteBinding,
+            Option<Arc<std::os::fd::OwnedFd>>,
         ),
         ResourceRuntimeError,
     > {
-        let (daemon_endpoint, context) = endpoint.into_parts();
+        let (daemon_endpoint, backend_endpoint, context) = endpoint.into_parts();
         let authentication_error = |stage: &'static str| {
             tracing::warn!(
                 zone = %self.zone.as_str(),
@@ -16759,6 +16771,7 @@ impl ControllerSessionCoordinator {
             service_task,
             session_generation,
             route,
+            backend_endpoint,
         ))
     }
 

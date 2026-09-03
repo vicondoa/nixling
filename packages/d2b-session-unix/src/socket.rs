@@ -84,7 +84,7 @@ impl AncillaryCapacity {
 }
 
 pub struct OutboundPacket {
-    payload: Vec<u8>,
+    payload: zeroize::Zeroizing<Vec<u8>>,
     files: Vec<Arc<OwnedFd>>,
     credentials: Option<PeerCredentials>,
     credits: CreditBundle,
@@ -126,7 +126,7 @@ impl OutboundPacket {
             .reserve(file_count)
             .map_err(|_| UnixSessionError::CreditExceeded)?;
         Ok(Self {
-            payload,
+            payload: zeroize::Zeroizing::new(payload),
             files,
             credentials,
             credits,

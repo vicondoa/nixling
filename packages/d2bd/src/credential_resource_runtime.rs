@@ -703,7 +703,11 @@ where
                 None,
                 None,
                 d2b_core_controller::MutationIntentKind::Create,
-                Some(managed_identity_agent_payload(resource)?),
+                Some(managed_identity_agent_payload_with_dependencies(
+                    resource,
+                    dependencies,
+                    &self.provider_ref,
+                )?),
             )
             .map_err(|_| CredentialResourceRuntimeError::InvalidResource)?;
             return ResourceMutationBatch::new(vec![mutation])
@@ -1318,8 +1322,25 @@ fn managed_identity_agent_ref(
     .map_err(|_| CredentialResourceRuntimeError::InvalidResource)
 }
 
+#[cfg(test)]
 fn managed_identity_agent_payload(
     resource: &ResourceSnapshot,
+) -> Result<Vec<u8>, CredentialResourceRuntimeError> {
+    managed_identity_agent_payload_inner(resource, None, None)
+}
+
+fn managed_identity_agent_payload_with_dependencies(
+    resource: &ResourceSnapshot,
+    dependencies: &[DependencySnapshot],
+    provider_ref: &ResourceRef,
+) -> Result<Vec<u8>, CredentialResourceRuntimeError> {
+    managed_identity_agent_payload_inner(resource, Some(dependencies), Some(provider_ref))
+}
+
+fn managed_identity_agent_payload_inner(
+    resource: &ResourceSnapshot,
+    dependencies: Option<&[DependencySnapshot]>,
+    provider_ref: Option<&ResourceRef>,
 ) -> Result<Vec<u8>, CredentialResourceRuntimeError> {
     let spec = credential_spec(resource)?;
     let execution_ref = credential_execution_ref(&spec)?.clone();
@@ -1409,8 +1430,23 @@ fn managed_identity_agent_payload(
         .ok_or(CredentialResourceRuntimeError::InvalidResource)?;
     process_spec.insert(
         "providerRef".to_owned(),
-        serde_json::Value::String("Provider/system-systemd".to_owned()),
+        serde_json::Value::String("Provider/system-minijail".to_owned()),
     );
+    let annotations = match (dependencies, provider_ref) {
+        (Some(dependencies), Some(provider_ref)) => {
+            let provider = dependencies
+                .iter()
+                .find(|dependency| dependency.resource().key().resource_ref() == provider_ref)
+                .ok_or(CredentialResourceRuntimeError::InvalidResource)?
+                .resource();
+            serde_json::json!({
+                "d2b.d2bus.org/controller-provider-ref": provider_ref.to_canonical_string(),
+                "d2b.d2bus.org/controller-provider-uid": provider.key().uid().as_str(),
+                "d2b.d2bus.org/controller-provider-generation": provider.generation().get(),
+            })
+        }
+        _ => serde_json::json!({}),
+    };
     let child_ref = managed_identity_agent_ref(resource)?;
     let value = serde_json::json!({
         "apiVersion": "resources.d2bus.org/v3",
@@ -1420,6 +1456,7 @@ fn managed_identity_agent_payload(
             "zone": resource.key().zone().as_str(),
             "ownerRef": resource.key().resource_ref().to_canonical_string(),
             "finalizers": [],
+            "annotations": annotations,
             "deletionRequestedAt": null,
             "createdAt": "1970-01-01T00:00:00.000Z",
             "updatedAt": "1970-01-01T00:00:00.000Z",
@@ -1478,7 +1515,7 @@ fn managed_identity_agent_matches(
         && value
             .pointer("/spec/providerRef")
             .and_then(serde_json::Value::as_str)
-            == Some("Provider/system-systemd")
+            == Some("Provider/system-minijail")
         && value
             .pointer("/spec/template")
             .and_then(serde_json::Value::as_str)
@@ -3436,7 +3473,7 @@ mod tests {
             value["spec"]["executionRef"],
             "Guest/gateway"
         );
-        assert_eq!(value["spec"]["providerRef"], "Provider/system-systemd");
+        assert_eq!(value["spec"]["providerRef"], "Provider/system-minijail");
         assert_eq!(value["spec"]["processClass"], "service");
         assert_eq!(
             value["spec"]["template"],

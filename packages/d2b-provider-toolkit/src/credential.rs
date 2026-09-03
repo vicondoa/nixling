@@ -6,12 +6,18 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use d2b_contracts_provider::v3::credential::{
-    CredentialAuthorization, CredentialMethod, CredentialProvider, CredentialRequest,
-    CredentialResponse, CredentialServiceError, CredentialServiceErrorCode,
-    CredentialSessionBinding, DeliveryResponse, MetadataResponse, decode_outer,
-    dispatch_authorized_provider, encode_outer,
+    AudienceToken, CredentialAuthorization, CredentialMethod, CredentialProvider,
+    CredentialRequest, CredentialResponse, CredentialServiceError, CredentialServiceErrorCode,
+    CredentialSessionBinding, DeliveryResponse, DeliveryRouteDigest, DeliverySessionParams,
+    MetadataResponse, MAX_DELIVERY_RECORD_BYTES, decode_outer, dispatch_authorized_provider,
+    encode_outer,
+};
+use d2b_contracts_resource::v3::{
+    ControllerGeneration, ResourceGeneration, ResourceUid,
 };
 use d2b_session::{AuthenticatedComponentSession, AuthenticatedSessionRouteBinding, Cancellation};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     ProviderAdmission, ProviderEntrypoint, ProviderRuntimeError, ProviderSessionAdmission,
@@ -29,6 +35,18 @@ pub trait CredentialAuthorizationSource: Send + Sync + 'static {
         request: &CredentialRequest,
         route: &AuthenticatedSessionRouteBinding,
     ) -> Result<CredentialAuthorization, CredentialServiceError>;
+
+    /// Build authorization with the exact non-secret Resource metadata
+    /// supplied by the authenticated ResourceService request.
+    fn authorize_with_metadata(
+        &self,
+        method: CredentialMethod,
+        request: &CredentialRequest,
+        route: &AuthenticatedSessionRouteBinding,
+        _metadata: &CredentialRequestMetadata,
+    ) -> Result<CredentialAuthorization, CredentialServiceError> {
+        self.authorize(method, request, route)
+    }
 }
 
 /// Default authorization source for metadata and revocation operations.
@@ -55,6 +73,93 @@ impl CredentialAuthorizationSource for RouteCredentialAuthorization {
         CredentialAuthorization::new_for_subject(method, None, route.context().clone())?
             .with_authenticated_session(session)
     }
+
+    fn authorize_with_metadata(
+        &self,
+        method: CredentialMethod,
+        request: &CredentialRequest,
+        route: &AuthenticatedSessionRouteBinding,
+        metadata: &CredentialRequestMetadata,
+    ) -> Result<CredentialAuthorization, CredentialServiceError> {
+        let session =
+            CredentialSessionBinding::new(route.context().clone(), request.deadline_unix_ms())?;
+        let delivery = if method.requires_delivery() {
+            let provider_ref = route.provider_ref().cloned().ok_or_else(|| {
+                CredentialServiceError::new(CredentialServiceErrorCode::OperationDenied)
+            })?;
+            let expiry = request.requested_expiry_unix_ms();
+            Some(DeliverySessionParams::new(
+                request.credential_ref().clone(),
+                metadata.credential_uid.clone(),
+                metadata.credential_generation,
+                provider_ref,
+                metadata.provider_generation,
+                AudienceToken::parse("guest-local").map_err(|_| {
+                    CredentialServiceError::new(CredentialServiceErrorCode::InvariantFailure)
+                })?,
+                method.operation_class(),
+                expiry,
+                request.deadline_unix_ms(),
+                delivery_route_digest(route, request, metadata),
+                MAX_DELIVERY_RECORD_BYTES as u32,
+                next_delivery_sequence(),
+            )?)
+        } else {
+            None
+        };
+        CredentialAuthorization::new_for_subject(method, delivery, route.context().clone())?
+            .with_authenticated_session(session)
+    }
+}
+
+/// Exact non-secret Resource metadata bound into one Credential request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialRequestMetadata {
+    /// Credential UID.
+    pub credential_uid: ResourceUid,
+    /// Credential resource generation.
+    pub credential_generation: ResourceGeneration,
+    /// Provider component generation.
+    pub provider_generation: ResourceGeneration,
+    /// Controller generation.
+    pub controller_generation: ControllerGeneration,
+}
+
+static NEXT_DELIVERY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn next_delivery_sequence() -> u64 {
+    NEXT_DELIVERY_SEQUENCE.fetch_add(1, Ordering::Relaxed).max(1)
+}
+
+fn delivery_route_digest(
+    route: &AuthenticatedSessionRouteBinding,
+    request: &CredentialRequest,
+    metadata: &CredentialRequestMetadata,
+) -> DeliveryRouteDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"d2b:v3:credential-delivery-route");
+    digest.update([0]);
+    digest.update(route.zone().as_str().as_bytes());
+    digest.update([0]);
+    route
+        .provider_ref()
+        .into_iter()
+        .for_each(|provider| digest.update(provider.to_canonical_string().as_bytes()));
+    digest.update([0]);
+    digest.update(request.credential_ref().to_canonical_string().as_bytes());
+    digest.update([0]);
+    digest.update(metadata.credential_uid.as_str().as_bytes());
+    digest.update(metadata.credential_generation.get().to_be_bytes());
+    digest.update(metadata.provider_generation.get().to_be_bytes());
+    digest.update(metadata.controller_generation.get().to_be_bytes());
+    digest.update(request.operation_id().as_bytes());
+    let digest: [u8; 32] = digest.finalize().into();
+    let digest_hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    DeliveryRouteDigest::parse(format!("sha256:{digest_hex}"))
+        .expect("SHA-256 route digest is valid")
 }
 
 struct CredentialMethodHandler<P, A> {
@@ -84,26 +189,15 @@ where
             .route
             .provider_ref()
             .map(d2b_contracts_resource::v3::ResourceRef::to_canonical_string);
+        let metadata = request_metadata(&request)?;
         if metadata_value(&request, "d2b.credential.zone") != Some(self.route.zone().as_str())
             || metadata_value(&request, "d2b.credential.provider")
                 != expected_provider.as_deref()
             || metadata_value(&request, "d2b.credential.session-generation")
                 .and_then(|value| value.parse::<u64>().ok())
                 != Some(self.route.reconnect_generation().get())
-            || metadata_value(&request, "d2b.credential.uid")
-                .and_then(|value| {
-                    d2b_contracts_resource::v3::ResourceUid::parse(value.to_owned()).ok()
-                })
-                .is_none()
-            || metadata_value(&request, "d2b.credential.generation")
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_none_or(|value| value == 0)
-            || metadata_value(&request, "d2b.credential.provider-generation")
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_none_or(|value| value == 0)
-            || metadata_value(&request, "d2b.credential.controller-generation")
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_none_or(|value| value == 0)
+            || self.route.provider_generation() != Some(metadata.provider_generation)
+            || self.route.controller_generation() != Some(metadata.controller_generation)
         {
             return Err(rpc_error(CredentialServiceError::new(
                 CredentialServiceErrorCode::OperationDenied,
@@ -112,7 +206,7 @@ where
         let request = decode_outer::<CredentialRequest>(&request.payload).map_err(rpc_error)?;
         let authorization = self
             .authorizer
-            .authorize(self.method, &request, &self.route)
+            .authorize_with_metadata(self.method, &request, &self.route, &metadata)
             .map_err(rpc_error)?;
         let response = dispatch_authorized_provider(
             self.provider.as_ref(),
@@ -145,6 +239,56 @@ fn metadata_value<'a>(request: &'a ttrpc::Request, key: &str) -> Option<&'a str>
         .iter()
         .find(|value| value.key == key)
         .map(|value| value.value.as_str())
+}
+
+fn request_metadata(
+    request: &ttrpc::Request,
+) -> Result<CredentialRequestMetadata, ttrpc::Error> {
+    let parse = |key: &str| {
+        metadata_value(request, key).ok_or_else(|| {
+            rpc_error(CredentialServiceError::new(
+                CredentialServiceErrorCode::OperationDenied,
+            ))
+        })
+    };
+    let parse_u64 = |key: &str| {
+        parse(key)?.parse::<u64>().map_err(|_| {
+            rpc_error(CredentialServiceError::new(
+                CredentialServiceErrorCode::OperationDenied,
+            ))
+        })
+    };
+    Ok(CredentialRequestMetadata {
+        credential_uid: ResourceUid::parse(parse("d2b.credential.uid")?.to_owned()).map_err(
+            |_| {
+                rpc_error(CredentialServiceError::new(
+                    CredentialServiceErrorCode::OperationDenied,
+                ))
+            },
+        )?,
+        credential_generation: ResourceGeneration::new(parse_u64("d2b.credential.generation")?)
+            .map_err(|_| {
+                rpc_error(CredentialServiceError::new(
+                    CredentialServiceErrorCode::OperationDenied,
+                ))
+            })?,
+        provider_generation: ResourceGeneration::new(parse_u64(
+            "d2b.credential.provider-generation",
+        )?)
+        .map_err(|_| {
+            rpc_error(CredentialServiceError::new(
+                CredentialServiceErrorCode::OperationDenied,
+            ))
+        })?,
+        controller_generation: ControllerGeneration::new(parse_u64(
+            "d2b.credential.controller-generation",
+        )?)
+        .map_err(|_| {
+            rpc_error(CredentialServiceError::new(
+                CredentialServiceErrorCode::OperationDenied,
+            ))
+        })?,
+    })
 }
 
 /// Build the typed Credential service map for an authenticated route.
@@ -375,6 +519,40 @@ mod tests {
             .get("RevokeToken")
             .unwrap();
         assert!(method.handler(test_context(), request()).await.is_err());
+    }
+
+    #[test]
+    fn route_authorization_builds_a_bounded_delivery_binding() {
+        let route = route(false);
+        let request = CredentialRequest::new(
+            ResourceRef::parse("Credential/example").unwrap(),
+            "acquire-operation",
+            "acquire-idempotency",
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        let metadata = CredentialRequestMetadata {
+            credential_uid: ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap(),
+            credential_generation: ResourceGeneration::new(2).unwrap(),
+            provider_generation: ResourceGeneration::new(1).unwrap(),
+            controller_generation: ControllerGeneration::new(1).unwrap(),
+        };
+        let authorization = RouteCredentialAuthorization
+            .authorize_with_metadata(
+                CredentialMethod::AcquireToken,
+                &request,
+                &route,
+                &metadata,
+            )
+            .unwrap();
+        let delivery = authorization.delivery_session_params().unwrap();
+        assert_eq!(delivery.credential_uid(), &metadata.credential_uid);
+        assert_eq!(
+            delivery.consumer_component_generation(),
+            metadata.provider_generation
+        );
+        assert!(delivery.max_token_bytes() as usize <= MAX_DELIVERY_RECORD_BYTES);
     }
 
     fn test_context() -> ttrpc::r#async::TtrpcContext {

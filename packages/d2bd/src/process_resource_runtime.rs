@@ -473,6 +473,18 @@ impl ProcessResourceRuntime {
             self.target_ref.as_ref(),
         );
         let owner_ref = record.owner_ref();
+        let controller_provider_ref = metadata_resource_ref(
+            &record.resource,
+            "d2b.d2bus.org/controller-provider-ref",
+        );
+        let controller_provider_uid = metadata_resource_uid(
+            &record.resource,
+            "d2b.d2bus.org/controller-provider-uid",
+        );
+        let controller_provider_generation = metadata_resource_generation(
+            &record.resource,
+            "d2b.d2bus.org/controller-provider-generation",
+        );
         ProcessResourceContext::new(
             self.zone.clone(),
             &record.resource.resource_ref,
@@ -498,14 +510,20 @@ impl ProcessResourceRuntime {
                 .and_then(|owner| self.owner_uids.get(owner))
                 .cloned(),
         )
+        .with_controller_provider_ref(controller_provider_ref)
         .with_guest_descriptor_digest(
             owner_ref
                 .as_ref()
                 .and_then(|owner| self.guest_descriptor_digests.get(owner)),
         )
         .with_provider_identity(
-            record.controller_provider_uid.as_ref(),
-            record.controller_provider_generation,
+            record
+                .controller_provider_uid
+                .as_ref()
+                .or(controller_provider_uid.as_ref()),
+            record
+                .controller_provider_generation
+                .or(controller_provider_generation),
         )
     }
 
@@ -2221,6 +2239,38 @@ fn metadata_value(resource: &StoredResource, key: &str) -> Option<CanonicalJsonV
         return None;
     };
     metadata.get(key).cloned()
+}
+
+fn metadata_annotation(resource: &StoredResource, key: &str) -> Option<String> {
+    let value = CanonicalJsonValue::parse(&resource.canonical_json).ok()?;
+    let CanonicalJsonValue::Object(root) = value else {
+        return None;
+    };
+    let CanonicalJsonValue::Object(metadata) = root.get("metadata")? else {
+        return None;
+    };
+    let CanonicalJsonValue::Object(annotations) = metadata.get("annotations")? else {
+        return None;
+    };
+    match annotations.get(key) {
+        Some(CanonicalJsonValue::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn metadata_resource_ref(resource: &StoredResource, key: &str) -> Option<ResourceRef> {
+    ResourceRef::parse(&metadata_annotation(resource, key)?).ok()
+}
+
+fn metadata_resource_uid(resource: &StoredResource, key: &str) -> Option<ResourceUid> {
+    ResourceUid::parse(&metadata_annotation(resource, key)?).ok()
+}
+
+fn metadata_resource_generation(
+    resource: &StoredResource,
+    key: &str,
+) -> Option<ResourceGeneration> {
+    ResourceGeneration::new(metadata_annotation(resource, key)?.parse().ok()?).ok()
 }
 
 fn status_phase(resource: &StoredResource) -> Option<ResourcePhase> {

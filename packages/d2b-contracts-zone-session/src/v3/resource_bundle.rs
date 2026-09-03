@@ -203,7 +203,11 @@ impl<'de> Deserialize<'de> for BundleResource {
     }
 }
 
-/// Private binding from a generic controller Process template to the signed
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Private binding from a generic supervised Process template to the signed
 /// Provider package executable.
 ///
 /// This metadata is carried by the integrity-pinned private Zone bundle, not
@@ -220,6 +224,8 @@ pub struct ProcessTemplateBinding {
     binary_ref: BinaryRef,
     artifact_digest: ArtifactDigest,
     binary_path: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    dynamic: bool,
 }
 
 impl ProcessTemplateBinding {
@@ -234,6 +240,58 @@ impl ProcessTemplateBinding {
         binary_ref: BinaryRef,
         artifact_digest: ArtifactDigest,
         binary_path: impl Into<String>,
+    ) -> Result<Self, ResourceBundleError> {
+        Self::new_inner(
+            process_ref,
+            owner_ref,
+            execution_ref,
+            template,
+            artifact_id,
+            binary_ref,
+            artifact_digest,
+            binary_path,
+            false,
+        )
+    }
+
+    /// Construct a private Provider component template for a
+    /// controller-created Process that is intentionally absent from the
+    /// declarative bundle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_dynamic(
+        process_ref: ResourceRef,
+        owner_ref: ResourceRef,
+        execution_ref: ResourceRef,
+        template: BoundedToken,
+        artifact_id: ArtifactId,
+        binary_ref: BinaryRef,
+        artifact_digest: ArtifactDigest,
+        binary_path: impl Into<String>,
+    ) -> Result<Self, ResourceBundleError> {
+        Self::new_inner(
+            process_ref,
+            owner_ref,
+            execution_ref,
+            template,
+            artifact_id,
+            binary_ref,
+            artifact_digest,
+            binary_path,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        process_ref: ResourceRef,
+        owner_ref: ResourceRef,
+        execution_ref: ResourceRef,
+        template: BoundedToken,
+        artifact_id: ArtifactId,
+        binary_ref: BinaryRef,
+        artifact_digest: ArtifactDigest,
+        binary_path: impl Into<String>,
+        dynamic: bool,
     ) -> Result<Self, ResourceBundleError> {
         let binary_path = binary_path.into();
         if process_ref.resource_type().as_str() != "Process"
@@ -259,6 +317,7 @@ impl ProcessTemplateBinding {
             binary_ref,
             artifact_digest,
             binary_path,
+            dynamic,
         })
     }
 
@@ -301,6 +360,11 @@ impl ProcessTemplateBinding {
     pub fn binary_path(&self) -> &str {
         &self.binary_path
     }
+
+    /// Whether this binding is for a controller-created Process.
+    pub const fn is_dynamic(&self) -> bool {
+        self.dynamic
+    }
 }
 
 impl core::fmt::Debug for ProcessTemplateBinding {
@@ -322,9 +386,11 @@ impl<'de> Deserialize<'de> for ProcessTemplateBinding {
             binary_ref: BinaryRef,
             artifact_digest: ArtifactDigest,
             binary_path: String,
+            #[serde(default)]
+            dynamic: bool,
         }
         let wire = Wire::deserialize(deserializer)?;
-        Self::new(
+        Self::new_inner(
             wire.process_ref,
             wire.owner_ref,
             wire.execution_ref,
@@ -333,6 +399,7 @@ impl<'de> Deserialize<'de> for ProcessTemplateBinding {
             wire.binary_ref,
             wire.artifact_digest,
             wire.binary_path,
+            wire.dynamic,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -546,16 +613,10 @@ impl ResourceBundle {
             if !process_refs.insert(binding.process_ref()) {
                 return Err(ResourceBundleError::DuplicateProcessTemplate);
             }
-            let Some(resource) = resources.get(binding.process_ref()) else {
-                return Err(ResourceBundleError::ProcessTemplateMismatch);
-            };
             let Some(owner) = resources.get(binding.owner_ref()) else {
                 return Err(ResourceBundleError::ProcessTemplateMismatch);
             };
-            if resource.resource_type().as_str() != "Process"
-                || resource.metadata().owner_ref() != Some(binding.owner_ref())
-                || owner.resource_type().as_str() != "Provider"
-            {
+            if owner.resource_type().as_str() != "Provider" {
                 return Err(ResourceBundleError::ProcessTemplateMismatch);
             }
             let CanonicalJsonValue::String(owner_artifact_id) = owner
@@ -566,6 +627,31 @@ impl ResourceBundle {
                 return Err(ResourceBundleError::ProcessTemplateMismatch);
             };
             if owner_artifact_id != binding.artifact_id().as_str() {
+                return Err(ResourceBundleError::ProcessTemplateMismatch);
+            }
+            if binding.is_dynamic() {
+                if binding.owner_ref().to_canonical_string()
+                    != "Provider/credential-managed-identity"
+                    || binding.template().as_str() != "d2b-managed-identity-agent"
+                    || !binding
+                        .process_ref()
+                        .name()
+                        .as_str()
+                        .starts_with("d2b-mi-agent-template-")
+                    || !resources.keys().any(|resource_ref| {
+                        resource_ref == binding.execution_ref()
+                    })
+                {
+                    return Err(ResourceBundleError::ProcessTemplateMismatch);
+                }
+                continue;
+            }
+            let Some(resource) = resources.get(binding.process_ref()) else {
+                return Err(ResourceBundleError::ProcessTemplateMismatch);
+            };
+            if resource.resource_type().as_str() != "Process"
+                || resource.metadata().owner_ref() != Some(binding.owner_ref())
+            {
                 return Err(ResourceBundleError::ProcessTemplateMismatch);
             }
             let CanonicalJsonValue::String(execution_ref) = resource
@@ -648,11 +734,12 @@ pub enum ResourceBundleError {
     UnsortedResources,
     /// The recorded content hash differs from the resource array.
     ContentHashMismatch,
-    /// A static Process template binding is malformed.
+    /// A Process template binding is malformed.
     InvalidProcessTemplate,
-    /// A static Process template binding is duplicated.
+    /// A Process template binding is duplicated.
     DuplicateProcessTemplate,
-    /// A static Process template binding does not match its Process resource.
+    /// A declarative Process template binding does not match its Process
+    /// resource.
     ProcessTemplateMismatch,
     /// A canonical rendering operation failed.
     CanonicalJsonEncode(d2b_contracts_resource::v3::resource_schema::CanonicalJsonError),
@@ -776,6 +863,49 @@ mod tests {
             .unwrap_err(),
             ResourceBundleError::InvalidProcessTemplate
         );
+    }
+
+    #[test]
+    fn dynamic_process_template_binding_does_not_require_a_bundle_process() {
+        let owner = BundleResource::new(
+            ResourceTypeName::parse("Provider").unwrap(),
+            BundleResourceMetadata::new(
+                ResourceName::parse("credential-managed-identity").unwrap(),
+                ZoneId::parse("dev").unwrap(),
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            CanonicalJsonObject::parse(br#"{"artifactId":"runtime"}"#).unwrap(),
+        )
+        .unwrap();
+        let binding = ProcessTemplateBinding::new_dynamic(
+            ResourceRef::parse("Process/d2b-mi-agent-template-guest-dev").unwrap(),
+            ResourceRef::parse("Provider/credential-managed-identity").unwrap(),
+            ResourceRef::parse("Guest/dev").unwrap(),
+            BoundedToken::parse("d2b-managed-identity-agent").unwrap(),
+            ArtifactId::parse("runtime").unwrap(),
+            BinaryRef::parse("d2b-managed-identity-agent").unwrap(),
+            ArtifactDigest::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
+            "/nix/store/runtime/bin/d2b-managed-identity-agent",
+        )
+        .unwrap();
+        let resources = vec![owner, resource("Guest", "dev")];
+        let content_hash = digest_resources(&resources).unwrap();
+        let bundle = ResourceBundle::new(
+            ZoneId::parse("dev").unwrap(),
+            resources,
+            content_hash,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            timestamp(),
+        )
+        .unwrap()
+        .with_process_templates(vec![binding])
+        .unwrap();
+        assert!(bundle.process_templates[0].is_dynamic());
+        let bytes = canonical_json_bytes(&bundle).unwrap();
+        assert!(ResourceBundle::from_json(&bytes).is_ok());
     }
 
     #[test]
