@@ -212,7 +212,8 @@ fn is_false(value: &bool) -> bool {
 ///
 /// This metadata is carried by the integrity-pinned private Zone bundle, not
 /// by the public Process resource spec. It is the runtime resolver's only
-/// executable binding for static Provider controller Processes.
+/// executable binding for Provider controller and controller-created
+/// component Processes.
 #[derive(Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProcessTemplateBinding {
@@ -445,7 +446,8 @@ pub struct ResourceBundle {
     pub integrity: BundleIntegrityPin,
     /// Sorted desired-state resources.
     pub resources: Vec<BundleResource>,
-    /// Private signed-package bindings for static controller Processes.
+    /// Private signed-package bindings for declarative and
+    /// controller-created Processes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub process_templates: Vec<ProcessTemplateBinding>,
     /// Stable generation timestamp supplied by the compiler.
@@ -520,7 +522,7 @@ impl ResourceBundle {
         self.zone_uid.as_ref()
     }
 
-    /// Attach private static Process template bindings to this bundle.
+    /// Attach private Process template bindings to this bundle.
     pub fn with_process_templates(
         mut self,
         mut process_templates: Vec<ProcessTemplateBinding>,
