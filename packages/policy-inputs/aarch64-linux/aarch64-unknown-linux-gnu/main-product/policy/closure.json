@@ -67,7 +67,7 @@
   "features": [],
   "default_features": true,
   "source_authority": "Cargo.lock",
-  "lock_sha256": "6684b9f85578b151ef0716077de68f0d41eb72ca0836c3da9a7b1fa32d6aed07",
+  "lock_sha256": "6c0f3db276c6a3217224ff3403dbbfd1b0ff50878f1d29ab1358aed2acf52b16",
   "packages": [
     {
       "id": "adler2@2.0.1#registry+https://github.com/rust-lang/crates.io-index",
@@ -4712,6 +4712,12 @@
       "target": null
     },
     {
+      "from": "d2b-provider-credential-entra@0.0.0-bootstrap#path",
+      "to": "tokio@1.53.1#registry+https://github.com/rust-lang/crates.io-index",
+      "kind": "normal",
+      "target": null
+    },
+    {
       "from": "d2b-provider-credential-managed-identity@0.0.0-bootstrap#path",
       "to": "d2b-contracts-provider@0.0.0-bootstrap#path",
       "kind": "normal",
@@ -4742,6 +4748,12 @@
       "target": null
     },
     {
+      "from": "d2b-provider-credential-managed-identity@0.0.0-bootstrap#path",
+      "to": "tokio@1.53.1#registry+https://github.com/rust-lang/crates.io-index",
+      "kind": "normal",
+      "target": null
+    },
+    {
       "from": "d2b-provider-credential-secret-service@0.0.0-bootstrap#path",
       "to": "d2b-contracts-provider@0.0.0-bootstrap#path",
       "kind": "normal",
@@ -4768,6 +4780,12 @@
     {
       "from": "d2b-provider-credential-secret-service@0.0.0-bootstrap#path",
       "to": "serde_json@1.0.151#registry+https://github.com/rust-lang/crates.io-index",
+      "kind": "normal",
+      "target": null
+    },
+    {
+      "from": "d2b-provider-credential-secret-service@0.0.0-bootstrap#path",
+      "to": "tokio@1.53.1#registry+https://github.com/rust-lang/crates.io-index",
       "kind": "normal",
       "target": null
     },
@@ -5697,6 +5715,12 @@
     },
     {
       "from": "d2b-provider-toolkit@0.0.0-bootstrap#path",
+      "to": "sha2@0.10.9#registry+https://github.com/rust-lang/crates.io-index",
+      "kind": "normal",
+      "target": null
+    },
+    {
+      "from": "d2b-provider-toolkit@0.0.0-bootstrap#path",
       "to": "tokio@1.53.1#registry+https://github.com/rust-lang/crates.io-index",
       "kind": "normal",
       "target": null
@@ -5704,6 +5728,12 @@
     {
       "from": "d2b-provider-toolkit@0.0.0-bootstrap#path",
       "to": "ttrpc@0.9.0#registry+https://github.com/rust-lang/crates.io-index",
+      "kind": "normal",
+      "target": null
+    },
+    {
+      "from": "d2b-provider-toolkit@0.0.0-bootstrap#path",
+      "to": "zeroize@1.9.0#registry+https://github.com/rust-lang/crates.io-index",
       "kind": "normal",
       "target": null
     },
@@ -6442,6 +6472,12 @@
     {
       "from": "d2b-session-unix@0.0.0-bootstrap#path",
       "to": "uapi@0.2.13#registry+https://github.com/rust-lang/crates.io-index",
+      "kind": "normal",
+      "target": null
+    },
+    {
+      "from": "d2b-session-unix@0.0.0-bootstrap#path",
+      "to": "zeroize@1.9.0#registry+https://github.com/rust-lang/crates.io-index",
       "kind": "normal",
       "target": null
     },

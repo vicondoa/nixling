@@ -894,6 +894,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "zeroize",
 ]
 
 
@@ -1389,6 +1390,7 @@ dependencies = [
  "rustix 0.38.44",
  "tokio",
  "tokio-vsock",
+ "zeroize",
 ]
 
 
