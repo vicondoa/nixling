@@ -2902,7 +2902,10 @@ async fn run_provider_failure_isolation(failure: ProviderWatchFailure) {
         ),
     }
 
-    drop(sources.remove(&failed_provider));
+    if let Some(failed_source) = sources.remove(&failed_provider) {
+        failed_source.close();
+        drop(failed_source);
+    }
     let watch_signals = fixture
         .store()
         .watch_signals()
