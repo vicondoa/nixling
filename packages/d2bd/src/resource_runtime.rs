@@ -4963,12 +4963,15 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
             return Err(SharedProviderEffectError::InvalidResource);
         }
         let runtime = self.runtime()?;
-        if let Some(identity) = runtime.interaction_identity.as_ref()
-            && (identity.wayland_session_ref() != resource.key().resource_ref()
-                || identity.wayland_session_uid() != resource.key().uid()
-                || identity.subject_ref() != spec.guest_ref()
-                || identity.host_execution_ref() != spec.host_ref()
-                || identity.user_ref() != spec.user_ref())
+        let identity = runtime
+            .interaction_identity
+            .as_ref()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        if identity.wayland_session_ref() != resource.key().resource_ref()
+            || identity.wayland_session_uid() != resource.key().uid()
+            || identity.subject_ref() != spec.guest_ref()
+            || identity.host_execution_ref() != spec.host_ref()
+            || identity.user_ref() != spec.user_ref()
         {
             return Err(SharedProviderEffectError::InvalidResource);
         }
@@ -7775,15 +7778,6 @@ async fn u9_provider_generations(
     let mut seen = BTreeSet::new();
     for registration in U9_SHARED_PROVIDER_RUNNERS {
         if !seen.insert(registration.provider_ref) {
-            active.extend(
-                U9_SHARED_PROVIDER_RUNNERS
-                    .iter()
-                    .copied()
-                    .filter(|candidate| {
-                        candidate.provider_ref == registration.provider_ref
-                            && candidate.resource_type == registration.resource_type
-                    }),
-            );
             continue;
         }
         let provider_ref = ResourceRef::parse(registration.provider_ref)

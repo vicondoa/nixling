@@ -3823,6 +3823,17 @@ pub async fn serve(options: ServeOptions) -> Result<(), TypedError> {
                                         error = ?error,
                                         "interaction and shell Provider runners refused during startup",
                                     );
+                                    if let Ok(mut slot) = state.resource_plane.lock() {
+                                        *slot = None;
+                                    }
+                                    if let Ok(mut owned_plane) = Arc::try_unwrap(plane) {
+                                        let _ = owned_plane.shutdown().await;
+                                    }
+                                    return Err(TypedError::InternalIo {
+                                        context: "start interaction and shell Provider runners"
+                                            .to_owned(),
+                                        detail: error.to_string(),
+                                    });
                                 }
                             }
                         }
