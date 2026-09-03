@@ -3812,31 +3812,6 @@ pub async fn serve(options: ServeOptions) -> Result<(), TypedError> {
                                 detail: "resource-plane state lock unavailable".to_owned(),
                             });
                         }
-                        for zone in plane.zone_ids() {
-                            if let Ok(resource) = plane.zone(&zone) {
-                                if let Err(error) = resource
-                                    .start_u9_controller_runners(Arc::new(state.clone()))
-                                    .await
-                                {
-                                    tracing::error!(
-                                        zone = %zone,
-                                        error = ?error,
-                                        "interaction and shell Provider runners refused during startup",
-                                    );
-                                    if let Ok(mut slot) = state.resource_plane.lock() {
-                                        *slot = None;
-                                    }
-                                    if let Ok(mut owned_plane) = Arc::try_unwrap(plane) {
-                                        let _ = owned_plane.shutdown().await;
-                                    }
-                                    return Err(TypedError::InternalIo {
-                                        context: "start interaction and shell Provider runners"
-                                            .to_owned(),
-                                        detail: error.to_string(),
-                                    });
-                                }
-                            }
-                        }
                         let mut runtimes = InteractionRuntime::new();
                         let mut listener_set: Option<
                             interaction_composition::InteractionListenerSet,
@@ -16815,6 +16790,22 @@ async fn open_resource_plane(
             }
             return Err(error);
         }
+        if let Err(error) = runtime
+            .start_u9_controller_runners(Arc::new(state.clone()))
+            .await
+        {
+            tracing::error!(
+                zone = %runtime.zone(),
+                error = ?error,
+                "interaction and shell Provider runners refused during startup",
+            );
+            let _ = runtime.shutdown().await;
+            let _ = plane.shutdown().await;
+            while let Some((_, runtime, _)) = remaining.next() {
+                let _ = runtime.shutdown().await;
+            }
+            return Err(error);
+        }
         let _ = runtime.audio_binding_statuses();
         if let Err(error) = runtime.require_ready() {
             let _ = runtime.shutdown().await;
@@ -17125,6 +17116,37 @@ mod zone_publication_order_tests {
         assert!(!arm.contains("tracing::warn!"));
         assert!(!arm.contains("degraded"));
         assert!(end < require_ready);
+    }
+
+    #[test]
+    fn u9_runners_attach_before_zone_readiness_and_publication() {
+        let full_source = include_str!("composition.rs");
+        let source = full_source
+            .split_once("async fn open_resource_plane")
+            .and_then(|(_, source)| source.split_once("const BROKER_AUDIT_EVIDENCE_PAGE_LIMIT"))
+            .map(|(source, _)| source)
+            .expect("resource-plane source span");
+        assert_eq!(
+            source.matches(".start_u9_controller_runners(").count(),
+            1,
+            "U9 must have one startup attach point in open_resource_plane"
+        );
+        let attach = source
+            .find(".start_u9_controller_runners(")
+            .expect("U9 runner attach");
+        let readiness = source
+            .find("if let Err(error) = runtime.require_ready()")
+            .expect("Zone readiness check");
+        let publication = source.find("match plane.insert(runtime)").expect("Zone publication");
+        assert!(attach < readiness);
+        assert!(attach < publication);
+
+        let serve_source = full_source
+            .split_once("pub async fn serve")
+            .and_then(|(_, source)| source.split_once("async fn open_resource_plane"))
+            .map(|(source, _)| source)
+            .expect("serve source span");
+        assert!(!serve_source.contains(".start_u9_controller_runners("));
     }
 }
 

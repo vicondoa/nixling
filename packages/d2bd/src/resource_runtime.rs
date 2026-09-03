@@ -29,11 +29,10 @@ use crate::ServerState;
 use d2b_contracts::types::{BundleOpId, VmId};
 use crate::audio_resource_runtime::{
     AUDIO_BINDING_TYPE, AudioBindingRuntimeStatus, AudioResourceRuntime, AudioResourceRuntimeError,
-    audio_binding_status_projection_with_status, audio_binding_status_value, list_audio_resources,
-    list_audio_snapshot,
+    audio_binding_status_projection_with_status,
 };
 use crate::binding_child_resource_runtime::{
-    OneOwnedChildProgress, OwnedChildOwner, reconcile_binding_children,
+    OneOwnedChildProgress, OwnedChildOwner,
     reconcile_one_guest_child,
 };
 use crate::process_resource_runtime::{
@@ -1769,6 +1768,41 @@ impl DaemonSharedProviderEffects {
             .ok_or(SharedProviderEffectError::Unavailable)
     }
 
+    async fn finalization_resource(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<StoredResource, SharedProviderEffectError> {
+        if !resource.canonical_json().is_empty() {
+            return Ok(stored_resource_from_snapshot(resource));
+        }
+        let stored = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: context.operation_id.clone(),
+                    idempotency_key: None,
+                    correlation_id: context.operation_id.clone(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: resource.key().resource_ref().clone(),
+                expected_uid: Some(resource.key().uid().clone()),
+                projection: StoreProjection::Full,
+            })
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if stored.zone != self.zone
+            || stored.resource_ref != *resource.key().resource_ref()
+            || stored.uid != *resource.key().uid()
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        Ok(stored)
+    }
+
     async fn usbip_service_port(
         &self,
         context: &SharedProviderEffectContext,
@@ -1846,28 +1880,32 @@ impl DaemonSharedProviderEffects {
     async fn finalize_u9(
         &self,
         kind: SharedProviderResourceKind,
-        _context: &SharedProviderEffectContext,
+        context: &SharedProviderEffectContext,
         resource: &ResourceSnapshot,
     ) -> Result<(), SharedProviderEffectError> {
         let runtime = self.runtime()?;
         match kind {
             SharedProviderResourceKind::DisplayWaylandPolicy => Ok(()),
             SharedProviderResourceKind::DisplayWaylandSession => {
-                    let envelope = ResourceEnvelope::from_json(resource.canonical_json())
-                        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-                    let _spec = serde_json::from_slice::<WaylandSessionSpec>(
-                        &envelope.spec().base().to_canonical_bytes(),
-                    )
+                let target = self
+                    .finalization_resource(&runtime, context, resource)
+                    .await?;
+                let envelope = ResourceEnvelope::from_json(&target.canonical_json)
                     .map_err(|_| SharedProviderEffectError::InvalidResource)?;
-                    let owner = crate::binding_child_resource_runtime::OwnedChildOwner {
-                        resource: stored_resource_from_snapshot(resource),
-                        desired: None,
-                        fenced: false,
-                    };
-                    let client = runtime
-                        .process_resource_client()
-                        .ok_or(SharedProviderEffectError::Unavailable)?;
-                    let converged = crate::binding_child_resource_runtime::reconcile_owned_children(
+                let _spec = serde_json::from_slice::<WaylandSessionSpec>(
+                    &envelope.spec().base().to_canonical_bytes(),
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let owner = crate::binding_child_resource_runtime::OwnedChildOwner {
+                    resource: target,
+                    desired: None,
+                    fenced: false,
+                };
+                let client = runtime
+                    .process_resource_client()
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let converged =
+                    crate::binding_child_resource_runtime::reconcile_owned_children(
                         &runtime.store,
                         &client,
                         &self.zone,
@@ -1875,80 +1913,53 @@ impl DaemonSharedProviderEffects {
                     )
                     .await
                     .map_err(|_| SharedProviderEffectError::Unavailable)?;
-                    if converged.contains(resource.key().resource_ref()) {
-                        Ok(())
-                    } else {
-                        Err(SharedProviderEffectError::Unavailable)
-                    }
+                if converged.contains(resource.key().resource_ref()) {
+                    Ok(())
+                } else {
+                    Err(SharedProviderEffectError::Unavailable)
+                }
             }
             SharedProviderResourceKind::AudioService => {
-                    let bindings = runtime
-                        .committed_resources_of_type(AUDIO_BINDING_TYPE)
-                        .await
-                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
-                    if bindings.iter().any(|binding| {
-                        !value_deletion_requested(binding)
-                            && binding
-                                .pointer("/spec/serviceRef")
-                                .and_then(Value::as_str)
-                                == Some(resource.key().resource_ref().to_canonical_string().as_str())
-                    }) {
-                        Err(SharedProviderEffectError::Unavailable)
-                    } else {
-                        Ok(())
-                    }
+                let bindings = runtime
+                    .committed_resources_of_type(AUDIO_BINDING_TYPE)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if bindings.iter().any(|binding| {
+                    binding
+                        .pointer("/spec/serviceRef")
+                        .and_then(Value::as_str)
+                        == Some(resource.key().resource_ref().to_canonical_string().as_str())
+                }) {
+                    Err(SharedProviderEffectError::Unavailable)
+                } else {
+                    Ok(())
+                }
             }
             SharedProviderResourceKind::AudioBinding => {
-                    runtime
-                        .reconcile_audio_resources(Arc::clone(&self.state))
-                        .await
+                let target = self
+                    .finalization_resource(&runtime, context, resource)
+                    .await?;
+                let owner = {
+                    let mut audio = runtime
+                        .audio_runtime
+                        .lock()
                         .map_err(|_| SharedProviderEffectError::Unavailable)?;
-                    let children =
-                        crate::binding_child_resource_runtime::list_binding_children(
-                            &runtime.store,
-                            &self.zone,
-                        )
-                        .await
-                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
-                    if children.iter().any(|child| {
-                        ResourceEnvelope::from_json(&child.canonical_json)
-                            .ok()
-                            .and_then(|envelope| envelope.metadata().owner_ref().cloned())
-                            == Some(resource.key().resource_ref().clone())
-                    }) {
-                        Err(SharedProviderEffectError::Unavailable)
-                    } else {
-                        Ok(())
-                    }
-            }
-            SharedProviderResourceKind::ShellPool => {
-                    let sessions = runtime
-                        .committed_resources_of_type("shell-terminal.d2bus.org.ShellSession")
-                        .await
-                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
-                    let pool_ref = resource.key().resource_ref().to_canonical_string();
-                    if sessions.iter().any(|session| {
-                        !value_deletion_requested(session)
-                            && session
-                                .pointer("/spec/poolRef")
-                                .and_then(Value::as_str)
-                                == Some(pool_ref.as_str())
-                    }) {
-                        Err(SharedProviderEffectError::Unavailable)
-                    } else {
-                        Ok(())
-                    }
-            }
-            SharedProviderResourceKind::ShellSession => {
-                    let owner = crate::binding_child_resource_runtime::OwnedChildOwner {
-                        resource: stored_resource_from_snapshot(resource),
-                        desired: None,
-                        fenced: false,
-                    };
-                    let client = runtime
-                        .process_resource_client()
-                        .ok_or(SharedProviderEffectError::Unavailable)?;
-                    let converged = crate::binding_child_resource_runtime::reconcile_owned_children(
+                    let registry = audio
+                        .get_or_insert_with(|| {
+                            AudioResourceRuntime::new(self.zone.clone(), self.state.clone())
+                        });
+                    registry
+                        .finalize_binding_resource(&target)
+                        .map_err(map_audio_effect_error)?;
+                    registry
+                        .child_owner_for(&target)
+                        .map_err(map_audio_effect_error)?
+                };
+                let client = runtime
+                    .process_resource_client()
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let converged =
+                    crate::binding_child_resource_runtime::reconcile_binding_children(
                         &runtime.store,
                         &client,
                         &self.zone,
@@ -1956,11 +1967,55 @@ impl DaemonSharedProviderEffects {
                     )
                     .await
                     .map_err(|_| SharedProviderEffectError::Unavailable)?;
-                    if converged.contains(resource.key().resource_ref()) {
-                        Ok(())
-                    } else {
-                        Err(SharedProviderEffectError::Unavailable)
-                    }
+                if converged.contains(resource.key().resource_ref()) {
+                    Ok(())
+                } else {
+                    Err(SharedProviderEffectError::Unavailable)
+                }
+            }
+            SharedProviderResourceKind::ShellPool => {
+                let sessions = runtime
+                    .committed_resources_of_type("shell-terminal.d2bus.org.ShellSession")
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let pool_ref = resource.key().resource_ref().to_canonical_string();
+                if sessions.iter().any(|session| {
+                    session
+                        .pointer("/spec/poolRef")
+                        .and_then(Value::as_str)
+                        == Some(pool_ref.as_str())
+                }) {
+                    Err(SharedProviderEffectError::Unavailable)
+                } else {
+                    Ok(())
+                }
+            }
+            SharedProviderResourceKind::ShellSession => {
+                let target = self
+                    .finalization_resource(&runtime, context, resource)
+                    .await?;
+                let owner = crate::binding_child_resource_runtime::OwnedChildOwner {
+                    resource: target,
+                    desired: None,
+                    fenced: false,
+                };
+                let client = runtime
+                    .process_resource_client()
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let converged =
+                    crate::binding_child_resource_runtime::reconcile_owned_children(
+                        &runtime.store,
+                        &client,
+                        &self.zone,
+                        std::slice::from_ref(&owner),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if converged.contains(resource.key().resource_ref()) {
+                    Ok(())
+                } else {
+                    Err(SharedProviderEffectError::Unavailable)
+                }
             }
             _ => Err(SharedProviderEffectError::InvalidResource),
         }
@@ -5070,42 +5125,106 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         kind: SharedProviderResourceKind,
         context: &SharedProviderEffectContext,
         resource: &ResourceSnapshot,
-        _dependencies: &[DependencySnapshot],
+        dependencies: &[DependencySnapshot],
     ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
         let _ = self.validate(kind, context, resource)?;
         let runtime = self.runtime()?;
-        runtime
-            .reconcile_audio_resources(Arc::clone(&self.state))
-            .await
-            .map_err(|_| SharedProviderEffectError::Unavailable)?;
-        let phase = match kind {
-            SharedProviderResourceKind::AudioService => runtime
-                .audio_runtime
-                .lock()
-                .map_err(|_| SharedProviderEffectError::Unavailable)?
-                .as_ref()
-                .is_some_and(|audio| audio.service_is_ready(resource.key().resource_ref()))
-                .then_some(SharedProviderEffectPhase::Ready)
-                .unwrap_or(SharedProviderEffectPhase::Pending),
-            SharedProviderResourceKind::AudioBinding => runtime
-                .audio_runtime
-                .lock()
-                .map_err(|_| SharedProviderEffectError::Unavailable)?
-                .as_ref()
-                .and_then(|audio| audio.binding_phase(resource.key().resource_ref()))
-                .map(|phase| {
-                    (phase == d2b_provider_audio_pipewire::AudioBindingPhase::Ready)
-                        .then_some(SharedProviderEffectPhase::Ready)
-                        .unwrap_or(SharedProviderEffectPhase::Pending)
+        let target = stored_resource_from_snapshot(resource);
+        match kind {
+            SharedProviderResourceKind::AudioService => {
+                let mut audio = runtime
+                    .audio_runtime
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let registry = audio
+                    .get_or_insert_with(|| AudioResourceRuntime::new(self.zone.clone(), self.state.clone()));
+                registry
+                    .reconcile_service_resource(&target)
+                    .map_err(map_audio_effect_error)?;
+                Ok(SharedProviderEffectResult {
+                    phase: SharedProviderEffectPhase::Ready,
+                    child_mutated: false,
+                    resource_projection: None,
                 })
-                .unwrap_or(SharedProviderEffectPhase::Pending),
-            _ => return Err(SharedProviderEffectError::InvalidResource),
-        };
-        Ok(SharedProviderEffectResult {
-            phase,
-            child_mutated: kind == SharedProviderResourceKind::AudioBinding,
-            resource_projection: None,
-        })
+            }
+            SharedProviderResourceKind::AudioBinding => {
+                let value = serde_json::from_slice::<Value>(resource.canonical_json())
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let service_ref = resource_ref_at(&value, "/spec/serviceRef")?;
+                let target_ref = resource_ref_at(&value, "/spec/targetRef")?;
+                let service = audio_dependency(dependencies, &service_ref)
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let guest = audio_dependency(dependencies, &target_ref)
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let (status, owner) = {
+                    let mut audio = runtime
+                        .audio_runtime
+                        .lock()
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                    let registry = audio.get_or_insert_with(|| {
+                        AudioResourceRuntime::new(self.zone.clone(), self.state.clone())
+                    });
+                    let status = registry
+                        .reconcile_binding_resource(&target, &service, &guest)
+                        .map_err(map_audio_effect_error)?
+                        .ok_or(SharedProviderEffectError::InvalidResource)?;
+                    let owner = registry
+                        .child_owner_for(&target)
+                        .map_err(map_audio_effect_error)?;
+                    (status, owner)
+                };
+                let client = runtime
+                    .process_resource_client()
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let converged =
+                    crate::binding_child_resource_runtime::reconcile_binding_children(
+                        &runtime.store,
+                        &client,
+                        &self.zone,
+                        std::slice::from_ref(&owner),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if !converged.contains(resource.key().resource_ref()) {
+                    return Ok(SharedProviderEffectResult {
+                        phase: SharedProviderEffectPhase::Pending,
+                        child_mutated: true,
+                        resource_projection: None,
+                    });
+                }
+                let children = crate::binding_child_resource_runtime::list_binding_children(
+                    &runtime.store,
+                    &self.zone,
+                )
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let binding_status = &status.status;
+                let projection =
+                    audio_binding_status_projection_with_status(
+                        &target,
+                        &children,
+                        binding_status,
+                    )
+                        .map_err(|error| match error {
+                            AudioResourceRuntimeError::InvalidResource
+                            | AudioResourceRuntimeError::InvalidRelationship => {
+                                SharedProviderEffectError::InvalidResource
+                            }
+                            AudioResourceRuntimeError::Controller(_) => {
+                                SharedProviderEffectError::Unavailable
+                            }
+                        })?;
+                Ok(SharedProviderEffectResult {
+                    phase: (binding_status.phase
+                        == d2b_provider_audio_pipewire::AudioBindingPhase::Ready)
+                        .then_some(SharedProviderEffectPhase::Ready)
+                        .unwrap_or(SharedProviderEffectPhase::Pending),
+                    child_mutated: false,
+                    resource_projection: Some(projection),
+                })
+            }
+            _ => Err(SharedProviderEffectError::InvalidResource),
+        }
     }
 
     async fn reconcile_shell(
@@ -5274,6 +5393,16 @@ impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
         ) {
             self.reconcile_guest_runtime(kind, context, resource, &[])
                 .await
+        } else if matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+                | SharedProviderResourceKind::AudioService
+                | SharedProviderResourceKind::AudioBinding
+                | SharedProviderResourceKind::ShellPool
+                | SharedProviderResourceKind::ShellSession
+        ) {
+            self.reconcile_result(kind, context, resource, &[]).await
         } else {
             self.observe(kind, context, resource)
                 .await
@@ -7008,6 +7137,28 @@ fn resource_ref_at(value: &Value, path: &str) -> Result<ResourceRef, SharedProvi
         .ok_or(SharedProviderEffectError::InvalidResource)
 }
 
+fn audio_dependency(
+    dependencies: &[DependencySnapshot],
+    target: &ResourceRef,
+) -> Option<StoredResource> {
+    dependencies
+        .iter()
+        .find(|dependency| dependency.resource().key().resource_ref() == target)
+        .map(|dependency| stored_resource_from_snapshot(dependency.resource()))
+}
+
+fn map_audio_effect_error(
+    error: AudioResourceRuntimeError,
+) -> SharedProviderEffectError {
+    match error {
+        AudioResourceRuntimeError::InvalidResource
+        | AudioResourceRuntimeError::InvalidRelationship => {
+            SharedProviderEffectError::InvalidResource
+        }
+        AudioResourceRuntimeError::Controller(_) => SharedProviderEffectError::Unavailable,
+    }
+}
+
 fn shell_pool_spec(
     value: &Value,
 ) -> Result<(ResourceRef, ResourceRef), SharedProviderEffectError> {
@@ -7768,8 +7919,8 @@ pub fn compose_shared_provider_runner_descriptors(
                         .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
                 );
             }
-            let dependency_selectors = if registration.resource_type == "Guest" {
-                [
+            let dependency_types: &[&str] = match registration.resource_type {
+                "Guest" => &[
                     "Provider",
                     "Process",
                     "EphemeralProcess",
@@ -7778,21 +7929,33 @@ pub fn compose_shared_provider_runner_descriptors(
                     "Network",
                     "Device",
                     "Credential",
-                ]
-                .into_iter()
+                ],
+                "display-wayland.d2bus.org.WaylandSession" => &[
+                    "Guest",
+                    "Host",
+                    "User",
+                    "display-wayland.d2bus.org.WaylandPolicy",
+                ],
+                "audio.d2bus.org.AudioBinding" => {
+                    &["audio.d2bus.org.AudioService", "Guest"]
+                }
+                "shell-terminal.d2bus.org.ShellSession" => {
+                    &["shell-terminal.d2bus.org.ShellPool"]
+                }
+                _ => &[],
+            };
+            let dependency_selectors = dependency_types
+                .iter()
                 .map(|resource_type| {
                     ControllerSelector::new(
-                        ResourceTypeName::parse(resource_type.to_owned())
+                        ResourceTypeName::parse((*resource_type).to_owned())
                             .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
                         SelectorField::Metadata,
                         None,
                     )
                     .map_err(|_| ResourceRuntimeError::HandlerNotReady)
                 })
-                .collect::<Result<Vec<_>, _>>()?
-            } else {
-                Vec::new()
-            };
+                .collect::<Result<Vec<_>, _>>()?;
             let execution = ControllerExecutionPolicy::new(
                 8,
                 4,
@@ -7855,6 +8018,17 @@ async fn abort_u12_runner_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
         task.abort();
         let _ = task.await;
     }
+}
+
+async fn abort_u9_runner_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+    for task in tasks.drain(..) {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+fn u9_runner_tasks_are_live(tasks: &[tokio::task::JoinHandle<()>]) -> bool {
+    !tasks.is_empty() && tasks.iter().all(|task| !task.is_finished())
 }
 
 async fn u9_provider_generations(
@@ -12620,7 +12794,7 @@ impl ZoneResourceRuntime {
                 .u9_runner_tasks
                 .lock()
                 .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            if tasks.iter().any(|task| !task.is_finished()) {
+            if u9_runner_tasks_are_live(&tasks) {
                 return Ok(());
             }
         }
@@ -12631,9 +12805,8 @@ impl ZoneResourceRuntime {
                 .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
             std::mem::take(&mut *tasks)
         };
-        for task in stale {
-            let _ = task.await;
-        }
+        let mut stale = stale;
+        abort_u9_runner_tasks(&mut stale).await;
         let subject_context = self
             .core_controller_subject
             .lock()
@@ -12658,6 +12831,7 @@ impl ZoneResourceRuntime {
             self.u9_required.store(false, Ordering::Release);
             return Ok(());
         }
+        self.u9_required.store(true, Ordering::Release);
         let descriptors = compose_shared_provider_runner_descriptors(
             active_registrations,
             self.zone.clone(),
@@ -12670,137 +12844,158 @@ impl ZoneResourceRuntime {
         );
         let mut new_tasks = Vec::with_capacity(descriptors.len());
         for (registration, descriptor) in descriptors {
-            let kind = SharedProviderResourceKind::from_registration(registration)?;
-            let provider_ref = ResourceRef::parse(registration.provider_ref)
-                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-            let controller_ref = ResourceRef::parse(registration.controller_ref)
-                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-            let provider_generation = *provider_generations
-                .get(&provider_ref)
-                .ok_or(ResourceRuntimeError::HandlerNotReady)?;
-            let (assignments, authority) = self
-                .u12_controller_assignments(
-                    &descriptor,
-                    controller_ref.clone(),
-                    provider_generation,
-                    controller_generation,
-                    session_generation,
-                )
-                .await?;
-            let subject = self
-                .authorizer
-                .issue_authenticated_subject(
-                    subject_context.clone(),
-                    authorization_state.clone(),
-                )
-                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
-            let api = self
-                .api
-                .registered_controller_api(subject, authorization_state.clone(), assignments)
-                .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
-            let allowed_types = descriptor
-                .resource_types()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            let resolver_store = Arc::clone(&self.store);
-            let resolver_zone = self.zone.clone();
-            let resolver_authority = Arc::clone(&authority);
-            let resolver: AssignmentFenceResolver = Arc::new(move |target, uid, revision| {
-                let store = Arc::clone(&resolver_store);
-                let zone = resolver_zone.clone();
-                let authority = Arc::clone(&resolver_authority);
-                let allowed_types = allowed_types.clone();
-                Box::pin(async move {
-                    if !allowed_types.contains(target.resource_type()) {
-                        return Err(SourceError::Integrity);
+            let task = async {
+                let kind = SharedProviderResourceKind::from_registration(registration)?;
+                let provider_ref = ResourceRef::parse(registration.provider_ref)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+                let controller_ref = ResourceRef::parse(registration.controller_ref)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+                let provider_generation = *provider_generations
+                    .get(&provider_ref)
+                    .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+                let (assignments, authority) = self
+                    .u12_controller_assignments(
+                        &descriptor,
+                        controller_ref.clone(),
+                        provider_generation,
+                        controller_generation,
+                        session_generation,
+                    )
+                    .await?;
+                let subject = self
+                    .authorizer
+                    .issue_authenticated_subject(
+                        subject_context.clone(),
+                        authorization_state.clone(),
+                    )
+                    .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+                let api = self
+                    .api
+                    .registered_controller_api(
+                        subject,
+                        authorization_state.clone(),
+                        assignments,
+                    )
+                    .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
+                let allowed_types = descriptor
+                    .resource_types()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let resolver_store = Arc::clone(&self.store);
+                let resolver_zone = self.zone.clone();
+                let resolver_authority = Arc::clone(&authority);
+                let resolver: AssignmentFenceResolver =
+                    Arc::new(move |target, uid, revision| {
+                        let store = Arc::clone(&resolver_store);
+                        let zone = resolver_zone.clone();
+                        let authority = Arc::clone(&resolver_authority);
+                        let allowed_types = allowed_types.clone();
+                        Box::pin(async move {
+                            if !allowed_types.contains(target.resource_type()) {
+                                return Err(SourceError::Integrity);
+                            }
+                            if let Some(stored) = store
+                                .assignment_fence(zone, target.clone())
+                                .await
+                                .map_err(|error| match error.kind() {
+                                    StoreErrorKind::Backpressure
+                                    | StoreErrorKind::StoreBackpressure => {
+                                        SourceError::Backpressure
+                                    }
+                                    StoreErrorKind::Timeout => SourceError::Timeout,
+                                    _ => SourceError::Unavailable,
+                                })?
+                            {
+                                if stored.resource_uid != uid
+                                    || stored.epoch > authority.epoch
+                                    || (stored.epoch == authority.epoch
+                                        && (stored.provider_generation
+                                            != authority.provider_generation
+                                            || stored.controller_generation
+                                                != authority.controller_generation
+                                            || stored.controller_role
+                                                != authority.controller_role
+                                            || stored.target != authority.target
+                                            || stored.session_generation
+                                                != authority.session_generation))
+                                {
+                                    return Err(SourceError::Integrity);
+                                }
+                                if stored.epoch == authority.epoch
+                                    && stored.resource_revision != revision
+                                {
+                                    return Err(SourceError::Conflict(stored.resource_revision));
+                                }
+                            }
+                            Ok(ResourceAssignmentFence {
+                                resource_uid: uid,
+                                resource_revision: revision,
+                                provider_generation: authority.provider_generation,
+                                controller_generation: authority.controller_generation,
+                                controller_role: authority.controller_role.clone(),
+                                target: authority.target.clone(),
+                                session_generation: authority.session_generation,
+                                epoch: authority.epoch,
+                                scope: ResourceAssignmentScope::Primary,
+                            })
+                        })
+                    });
+                let api = api.with_assignment_fence_resolver(resolver);
+                let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+                let reconciler = SharedProviderResourceReconciler::new(
+                    descriptor.clone(),
+                    kind,
+                    Arc::clone(&effects),
+                );
+                let runner = Runner::new(
+                    reconciler,
+                    source,
+                    RunnerConfig {
+                        policy_revision: authorization_state.snapshot.policy_revision,
+                        api_revision: authorization_state.snapshot.api_catalog_revision,
+                        configuration_revision: authorization_state
+                            .snapshot
+                            .active_configuration_revision,
+                        deadline_tick: 5_000,
+                        max_attempts: 3,
+                    },
+                );
+                let resource_type = registration.resource_type;
+                let controller = registration.controller_ref;
+                Ok::<_, ResourceRuntimeError>(tokio::spawn(async move {
+                    match runner.run().await {
+                        Ok(report) => tracing::debug!(
+                            controller,
+                            resource_type,
+                            dispatched = report.dispatched,
+                            relists = report.relists,
+                            "U9 interaction shared Runner stopped",
+                        ),
+                        Err(error) => tracing::warn!(
+                            controller,
+                            resource_type,
+                            error = %error,
+                            "U9 interaction shared Runner failed",
+                        ),
                     }
-                    if let Some(stored) = store
-                        .assignment_fence(zone, target.clone())
-                        .await
-                        .map_err(|error| match error.kind() {
-                            StoreErrorKind::Backpressure
-                            | StoreErrorKind::StoreBackpressure => SourceError::Backpressure,
-                            StoreErrorKind::Timeout => SourceError::Timeout,
-                            _ => SourceError::Unavailable,
-                        })?
-                    {
-                        if stored.resource_uid != uid
-                            || stored.epoch > authority.epoch
-                            || (stored.epoch == authority.epoch
-                                && (stored.provider_generation
-                                    != authority.provider_generation
-                                    || stored.controller_generation
-                                        != authority.controller_generation
-                                    || stored.controller_role != authority.controller_role
-                                    || stored.target != authority.target
-                                    || stored.session_generation
-                                        != authority.session_generation))
-                        {
-                            return Err(SourceError::Integrity);
-                        }
-                        if stored.epoch == authority.epoch
-                            && stored.resource_revision != revision
-                        {
-                            return Err(SourceError::Conflict(stored.resource_revision));
-                        }
-                    }
-                    Ok(ResourceAssignmentFence {
-                        resource_uid: uid,
-                        resource_revision: revision,
-                        provider_generation: authority.provider_generation,
-                        controller_generation: authority.controller_generation,
-                        controller_role: authority.controller_role.clone(),
-                        target: authority.target.clone(),
-                        session_generation: authority.session_generation,
-                        epoch: authority.epoch,
-                        scope: ResourceAssignmentScope::Primary,
-                    })
-                })
-            });
-            let api = api.with_assignment_fence_resolver(resolver);
-            let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
-            let reconciler = SharedProviderResourceReconciler::new(
-                descriptor.clone(),
-                kind,
-                Arc::clone(&effects),
-            );
-            let runner = Runner::new(
-                reconciler,
-                source,
-                RunnerConfig {
-                    policy_revision: authorization_state.snapshot.policy_revision,
-                    api_revision: authorization_state.snapshot.api_catalog_revision,
-                    configuration_revision: authorization_state
-                        .snapshot
-                        .active_configuration_revision,
-                    deadline_tick: 5_000,
-                    max_attempts: 3,
-                },
-            );
-            let resource_type = registration.resource_type;
-            let controller = registration.controller_ref;
-            new_tasks.push(tokio::spawn(async move {
-                match runner.run().await {
-                    Ok(report) => tracing::debug!(
-                        controller,
-                        resource_type,
-                        dispatched = report.dispatched,
-                        relists = report.relists,
-                        "U9 interaction shared Runner stopped",
-                    ),
-                    Err(error) => tracing::warn!(
-                        controller,
-                        resource_type,
-                        error = %error,
-                        "U9 interaction shared Runner failed",
-                    ),
+                }))
+            }
+            .await;
+            match task {
+                Ok(task) => new_tasks.push(task),
+                Err(error) => {
+                    abort_u9_runner_tasks(&mut new_tasks).await;
+                    return Err(error);
                 }
-            }));
+            }
         }
-        let mut tasks = self
-            .u9_runner_tasks
-            .lock()
-            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        let mut tasks = match self.u9_runner_tasks.lock() {
+            Ok(tasks) => tasks,
+            Err(_) => {
+                abort_u9_runner_tasks(&mut new_tasks).await;
+                return Err(ResourceRuntimeError::WatchUnavailable);
+            }
+        };
         tasks.extend(new_tasks);
         self.u9_required.store(true, Ordering::Release);
         Ok(())
@@ -14705,96 +14900,6 @@ impl ZoneResourceRuntime {
         ))
     }
 
-    /// Relist and reconcile the durable PipeWire resources owned by this
-    /// Zone. The registry is initialized once and survives ordinary
-    /// watch/reconcile cycles; a daemon restart reconstructs it from store
-    /// rows before any public readiness is published.
-    pub(crate) async fn reconcile_audio_resources(
-        &self,
-        state: Arc<crate::ServerState>,
-    ) -> Result<(), ResourceRuntimeError> {
-        if !self.readiness.resource_api_ready {
-            return Ok(());
-        }
-        let snapshot = list_audio_snapshot(&self.store, &self.zone)
-            .await
-            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let binding_resources = snapshot.bindings.clone();
-        let statuses;
-        let child_owners;
-        {
-            let mut runtime = self
-                .audio_runtime
-                .lock()
-                .map_err(|_| ResourceRuntimeError::CapabilityUnavailable)?;
-            let registry =
-                runtime.get_or_insert_with(|| AudioResourceRuntime::new(self.zone.clone(), state));
-            registry
-                .reconcile(snapshot)
-                .map_err(map_audio_runtime_error)?;
-            statuses = registry.statuses();
-            child_owners = registry
-                .child_owners(&binding_resources)
-                .map_err(map_audio_runtime_error)?;
-        }
-        let client = self.status_client()?;
-        reconcile_binding_children(&self.store, &client, &self.zone, &child_owners)
-            .await
-            .map_err(|_| ResourceRuntimeError::CapabilityUnavailable)?;
-        // Relist authoritative Binding rows before status writes so their
-        // exact UID/revision preconditions remain current.
-        let binding_resources = list_audio_resources(
-            &self.store,
-            &self.zone,
-            ResourceTypeName::parse(AUDIO_BINDING_TYPE).expect("static audio binding type"),
-            "binding-status",
-        )
-        .await
-        .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let children =
-            crate::binding_child_resource_runtime::list_binding_children(&self.store, &self.zone)
-                .await
-                .map_err(|_| ResourceRuntimeError::CapabilityUnavailable)?;
-        for status in statuses {
-            let Some(resource) = binding_resources
-                .iter()
-                .find(|resource| resource.resource_ref == status.resource)
-            else {
-                continue;
-            };
-            let projection = match audio_binding_status_projection_with_status(
-                resource,
-                &children,
-                &status.status,
-            ) {
-                Ok(projection) => projection,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        resource = %status.resource,
-                        "audio status projection construction failed"
-                    );
-                    continue;
-                }
-            };
-            if let Err(error) = persist_resource_status_with_projection(
-                &client,
-                resource,
-                &audio_binding_status_value(status.status),
-                Some(&projection),
-            )
-            .await
-            {
-                tracing::warn!(
-                    error = %error,
-                    resource = %status.resource,
-                    "audio status projection persistence failed"
-                );
-            }
-        }
-        Ok(())
-    }
-
     /// Relist and reconcile USB, security-key, and telemetry Bindings.
     ///
     /// These Providers retain semantic authority in their own crates; the
@@ -16500,9 +16605,7 @@ impl ZoneResourceRuntime {
         let u9_ready = if self.u9_required.load(Ordering::Acquire) {
             self.u9_runner_tasks
                 .try_lock()
-                .map(|tasks| {
-                    !tasks.is_empty() && !tasks.iter().any(|task| task.is_finished())
-                })
+                .map(|tasks| u9_runner_tasks_are_live(&tasks))
                 .unwrap_or(false)
         } else {
             true
@@ -18835,16 +18938,6 @@ fn host_status_value(
     Ok(status)
 }
 
-fn map_audio_runtime_error(error: AudioResourceRuntimeError) -> ResourceRuntimeError {
-    match error {
-        AudioResourceRuntimeError::Controller(_) => ResourceRuntimeError::CapabilityUnavailable,
-        AudioResourceRuntimeError::InvalidResource
-        | AudioResourceRuntimeError::InvalidRelationship => {
-            ResourceRuntimeError::CapabilityUnavailable
-        }
-    }
-}
-
 fn map_process_runtime_error(error: ProcessResourceRuntimeError) -> ResourceRuntimeError {
     match error {
         ProcessResourceRuntimeError::Store => ResourceRuntimeError::StoreReadFailed,
@@ -20422,6 +20515,20 @@ mod tests {
             Ok(SharedProviderEffectPhase::Ready)
         }
 
+        async fn reconcile_audio(
+            &self,
+            _kind: SharedProviderResourceKind,
+            _context: &SharedProviderEffectContext,
+            _resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+        ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+            Ok(SharedProviderEffectResult {
+                phase: SharedProviderEffectPhase::Pending,
+                child_mutated: true,
+                resource_projection: None,
+            })
+        }
+
         async fn finalize(
             &self,
             _kind: SharedProviderResourceKind,
@@ -20572,6 +20679,58 @@ mod tests {
             d2b_core_controller::MutationIntentKind::UpdateFinalizers
         );
         assert_eq!(effects.finalizes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn u9_repair_preserves_child_mutation_result() {
+        let registration = U9_SHARED_PROVIDER_RUNNERS[3];
+        let (_, descriptor) = shared_provider_test_descriptor_for(registration);
+        let effects = RecordingSharedProviderEffects {
+            reconciles: AtomicUsize::new(0),
+            finalizes: AtomicUsize::new(0),
+            cleanup_ready: std::sync::atomic::AtomicBool::new(true),
+        };
+        let resource =
+            shared_provider_test_resource_for(registration, &[registration.finalizer], false);
+        let context = SharedProviderEffectContext {
+            identity: descriptor.identity().clone(),
+            target: resource.key().clone(),
+            operation_id: "u9-repair-child-mutation".to_owned(),
+        };
+        let result = effects
+            .observe_result(
+                SharedProviderResourceKind::AudioBinding,
+                &context,
+                &resource,
+            )
+            .await
+            .expect("U9 repair result");
+        assert_eq!(result.phase, SharedProviderEffectPhase::Pending);
+        assert!(result.child_mutated);
+        assert!(result.resource_projection.is_none());
+    }
+
+    #[tokio::test]
+    async fn u9_runner_recovery_reaps_finished_sibling_before_respawn() {
+        let mut tasks = vec![
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+            tokio::spawn(async {
+                panic!("finished U9 runner");
+            }),
+        ];
+        tokio::task::yield_now().await;
+        assert!(!u9_runner_tasks_are_live(&tasks));
+        abort_u9_runner_tasks(&mut tasks).await;
+        assert!(tasks.is_empty());
+
+        let mut replacement = vec![tokio::spawn(async {
+            std::future::pending::<()>().await;
+        })];
+        assert!(u9_runner_tasks_are_live(&replacement));
+        abort_u9_runner_tasks(&mut replacement).await;
+        assert!(replacement.is_empty());
     }
 
     #[test]

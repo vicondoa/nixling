@@ -339,6 +339,16 @@ fn u9_composition_builds_one_fenced_runner_per_owned_interaction_resource() {
         } else {
             assert_eq!(descriptor.finalizers(), &[registration.finalizer.to_owned()]);
         }
+        if registration.resource_type == "audio.d2bus.org.AudioBinding" {
+            assert_eq!(
+                descriptor
+                    .dependency_selectors()
+                    .iter()
+                    .map(|selector| selector.resource_type().as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["audio.d2bus.org.AudioService", "Guest"])
+            );
+        }
     }
 }
 
@@ -352,6 +362,14 @@ fn u9_component_contracts_keep_clipboard_and_notifications_on_typed_sessions() {
     assert!(notification.legacy_scheduler_disabled());
     assert_eq!(clipboard.repair_interval_secs(), 300);
     assert_eq!(notification.repair_interval_secs(), 300);
+    assert!(
+        !U9_SHARED_PROVIDER_RUNNERS
+            .iter()
+            .any(|registration| registration.provider_ref
+                == d2b_provider_clipboard_wayland::PROVIDER_REF
+                || registration.provider_ref
+                    == d2b_provider_notification_desktop::PROVIDER_REF)
+    );
 }
 
 #[test]
