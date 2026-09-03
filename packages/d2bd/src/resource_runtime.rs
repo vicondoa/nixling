@@ -7681,9 +7681,9 @@ impl ResourceReconciler for SharedProviderResourceReconciler {
     }
 }
 
-/// Compose the exact U8 Provider descriptors used by the production shared
-/// Runner. The provider-generation map is supplied by the authoritative
-/// Provider rows; no generation or assignment epoch is guessed.
+/// Compose exact Provider descriptors used by the production shared Runner.
+/// The provider-generation map is supplied by authoritative Provider rows; no
+/// generation or assignment epoch is guessed.
 pub fn compose_shared_provider_runner_descriptors(
     registrations: impl IntoIterator<Item = SharedProviderRunnerRegistration>,
     zone: ZoneId,
