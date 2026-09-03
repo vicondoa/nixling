@@ -1237,6 +1237,7 @@ dependencies = [
  "d2b-contracts-resource",
  "d2b-contracts-zone-session",
  "d2b-provider-toolkit",
+ "d2b-session-unix",
  "serde_json",
  "tokio",
 ]

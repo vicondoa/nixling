@@ -4499,7 +4499,9 @@ pub async fn serve_guest(options: GuestServeOptions) -> Result<(), TypedError> {
             d2bd_runtime::target_runtime::DaemonMode::Guest,
         )
         .with_guest_backend_supervisor(
-            credential_backend_runtime::ProductionGuestCredentialBackendSupervisor::fail_closed(),
+            credential_backend_runtime::ProductionGuestCredentialBackendSupervisor::new(
+                credential_backend_runtime::GuestLocalCredentialBackend::production(),
+            ),
         ),
     );
     let local_private_path =

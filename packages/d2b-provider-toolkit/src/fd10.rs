@@ -106,6 +106,8 @@ pub struct ProviderSessionMetadata {
     zone_ref: ResourceRef,
     evidence_class: EvidenceClass,
     execution_ref: Option<ResourceRef>,
+    #[serde(default)]
+    user_ref: Option<ResourceRef>,
     process_ref: Option<ResourceRef>,
     provider_generation: Option<ResourceGeneration>,
     controller_generation: Option<ControllerGeneration>,
@@ -127,10 +129,32 @@ impl ProviderSessionMetadata {
     pub fn from_route(
         route: &AuthenticatedSessionRouteBinding,
     ) -> Result<Self, ProviderRuntimeError> {
+        Self::from_route_with_user(route, None)
+    }
+
+    /// Snapshot an authenticated route and an exact User scope claim.
+    ///
+    /// The claim is supplied by the trusted Process/Resource placement
+    /// binding; it never changes the authenticated Provider subject.
+    pub fn from_route_with_user(
+        route: &AuthenticatedSessionRouteBinding,
+        user_ref: Option<&ResourceRef>,
+    ) -> Result<Self, ProviderRuntimeError> {
         let provider_ref = route
             .provider_ref()
             .cloned()
             .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
+        if route.subject_ref().resource_type().as_str() != "Provider"
+            || route.subject_ref() != &provider_ref
+        {
+            return Err(ProviderRuntimeError::SessionUnauthenticated);
+        }
+        if user_ref
+            .as_ref()
+            .is_some_and(|reference| reference.resource_type().as_str() != "User")
+        {
+            return Err(ProviderRuntimeError::SessionUnauthenticated);
+        }
         Ok(Self {
             protocol: PROVIDER_BOOTSTRAP_PROTOCOL.to_owned(),
             zone: route.zone().clone(),
@@ -140,6 +164,7 @@ impl ProviderSessionMetadata {
             zone_ref: route.context().zone_ref().clone(),
             evidence_class: route.evidence_class(),
             execution_ref: route.context().execution_ref().cloned(),
+            user_ref: user_ref.cloned(),
             process_ref: route.context().process_ref().cloned(),
             provider_generation: route.provider_generation(),
             controller_generation: route.controller_generation(),
@@ -177,7 +202,19 @@ impl ProviderSessionMetadata {
         if metadata.protocol != PROVIDER_BOOTSTRAP_PROTOCOL {
             return Err(ProviderRuntimeError::SessionUnauthenticated);
         }
+        if metadata
+            .user_ref
+            .as_ref()
+            .is_some_and(|reference| reference.resource_type().as_str() != "User")
+        {
+            return Err(ProviderRuntimeError::SessionUnauthenticated);
+        }
         Ok(metadata)
+    }
+
+    /// Borrow the optional authenticated User placement claim.
+    pub fn user_ref(&self) -> Option<&ResourceRef> {
+        self.user_ref.as_ref()
     }
 
     fn allocator_binding(&self) -> Result<AllocatorSessionBinding, ProviderRuntimeError> {
@@ -666,14 +703,21 @@ pub trait GuestCredentialBackendHandler: Send + Sync + 'static {
     fn handle(
         &self,
         route: &AuthenticatedSessionRouteBinding,
+        user_ref: Option<&ResourceRef>,
         operation: &str,
         fields: serde_json::Value,
     ) -> GuestCredentialBackendHandlerFuture<'_>;
 }
 
+#[derive(Clone)]
+struct GuestCredentialBackendBinding {
+    route: AuthenticatedSessionRouteBinding,
+    user_ref: Option<ResourceRef>,
+}
+
 /// Cancellable Guest-local backend responder lease.
 pub struct GuestCredentialBackendResponderLease {
-    route: tokio::sync::watch::Sender<Option<AuthenticatedSessionRouteBinding>>,
+    route: tokio::sync::watch::Sender<Option<GuestCredentialBackendBinding>>,
     cancel: tokio::sync::watch::Sender<bool>,
     bound: std::sync::Mutex<bool>,
 }
@@ -690,7 +734,22 @@ impl GuestCredentialBackendResponderLease {
         &self,
         route: AuthenticatedSessionRouteBinding,
     ) -> Result<(), ProviderRuntimeError> {
+        self.bind_route_with_user(route, None)
+    }
+
+    /// Bind the responder to one exact Provider route and User scope claim.
+    pub fn bind_route_with_user(
+        &self,
+        route: AuthenticatedSessionRouteBinding,
+        user_ref: Option<ResourceRef>,
+    ) -> Result<(), ProviderRuntimeError> {
         if !validate_guest_backend_route(&route).is_ok() {
+            return Err(ProviderRuntimeError::SessionUnauthenticated);
+        }
+        if user_ref
+            .as_ref()
+            .is_some_and(|reference| reference.resource_type().as_str() != "User")
+        {
             return Err(ProviderRuntimeError::SessionUnauthenticated);
         }
         let mut bound = self
@@ -702,7 +761,7 @@ impl GuestCredentialBackendResponderLease {
         }
         *bound = true;
         self.route
-            .send(Some(route))
+            .send(Some(GuestCredentialBackendBinding { route, user_ref }))
             .map_err(|_| ProviderRuntimeError::SessionLoopFailed)
     }
 
@@ -1158,21 +1217,21 @@ async fn run_guest_credential_backend_responder(
     expected_peer: d2b_session_unix::PeerCredentials,
     delivery_keys: CredentialDeliveryKeyMaterial,
     handler: Arc<dyn GuestCredentialBackendHandler>,
-    mut route_rx: tokio::sync::watch::Receiver<Option<AuthenticatedSessionRouteBinding>>,
+    mut route_rx: tokio::sync::watch::Receiver<Option<GuestCredentialBackendBinding>>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let route = loop {
         if *cancel_rx.borrow() {
             return;
     }
-        if let Some(route) = route_rx.borrow().clone() {
-            break route;
+    if let Some(binding) = route_rx.borrow().clone() {
+        break binding;
     }
         tokio::select! {
             result = route_rx.changed() => {
                 if result.is_err() {
                     return;
-    }
+            }
             }
             result = cancel_rx.changed() => {
                 if result.is_err() || *cancel_rx.borrow() {
@@ -1181,10 +1240,10 @@ async fn run_guest_credential_backend_responder(
             }
         }
     };
-    if !validate_guest_backend_route(&route).is_ok() {
+    if !validate_guest_backend_route(&route.route).is_ok() {
         return;
     }
-    let policy = credential_delivery_endpoint_policy(route.reconnect_generation().get());
+    let policy = credential_delivery_endpoint_policy(route.route.reconnect_generation().get());
     let Ok(transport) = guest_backend_transport(socket, &policy, expected_peer) else {
         return;
     };
@@ -1200,7 +1259,11 @@ async fn run_guest_credential_backend_responder(
     let service = ttrpc::r#async::Service {
         methods: HashMap::from([(
             "Request".to_owned(),
-            Box::new(GuestCredentialBackendMethod { route, handler })
+            Box::new(GuestCredentialBackendMethod {
+                route: route.route,
+                user_ref: route.user_ref,
+                handler,
+            })
                 as Box<dyn ttrpc::r#async::MethodHandler + Send + Sync>,
         )]),
         streams: HashMap::new(),
@@ -1218,6 +1281,7 @@ async fn run_guest_credential_backend_responder(
 
 struct GuestCredentialBackendMethod {
     route: AuthenticatedSessionRouteBinding,
+    user_ref: Option<ResourceRef>,
     handler: Arc<dyn GuestCredentialBackendHandler>,
 }
 
@@ -1283,7 +1347,10 @@ impl GuestCredentialBackendMethod {
             return Err(GuestCredentialBackendHandlerError::Denied);
         }
         let fields = serde_json::Value::Object(std::mem::take(object));
-        let reply = self.handler.handle(&self.route, &operation, fields).await?;
+        let reply = self
+            .handler
+            .handle(&self.route, self.user_ref.as_ref(), &operation, fields)
+            .await?;
         payload.fill(0);
         reply.encode()
     }
@@ -1349,6 +1416,7 @@ where
     A: crate::CredentialAuthorizationSource,
     F: FnOnce(
             &AuthenticatedSessionRouteBinding,
+            &ProviderSessionMetadata,
             Arc<GuestCredentialBackend>,
         ) -> Result<(Arc<P>, Arc<A>), ProviderRuntimeError>
         + Send
@@ -1379,6 +1447,7 @@ where
     A: crate::CredentialAuthorizationSource,
     F: FnOnce(
             &AuthenticatedSessionRouteBinding,
+            &ProviderSessionMetadata,
             Arc<GuestCredentialBackend>,
         ) -> Result<(Arc<P>, Arc<A>), ProviderRuntimeError>
         + Send
@@ -1458,7 +1527,7 @@ where
     }
     let registration = entrypoint.admit()?;
     let session_admission = entrypoint.admit_authenticated(&route)?;
-    let (provider, authorizer) = factory(&route, backend)?;
+    let (provider, authorizer) = factory(&route, &metadata, backend)?;
     serve_provider_route(
         entrypoint,
         registration,

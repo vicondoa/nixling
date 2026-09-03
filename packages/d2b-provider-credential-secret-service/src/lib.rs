@@ -28,7 +28,7 @@ use d2b_contracts_provider::v3::credential::{
 use d2b_contracts_resource::v3::{ResourceGeneration, ResourceRef, ZoneId};
 use d2b_provider_toolkit::{
     AuthenticatedSessionRouteBinding, GuestCredentialBackend, GuestCredentialBackendResponse,
-    ProviderFd10Spec, ProviderRuntimeError, RouteCredentialAuthorization,
+    ProviderFd10Spec, ProviderRuntimeError, ProviderSessionMetadata, RouteCredentialAuthorization,
     run_from_fd10 as run_provider_from_fd10,
 };
 
@@ -92,6 +92,7 @@ pub fn controller_binary_entrypoint() -> i32 {
 
 fn runtime_provider(
     route: &AuthenticatedSessionRouteBinding,
+    metadata: &ProviderSessionMetadata,
     backend: Arc<GuestCredentialBackend>,
 ) -> Result<
     (
@@ -110,10 +111,16 @@ fn runtime_provider(
         .filter(|reference| reference.resource_type().as_str() == "Guest")
         .cloned()
         .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
-    let user_ref = route.subject_ref().clone();
-    if user_ref.resource_type().as_str() != "User" {
+    if route.subject_ref() != &provider_ref
+        || route.subject_ref().resource_type().as_str() != "Provider"
+    {
         return Err(ProviderRuntimeError::SessionUnauthenticated);
     }
+    let user_ref = metadata
+        .user_ref()
+        .cloned()
+        .filter(|reference| reference.resource_type().as_str() == "User")
+        .ok_or(ProviderRuntimeError::SessionUnauthenticated)?;
     let placement = SecretServicePlacement::new(
         route.zone().clone(),
         PlacementBinding::UserAgent,
@@ -1659,8 +1666,95 @@ impl fmt::Debug for SecretServiceCredentialProvider {
 mod tests {
     use super::*;
     use d2b_contracts_provider::v3::credential::CredentialMethod;
+    use d2b_contracts_resource::v3::identity::{
+        AuthenticatedSubjectContext, BindingDigest, EvidenceClass, Locality,
+        ReconnectGeneration, ServiceName, SessionBinding as AuthSessionBinding, SessionPurpose,
+        TranscriptHash,
+        TransportBinding,
+    };
+    use d2b_contracts_zone_session::v3::component_session::{
+        EndpointRole, Locality as ComponentLocality, PurposeClass, TransportClass,
+    };
+    use d2b_provider_toolkit::ProviderSessionMetadata;
+    use d2b_session_unix::{SeqpacketSocket, prearmed_seqpacket_pair};
     use std::sync::Arc;
     use std::thread;
+
+    fn production_provider_route() -> AuthenticatedSessionRouteBinding {
+        let provider_ref = ResourceRef::parse(PROVIDER_REF).unwrap();
+        let context = AuthenticatedSubjectContext::new(
+            provider_ref.clone(),
+            d2b_contracts_resource::v3::ResourceUid::parse(
+                "123e4567-e89b-42d3-a456-426614174000",
+            )
+            .unwrap(),
+            ResourceRef::parse("Zone/dev").unwrap(),
+            EvidenceClass::UnixPeer,
+            SessionPurpose::parse("provider-control").unwrap(),
+            ServiceName::parse(CREDENTIAL_SERVICE_NAME).unwrap(),
+            AuthSessionBinding::new(
+                d2b_contracts_resource::v3::SchemaFingerprint::parse(
+                    "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                )
+                .unwrap(),
+                TransportBinding::new(
+                    Locality::Local,
+                    BindingDigest::parse(
+                        "sha256:3434343434343434343434343434343434343434343434343434343434343434",
+                    )
+                    .unwrap(),
+                ),
+                ReconnectGeneration::new(1).unwrap(),
+                TranscriptHash::from_bytes([0x5a; 32]),
+            ),
+        )
+        .with_execution_ref(ResourceRef::parse("Guest/test").unwrap())
+        .with_provider_ref(provider_ref)
+        .with_process_ref(ResourceRef::parse("Process/credential-controller").unwrap())
+        .with_provider_generation(ResourceGeneration::new(1).unwrap())
+        .with_controller_generation(
+            d2b_contracts_resource::v3::ControllerGeneration::new(1).unwrap(),
+        );
+        AuthenticatedSessionRouteBinding::from_authenticated_peer(
+            context,
+            ComponentLocality::HostLocal,
+            PurposeClass::Local,
+            EndpointRole::Provider,
+            EndpointRole::ZoneController,
+            TransportClass::InheritedSocketpair,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_provider_uses_authenticated_user_scope_claim() {
+        let route = production_provider_route();
+        let user_ref = ResourceRef::parse("User/alice").unwrap();
+        let metadata =
+            ProviderSessionMetadata::from_route_with_user(&route, Some(&user_ref)).unwrap();
+        let (client_fd, _server_fd) = prearmed_seqpacket_pair().unwrap();
+        let backend =
+            GuestCredentialBackend::from_socket_for_test(SeqpacketSocket::from_parent_prearmed(
+                client_fd,
+            )
+            .unwrap());
+        let (provider, _) = runtime_provider(&route, &metadata, backend).unwrap();
+        assert_eq!(provider.placement().user_ref(), &user_ref);
+        assert_eq!(provider.placement().zone().as_str(), "dev");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_provider_rejects_missing_user_scope_claim_without_subject_spoof() {
+        let route = production_provider_route();
+        let metadata = ProviderSessionMetadata::from_route(&route).unwrap();
+        let (client_fd, _server_fd) = prearmed_seqpacket_pair().unwrap();
+        let backend =
+            GuestCredentialBackend::from_socket_for_test(SeqpacketSocket::from_parent_prearmed(
+                client_fd,
+            )
+            .unwrap());
+        assert!(runtime_provider(&route, &metadata, backend).is_err());
+    }
 
     #[test]
     fn collection_alias_accepts_spaces_and_rejects_unsafe_text() {

@@ -498,6 +498,10 @@ impl ProcessResourceRuntime {
             self.controller_generation,
             target_ref,
         )
+        .with_user_ref(match &record.process {
+            DesiredProcess::Process(spec) => spec.execution().user_ref(),
+            DesiredProcess::Ephemeral(spec) => spec.execution().user_ref(),
+        })
         .with_guest_execution(self.guest_execution.as_ref())
         .with_lifecycle_identity(
             self.zone_uid.clone(),

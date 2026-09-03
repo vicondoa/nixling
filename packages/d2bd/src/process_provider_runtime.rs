@@ -339,6 +339,8 @@ pub(crate) struct ProcessResourceContext<'a> {
     pub(crate) target_ref: Option<ResourceRef>,
     /// Exact execution reference from the Process spec.
     pub(crate) execution_ref: Option<ResourceRef>,
+    /// Exact User scope from the Process execution spec.
+    pub(crate) user_ref: Option<ResourceRef>,
     /// Catalog-bound private Guest setup descriptor digest.
     pub(crate) guest_descriptor_digest: Option<SchemaFingerprint>,
 }
@@ -373,6 +375,7 @@ impl<'a> ProcessResourceContext<'a> {
             controller_provider_ref: None,
             target_ref,
             execution_ref: None,
+            user_ref: None,
             guest_descriptor_digest: None,
         }
     }
@@ -434,6 +437,11 @@ impl<'a> ProcessResourceContext<'a> {
         self.execution_ref = Some(execution_ref.clone());
         self
     }
+
+    pub(crate) fn with_user_ref(mut self, user_ref: Option<&ResourceRef>) -> Self {
+        self.user_ref = user_ref.cloned();
+        self
+    }
 }
 
 /// Result of a Provider-backed launch, carrying only opaque process identity.
@@ -477,6 +485,7 @@ pub(crate) struct ControllerBootstrapContext {
     provider_uid: ResourceUid,
     provider_generation: ResourceGeneration,
     execution_ref: ResourceRef,
+    user_ref: Option<ResourceRef>,
     controller_generation: ControllerGeneration,
 }
 
@@ -511,6 +520,13 @@ impl ControllerBootstrapContext {
         let provider_generation = context
             .provider_generation
             .ok_or_else(|| "provider-controller-provider-identity-missing".to_owned())?;
+        if context
+            .user_ref
+            .as_ref()
+            .is_some_and(|user| user.resource_type().as_str() != "User")
+        {
+            return Err("provider-controller-user-identity-invalid".to_owned());
+        }
         Ok(Self {
             zone: context.zone.clone(),
             zone_uid: context.zone_uid.clone(),
@@ -523,6 +539,7 @@ impl ControllerBootstrapContext {
             provider_uid,
             provider_generation,
             execution_ref: execution_ref.clone(),
+            user_ref: context.user_ref.clone(),
             controller_generation: context.controller_generation,
         })
     }
@@ -567,6 +584,10 @@ impl ControllerBootstrapContext {
         &self.execution_ref
     }
 
+    pub(crate) fn user_ref(&self) -> Option<&ResourceRef> {
+        self.user_ref.as_ref()
+    }
+
     pub(crate) const fn controller_generation(&self) -> ControllerGeneration {
         self.controller_generation
     }
@@ -575,7 +596,11 @@ impl ControllerBootstrapContext {
 /// Lifetime handle returned by the Guest-local Credential backend supervisor.
 pub(crate) trait GuestCredentialBackendLease: Send + Sync {
     /// Bind the responder to the exact authenticated Provider route.
-    fn bind_route(&self, route: &AuthenticatedSessionRouteBinding) -> Result<(), String>;
+    fn bind_route(
+        &self,
+        route: &AuthenticatedSessionRouteBinding,
+        user_ref: Option<&ResourceRef>,
+    ) -> Result<(), String>;
 
     /// Stop the responder and revoke its session-bound backend authority.
     fn cancel(&self);
@@ -977,7 +1002,9 @@ impl ProductionProcessProviders {
         spec: &ProcessSpec,
         timeout: Duration,
     ) -> Result<ProviderLaunch, String> {
-        let context = context.with_execution_ref(spec.execution().execution_ref());
+        let context = context
+            .with_execution_ref(spec.execution().execution_ref())
+            .with_user_ref(spec.execution().user_ref());
         self.validate_execution_target(spec.execution().execution_ref())?;
         let provider = managed_provider_from_ref(context.provider_ref)?;
         validate_resource_execution_target(self.mode, &context, spec.execution())?;
@@ -1691,6 +1718,7 @@ impl ProductionProcessProviders {
                         .provider_generation
                         .is_some_and(|generation| marker_context.provider_generation == generation)
                     && marker_context.execution_ref == *execution_ref
+                    && marker_context.user_ref.as_ref() == context.user_ref.as_ref()
                     && marker_context.controller_generation == context.controller_generation
             })
         {
@@ -1722,6 +1750,7 @@ impl ProductionProcessProviders {
                     && context
                         .provider_generation
                         .is_none_or(|generation| marker_context.provider_generation == generation)
+                    && context.user_ref.as_ref() == marker_context.user_ref.as_ref()
                     && marker_context.controller_generation == context.controller_generation
             })
         {

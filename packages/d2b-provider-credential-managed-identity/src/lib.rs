@@ -32,7 +32,7 @@ use d2b_contracts_resource::v3::ResourceRef;
 use d2b_contracts_resource::v3::identity::{AuthenticatedSubjectContext, Locality};
 use d2b_provider_toolkit::{
     AuthenticatedSessionRouteBinding, GuestCredentialBackend, GuestCredentialBackendResponse,
-    ProviderFd10Spec, ProviderRuntimeError, RouteCredentialAuthorization,
+    ProviderFd10Spec, ProviderRuntimeError, ProviderSessionMetadata, RouteCredentialAuthorization,
     run_from_fd10 as run_provider_from_fd10,
 };
 
@@ -112,8 +112,12 @@ pub fn agent_binary_entrypoint() -> i32 {
 
 fn runtime_provider(
     route: &AuthenticatedSessionRouteBinding,
+    metadata: &ProviderSessionMetadata,
     backend: Arc<GuestCredentialBackend>,
 ) -> Result<(Arc<ManagedIdentityAgent>, Arc<RouteCredentialAuthorization>), ProviderRuntimeError> {
+    if metadata.user_ref().is_some() {
+        return Err(ProviderRuntimeError::SessionUnauthenticated);
+    }
     let provider_ref = route
         .provider_ref()
         .cloned()

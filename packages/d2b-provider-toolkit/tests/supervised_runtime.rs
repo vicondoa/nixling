@@ -46,14 +46,9 @@ fn route_with_execution(
     execution: &str,
 ) -> d2b_session::AuthenticatedSessionRouteBinding {
     let provider_ref = ResourceRef::parse(provider).expect("Provider reference");
-    let subject_ref = if provider.ends_with("secret-service") {
-        ResourceRef::parse("User/provider-controller").expect("User reference")
-    } else {
-        provider_ref.clone()
-    };
     let digest = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
     let context = AuthenticatedSubjectContext::new(
-        subject_ref,
+        provider_ref.clone(),
         ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").expect("UID"),
         ResourceRef::parse("Zone/dev").expect("Zone reference"),
         EvidenceClass::UnixPeer,
@@ -231,7 +226,10 @@ fn run_supervised_binary(path: &str, provider: &str) {
         .expect("provider handshake");
         let driver = responder.into_driver();
         let route = route(provider);
-        let metadata = ProviderSessionMetadata::from_route(&route)
+        let user_ref = provider
+            .ends_with("credential-secret-service")
+            .then(|| ResourceRef::parse("User/provider-scope").expect("User reference"));
+        let metadata = ProviderSessionMetadata::from_route_with_user(&route, user_ref.as_ref())
             .expect("route metadata")
             .encode()
             .expect("metadata encoding");
@@ -265,7 +263,7 @@ fn run_supervised_binary(path: &str, provider: &str) {
         )
         .expect("backend responder");
         backend_responder
-            .bind_route(route.clone())
+            .bind_route_with_user(route.clone(), user_ref.clone())
             .expect("bind backend responder route");
         let key_handoff = CredentialDeliveryKeyHandoff::new(provider_private, backend_public)
             .expect("delivery key handoff");
@@ -565,6 +563,7 @@ impl GuestCredentialBackendHandler for ScriptedGuestCredentialBackend {
     fn handle(
         &self,
         _route: &d2b_session::AuthenticatedSessionRouteBinding,
+        _user_ref: Option<&ResourceRef>,
         operation: &str,
         _fields: serde_json::Value,
     ) -> GuestCredentialBackendHandlerFuture<'_> {
