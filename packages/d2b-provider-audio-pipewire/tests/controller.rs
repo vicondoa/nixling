@@ -490,7 +490,7 @@ fn audio_runner_contract_keeps_service_and_binding_on_one_cutover() {
     );
     assert_eq!(
         contract.binding_finalizer(),
-        "audio.d2bus.org/binding-finalizer"
+        "audio.d2bus.org/cleanup"
     );
     assert_eq!(contract.repair_interval_secs(), 300);
     assert!(contract.legacy_scheduler_disabled());

@@ -21,7 +21,7 @@ pub const AUDIO_REPAIR_INTERVAL_SECS: u64 = 300;
 /// Exact finalizer for an AudioService authority.
 pub const AUDIO_SERVICE_FINALIZER: &str = "audio.d2bus.org/service-finalizer";
 /// Exact finalizer for an AudioBinding authority.
-pub const AUDIO_BINDING_FINALIZER: &str = "audio.d2bus.org/binding-finalizer";
+pub const AUDIO_BINDING_FINALIZER: &str = "audio.d2bus.org/cleanup";
 
 /// The cutover contract for AudioService and AudioBinding owners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

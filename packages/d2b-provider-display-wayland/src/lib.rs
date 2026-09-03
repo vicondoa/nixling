@@ -23,9 +23,10 @@ pub use audit::{DisplayAuditKind, DisplayAuditOutcome, DisplayAuditRecord};
 pub use controller::{
     AuthenticatedDisplaySession, CapabilityReadiness, CleanupState, DependencyReadiness,
     DependencyState, DisplayController, DisplayDependencyProof, DisplayRunnerContract,
-    FinalizationDecision, FinalizationInput, GraceState, Phase, PrincipalReleaseReceipt,
-    ReconcileResult, SessionCondition, StopRequest, WaylandPolicySnapshot,
-    WaylandSessionResourceStatus, WaylandSessionStatus, display_runner_contract,
+    DISPLAY_MAX_REPAIR_INTERVAL_SECS, DISPLAY_REPAIR_INTERVAL_SECS, FinalizationDecision,
+    FinalizationInput, GraceState, Phase, PrincipalReleaseReceipt, ReconcileResult,
+    SessionCondition, StopRequest, WaylandPolicySnapshot, WaylandSessionResourceStatus,
+    WaylandSessionStatus, display_runner_contract,
 };
 pub use descriptor::{DisplayDescriptorError, DisplayProviderDescriptor};
 pub use metrics::{DisplayTelemetryField, DisplayTelemetryFrame, MetricOutcome};
