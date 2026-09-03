@@ -95,6 +95,10 @@
           cp -r ${./packages/d2b-provider-audio-pipewire} $out/packages/d2b-provider-audio-pipewire
           cp -r ${./packages/d2b-provider-clipboard-wayland} $out/packages/d2b-provider-clipboard-wayland
           cp -r ${./packages/d2b-provider-config-nixos} $out/packages/d2b-provider-config-nixos
+          cp -r ${./packages/d2b-provider-credential-entra} $out/packages/d2b-provider-credential-entra
+          cp -r ${./packages/d2b-provider-credential-managed-identity} $out/packages/d2b-provider-credential-managed-identity
+          cp -r ${./packages/d2b-provider-credential-secret-service} $out/packages/d2b-provider-credential-secret-service
+          cp -r ${./packages/d2b-provider-device-gpu} $out/packages/d2b-provider-device-gpu
           cp -r ${./packages/d2b-provider-device-security-key} $out/packages/d2b-provider-device-security-key
           cp -r ${./packages/d2b-provider-device-tpm} $out/packages/d2b-provider-device-tpm
           cp -r ${./packages/d2b-provider-device-usbip} $out/packages/d2b-provider-device-usbip
@@ -103,7 +107,9 @@
           cp -r ${./packages/d2b-provider-notification-desktop} $out/packages/d2b-provider-notification-desktop
           cp -r ${./packages/d2b-provider-observability-otel} $out/packages/d2b-provider-observability-otel
           cp -r ${./packages/d2b-provider-runtime-azure-container-apps} $out/packages/d2b-provider-runtime-azure-container-apps
+          cp -r ${./packages/d2b-provider-runtime-azure-virtual-machine} $out/packages/d2b-provider-runtime-azure-virtual-machine
           cp -r ${./packages/d2b-provider-runtime-cloud-hypervisor} $out/packages/d2b-provider-runtime-cloud-hypervisor
+          cp -r ${./packages/d2b-provider-runtime-qemu-media} $out/packages/d2b-provider-runtime-qemu-media
           cp -r ${./packages/d2b-provider-shell-terminal} $out/packages/d2b-provider-shell-terminal
           cp -r ${./packages/d2b-provider-supervisor} $out/packages/d2b-provider-supervisor
           cp -r ${./packages/d2b-provider-system-core} $out/packages/d2b-provider-system-core
@@ -112,6 +118,7 @@
           cp -r ${./packages/d2b-provider-toolkit} $out/packages/d2b-provider-toolkit
           cp -r ${./packages/d2b-provider-transport-azure-relay} $out/packages/d2b-provider-transport-azure-relay
           cp -r ${./packages/d2b-provider-volume-local} $out/packages/d2b-provider-volume-local
+          cp -r ${./packages/d2b-provider-volume-virtiofs} $out/packages/d2b-provider-volume-virtiofs
           cp -r ${./packages/d2b-resource-api} $out/packages/d2b-resource-api
           cp -r ${./packages/d2b-resource-store} $out/packages/d2b-resource-store
           cp -r ${./packages/d2b-resource-store-redb} $out/packages/d2b-resource-store-redb
