@@ -289,6 +289,7 @@ struct GuestCredentialLeaseRecord {
 struct GuestCredentialLeaseRegistryState {
     leases: BTreeMap<String, GuestCredentialLeaseRecord>,
     operations: BTreeMap<GuestCredentialIssueKey, (String, String)>,
+    idempotencies: BTreeMap<(GuestCredentialOperationScope, String), String>,
 }
 
 /// Guest-local lease registry used by the typed Secret Service, identity
@@ -305,6 +306,7 @@ impl GuestCredentialLeaseRegistry {
             state: Mutex::new(GuestCredentialLeaseRegistryState {
                 leases: BTreeMap::new(),
                 operations: BTreeMap::new(),
+                idempotencies: BTreeMap::new(),
             }),
         }
     }
@@ -403,6 +405,14 @@ impl GuestCredentialLeaseRegistry {
         {
             return Err(GuestCredentialBackendSourceError::Unavailable);
         }
+        let idempotency_scope = (scope.operation_scope(), idempotency_key.clone());
+        if state
+            .idempotencies
+            .get(&idempotency_scope)
+            .is_some_and(|existing_operation| existing_operation != &operation_id)
+        {
+            return Err(GuestCredentialBackendSourceError::Denied);
+        }
         let lease_handle = random_opaque_handle()?;
         let source_version = format!(
             "guest-{}-source",
@@ -430,6 +440,9 @@ impl GuestCredentialLeaseRegistry {
             operation_key,
             (idempotency_key, lease_handle.clone()),
         );
+        state
+            .idempotencies
+            .insert(idempotency_scope, record.operation_id.clone());
         let reply = record_reply(&record, true, None, false);
         state.leases.insert(lease_handle, record);
         Ok(reply)
