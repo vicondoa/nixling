@@ -35,7 +35,6 @@ use crate::binding_child_resource_runtime::{
     OneOwnedChildProgress, OwnedChildOwner,
     reconcile_one_guest_child,
 };
-use crate::binding_child_resource_runtime::reconcile_binding_children;
 use crate::credential_resource_runtime::{
     CredentialResourceReconciler, CredentialSessionRegistry, ComponentCredentialSession,
     CredentialSession, credential_controller_descriptor, is_credential_provider_ref,
@@ -17924,7 +17923,6 @@ impl ZoneResourceRuntime {
             u6_runner_tasks,
             u9_runner_tasks,
             u10_runner_tasks,
-            audio_watch_task,
             audio_runtime,
             device_binding_watch_task,
             process_runner_task,
@@ -17980,13 +17978,6 @@ impl ZoneResourceRuntime {
             .into_inner()
             .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
         for task in u10_runner_tasks {
-            task.abort();
-            let _ = task.await;
-        }
-        if let Some(task) = audio_watch_task
-            .into_inner()
-            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
-        {
             task.abort();
             let _ = task.await;
         }
