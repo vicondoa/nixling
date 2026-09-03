@@ -4499,11 +4499,17 @@ pub async fn serve_guest(options: GuestServeOptions) -> Result<(), TypedError> {
             d2bd_runtime::target_runtime::DaemonMode::Guest,
         )
         .with_guest_backend_supervisor(
-            credential_backend_runtime::ProductionGuestCredentialBackendSupervisor::new(
-                credential_backend_runtime::GuestLocalCredentialBackend::from_guest_context(
-                    identity.guest_ref().clone(),
-                ),
-            ),
+            {
+                let guest_credential_sources =
+                    credential_backend_runtime::GuestCredentialBackendSources::from_guest_context(
+                        identity.guest_ref().clone(),
+                    );
+                credential_backend_runtime::ProductionGuestCredentialBackendSupervisor::new(
+                    credential_backend_runtime::GuestLocalCredentialBackend::from_sources(
+                        guest_credential_sources,
+                    ),
+                )
+            },
         ),
     );
     let local_private_path =

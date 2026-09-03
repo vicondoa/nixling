@@ -132,6 +132,7 @@ trait GuestCredentialProviderAdapter: Send + Sync + 'static {
 /// receives no adapter or credential bytes; source ports expose only opaque
 /// metadata and zeroizing delivery through the authenticated backend session.
 pub(crate) struct GuestCredentialBackendAdapters {
+    expected_execution_ref: Option<ResourceRef>,
     secret_service: Arc<dyn GuestCredentialProviderAdapter>,
     entra: Arc<dyn GuestCredentialProviderAdapter>,
     managed_identity: Arc<dyn GuestCredentialProviderAdapter>,
@@ -144,9 +145,10 @@ impl std::fmt::Debug for GuestCredentialBackendAdapters {
 }
 
 impl GuestCredentialBackendAdapters {
-    fn from_sources(sources: GuestCredentialBackendSources) -> Arc<Self> {
+    pub(crate) fn from_sources(sources: GuestCredentialBackendSources) -> Arc<Self> {
         let unavailable = Arc::new(FailClosedGuestCredentialAdapter);
-        Self::new(
+        Self::with_execution_ref(
+            Some(sources.execution_ref),
             sources.secret_service.unwrap_or_else(|| unavailable.clone()),
             sources.entra.unwrap_or_else(|| unavailable.clone()),
             sources
@@ -155,21 +157,18 @@ impl GuestCredentialBackendAdapters {
         )
     }
 
-    fn new(
+    fn with_execution_ref(
+        expected_execution_ref: Option<ResourceRef>,
         secret_service: Arc<dyn GuestCredentialProviderAdapter>,
         entra: Arc<dyn GuestCredentialProviderAdapter>,
         managed_identity: Arc<dyn GuestCredentialProviderAdapter>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            expected_execution_ref,
             secret_service,
             entra,
             managed_identity,
         })
-    }
-
-    /// Compose source adapters supplied by the Guest execution context.
-    pub(crate) fn from_guest_context(execution_ref: ResourceRef) -> Arc<Self> {
-        Self::from_sources(GuestCredentialBackendSources::from_guest_context(execution_ref))
     }
 
     #[cfg(test)]
@@ -177,7 +176,8 @@ impl GuestCredentialBackendAdapters {
         let secret_service = Arc::new(GuestCredentialLeaseRegistry::new());
         let entra = Arc::new(GuestCredentialLeaseRegistry::new());
         let managed_identity = Arc::new(GuestCredentialLeaseRegistry::new());
-        Self::new(
+        Self::with_execution_ref(
+            None,
             Arc::new(GuestSecretServiceCollectionPort { registry: secret_service }),
             Arc::new(GuestEntraIdentityEndpointClient { registry: entra }),
             Arc::new(GuestManagedIdentityImdsClient {
@@ -211,7 +211,7 @@ impl GuestCredentialBackendSources {
     /// Resolve only sources enrolled by the Guest execution context. d2bd
     /// does not synthesize a Secret Service, Entra, or IMDS backend when the
     /// corresponding Guest-local Endpoint is absent.
-    fn from_guest_context(execution_ref: ResourceRef) -> Self {
+    pub(crate) fn from_guest_context(execution_ref: ResourceRef) -> Self {
         Self {
             execution_ref,
             secret_service: None,
@@ -866,6 +866,16 @@ impl GuestCredentialBackendSource for GuestLocalCredentialBackend {
         &self,
         request: GuestCredentialBackendRequest,
     ) -> GuestCredentialBackendSourceFuture<'_> {
+        if self
+            .adapters
+            .expected_execution_ref
+            .as_ref()
+            .is_some_and(|expected| expected != &request.execution_ref)
+        {
+            return Box::pin(async {
+                Err(GuestCredentialBackendSourceError::Denied)
+            });
+        }
         let adapter = self
             .adapters
             .adapter(request.provider_ref.name().as_str())
@@ -880,10 +890,10 @@ impl GuestCredentialBackendSource for GuestLocalCredentialBackend {
 }
 
 impl GuestLocalCredentialBackend {
-    /// Bind the typed sources owned by the current Guest execution context.
-    pub(crate) fn from_guest_context(execution_ref: ResourceRef) -> Arc<Self> {
+    /// Bind typed source ports owned by the current Guest execution context.
+    pub(crate) fn from_sources(sources: GuestCredentialBackendSources) -> Arc<Self> {
         Arc::new(Self {
-            adapters: GuestCredentialBackendAdapters::from_guest_context(execution_ref),
+            adapters: GuestCredentialBackendAdapters::from_sources(sources),
         })
     }
 
