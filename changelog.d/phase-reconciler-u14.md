@@ -10,6 +10,10 @@
   committed resources, while still refusing a missing Provider that owns work.
 - Applied the same fail-closed ownership check to Credential, storage,
   interaction, Guest, and observability runner startup paths.
+- Made sparse interaction composition explicitly absent-aware, kept present
+  U9 Providers on filtered watches while refusing incomplete identity, accepted
+  schema-valid system-core Users without a synthetic providerRef, and withheld
+  daemon readiness on mandatory Process runner failure with bounded diagnostics.
 - Kept authenticated system-core status and finalizer projections local to
   resource audit while retaining broker evidence for desired-state mutations.
 - Preserved that broker-evidence classification when pending audit outboxes

@@ -654,15 +654,15 @@ pub enum RunnerError {
 
 impl core::fmt::Display for RunnerError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::InvalidDescriptor => "controller descriptor bounds are invalid",
-            Self::Controller => "controller handler failed",
-            Self::Source(_) => "controller source failed",
-            Self::Queue(_) => "controller queue failed",
-            Self::Context(_) => "reconcile context failed",
-            Self::Cancelled => "controller runner cancelled",
-            Self::TaskFailed => "controller task failed",
-        })
+        match self {
+            Self::InvalidDescriptor => f.write_str("controller descriptor bounds are invalid"),
+            Self::Controller => f.write_str("controller handler failed"),
+            Self::Source(error) => write!(f, "controller source failed: {error}"),
+            Self::Queue(error) => write!(f, "controller queue failed: {error}"),
+            Self::Context(error) => write!(f, "reconcile context failed: {error}"),
+            Self::Cancelled => f.write_str("controller runner cancelled"),
+            Self::TaskFailed => f.write_str("controller task failed"),
+        }
     }
 }
 
@@ -726,6 +726,8 @@ pub struct Runner<R, S> {
     observer: Arc<dyn RunnerObserver>,
 }
 
+type RunnerStartupCallback = Box<dyn FnOnce(Result<(), RunnerError>) + Send + 'static>;
+
 impl<R, S> Runner<R, S>
 where
     R: ResourceReconciler,
@@ -756,6 +758,25 @@ where
 
     /// Register, list, watch, and reconcile until the watch closes and work drains.
     pub fn run(&self) -> RunnerFuture {
+        self.run_with_startup_callback(None)
+    }
+
+    /// Register, list, and open the watch before reporting startup success.
+    ///
+    /// The callback is invoked exactly once for startup success or for a
+    /// failure before the initial watch is admitted. Later runner failures
+    /// remain the returned future's result.
+    pub fn run_with_startup<F>(&self, startup: F) -> RunnerFuture
+    where
+        F: FnOnce(Result<(), RunnerError>) + Send + 'static,
+    {
+        self.run_with_startup_callback(Some(Box::new(startup)))
+    }
+
+    fn run_with_startup_callback(
+        &self,
+        mut startup: Option<RunnerStartupCallback>,
+    ) -> RunnerFuture {
         let runner = Self {
             reconciler: Arc::clone(&self.reconciler),
             source: Arc::clone(&self.source),
@@ -769,7 +790,7 @@ where
         RunnerFuture {
             shutdown,
             inner: Box::pin(async move {
-                let result = runner.run_inner(run_shutdown).await;
+                let result = runner.run_inner(run_shutdown, &mut startup).await;
                 observer.observe(RunnerObservation {
                     counter: None,
                     lane: None,
@@ -797,11 +818,20 @@ where
         }
     }
 
-    async fn run_inner(&self, shutdown: Cancellation) -> Result<RunnerReport, RunnerFailure> {
+    async fn run_inner(
+        &self,
+        shutdown: Cancellation,
+        startup: &mut Option<RunnerStartupCallback>,
+    ) -> Result<RunnerReport, RunnerFailure> {
         let mut report = RunnerReport::default();
-        match self.run_loop(shutdown, &mut report).await {
+        match self.run_loop(shutdown, &mut report, startup).await {
             Ok(()) => Ok(report),
-            Err(error) => Err(RunnerFailure { error, report }),
+            Err(error) => {
+                if let Some(startup) = startup.take() {
+                    startup(Err(error));
+                }
+                Err(RunnerFailure { error, report })
+            }
         }
     }
 
@@ -809,6 +839,7 @@ where
         &self,
         shutdown: Cancellation,
         report: &mut RunnerReport,
+        startup: &mut Option<RunnerStartupCallback>,
     ) -> Result<(), RunnerError> {
         let startup_deadline = phase_deadline(self.clock.as_ref(), self.config.deadline_tick);
         let descriptor = bounded_phase(
@@ -845,6 +876,9 @@ where
                 .open_watch(&descriptor, initial.snapshot_revision),
         )
         .await?;
+        if let Some(startup) = startup.take() {
+            startup(Ok(()));
+        }
 
         let queue = Arc::new(PendingQueue::new(
             descriptor.max_pending_resources(),
@@ -3219,6 +3253,37 @@ mod tests {
         reconciler.release(1);
         watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
         runner.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn startup_callback_retains_initial_source_failure_kind() {
+        let (reconciler, _entered, source, _watch_tx) = harness(Vec::new(), 1);
+        source
+            .initial
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let startup = Arc::new(Mutex::new(None));
+        let startup_result = Arc::clone(&startup);
+        let result = block_on(
+            Runner::new(reconciler, source, config()).run_with_startup(move |result| {
+                *startup_result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+            }),
+        );
+        assert_eq!(
+            startup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .copied(),
+            Some(Err(RunnerError::Source(SourceError::Unavailable)))
+        );
+        assert_eq!(
+            result.unwrap_err().error(),
+            RunnerError::Source(SourceError::Unavailable)
+        );
     }
 
     #[test]

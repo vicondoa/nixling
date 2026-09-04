@@ -3709,6 +3709,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), TypedError> {
     refresh_activation_marker_metrics_on_startup(&state);
     refresh_broker_reap_log(&state, "startup");
 
+    let mut startup_resource_plane_ready = !state.config.enable_resource_plane;
     match load_bundle_resolver(&state) {
         Ok(resolver) => {
             let provider_root = d2bd_runtime::zone_authority::authoritative_zone_ids(&resolver)
@@ -3782,6 +3783,8 @@ pub async fn serve(options: ServeOptions) -> Result<(), TypedError> {
                         }
                         if let Ok(mut slot) = state.resource_plane.lock() {
                             *slot = Some(Arc::clone(&plane));
+                            startup_resource_plane_ready =
+                                plane.ready_zone_count() == plane.zone_ids().len();
                         } else {
                             return Err(TypedError::InternalIo {
                                 context: "publish resource plane".to_owned(),
@@ -3792,6 +3795,8 @@ pub async fn serve(options: ServeOptions) -> Result<(), TypedError> {
                         let mut listener_set: Option<
                             interaction_composition::InteractionListenerSet,
                         > = None;
+                        let mut interaction_required = false;
+                        let mut interaction_startup_failed = false;
                         for zone in plane.zone_ids() {
                             let Some(resource) = plane.zone(&zone).ok() else {
                                 continue;
@@ -3799,12 +3804,20 @@ pub async fn serve(options: ServeOptions) -> Result<(), TypedError> {
                             if resource.require_ready().is_err() {
                                 continue;
                             }
-                            if resource.interaction_provider_configuration_refused() {
-                                tracing::error!(
-                                    zone = %zone,
-                                    "interaction Provider composition refused: committed configuration is incomplete",
-                                );
-                                continue;
+                            match resource.interaction_state() {
+                                resource_runtime::InteractionState::Absent => continue,
+                                resource_runtime::InteractionState::Refused => {
+                                    interaction_required = true;
+                                    interaction_startup_failed = true;
+                                    tracing::error!(
+                                        zone = %zone,
+                                        "interaction Provider composition refused: committed configuration is incomplete",
+                                    );
+                                    continue;
+                                }
+                                resource_runtime::InteractionState::Ready => {
+                                    interaction_required = true;
+                                }
                             }
                             match interaction_composition::production_interaction_composition(
                                 state.daemon_uid,
@@ -3821,11 +3834,14 @@ pub async fn serve(options: ServeOptions) -> Result<(), TypedError> {
                                 Ok(runtime) => {
                                     runtimes.insert(zone.clone(), runtime);
                                 }
-                                Err(error) => tracing::error!(
-                                    error = ?error,
-                                    zone = %zone,
-                                    "interaction Provider composition failed closed during startup",
-                                ),
+                                Err(error) => {
+                                    interaction_startup_failed = true;
+                                    tracing::error!(
+                                        error = ?error,
+                                        zone = %zone,
+                                        "interaction Provider composition failed closed during startup",
+                                    );
+                                }
                             }
                         }
                         if !runtimes.is_empty() {
@@ -3856,10 +3872,13 @@ pub async fn serve(options: ServeOptions) -> Result<(), TypedError> {
                                             listener_set = Some(listeners);
                                         }
                                     }
-                                    Err(error) => tracing::error!(
-                                        %error,
-                                        "interaction Provider listeners failed closed during startup",
-                                    ),
+                                    Err(error) => {
+                                        interaction_startup_failed = true;
+                                        tracing::error!(
+                                            %error,
+                                            "interaction Provider listeners failed closed during startup",
+                                        );
+                                    }
                                 }
                             }
                             if let Some(listeners) = listener_set {
@@ -3873,10 +3892,13 @@ pub async fn serve(options: ServeOptions) -> Result<(), TypedError> {
                                     "ComponentSession listeners ready",
                                 );
                             }
-                        } else {
+                        } else if interaction_required {
                             tracing::error!(
                                 "interaction Provider composition refused: no ready resource Zone",
                             );
+                        }
+                        if interaction_startup_failed {
+                            startup_resource_plane_ready = false;
                         }
                     }
                     Err(error) => {
@@ -4031,14 +4053,32 @@ pub async fn serve(options: ServeOptions) -> Result<(), TypedError> {
         "d2bd running startup autostart reconciliation",
     );
     run_startup_autostart(&state, &combined_pre_degraded).await;
-    sd_notify_ready(notify_socket.as_deref());
+    if startup_resource_plane_ready {
+        sd_notify_ready(notify_socket.as_deref());
+    } else {
+        sd_notify_status(
+            notify_socket.as_deref(),
+            "d2bd diagnostic public socket only; resource plane is not ready",
+        );
+    }
     let interaction_runtime_ready = state.interaction_runtime.lock().await.is_some();
-    tracing::info!(
-        socket_kind = "public",
-        socket_ready = true,
-        interaction_runtime_ready,
-        "d2bd public socket ready; accepting connections",
-    );
+    if startup_resource_plane_ready {
+        tracing::info!(
+            socket_kind = "public",
+            socket_ready = true,
+            resource_plane_ready = true,
+            interaction_runtime_ready,
+            "d2bd public socket ready; accepting connections",
+        );
+    } else {
+        tracing::warn!(
+            socket_kind = "public",
+            socket_ready = false,
+            resource_plane_ready = false,
+            interaction_runtime_ready,
+            "d2bd public socket bound for diagnostic requests; readiness withheld",
+        );
+    }
 
     loop {
         let accepted = tokio::select! {
@@ -15981,12 +16021,19 @@ async fn open_resource_plane(
         }
         let _ = runtime.audio_binding_statuses();
         if let Err(error) = runtime.require_ready() {
-            let _ = runtime.shutdown().await;
-            let _ = plane.shutdown().await;
-            while let Some((_, runtime, _)) = remaining.next() {
+            if error != resource_runtime::ResourceRuntimeError::InteractionConfigurationUnavailable {
                 let _ = runtime.shutdown().await;
+                let _ = plane.shutdown().await;
+                while let Some((_, runtime, _)) = remaining.next() {
+                    let _ = runtime.shutdown().await;
+                }
+                return Err(error);
             }
-            return Err(error);
+            tracing::error!(
+                zone = %runtime.zone(),
+                error = %error,
+                "interaction Provider readiness refused; retaining filtered U9 watches for diagnostics",
+            );
         }
         match plane.insert(runtime) {
             Ok(_) => {}

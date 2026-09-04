@@ -70,9 +70,9 @@ pub use d2b_controller_toolkit::{
     ObservationResult, OperationContext, PriorityLane, ProjectionDisposition, ReconcileContext,
     ReconcileDisposition, ReconcilePlan, ReconcileProjection, ReconcileReason, ReconcileResult,
     ResourceKey, ResourceMutationBatch, ResourceReconciler, ResourceRegistration, ResourceSnapshot,
-    ResyncPolicy, Runner, RunnerConfig, SelectorField, SourceError, StatusPersistence,
-    TriggerReason, TriggerSet, UpdateAssessment, UpdateAssessmentState, UpgradePlan, UpgradeStage,
-    ValidationResult, WatchEvent, WatchFailure, WatchHint,
+    ResyncPolicy, Runner, RunnerConfig, RunnerError, SelectorField, SourceError,
+    StatusPersistence, TriggerReason, TriggerSet, UpdateAssessment, UpdateAssessmentState,
+    UpgradePlan, UpgradeStage, ValidationResult, WatchEvent, WatchFailure, WatchHint,
 };
 pub use dependencies::{
     DependencyError, DependencyEvent, DependencyIndex, DependencyTeardownPlan, DependencyTrigger,

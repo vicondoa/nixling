@@ -92,6 +92,7 @@ pkgs.testers.runNixOSTest {
                 "Host"
                 "Process"
                 "Provider"
+                "User"
               ];
               verbs = [ "get" "list" ];
               subresources = [ ];
@@ -153,6 +154,16 @@ pkgs.testers.runNixOSTest {
         ".status.observedGeneration == .metadata.generation)' "
         "/run/d2b-host-before.json",
         timeout=60,
+    )
+    machine.succeed(
+          "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
+          "d2b --zone work --json list User "
+          ">/run/d2b-user-before.json && "
+          "jq -e '.resources[] | select(.type == \"User\" and "
+          ".metadata.name == \"alice\") | "
+          "(.status.phase == \"Ready\" and "
+          ".status.observedGeneration == .metadata.generation)' "
+          "/run/d2b-user-before.json"
     )
     machine.succeed(
         "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "

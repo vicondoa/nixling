@@ -96,8 +96,9 @@ use d2b_core_controller::{
     CoreControllerSource, CoreResourceReconciler, DependencySnapshot, DisruptionClass, DrainResult,
     FinalizeResult, ObservationResult, ReconcileContext, ReconcileDisposition, ReconcilePlan,
     ReconcileReason, ReconcileResult, ResourceKey, ResourceMutationBatch, ResourceReconciler,
-    ResourceRegistration, ResourceSnapshot, ResyncPolicy, Runner, RunnerConfig, SelectorField,
-    SourceError, StatusPersistence, TriggerReason, UpdateAssessment, UpdateAssessmentState,
+    ResourceRegistration, ResourceSnapshot, ResyncPolicy, Runner, RunnerConfig, RunnerError,
+    SelectorField, SourceError, StatusPersistence, TriggerReason, UpdateAssessment,
+    UpdateAssessmentState,
     UpgradePlan, UpgradeStage, ValidationResult, core_controller_descriptors, OwnedChildIntent,
 };
 use d2b_core_controller::main::{
@@ -446,6 +447,14 @@ pub const U9_SHARED_PROVIDER_RUNNERS: [SharedProviderRunnerRegistration; 6] = [
             d2b_provider_shell_terminal::shell_runner_contract()
                 .watched_configuration_is_dependency(),
     },
+];
+
+const U9_PROVIDER_REFS: [&str; 5] = [
+    "Provider/display-wayland",
+    "Provider/audio-pipewire",
+    "Provider/clipboard-wayland",
+    "Provider/notification-desktop",
+    "Provider/shell-terminal",
 ];
 
 /// Closed Provider handler set used by the shared Runner.
@@ -8288,6 +8297,64 @@ fn u12_runner_readiness(required: bool, task_count: usize, any_finished: bool) -
     !required || (task_count != 0 && !any_finished)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InteractionState {
+    Absent,
+    Ready,
+    Refused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ControllerRunnerFailure {
+    controller: ResourceRef,
+    resource_types: Vec<ResourceTypeName>,
+    error: RunnerError,
+}
+
+impl ControllerRunnerFailure {
+    fn new(
+        controller: ResourceRef,
+        resource_types: impl IntoIterator<Item = ResourceTypeName>,
+        error: RunnerError,
+    ) -> Self {
+        Self {
+            controller,
+            resource_types: resource_types.into_iter().collect(),
+            error,
+        }
+    }
+
+    pub(crate) fn controller(&self) -> &ResourceRef {
+        &self.controller
+    }
+
+    pub(crate) fn resource_types(&self) -> &[ResourceTypeName] {
+        &self.resource_types
+    }
+
+    pub(crate) const fn error(&self) -> RunnerError {
+        self.error
+    }
+}
+
+fn store_runner_failure(
+    slot: &Mutex<Option<ControllerRunnerFailure>>,
+    failure: ControllerRunnerFailure,
+) {
+    if let Ok(mut slot) = slot.lock() {
+        *slot = Some(failure);
+    }
+}
+
+fn push_runner_failure(
+    slot: &Mutex<Vec<ControllerRunnerFailure>>,
+    failure: ControllerRunnerFailure,
+) {
+    if let Ok(mut slot) = slot.lock() {
+        slot.push(failure);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct CommittedInteractionProviderConfiguration {
     clipboard: Option<CommittedClipboardProviderConfiguration>,
@@ -10259,6 +10326,9 @@ pub struct ZoneResourceRuntime {
     u10_runner_lock: Arc<tokio::sync::Mutex<()>>,
     u10_required: AtomicBool,
     credential_sessions: CredentialSessionRegistry,
+    process_controller_required: AtomicBool,
+    process_runner_failure: Arc<Mutex<Option<ControllerRunnerFailure>>>,
+    u9_runner_failures: Arc<Mutex<Vec<ControllerRunnerFailure>>>,
     #[cfg(test)]
     core_runner_events: Arc<Mutex<Vec<&'static str>>>,
     core: Mutex<CoreProcess>,
@@ -10288,7 +10358,7 @@ pub struct ZoneResourceRuntime {
     shared_provider_effects: Arc<dyn SharedProviderEffectExecutor>,
     interaction_provider_configuration: Option<CommittedInteractionProviderConfiguration>,
     interaction_identity: Option<CommittedInteractionIdentity>,
-    interaction_provider_configuration_refused: bool,
+    interaction_state: InteractionState,
 }
 
 /// Store-derived admission evidence for one security-key Device effect.
@@ -11010,6 +11080,18 @@ impl ZoneResourceRuntime {
             .runtime_metadata()
             .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        let interaction_state = if defer_activation {
+            InteractionState::Absent
+        } else {
+            let interaction_present =
+                interaction_resources_present(&zone, &store).await?;
+            derive_interaction_state(
+                interaction_present,
+                interaction_provider_configuration.as_ref(),
+                interaction_identity.as_ref(),
+                interaction_provider_configuration_refused,
+            )
+        };
         let defer_core_start = authority_identity.is_some();
         let runtime = Self {
             zone,
@@ -11055,6 +11137,9 @@ impl ZoneResourceRuntime {
             u10_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
             u10_required: AtomicBool::new(false),
             credential_sessions: CredentialSessionRegistry::default(),
+            process_controller_required: AtomicBool::new(false),
+            process_runner_failure: Arc::new(Mutex::new(None)),
+            u9_runner_failures: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             core_runner_events: Arc::new(Mutex::new(Vec::new())),
             core: Mutex::new(core),
@@ -11095,7 +11180,7 @@ impl ZoneResourceRuntime {
             shared_provider_effects: Arc::new(UnavailableSharedProviderEffects),
             interaction_provider_configuration,
             interaction_identity,
-            interaction_provider_configuration_refused,
+            interaction_state,
         };
         if !defer_core_start && runtime.readiness.resource_api_ready {
             if let Err(error) = runtime.start_core_controller_runners().await {
@@ -11334,16 +11419,14 @@ impl ZoneResourceRuntime {
             .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
 
-        (
-            self.interaction_provider_configuration,
-            self.interaction_provider_configuration_refused,
-        ) = match load_interaction_provider_configuration(
-            &self.zone,
-            &self.store,
-            store_metadata.current_revision,
-        )
-        .await
-        {
+        let (interaction_provider_configuration, mut interaction_provider_configuration_refused) =
+            match load_interaction_provider_configuration(
+                &self.zone,
+                &self.store,
+                store_metadata.current_revision,
+            )
+            .await
+            {
             Ok(None) => (None, false),
             Ok(Some(configuration)) if configuration.is_complete() => (Some(configuration), false),
             Ok(Some(_)) => {
@@ -11362,6 +11445,7 @@ impl ZoneResourceRuntime {
                 (None, true)
             }
         };
+        self.interaction_provider_configuration = interaction_provider_configuration;
         self.interaction_identity = match load_committed_interaction_identity(
             &self.zone,
             &self.store,
@@ -11377,10 +11461,18 @@ impl ZoneResourceRuntime {
                     error = %error,
                     "resource runtime committed interaction identity load failed",
                 );
-                self.interaction_provider_configuration_refused = true;
+                interaction_provider_configuration_refused = true;
                 None
             }
         };
+        let interaction_present =
+            interaction_resources_present(&self.zone, &self.store).await?;
+        self.interaction_state = derive_interaction_state(
+            interaction_present,
+            self.interaction_provider_configuration.as_ref(),
+            self.interaction_identity.as_ref(),
+            interaction_provider_configuration_refused,
+        );
         let system_core =
             system_core_startup_result(&self.zone, &self.store)
                 .await
@@ -13317,6 +13409,9 @@ impl ZoneResourceRuntime {
             task.abort();
             let _ = task.await;
         }
+        if let Ok(mut failures) = self.u9_runner_failures.lock() {
+            failures.clear();
+        }
         self.u9_required.store(false, Ordering::Release);
         Ok(())
     }
@@ -13390,10 +13485,16 @@ impl ZoneResourceRuntime {
         let (active_registrations, provider_generations) =
             u9_provider_generations(self).await?;
         if active_registrations.is_empty() {
+            if let Ok(mut failures) = self.u9_runner_failures.lock() {
+                failures.clear();
+            }
             self.u9_required.store(false, Ordering::Release);
             return Ok(());
         }
         self.u9_required.store(true, Ordering::Release);
+        if let Ok(mut failures) = self.u9_runner_failures.lock() {
+            failures.clear();
+        }
         let descriptors = compose_shared_provider_runner_descriptors(
             active_registrations,
             self.zone.clone(),
@@ -13405,6 +13506,7 @@ impl ZoneResourceRuntime {
             DaemonSharedProviderEffects::new(Arc::clone(&state), self.zone.clone()),
         );
         let mut new_tasks = Vec::with_capacity(descriptors.len());
+        let mut startup_receivers = Vec::with_capacity(descriptors.len());
         for (registration, descriptor) in descriptors {
             let task = async {
                 let kind = SharedProviderResourceKind::from_registration(registration)?;
@@ -13524,8 +13626,31 @@ impl ZoneResourceRuntime {
                 );
                 let resource_type = registration.resource_type;
                 let controller = registration.controller_ref;
-                Ok::<_, ResourceRuntimeError>(tokio::spawn(async move {
-                    match runner.run().await {
+                let diagnostic_controller = controller_ref.clone();
+                let diagnostic_resource_type = ResourceTypeName::parse(resource_type)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+                let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+                let failure_slot = Arc::clone(&self.u9_runner_failures);
+                let startup_failure_slot = Arc::clone(&failure_slot);
+                let callback_controller = diagnostic_controller.clone();
+                let callback_resource_type = diagnostic_resource_type.clone();
+                let task = tokio::spawn(async move {
+                    let result = runner
+                        .run_with_startup(move |startup| {
+                            if let Err(error) = startup {
+                                push_runner_failure(
+                                    &startup_failure_slot,
+                                    ControllerRunnerFailure::new(
+                                        callback_controller,
+                                        [callback_resource_type],
+                                        error,
+                                    ),
+                                );
+                            }
+                            let _ = startup_tx.send(startup);
+                        })
+                        .await;
+                    match result {
                         Ok(report) => tracing::debug!(
                             controller,
                             resource_type,
@@ -13533,21 +13658,43 @@ impl ZoneResourceRuntime {
                             relists = report.relists,
                             "U9 interaction shared Runner stopped",
                         ),
-                        Err(error) => tracing::warn!(
-                            controller,
-                            resource_type,
-                            error = %error,
-                            "U9 interaction shared Runner failed",
-                        ),
+                        Err(error) => {
+                            let diagnostic = ControllerRunnerFailure::new(
+                                diagnostic_controller,
+                                [diagnostic_resource_type],
+                                error.error(),
+                            );
+                            push_runner_failure(&failure_slot, diagnostic.clone());
+                            tracing::warn!(
+                                controller = %diagnostic.controller(),
+                                resource_type,
+                                error_kind = ?diagnostic.error(),
+                                error = %diagnostic.error(),
+                                "U9 interaction shared Runner failed",
+                            );
+                        }
                     }
-                }))
+                });
+                Ok::<_, ResourceRuntimeError>((task, startup_rx))
             }
             .await;
             match task {
-                Ok(task) => new_tasks.push(task),
+                Ok((task, startup_rx)) => {
+                    new_tasks.push(task);
+                    startup_receivers.push(startup_rx);
+                }
                 Err(error) => {
                     abort_u9_runner_tasks(&mut new_tasks).await;
                     return Err(error);
+                }
+            }
+        }
+        for startup in startup_receivers {
+            match startup.await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => {
+                    abort_u9_runner_tasks(&mut new_tasks).await;
+                    return Err(ResourceRuntimeError::HandlerNotReady);
                 }
             }
         }
@@ -14200,6 +14347,10 @@ impl ZoneResourceRuntime {
         self.interaction_identity.as_ref()
     }
 
+    pub(crate) const fn interaction_state(&self) -> InteractionState {
+        self.interaction_state
+    }
+
     /// Resolve the one committed WaylandSession that owns a VM's display
     /// lifecycle. A missing row is reported separately so VM start can fail
     /// closed without inventing a display process or session identity.
@@ -14261,10 +14412,6 @@ impl ZoneResourceRuntime {
             return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
         }
         Ok(Some((resource.resource_ref, resource.uid, spec)))
-    }
-
-    pub(crate) const fn interaction_provider_configuration_refused(&self) -> bool {
-        self.interaction_provider_configuration_refused
     }
 
     /// Return the current core-controller stage.
@@ -16888,6 +17035,7 @@ impl ZoneResourceRuntime {
         if !self.readiness.resource_api_ready {
             return Ok(());
         }
+        self.process_controller_required.store(true, Ordering::Release);
         let providers = state
             .provider_runtime
             .process_providers()
@@ -17084,6 +17232,9 @@ impl ZoneResourceRuntime {
                 );
             }));
             runtime.set_status_client(self.status_client()?);
+            let diagnostic_controller = descriptor.identity().controller_ref().clone();
+            let diagnostic_resource_types =
+                descriptor.resource_types().cloned().collect::<Vec<_>>();
             let handler = ProcessResourceReconciler::new(descriptor, runtime);
             let runner = Runner::new(
                 handler,
@@ -17098,19 +17249,60 @@ impl ZoneResourceRuntime {
                     max_attempts: 3,
                 },
             );
+            let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+            let failure_slot = Arc::clone(&self.process_runner_failure);
+            let startup_failure_slot = Arc::clone(&failure_slot);
+            let callback_controller = diagnostic_controller.clone();
+            let callback_resource_types = diagnostic_resource_types.clone();
             let task = tokio::spawn(async move {
-                match runner.run().await {
+                let result = runner
+                    .run_with_startup(move |startup| {
+                        if let Err(error) = startup {
+                            store_runner_failure(
+                                &startup_failure_slot,
+                                ControllerRunnerFailure::new(
+                                    callback_controller,
+                                    callback_resource_types,
+                                    error,
+                                ),
+                            );
+                        }
+                        let _ = startup_tx.send(startup);
+                    })
+                    .await;
+                match result {
                     Ok(report) => tracing::debug!(
                         dispatched = report.dispatched,
                         relists = report.relists,
                         "Process Provider shared runner stopped",
                     ),
-                    Err(error) => tracing::warn!(
-                        error = %error,
-                        "Process Provider shared runner failed",
-                    ),
+                    Err(error) => {
+                        let diagnostic = ControllerRunnerFailure::new(
+                            diagnostic_controller,
+                            diagnostic_resource_types,
+                            error.error(),
+                        );
+                        store_runner_failure(&failure_slot, diagnostic.clone());
+                        tracing::warn!(
+                            controller = %diagnostic.controller(),
+                            resource_types = ?diagnostic.resource_types(),
+                            error_kind = ?diagnostic.error(),
+                            error = %diagnostic.error(),
+                            "Process Provider shared runner failed",
+                        );
+                    }
                 }
             });
+            match startup_rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => {
+                    let _ = task.await;
+                    return Err(ResourceRuntimeError::HandlerNotReady);
+                }
+            }
+            if let Ok(mut failure) = self.process_runner_failure.lock() {
+                *failure = None;
+            }
             *self
                 .process_runner_task
                 .lock()
@@ -17258,6 +17450,34 @@ impl ZoneResourceRuntime {
         }
         if !self.readiness.provider_path_ready {
             return Some(ResourceRuntimeError::ProviderPathUnavailable);
+        }
+        if self
+            .process_runner_failure
+            .lock()
+            .map(|failure| failure.is_some())
+            .unwrap_or(true)
+        {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
+        if self.process_controller_required.load(Ordering::Acquire)
+            && !self
+                .process_runner_task
+                .try_lock()
+                .map(|task| task.as_ref().is_some_and(|task| !task.is_finished()))
+                .unwrap_or(false)
+        {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
+        if matches!(self.interaction_state, InteractionState::Refused) {
+            return Some(ResourceRuntimeError::InteractionConfigurationUnavailable);
+        }
+        if self
+            .u9_runner_failures
+            .lock()
+            .map(|failures| !failures.is_empty())
+            .unwrap_or(true)
+        {
+            return Some(ResourceRuntimeError::HandlerNotReady);
         }
         let u12_ready = if self.u12_required.load(Ordering::Acquire) {
             self.u12_runner_tasks
@@ -18283,6 +18503,125 @@ async fn discover_local_user(
     }))
 }
 
+fn is_u9_provider_ref(value: &str) -> bool {
+    U9_PROVIDER_REFS.contains(&value)
+}
+
+fn contains_u9_provider_ref(value: &Value) -> bool {
+    match value {
+        Value::String(value) => is_u9_provider_ref(value),
+        Value::Array(values) => values.iter().any(contains_u9_provider_ref),
+        Value::Object(values) => values.values().any(contains_u9_provider_ref),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn is_u9_resource_type(resource_type: &ResourceTypeName) -> bool {
+    let resource_type = resource_type.as_str();
+    resource_type.starts_with("display-wayland.")
+        || resource_type.starts_with("audio.d2bus.org.")
+        || resource_type.starts_with("shell-terminal.d2bus.org.")
+}
+
+async fn interaction_resources_present(
+    zone: &ZoneId,
+    store: &RedbResourceStore,
+) -> Result<bool, ResourceRuntimeError> {
+    let provider_type =
+        ResourceTypeName::parse("Provider").map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+    let provider_names = U9_PROVIDER_REFS
+        .iter()
+        .map(|provider| {
+            provider
+                .strip_prefix("Provider/")
+                .and_then(|name| ResourceName::parse(name).ok())
+                .ok_or(ResourceRuntimeError::HandlerNotReady)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut cursor = None;
+    loop {
+        let page = store
+            .list(StoreListRequest {
+                operation: StoreOperationContext {
+                    operation_id: "interaction-presence-providers".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "interaction-presence-providers".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                resource_types: vec![provider_type.clone()],
+                resource_names: provider_names.clone(),
+                filters: Vec::new(),
+                page_size: 16,
+                cursor,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        if !page.resources.is_empty() {
+            return Ok(true);
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    let mut cursor = None;
+    loop {
+        let page = store
+            .list(StoreListRequest {
+                operation: StoreOperationContext {
+                    operation_id: "interaction-presence-resources".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "interaction-presence-resources".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                resource_types: Vec::new(),
+                resource_names: Vec::new(),
+                filters: Vec::new(),
+                page_size: 512,
+                cursor,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        for resource in page.resources {
+            if is_u9_resource_type(&resource.resource_ref.resource_type()) {
+                return Ok(true);
+            }
+            let value: Value = serde_json::from_slice(&resource.canonical_json)
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+            if contains_u9_provider_ref(&value) {
+                return Ok(true);
+            }
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(false)
+}
+
+fn derive_interaction_state(
+    interaction_present: bool,
+    configuration: Option<&CommittedInteractionProviderConfiguration>,
+    identity: Option<&CommittedInteractionIdentity>,
+    refused: bool,
+) -> InteractionState {
+    if !interaction_present && configuration.is_none() && identity.is_none() && !refused {
+        InteractionState::Absent
+    } else if !refused && configuration.is_some() && identity.is_some() {
+        InteractionState::Ready
+    } else {
+        InteractionState::Refused
+    }
+}
+
 async fn load_interaction_provider_configuration(
     zone: &ZoneId,
     store: &RedbResourceStore,
@@ -19246,6 +19585,37 @@ impl SystemCoreResourceReconciler {
         Arc::new(Self { descriptor })
     }
 
+    fn valid_spec(resource: &ResourceSnapshot) -> bool {
+        let resource_type = (|| {
+            let envelope = ResourceEnvelope::from_json(resource.canonical_json())
+                .map_err(|_| SystemCoreResourceReconcileError)?;
+            let resource_type = envelope.resource_type().as_str();
+            match resource_type {
+                "Host" => {
+                    if envelope.spec().provider_ref().map(|provider| {
+                        provider.to_canonical_string() == HOST_PROVIDER_REF
+                    }) != Some(true)
+                    {
+                        return Err(SystemCoreResourceReconcileError);
+                    }
+                    serde_json::from_slice::<HostSpec>(
+                        &envelope.spec().base().to_canonical_bytes(),
+                    )
+                    .map_err(|_| SystemCoreResourceReconcileError)?;
+                }
+                "User" => {
+                    serde_json::from_slice::<UserSpec>(
+                        &envelope.spec().base().to_canonical_bytes(),
+                    )
+                    .map_err(|_| SystemCoreResourceReconcileError)?;
+                }
+                _ => return Err(SystemCoreResourceReconcileError),
+            }
+            Ok::<_, SystemCoreResourceReconcileError>(())
+        })();
+        resource_type.is_ok()
+    }
+
     fn resource_type(
         resource: &ResourceSnapshot,
     ) -> Result<&str, SystemCoreResourceReconcileError> {
@@ -19367,40 +19737,7 @@ impl ResourceReconciler for SystemCoreResourceReconciler {
         _context: &ReconcileContext,
         resource: &ResourceSnapshot,
     ) -> impl Future<Output = Result<ValidationResult, Self::Error>> + Send {
-        let valid = (|| {
-            let resource_type = Self::resource_type(resource)?;
-            let envelope = ResourceEnvelope::from_json(resource.canonical_json())
-                .map_err(|_| SystemCoreResourceReconcileError)?;
-            match resource_type {
-                "Host" => {
-                    if envelope.spec().provider_ref().map(|provider| {
-                        provider.to_canonical_string() == HOST_PROVIDER_REF
-                    }) != Some(true)
-                    {
-                        return Err(SystemCoreResourceReconcileError);
-                    }
-                    serde_json::from_slice::<HostSpec>(
-                        &envelope.spec().base().to_canonical_bytes(),
-                    )
-                    .map_err(|_| SystemCoreResourceReconcileError)?;
-                }
-                "User" => {
-                    if envelope.spec().provider_ref().map(|provider| {
-                        provider.to_canonical_string() == CORE_CONTROLLER_PROVIDER_REF
-                    }) != Some(true)
-                    {
-                        return Err(SystemCoreResourceReconcileError);
-                    }
-                    serde_json::from_slice::<UserSpec>(
-                        &envelope.spec().base().to_canonical_bytes(),
-                    )
-                    .map_err(|_| SystemCoreResourceReconcileError)?;
-                }
-                _ => return Err(SystemCoreResourceReconcileError),
-            }
-            Ok(())
-        })()
-        .is_ok();
+        let valid = Self::resource_type(resource).is_ok() && Self::valid_spec(resource);
         std::future::ready(Ok(if valid {
             ValidationResult::Valid
         } else {
@@ -24778,6 +25115,151 @@ mod tests {
         runtime
             .require_ready()
             .expect("sparse bundle must reach Host readiness");
+        assert_eq!(runtime.interaction_state, InteractionState::Absent);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn present_u9_provider_without_identity_refuses_readiness_but_keeps_watch() {
+        let (_directory, mut runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Provider",
+                "display-wayland",
+                &zone,
+                r#"{"artifactId":"display-wayland","config":{}}"#,
+            )],
+        )
+        .await;
+        assert!(
+            interaction_resources_present(&zone, &runtime.store)
+                .await
+                .expect("interaction presence scan")
+        );
+        runtime.interaction_state = InteractionState::Refused;
+        let state = Arc::new(crate::detached_exec_routing_tests::test_state(
+            Default::default(),
+        ));
+        runtime
+            .start_u9_controller_runners(state)
+            .await
+            .expect("present U9 Provider keeps its filtered watch");
+        assert!(runtime.u9_required.load(Ordering::Acquire));
+        runtime.set_provider_path_ready(true);
+        assert_eq!(
+            runtime.require_ready(),
+            Err(ResourceRuntimeError::InteractionConfigurationUnavailable)
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn exact_host_fixture_user_shape_is_valid_without_provider_ref() {
+        let zone = ZoneId::parse("work").unwrap();
+        let resource_ref = ResourceRef::parse("User/alice").unwrap();
+        let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let resource = ResourceSnapshot::new(
+            ResourceKey::new(zone, resource_ref, uid),
+            ZoneRevision::new(1),
+            ResourceGeneration::new(1).unwrap(),
+            serde_json::to_vec(&json!({
+                "apiVersion": "resources.d2bus.org/v3",
+                "type": "User",
+                "metadata": {
+                    "name": "alice",
+                    "zone": "work",
+                    "uid": "123e4567-e89b-42d3-a456-426614174000",
+                    "generation": 1,
+                    "revision": 1,
+                    "configurationGeneration": 1,
+                    "ownerRef": null,
+                    "finalizers": [],
+                    "deletionRequestedAt": null,
+                    "createdAt": "1970-01-01T00:00:00.000Z",
+                    "updatedAt": "1970-01-01T00:00:00.000Z",
+                    "managedBy": "configuration",
+                },
+                "spec": {
+                    "displayName": "Alice",
+                    "groups": [],
+                    "osUsername": "alice",
+                },
+                "status": {
+                    "completedAt": null,
+                    "conditions": [],
+                    "lastReconciledAt": null,
+                    "observedGeneration": 0,
+                    "outcome": null,
+                    "phase": "Pending",
+                    "resource": {},
+                    "startedAt": null,
+                    "update": {
+                        "dependencies": {"count": 0, "refs": []},
+                        "disruption": "None",
+                        "lastAssessedAt": null,
+                        "observedGeneration": 0,
+                        "operationId": null,
+                        "owned": {"count": 0, "refs": []},
+                        "preserveState": true,
+                        "reasons": [],
+                        "state": "Unknown",
+                        "targetGeneration": 1,
+                    },
+                },
+            }))
+            .unwrap(),
+            false,
+        );
+        assert!(SystemCoreResourceReconciler::valid_spec(&resource));
+    }
+
+    #[tokio::test]
+    async fn injected_process_source_failure_blocks_readiness_with_bounded_diagnostic() {
+        let (_directory, mut runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        runtime.set_provider_path_ready(true);
+        runtime
+            .process_controller_required
+            .store(true, Ordering::Release);
+        let controller = ResourceRef::parse("Process/d2b-core-controller").unwrap();
+        let resource_types = [
+            ResourceTypeName::parse("Process").unwrap(),
+            ResourceTypeName::parse("EphemeralProcess").unwrap(),
+        ];
+        store_runner_failure(
+            &runtime.process_runner_failure,
+            ControllerRunnerFailure::new(
+                controller.clone(),
+                resource_types,
+                RunnerError::Source(SourceError::Integrity),
+            ),
+        );
+        assert_eq!(
+            runtime.require_ready(),
+            Err(ResourceRuntimeError::HandlerNotReady)
+        );
+        let failure = runtime
+            .process_runner_failure
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("process failure diagnostic");
+        assert_eq!(failure.controller(), &controller);
+        assert_eq!(
+            failure.resource_types(),
+            &[
+                ResourceTypeName::parse("Process").unwrap(),
+                ResourceTypeName::parse("EphemeralProcess").unwrap()
+            ]
+        );
+        assert_eq!(failure.error(), RunnerError::Source(SourceError::Integrity));
+        assert_eq!(
+            failure.error().to_string(),
+            "controller source failed: resource plane integrity failure"
+        );
         runtime.shutdown().await.unwrap();
     }
 
