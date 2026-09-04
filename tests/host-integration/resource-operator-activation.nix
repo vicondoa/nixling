@@ -143,6 +143,11 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("d2b-broker.socket", timeout=30)
     machine.wait_for_unit("d2bd.service", timeout=180)
     machine.wait_for_file("/run/d2b/public.sock", timeout=30)
+    machine.wait_until_succeeds(
+        "journalctl -u d2bd.service --no-pager -o cat "
+        "| grep -F 'external Provider controller ResourceV3 session live'",
+        timeout=60,
+    )
     machine.succeed("runuser -u alice -- d2b auth status --json >/run/d2b-auth-before.json")
 
     machine.wait_until_succeeds(

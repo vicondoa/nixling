@@ -418,6 +418,17 @@
         providerMatrix = pkgs.writeText
           "d2b-provider-matrix.json"
           "${providerMatrixJson}\n";
+        providerTestController = rustWorkspace {
+          pname = "d2b-provider-test-controller";
+          cargoBuildFlags = [
+            "--package"
+            "d2b-provider-test-controller"
+            "--bin"
+            "d2b-provider-test-controller"
+          ];
+          doCheck = false;
+          meta.mainProgram = "d2b-provider-test-controller";
+        };
         cloudHypervisorController = rustWorkspace {
           pname = "d2b-cloud-hypervisor-controller";
           cargoBuildFlags = [
@@ -512,6 +523,7 @@
           doCheck = false;
           meta.mainProgram = "d2b-resource-compiler";
         };
+        d2b-provider-test-controller = providerTestController;
         d2b-provider-runtime-cloud-hypervisor =
           cloudHypervisorArtifact.package;
         provider-matrix = providerMatrix;

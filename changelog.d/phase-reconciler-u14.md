@@ -20,6 +20,9 @@
   resource audit while retaining broker evidence for desired-state mutations.
 - Preserved that broker-evidence classification when pending audit outboxes
   are normalized during crash recovery.
+- Replaced the inert host acceptance controller with an authenticated fd10
+  ComponentSession fixture, made controller-session shutdown ownership explicit,
+  and retried bounded watch revision conflicts during relist/open-watch recovery.
 
 ### Removed
 

@@ -205,23 +205,19 @@ let
 
   mkAcceptanceProviderArtifact = pkgs:
     let
+      controller =
+        self.packages.${pkgs.stdenv.hostPlatform.system}.d2b-provider-test-controller;
       signer = pkgs.python3.withPackages
         (pythonPackages: [ pythonPackages.cryptography ]);
       manifest = ../../tests/fixtures/provider-acceptance/provider-manifest.json;
       schema = ../../tests/fixtures/provider-acceptance/config-schema.json;
       package = pkgs.runCommand "d2b-u20-acceptance-provider" {
-        nativeBuildInputs = [ pkgs.stdenv.cc signer ];
+        nativeBuildInputs = [ signer ];
       } ''
         mkdir -p "$out/bin"
-        $CC -O2 -x c -o "$out/bin/acceptance-controller" - <<'C'
-        #include <unistd.h>
-
-        int main(void) {
-          for (;;) {
-            pause();
-          }
-        }
-        C
+        cp "${controller}/bin/d2b-provider-test-controller" \
+          "$out/bin/acceptance-controller"
+        chmod 0755 "$out/bin/acceptance-controller"
         ${signer}/bin/python3 - "${manifest}" "$out" <<'PY'
         import hashlib
         import json

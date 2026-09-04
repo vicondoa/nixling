@@ -10352,6 +10352,9 @@ pub struct ZoneResourceRuntime {
     controller_sessions: Arc<Mutex<BTreeMap<ResourceRef, ControllerSession>>>,
     controller_session_reconcile_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     controller_session_reconcile_wake: Arc<tokio::sync::Notify>,
+    controller_session_reconcile_shutdown: Arc<AtomicBool>,
+    controller_session_coordinator:
+        Arc<Mutex<Option<Arc<ControllerSessionCoordinator>>>>,
     controller_session_lock: Arc<tokio::sync::Mutex<()>>,
     controller_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
     cloud_hypervisor_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
@@ -11174,6 +11177,8 @@ impl ZoneResourceRuntime {
             controller_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             controller_session_reconcile_task: Arc::new(Mutex::new(None)),
             controller_session_reconcile_wake: Arc::new(tokio::sync::Notify::new()),
+            controller_session_reconcile_shutdown: Arc::new(AtomicBool::new(false)),
+            controller_session_coordinator: Arc::new(Mutex::new(None)),
             controller_session_lock: Arc::new(tokio::sync::Mutex::new(())),
             controller_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             cloud_hypervisor_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -11182,6 +11187,11 @@ impl ZoneResourceRuntime {
             interaction_identity,
             interaction_state,
         };
+        let coordinator = Arc::new(runtime.build_controller_session_coordinator());
+        *runtime
+            .controller_session_coordinator
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = Some(coordinator);
         if !defer_core_start && runtime.readiness.resource_api_ready {
             if let Err(error) = runtime.start_core_controller_runners().await {
                 #[cfg(not(test))]
@@ -15616,7 +15626,7 @@ impl ZoneResourceRuntime {
         ))
     }
 
-    fn controller_session_coordinator(&self) -> ControllerSessionCoordinator {
+    fn build_controller_session_coordinator(&self) -> ControllerSessionCoordinator {
         ControllerSessionCoordinator {
             zone: self.zone.clone(),
             bundle_resource_types: self.bundle_resource_types.clone(),
@@ -15631,17 +15641,32 @@ impl ZoneResourceRuntime {
             controller_session_lock: Arc::clone(&self.controller_session_lock),
         }
     }
+
+    fn controller_session_coordinator(&self) -> Arc<ControllerSessionCoordinator> {
+        self.controller_session_coordinator
+            .lock()
+            .ok()
+            .and_then(|coordinator| coordinator.clone())
+            .expect("controller session coordinator initialized")
+    }
 }
 
 fn schedule_controller_session_reconcile(
     task_slot: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     wake: Arc<tokio::sync::Notify>,
-    coordinator: ControllerSessionCoordinator,
+    shutdown: Arc<AtomicBool>,
+    coordinator: Arc<ControllerSessionCoordinator>,
     providers: Arc<crate::process_provider_runtime::ProductionProcessProviders>,
 ) -> Result<(), ResourceRuntimeError> {
+    if shutdown.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let mut slot = task_slot
         .lock()
         .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
+    if shutdown.load(Ordering::Acquire) {
+        return Ok(());
+    }
     if slot.as_ref().is_some_and(|task| !task.is_finished()) {
         wake.notify_one();
         return Ok(());
@@ -15649,6 +15674,9 @@ fn schedule_controller_session_reconcile(
     let wake_for_task = Arc::clone(&wake);
     *slot = Some(tokio::spawn(async move {
         loop {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
             if let Err(error) = coordinator
                 .reconcile_controller_sessions(Arc::clone(&providers), true)
                 .await
@@ -16087,6 +16115,15 @@ impl ControllerSessionCoordinator {
                         }
                         Err(_) => false,
                     };
+                    if inserted {
+                        tracing::info!(
+                            zone = %self.zone.as_str(),
+                            provider = %context.provider_owner_ref(),
+                            process = %context.process_ref(),
+                            session_generation = session_generation.get(),
+                            "external Provider controller ResourceV3 session live",
+                        );
+                    }
                     if !inserted {
                         if credential_session.is_some() {
                             self.credential_sessions.remove(
@@ -17150,19 +17187,24 @@ impl ZoneResourceRuntime {
                 ));
             let watch_task_slot = Arc::clone(&self.controller_session_reconcile_task);
             let watch_wake = Arc::clone(&self.controller_session_reconcile_wake);
-            let watch_coordinator = self.controller_session_coordinator();
+            let watch_shutdown = Arc::clone(&self.controller_session_reconcile_shutdown);
+            let watch_coordinator =
+                Arc::downgrade(&self.controller_session_coordinator());
             let watch_providers = Arc::clone(&providers);
             let api = api.with_watch_change_observer(Arc::new(move |change: &ChangeRecord| {
                 if matches!(
                     change.target.resource_ref().resource_type().as_str(),
                     "Process" | "EphemeralProcess"
                 ) {
-                    let _ = schedule_controller_session_reconcile(
-                        Arc::clone(&watch_task_slot),
-                        Arc::clone(&watch_wake),
-                        watch_coordinator.clone(),
-                        Arc::clone(&watch_providers),
-                    );
+                    if let Some(coordinator) = watch_coordinator.upgrade() {
+                        let _ = schedule_controller_session_reconcile(
+                            Arc::clone(&watch_task_slot),
+                            Arc::clone(&watch_wake),
+                            Arc::clone(&watch_shutdown),
+                            coordinator,
+                            Arc::clone(&watch_providers),
+                        );
+                    }
                 }
             }));
             let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
@@ -17224,18 +17266,23 @@ impl ZoneResourceRuntime {
             let wake_source = Arc::downgrade(&source);
             let liveness_task_slot = Arc::clone(&self.controller_session_reconcile_task);
             let liveness_wake = Arc::clone(&self.controller_session_reconcile_wake);
-            let liveness_coordinator = self.controller_session_coordinator();
+            let liveness_shutdown = Arc::clone(&self.controller_session_reconcile_shutdown);
+            let liveness_coordinator =
+                Arc::downgrade(&self.controller_session_coordinator());
             let liveness_providers = Arc::clone(&providers);
             runtime.set_liveness_waker(Arc::new(move |key, revision| {
                 if let Some(source) = wake_source.upgrade() {
                     let _ = source.dispatch_observation(key, revision);
                 }
-                let _ = schedule_controller_session_reconcile(
-                    Arc::clone(&liveness_task_slot),
-                    Arc::clone(&liveness_wake),
-                    liveness_coordinator.clone(),
-                    Arc::clone(&liveness_providers),
-                );
+                if let Some(coordinator) = liveness_coordinator.upgrade() {
+                    let _ = schedule_controller_session_reconcile(
+                        Arc::clone(&liveness_task_slot),
+                        Arc::clone(&liveness_wake),
+                        Arc::clone(&liveness_shutdown),
+                        coordinator,
+                        Arc::clone(&liveness_providers),
+                    );
+                }
             }));
             runtime.set_status_client(self.status_client()?);
             let diagnostic_controller = descriptor.identity().controller_ref().clone();
@@ -17333,6 +17380,7 @@ impl ZoneResourceRuntime {
         schedule_controller_session_reconcile(
             Arc::clone(&self.controller_session_reconcile_task),
             Arc::clone(&self.controller_session_reconcile_wake),
+            Arc::clone(&self.controller_session_reconcile_shutdown),
             coordinator.clone(),
             Arc::clone(&providers),
         )?;
@@ -18177,9 +18225,12 @@ impl ZoneResourceRuntime {
             process_runner_generation,
             controller_sessions,
             controller_session_reconcile_task,
+            controller_session_reconcile_shutdown,
+            controller_session_coordinator,
             assignments,
             ..
         } = self;
+        controller_session_reconcile_shutdown.store(true, Ordering::Release);
         if let Some(task) = service_task
             .into_inner()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
@@ -18246,6 +18297,10 @@ impl ZoneResourceRuntime {
             task.abort();
             let _ = task.await;
         }
+        controller_session_coordinator
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .take();
         let sessions = Arc::try_unwrap(controller_sessions)
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .into_inner()

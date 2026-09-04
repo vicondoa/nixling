@@ -1487,6 +1487,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "d2b-provider-test-controller"
+version = "0.0.0-bootstrap"
+dependencies = [
+ "d2b-contracts-zone-session",
+ "d2b-core-controller",
+ "d2b-session",
+ "d2b-session-unix",
+ "tokio",
+]
+
+[[package]]
 name = "d2b-provider-toolkit"
 version = "0.0.0-bootstrap"
 dependencies = [
@@ -1778,10 +1789,10 @@ dependencies = [
  "d2b-provider-activation-nixos",
  "d2b-provider-audio-pipewire",
  "d2b-provider-clipboard-wayland",
+ "d2b-provider-config-nixos",
  "d2b-provider-credential-entra",
  "d2b-provider-credential-managed-identity",
  "d2b-provider-credential-secret-service",
- "d2b-provider-config-nixos",
  "d2b-provider-device-gpu",
  "d2b-provider-device-security-key",
  "d2b-provider-device-tpm",
