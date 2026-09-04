@@ -74,6 +74,7 @@ pub struct ResolvedVolumeRoot {
     marker_owner_uid: u32,
     marker_group_gid: u32,
     quota: QuotaCapability,
+    preexisting_state: bool,
 }
 
 impl ResolvedVolumeRoot {
@@ -104,12 +105,26 @@ impl ResolvedVolumeRoot {
             marker_owner_uid: stat.st_uid,
             marker_group_gid: stat.st_gid,
             quota: QuotaCapability::Enforceable,
+            preexisting_state: false,
         })
     }
 
     /// Override the trusted quota capability observation.
     pub const fn with_quota(mut self, quota: QuotaCapability) -> Self {
         self.quota = quota;
+        self
+    }
+
+    /// Admit a broker-materialized root whose contents predate this
+    /// Volume-local reconcile.
+    pub const fn with_preexisting_state(mut self) -> Self {
+        self.preexisting_state = true;
+        self
+    }
+
+    /// Conditionally mark the opened root as already materialized.
+    pub const fn with_preexisting_state_if(mut self, preexisting: bool) -> Self {
+        self.preexisting_state = preexisting;
         self
     }
 
@@ -158,6 +173,7 @@ pub struct FdRootResolver {
     root: Arc<OwnedFd>,
     volume_uid: ResourceUid,
     quota: QuotaCapability,
+    preexisting_state: bool,
 }
 
 impl FdRootResolver {
@@ -169,12 +185,19 @@ impl FdRootResolver {
             root: Arc::new(fd),
             volume_uid,
             quota: QuotaCapability::Enforceable,
+            preexisting_state: false,
         })
     }
 
     /// Override the trusted quota observation.
     pub const fn with_quota(mut self, quota: QuotaCapability) -> Self {
         self.quota = quota;
+        self
+    }
+
+    /// Mark the opened root as already materialized by a trusted effect.
+    pub const fn with_preexisting_state(mut self) -> Self {
+        self.preexisting_state = true;
         self
     }
 }
@@ -198,7 +221,9 @@ impl VolumeRootResolver for FdRootResolver {
         }
         let fd = fcntl_dupfd_cloexec(self.root.as_ref(), 0)
             .map_err(|_| VolumeLocalError::EffectFailed)?;
-        Ok(ResolvedVolumeRoot::new(fd, volume_uid.clone())?.with_quota(self.quota))
+        Ok(ResolvedVolumeRoot::new(fd, volume_uid.clone())?
+            .with_quota(self.quota)
+            .with_preexisting_state_if(self.preexisting_state))
     }
 
     fn resolve_principal(&self, reference: &ResourceRef) -> Result<u32, VolumeLocalError> {
@@ -278,6 +303,7 @@ impl<R: VolumeRootResolver> VolumeSourceEffectPort for AnchoredVolumeEffectAdapt
                 root.marker_binding,
                 root.marker_owner_uid,
                 root.marker_group_gid,
+                root.preexisting_state,
             ))
         }
     }
@@ -511,7 +537,13 @@ impl<R: VolumeRootResolver> AnchoredVolumeEffectAdapter<R> {
                 return Err(VolumeLocalError::EffectFailed);
             };
             ensure_root_identity(root)?;
-            let Some((target, _parent)) = open_entry(fd, entry.declared().path(), false)? else {
+            let Some((target, _parent)) = open_entry(
+                fd,
+                entry.declared().path(),
+                false,
+                entry.entry_type() == EntryType::Symlink,
+            )?
+            else {
                 return Ok(ObservedEntry::absent());
             };
             let stat = fstat(&target).map_err(|_| VolumeLocalError::EffectFailed)?;
@@ -626,7 +658,7 @@ impl<R: VolumeRootResolver> AnchoredVolumeEffectAdapter<R> {
         self.with_lock(root, |_guard| {
             let fd = root_fd(root)?.ok_or(VolumeLocalError::EffectFailed)?;
             ensure_root_identity(root)?;
-            let Some((target, _)) = open_entry(fd, entry.declared().path(), false)? else {
+            let Some((target, _)) = open_entry(fd, entry.declared().path(), false, false)? else {
                 return Err(VolumeLocalError::EntryMissing);
             };
             if drift.contains(&DriftClass::Owner) || drift.contains(&DriftClass::Mode) {
@@ -754,7 +786,7 @@ impl<R: VolumeRootResolver> AnchoredVolumeEffectAdapter<R> {
         self.with_lock(root, |_guard| {
             let fd = root_fd(root)?.ok_or(VolumeLocalError::EffectFailed)?;
             ensure_root_identity(root)?;
-            let Some((target, _parent)) = open_entry(fd, marker_path, false)? else {
+            let Some((target, _parent)) = open_entry(fd, marker_path, false, false)? else {
                 return Ok(StoreViewMarkerEvidence {
                     present: false,
                     zero_length: false,
@@ -985,6 +1017,7 @@ fn open_entry(
     root: &OwnedFd,
     path: &str,
     create_missing: bool,
+    allow_final_symlink: bool,
 ) -> Result<Option<(OwnedFd, OwnedFd)>, VolumeLocalError> {
     if path.is_empty() {
         return Ok(Some((
@@ -993,13 +1026,18 @@ fn open_entry(
         )));
     }
     let (parent, leaf) = parent_for(root, path, create_missing)?;
-    match openat2(
-        &parent,
-        leaf.as_str(),
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-        resolve_flags(),
-    ) {
+    let (flags, resolve) = if allow_final_symlink {
+        (
+            OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_XDEV,
+        )
+    } else {
+        (
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            resolve_flags(),
+        )
+    };
+    match openat2(&parent, leaf.as_str(), flags, Mode::empty(), resolve) {
         Ok(fd) => Ok(Some((fd, parent))),
         Err(error) if error == rustix::io::Errno::NOENT => Ok(None),
         Err(error) if error == rustix::io::Errno::LOOP => {
@@ -1052,7 +1090,11 @@ fn marker_state_unlocked(root: &VolumeRootHandle) -> Result<MarkerState, VolumeL
         .is_none()
     {
         return if root_has_unprovisioned_entries(root)? {
-            Err(VolumeLocalError::PreviouslyProvisionedStateMissing)
+            if root.preexisting_state() {
+                Ok(MarkerState::NeverProvisioned)
+            } else {
+                Err(VolumeLocalError::PreviouslyProvisionedStateMissing)
+            }
         } else {
             Ok(MarkerState::NeverProvisioned)
         };
@@ -1388,7 +1430,7 @@ fn inspect_content_file(
     group_gid: u32,
 ) -> Result<Option<ObservedContentFile>, VolumeLocalError> {
     let fd = root.anchored_fd().ok_or(VolumeLocalError::EffectFailed)?;
-    let Some((target, _parent)) = open_entry(fd, path, false)? else {
+    let Some((target, _parent)) = open_entry(fd, path, false, false)? else {
         return Ok(None);
     };
     let stat = fstat(&target).map_err(|_| VolumeLocalError::EffectFailed)?;

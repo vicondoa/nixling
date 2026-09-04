@@ -79,6 +79,7 @@ pub struct VolumeRootHandle {
     pub(crate) marker_binding: Option<MarkerBinding>,
     pub(crate) marker_owner_uid: Option<u32>,
     pub(crate) marker_group_gid: Option<u32>,
+    pub(crate) preexisting_state: bool,
 }
 
 /// Borrowed descriptor view exposed only to the trusted core effect adapter.
@@ -123,6 +124,7 @@ impl VolumeRootHandle {
             marker_binding: None,
             marker_owner_uid: None,
             marker_group_gid: None,
+            preexisting_state: false,
         }
     }
 
@@ -155,6 +157,7 @@ impl VolumeRootHandle {
         marker_binding: MarkerBinding,
         marker_owner_uid: u32,
         marker_group_gid: u32,
+        preexisting_state: bool,
     ) -> Self {
         Self {
             fd: Some(fd),
@@ -166,6 +169,7 @@ impl VolumeRootHandle {
             marker_binding: Some(marker_binding),
             marker_owner_uid: Some(marker_owner_uid),
             marker_group_gid: Some(marker_group_gid),
+            preexisting_state,
         }
     }
 
@@ -212,6 +216,11 @@ impl VolumeRootHandle {
     /// Return the expected marker group GID.
     pub fn marker_group_gid(&self) -> Option<u32> {
         self.marker_group_gid
+    }
+
+    /// Whether the trusted effect already materialized this root.
+    pub fn preexisting_state(&self) -> bool {
+        self.preexisting_state
     }
 }
 

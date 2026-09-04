@@ -17,7 +17,7 @@ use d2b_contracts_resource::v3::canonical_digest;
 use d2b_contracts_resource::v3::{
     CanonicalJsonValue, ControllerGeneration, ResourceGeneration, ResourceName, ResourceRef,
     ResourceTypeName, ResourceUid, ZoneId, execution_policy::BoundedToken,
-    identity::ReconnectGeneration, volume::VolumeSpec,
+    identity::ReconnectGeneration, volume::{SourceKind, VolumeSpec},
 };
 use d2b_core_controller::{
     ControllerDescriptor, ControllerExecutionPolicy, ControllerIdentity, ControllerSelector,
@@ -604,16 +604,26 @@ impl DaemonVolumeProviderEffects {
         let value = self.validate(SharedVolumeResourceKind::Volume, context, resource)?;
         let spec = Self::volume_spec(&value)?;
         let runtime = self.runtime()?;
-        let resolver = DaemonVolumeRootResolver::new(&self.state, self.zone.clone())
-            .map_err(|_| SharedVolumeEffectError::Unavailable)?;
-        let adapter = AnchoredVolumeEffectAdapter::new(resolver);
-        let controller =
-            VolumeLocalController::new(VolumeLocalProfile::shipped(), &adapter, &adapter);
         let provider = value.pointer("/spec/provider");
         let owner_ref = value
             .pointer("/metadata/ownerRef")
             .and_then(Value::as_str)
             .and_then(|owner| ResourceRef::parse(owner).ok());
+        let guest_ref = (spec.source().settings().kind() == SourceKind::NixClosure)
+            .then(|| store_view_guest_ref(resource.key().resource_ref(), &value, &spec))
+            .transpose()
+            .map_err(|_| SharedVolumeEffectError::InvalidResource)?;
+        let resolver = DaemonVolumeRootResolver::new(
+            &self.state,
+            self.zone.clone(),
+            resource.key().resource_ref().clone(),
+            resource.key().uid().clone(),
+            guest_ref,
+        )
+        .map_err(|_| SharedVolumeEffectError::Unavailable)?;
+        let adapter = AnchoredVolumeEffectAdapter::new(resolver);
+        let controller =
+            VolumeLocalController::new(VolumeLocalProfile::shipped(), &adapter, &adapter);
         let report = controller
             .reconcile(resource.key().uid(), &spec, provider, owner_ref.as_ref())
             .await
@@ -690,8 +700,21 @@ impl DaemonVolumeProviderEffects {
         let plan = VirtiofsdWorkerPlan::for_export(&export, view, vcpu_count, principal.clone())
             .map_err(|_| SharedVolumeEffectError::InvalidResource)?;
         let store_view_marker_ready = if export.view().as_str() == "ro-store" {
-            let resolver = DaemonVolumeRootResolver::new(&self.state, self.zone.clone())
-                .map_err(|_| SharedVolumeEffectError::Unavailable)?;
+            let guest_ref = (volume_spec.source().settings().kind() == SourceKind::NixClosure)
+                .then(|| store_view_guest_ref(export.volume_ref(), &volume_value, &volume_spec))
+                .transpose()
+                .map_err(|_| SharedVolumeEffectError::InvalidResource)?;
+            if guest_ref.as_ref() != Some(export.execution_ref()) {
+                return Err(SharedVolumeEffectError::InvalidResource);
+            }
+            let resolver = DaemonVolumeRootResolver::new(
+                &self.state,
+                self.zone.clone(),
+                export.volume_ref().clone(),
+                volume_resource.uid.clone(),
+                guest_ref,
+            )
+            .map_err(|_| SharedVolumeEffectError::Unavailable)?;
             let adapter = AnchoredVolumeEffectAdapter::new(resolver);
             let settings = volume_spec.source().settings();
             let root = adapter
@@ -814,8 +837,18 @@ impl DaemonVolumeProviderEffects {
         if !converged.contains(context.target.resource_ref()) {
             return Err(SharedVolumeEffectError::Unavailable);
         }
-        let resolver = DaemonVolumeRootResolver::new(&self.state, self.zone.clone())
-            .map_err(|_| SharedVolumeEffectError::Unavailable)?;
+        let guest_ref = (spec.source().settings().kind() == SourceKind::NixClosure)
+            .then(|| store_view_guest_ref(resource.key().resource_ref(), &value, &spec))
+            .transpose()
+            .map_err(|_| SharedVolumeEffectError::InvalidResource)?;
+        let resolver = DaemonVolumeRootResolver::new(
+            &self.state,
+            self.zone.clone(),
+            resource.key().resource_ref().clone(),
+            resource.key().uid().clone(),
+            guest_ref,
+        )
+        .map_err(|_| SharedVolumeEffectError::Unavailable)?;
         let adapter = AnchoredVolumeEffectAdapter::new(resolver);
         let controller =
             VolumeLocalController::new(VolumeLocalProfile::shipped(), &adapter, &adapter);
@@ -972,22 +1005,200 @@ fn child_phase(children: &[StoredResource], target: &ResourceRef) -> Option<Stri
         })
 }
 
+fn store_view_guest_ref(
+    volume_ref: &ResourceRef,
+    value: &Value,
+    spec: &VolumeSpec,
+) -> Result<ResourceRef, d2b_provider_volume_local::VolumeLocalError> {
+    let owner_ref = value
+        .pointer("/metadata/ownerRef")
+        .and_then(Value::as_str)
+        .map(|owner| {
+            ResourceRef::parse(owner)
+                .map_err(|_| d2b_provider_volume_local::VolumeLocalError::InvalidSpec)
+        })
+        .transpose()?;
+    if owner_ref
+        .as_ref()
+        .is_some_and(|owner| owner.resource_type().as_str() != "Guest")
+    {
+        return Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec);
+    }
+
+    let mut attachment_guest = None;
+    for attachment in spec.attachments() {
+        if attachment.execution_ref().resource_type().as_str() != "Guest" {
+            return Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec);
+        }
+        if attachment_guest
+            .replace(attachment.execution_ref().clone())
+            .is_some_and(|guest| guest != *attachment.execution_ref())
+        {
+            return Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec);
+        }
+    }
+
+    let guest_ref = match (owner_ref, attachment_guest) {
+        (Some(owner), Some(attachment)) if owner != attachment => {
+            return Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec);
+        }
+        (Some(owner), _) => owner,
+        (None, Some(attachment)) => attachment,
+        (None, None) => return Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec),
+    };
+
+    if value
+        .pointer("/metadata/ownerRef")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        let expected = d2b_provider_runtime_cloud_hypervisor::deterministic_child_ref(
+            &guest_ref,
+            d2b_provider_runtime_cloud_hypervisor::ChildRole::SystemVolume,
+        )
+        .map_err(|_| d2b_provider_volume_local::VolumeLocalError::InvalidSpec)?;
+        if &expected != volume_ref {
+            return Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec);
+        }
+    } else if volume_ref.name().as_str() != format!("store-view-{}", guest_ref.name().as_str()) {
+        return Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec);
+    }
+
+    Ok(guest_ref)
+}
+
+fn validate_store_view_identity(
+    zone: &ZoneId,
+    guest_ref: &ResourceRef,
+    system_artifact_id: &BoundedToken,
+    descriptor_artifact_id: &str,
+    intent: &d2b_core::bundle_resolver::ResolvedStoreViewIntent,
+) -> Result<(), d2b_provider_volume_local::VolumeLocalError> {
+    if guest_ref.resource_type().as_str() != "Guest"
+        || intent.vm != guest_ref.name().as_str()
+        || intent.intent_id
+            != d2b_core::bundle_resolver::intent_id_store_view(zone, guest_ref.name().as_str())
+        || descriptor_artifact_id != system_artifact_id.as_str()
+    {
+        return Err(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved);
+    }
+    Ok(())
+}
+
 /// Trusted daemon-side resolver for bundle-selected Volume roots.
 struct DaemonVolumeRootResolver {
+    state: Arc<crate::ServerState>,
     resolver: d2b_core::bundle_resolver::BundleResolver,
-    _zone: ZoneId,
+    zone: ZoneId,
+    volume_ref: ResourceRef,
+    volume_uid: ResourceUid,
+    guest_ref: Option<ResourceRef>,
 }
 
 impl DaemonVolumeRootResolver {
     fn new(
         state: &Arc<crate::ServerState>,
         zone: ZoneId,
+        volume_ref: ResourceRef,
+        volume_uid: ResourceUid,
+        guest_ref: Option<ResourceRef>,
     ) -> Result<Self, super::ResourceRuntimeError> {
         Ok(Self {
+            state: Arc::clone(state),
             resolver: crate::load_bundle_resolver(state)
                 .map_err(|_| super::ResourceRuntimeError::ProviderPathUnavailable)?,
-            _zone: zone,
+            zone,
+            volume_ref,
+            volume_uid,
+            guest_ref,
         })
+    }
+
+    fn marker_root(&self) -> Result<OwnedFd, d2b_provider_volume_local::VolumeLocalError> {
+        let marker_root = self
+            .resolver
+            .find_storage_path_spec("path:state-root")
+            .map(|spec| PathBuf::from(spec.path_template.as_str()).join("volume-local-markers"))
+            .ok_or(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
+        open_anchored_directory(&marker_root)
+            .map_err(|_| d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)
+    }
+
+    fn resolve_nix_closure_root(
+        &self,
+        system_artifact_id: &BoundedToken,
+    ) -> Result<ResolvedVolumeRoot, d2b_provider_volume_local::VolumeLocalError> {
+        let guest_ref = self
+            .guest_ref
+            .as_ref()
+            .ok_or(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
+        let descriptor = self
+            .resolver
+            .guest_setup_descriptor_bytes(self.zone.as_str(), guest_ref.name().as_str())
+            .ok_or(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
+        let descriptor = serde_json::from_slice::<Value>(descriptor)
+            .map_err(|_| d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
+        let descriptor_artifact_id = descriptor
+            .get("systemArtifactId")
+            .and_then(Value::as_str)
+            .ok_or(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
+        let intent = self
+            .resolver
+            .find_store_view_intent_for_zone(&self.zone, guest_ref.name().as_str())
+            .ok_or(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
+        validate_store_view_identity(
+            &self.zone,
+            guest_ref,
+            system_artifact_id,
+            descriptor_artifact_id,
+            intent,
+        )?;
+        if intent.vm != guest_ref.name().as_str() {
+            return Err(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved);
+        }
+        let generation_token = u32::try_from(intent.generation)
+            .map_err(|_| d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
+        let response = crate::dispatch_broker_request_as(
+            &self.state,
+            d2b_contracts_broker::broker_wire::BrokerRequest::StoreSync(
+                d2b_contracts_broker::broker_wire::StoreSyncRequest {
+                    vm_id: d2b_contracts::types::VmId::new(guest_ref.name().as_str()),
+                    bundle_closure_ref: d2b_contracts::types::BundleClosureRef::new(
+                        intent.intent_id.clone(),
+                    ),
+                    generation_token,
+                    tracing_span_id: None,
+                },
+            ),
+            d2b_contracts_broker::broker_wire::BrokerCallerRole::AdminUid {
+                uid: self.state.daemon_uid,
+            },
+        )
+        .map_err(|_| d2b_provider_volume_local::VolumeLocalError::EffectFailed)?;
+        let response = match response {
+            d2b_contracts_broker::broker_wire::BrokerResponse::StoreSync(response) => response,
+            _ => return Err(d2b_provider_volume_local::VolumeLocalError::EffectFailed),
+        };
+        let expected_generation_id = d2b_host::hardlink_farm::generation_id(
+            &intent.closure_paths,
+            d2b_host::hardlink_farm::system_store_path(&intent.closure_paths),
+        );
+        let farm_path = PathBuf::from(&response.hardlink_farm_path);
+        if response.vm != guest_ref.name().as_str()
+            || response.generation_id != expected_generation_id
+            || response.generation_token != generation_token
+            || response.closure_count
+                != u32::try_from(intent.closure_paths.len()).unwrap_or(u32::MAX)
+            || farm_path != intent.hardlink_farm_path
+        {
+            return Err(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved);
+        }
+        let file = open_anchored_directory(&farm_path)
+            .map_err(|_| d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
+        let marker_root = self.marker_root()?;
+        Ok(ResolvedVolumeRoot::new(file, self.volume_uid.clone())?
+            .with_marker_root(marker_root)?
+            .with_preexisting_state())
     }
 }
 
@@ -996,9 +1207,21 @@ impl VolumeRootResolver for DaemonVolumeRootResolver {
         &self,
         volume_uid: &ResourceUid,
         source_policy_id: Option<&BoundedToken>,
-        _system_artifact_id: Option<&BoundedToken>,
-        _kind: d2b_contracts_resource::v3::volume::SourceKind,
+        system_artifact_id: Option<&BoundedToken>,
+        kind: SourceKind,
     ) -> Result<ResolvedVolumeRoot, d2b_provider_volume_local::VolumeLocalError> {
+        if volume_uid != &self.volume_uid || self.volume_ref.resource_type().as_str() != "Volume" {
+            return Err(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved);
+        }
+        if kind == SourceKind::NixClosure {
+            if source_policy_id.is_some() {
+                return Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec);
+            }
+            return self.resolve_nix_closure_root(
+                system_artifact_id
+                    .ok_or(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?,
+            );
+        }
         let policy = source_policy_id
             .map(BoundedToken::as_str)
             .ok_or(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
@@ -1022,13 +1245,7 @@ impl VolumeRootResolver for DaemonVolumeRootResolver {
         }
         let file = open_anchored_directory(path)
             .map_err(|_| d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
-        let marker_root = self
-            .resolver
-            .find_storage_path_spec("path:state-root")
-            .map(|spec| PathBuf::from(spec.path_template.as_str()).join("volume-local-markers"))
-            .ok_or(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
-        let marker_file = open_anchored_directory(&marker_root)
-            .map_err(|_| d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
+        let marker_file = self.marker_root()?;
         ResolvedVolumeRoot::new(file.into(), volume_uid.clone())?
             .with_marker_root(marker_file.into())
     }
@@ -1094,6 +1311,70 @@ fn open_anchored_directory(path: &Path) -> std::io::Result<OwnedFd> {
         .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
     }
     Ok(current)
+}
+
+#[cfg(test)]
+mod store_view_identity_tests {
+    use super::validate_store_view_identity;
+    use d2b_contracts_resource::v3::{ResourceRef, ZoneId, execution_policy::BoundedToken};
+    use d2b_core::bundle_resolver::{ResolvedStoreViewIntent, intent_id_store_view};
+    use std::path::PathBuf;
+
+    fn intent(zone: &ZoneId, guest: &str) -> ResolvedStoreViewIntent {
+        ResolvedStoreViewIntent {
+            intent_id: intent_id_store_view(zone, guest),
+            vm: guest.to_owned(),
+            generation: 1,
+            hardlink_farm_path: PathBuf::from(format!(
+                "/var/lib/d2b/zones/{}/guests/{guest}/store-view",
+                zone.as_str()
+            )),
+            target_view_path: PathBuf::from(format!(
+                "/var/lib/d2b/zones/{}/guests/{guest}/store-view/live/system",
+                zone.as_str()
+            )),
+            closure_paths: vec![PathBuf::from("/nix/store/acceptance-system")],
+            db_dump_path: PathBuf::from("/var/lib/d2b/closure.db"),
+        }
+    }
+
+    #[test]
+    fn store_view_identity_rejects_wrong_artifact_guest_and_zone() {
+        let zone = ZoneId::parse("work").expect("Zone");
+        let guest = ResourceRef::parse("Guest/acceptance-guest").expect("Guest");
+        let artifact = BoundedToken::parse("acceptance-system").expect("artifact");
+        let intent = intent(&zone, "acceptance-guest");
+        assert!(
+            validate_store_view_identity(&zone, &guest, &artifact, "acceptance-system", &intent)
+                .is_ok()
+        );
+        assert!(
+            validate_store_view_identity(&zone, &guest, &artifact, "other-system", &intent)
+                .is_err()
+        );
+        let other_guest = ResourceRef::parse("Guest/other-guest").expect("Guest");
+        assert!(
+            validate_store_view_identity(
+                &zone,
+                &other_guest,
+                &artifact,
+                "acceptance-system",
+                &intent
+            )
+            .is_err()
+        );
+        let other_zone = ZoneId::parse("personal").expect("Zone");
+        assert!(
+            validate_store_view_identity(
+                &other_zone,
+                &guest,
+                &artifact,
+                "acceptance-system",
+                &intent
+            )
+            .is_err()
+        );
+    }
 }
 
 /// Shared Runner reconciler for one U7 Provider owner.

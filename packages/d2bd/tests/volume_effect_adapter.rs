@@ -41,6 +41,16 @@ fn adapter_root(
     std::path::PathBuf,
     AnchoredVolumeEffectAdapter<FdRootResolver>,
 ) {
+    adapter_root_with_options(name, false)
+}
+
+fn adapter_root_with_options(
+    name: &str,
+    preexisting_state: bool,
+) -> (
+    std::path::PathBuf,
+    AnchoredVolumeEffectAdapter<FdRootResolver>,
+) {
     let base = std::path::PathBuf::from(
         std::env::var_os("CARGO_TARGET_TMPDIR").unwrap_or_else(|| "target/u7-volume-tests".into()),
     )
@@ -50,6 +60,11 @@ fn adapter_root(
     let resolver =
         FdRootResolver::new(std::fs::File::open(&base).expect("open root"), volume_uid())
             .expect("root resolver");
+    let resolver = if preexisting_state {
+        resolver.with_preexisting_state()
+    } else {
+        resolver
+    };
     (base, AnchoredVolumeEffectAdapter::new(resolver))
 }
 
@@ -299,6 +314,34 @@ fn production_store_view_marker_evidence_requires_a_zero_length_file() {
     .expect("ready marker evidence");
     assert!(ready.present);
     assert!(ready.zero_length);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn production_nix_closure_store_view_materializes_without_a_source_policy() {
+    let (base, adapter) = adapter_root_with_options("nix-closure-store-view", true);
+    let controller = VolumeLocalController::new(VolumeLocalProfile::shipped(), &adapter, &adapter);
+    let uid = volume_uid();
+    let spec = d2b_provider_volume_local::testing::fixtures::nix_closure_store_view_volume();
+
+    let first =
+        d2b_provider_volume_local::testing::block_on(controller.reconcile(&uid, &spec, None, None))
+            .expect("Nix closure Volume reconcile");
+    let restarted =
+        d2b_provider_volume_local::testing::block_on(controller.reconcile(&uid, &spec, None, None))
+            .expect("Nix closure Volume restart adoption");
+
+    assert_eq!(
+        first.layout_phase,
+        d2b_provider_volume_local::LayoutPhase::Ready
+    );
+    assert_eq!(
+        restarted.layout_phase,
+        d2b_provider_volume_local::LayoutPhase::Ready
+    );
+    assert!(base.join(".d2b-volume-marker").is_file());
+    assert!(base.join("live").is_dir());
+    assert!(base.join("meta/current").is_symlink());
     let _ = std::fs::remove_dir_all(base);
 }
 

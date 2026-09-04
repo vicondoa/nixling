@@ -361,6 +361,16 @@ pub mod fixtures {
         }))
     }
 
+    /// The canonical Guest store-view Volume selected by a Nix closure.
+    pub fn nix_closure_store_view_volume() -> VolumeSpec {
+        let mut rendered = serde_json::to_value(store_view_volume()).expect("fixture serializes");
+        rendered["source"]["settings"] = json!({
+            "kind": "nix-closure",
+            "systemArtifactId": "acceptance-system"
+        });
+        serde_json::from_value(rendered).expect("conformant Nix closure Volume spec")
+    }
+
     /// The canonical per-Guest TPM state Volume.
     pub fn swtpm_volume() -> VolumeSpec {
         let mut root = owned("", "directory", "0700");

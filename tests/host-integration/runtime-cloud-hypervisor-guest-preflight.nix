@@ -609,11 +609,23 @@ pkgs.testers.runNixOSTest {
         ".metadata.name == \"acceptance-guest-system\" and "
         ".metadata.ownerRef == \"Guest/acceptance-guest\" and "
         ".spec.source.settings.kind == \"nix-closure\" and "
+        ".spec.source.settings.sourcePolicyId == null and "
         ".spec.source.settings.systemArtifactId == \"acceptance-system\" and "
         ".status.phase == \"Ready\" and "
         ".status.observedGeneration == .metadata.generation)] | length == 1)' "
         "/run/d2b-volume-ready.json",
         timeout=180,
+    )
+    machine.succeed(
+        "jq -e '"
+        "([.resources[] | select(.type == \"Volume\" and "
+        ".metadata.name == \"store-view-acceptance-guest\" and "
+        ".spec.source.settings.kind == \"nix-closure\" and "
+        ".spec.source.settings.sourcePolicyId == null and "
+        ".spec.source.settings.systemArtifactId == \"acceptance-system\" and "
+        ".status.phase == \"Ready\" and "
+        ".status.observedGeneration == .metadata.generation)] | length == 1)' "
+        "/run/d2b-volume-ready.json"
     )
     machine.wait_until_succeeds(
         "test -S "
