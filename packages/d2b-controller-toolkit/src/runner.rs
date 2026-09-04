@@ -537,6 +537,8 @@ pub struct RunnerConfig {
     pub max_attempts: u32,
 }
 
+const WATCH_RECOVERY_MAX_CONFLICT_RETRIES: usize = 3;
+
 /// Successful loop summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RunnerReport {
@@ -1195,18 +1197,42 @@ where
                         queue.resource_count(),
                         workers.len(),
                     );
-                    let relist = bounded_source(
-                        self.clock.as_ref(),
-                        phase_deadline(self.clock.as_ref(), self.config.deadline_tick),
-                        &shutdown,
-                        self.source.list_initial(&descriptor),
-                    ).await?;
-                    bounded_source(
-                        self.clock.as_ref(),
-                        phase_deadline(self.clock.as_ref(), self.config.deadline_tick),
-                        &shutdown,
-                        self.source.open_watch(&descriptor, relist.snapshot_revision),
-                    ).await?;
+                    let mut conflict_retries = 0;
+                    let relist = loop {
+                        let relist = match bounded_source(
+                            self.clock.as_ref(),
+                            phase_deadline(self.clock.as_ref(), self.config.deadline_tick),
+                            &shutdown,
+                            self.source.list_initial(&descriptor),
+                        )
+                        .await
+                        {
+                            Ok(relist) => relist,
+                            Err(RunnerError::Source(SourceError::Conflict(_)))
+                                if conflict_retries < WATCH_RECOVERY_MAX_CONFLICT_RETRIES =>
+                            {
+                                conflict_retries += 1;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        match bounded_source(
+                            self.clock.as_ref(),
+                            phase_deadline(self.clock.as_ref(), self.config.deadline_tick),
+                            &shutdown,
+                            self.source.open_watch(&descriptor, relist.snapshot_revision),
+                        )
+                        .await
+                        {
+                            Ok(()) => break relist,
+                            Err(RunnerError::Source(SourceError::Conflict(_)))
+                                if conflict_retries < WATCH_RECOVERY_MAX_CONFLICT_RETRIES =>
+                            {
+                                conflict_retries += 1;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    };
                     queue.rebuild(initial_hints(&descriptor, relist.resources)?)?;
                     report.relists += 1;
                     watch_closed = false;
@@ -2400,6 +2426,8 @@ mod tests {
         starting: AtomicUsize,
         requeues: AtomicUsize,
         watch_opens: AtomicUsize,
+        list_initial_conflicts_remaining: AtomicUsize,
+        watch_open_conflicts_remaining: AtomicUsize,
     }
 
     impl FakeSource {
@@ -2436,6 +2464,8 @@ mod tests {
                     starting: AtomicUsize::new(0),
                     requeues: AtomicUsize::new(0),
                     watch_opens: AtomicUsize::new(0),
+                    list_initial_conflicts_remaining: AtomicUsize::new(0),
+                    watch_open_conflicts_remaining: AtomicUsize::new(0),
                 }),
                 watch_tx,
             )
@@ -2444,6 +2474,11 @@ mod tests {
         fn release_commit_gate(&self) {
             self.commit_released.store(true, Ordering::Release);
             self.commit_notify.notify_waiters();
+        }
+
+        fn inject_watch_recovery_conflicts(&self, count: usize) {
+            self.list_initial_conflicts_remaining
+                .store(count, Ordering::Release);
         }
     }
 
@@ -2459,6 +2494,19 @@ mod tests {
             &self,
             _descriptor: &ControllerDescriptor,
         ) -> impl Future<Output = Result<InitialList, SourceError>> + Send {
+            if self
+                .list_initial_conflicts_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return std::future::ready(Err(SourceError::Conflict(ZoneRevision::new(2))));
+            }
             std::future::ready(
                 self.initial
                     .lock()
@@ -2474,6 +2522,19 @@ mod tests {
             _after_revision: ZoneRevision,
         ) -> impl Future<Output = Result<(), SourceError>> + Send {
             self.watch_opens.fetch_add(1, Ordering::SeqCst);
+            if self
+                .watch_open_conflicts_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return std::future::ready(Err(SourceError::Conflict(ZoneRevision::new(2))));
+            }
             std::future::ready(Ok(()))
         }
 
@@ -4384,6 +4445,13 @@ mod tests {
             requeue_at: Mutex::new(None),
         });
         let runner = run_in_thread(reconciler, Arc::clone(&source));
+        for _ in 0..400 {
+            if source.watch_opens.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        source.inject_watch_recovery_conflicts(1);
         watch_tx.send(Err(WatchFailure::RevisionExpired)).unwrap();
         entered.recv_timeout(Duration::from_secs(2)).unwrap();
         watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
