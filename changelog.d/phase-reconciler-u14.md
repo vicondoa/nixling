@@ -8,6 +8,8 @@
   identity and Cloud Hypervisor API readiness.
 - Allowed sparse Zones to attach only shared Provider runners backed by
   committed resources, while still refusing a missing Provider that owns work.
+- Applied the same fail-closed ownership check to Credential, storage,
+  interaction, Guest, and observability runner startup paths.
 
 ### Removed
 

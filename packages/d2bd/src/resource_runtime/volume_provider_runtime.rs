@@ -1708,10 +1708,12 @@ async fn provider_generations(
                 active.push(registration);
             }
             Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
-                if !runtime
-                    .committed_resources_of_type(registration.resource_type)
+                if runtime
+                    .provider_resources_present(
+                        registration.provider_ref,
+                        &[registration.resource_type],
+                    )
                     .await?
-                    .is_empty()
                 {
                     return Err(super::ResourceRuntimeError::ProviderPathUnavailable);
                 }

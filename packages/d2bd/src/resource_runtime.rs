@@ -8236,16 +8236,16 @@ async fn u9_provider_generations(
             }
             Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
                 let owned_resource = runtime
-                    .committed_resources_of_type(registration.resource_type)
+                    .provider_resources_present(
+                        registration.provider_ref,
+                        &[registration.resource_type],
+                    )
                     .await?
-                    .into_iter()
-                    .any(|resource| {
-                        resource
-                            .pointer("/spec/providerRef")
-                            .and_then(Value::as_str)
-                            == Some(registration.provider_ref)
-                            || registration.resource_type.starts_with("display-wayland.")
-                    });
+                    || (registration.resource_type.starts_with("display-wayland.")
+                        && !runtime
+                            .committed_resources_of_type(registration.resource_type)
+                            .await?
+                            .is_empty());
                 if owned_resource {
                     return Err(ResourceRuntimeError::ProviderPathUnavailable);
                 }
@@ -8269,10 +8269,6 @@ async fn u9_provider_generations(
         )
     });
     Ok((active, generations))
-}
-
-fn u12_provider_missing_with_resources(resources_present: bool) -> bool {
-    resources_present
 }
 
 fn validate_observability_environment() -> Result<(), ResourceRuntimeError> {
@@ -12414,20 +12410,25 @@ impl ZoneResourceRuntime {
         Ok(resource.generation)
     }
 
-    async fn u8_provider_resources_present(
+    async fn provider_resources_present(
         &self,
-        registration: SharedProviderRunnerRegistration,
+        provider_ref: &str,
+        resource_types: &[&str],
     ) -> Result<bool, ResourceRuntimeError> {
-        let resources = self
-            .committed_resources_of_type(registration.resource_type)
-            .await?;
-        if resources.iter().any(|resource| {
-            resource
-                .pointer("/spec/providerRef")
-                .and_then(Value::as_str)
-                == Some(registration.provider_ref)
-        }) {
-            return Ok(true);
+        for resource_type in resource_types {
+            if self
+                .committed_resources_of_type(resource_type)
+                .await?
+                .iter()
+                .any(|resource| {
+                    resource
+                        .pointer("/spec/providerRef")
+                        .and_then(Value::as_str)
+                        == Some(provider_ref)
+                })
+            {
+                return Ok(true);
+            }
         }
         Ok(self
             .committed_resources_of_type("Process")
@@ -12435,9 +12436,13 @@ impl ZoneResourceRuntime {
             .iter()
             .any(|resource| {
                 resource
-                    .pointer("/metadata/ownerRef")
+                    .pointer("/spec/providerRef")
                     .and_then(Value::as_str)
-                    == Some(registration.provider_ref)
+                    == Some(provider_ref)
+                    || resource
+                        .pointer("/metadata/ownerRef")
+                        .and_then(Value::as_str)
+                        == Some(provider_ref)
             }))
     }
 
@@ -12476,7 +12481,13 @@ impl ZoneResourceRuntime {
                     provider_generations.insert(provider_ref, generation);
                 }
                 Err(ResourceRuntimeError::HandlerNotReady) => {
-                    if self.u8_provider_resources_present(registration).await? {
+                    if self
+                        .provider_resources_present(
+                            registration.provider_ref,
+                            &[registration.resource_type],
+                        )
+                        .await?
+                    {
                         return Err(ResourceRuntimeError::ProviderPathUnavailable);
                     }
                 }
@@ -12861,31 +12872,6 @@ impl ZoneResourceRuntime {
         if !self.readiness.resource_api_ready {
             return Ok(());
         }
-        let live_count = {
-            let tasks = self
-                .u10_runner_tasks
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            tasks.iter().filter(|task| !task.is_finished()).count()
-        };
-        if live_count == U10_PROVIDER_COUNT {
-            return Ok(());
-        }
-        if live_count != 0 {
-            self.stop_u10_controller_runners_locked().await?;
-        } else {
-            let stale = {
-                let mut tasks = self
-                    .u10_runner_tasks
-                    .lock()
-                    .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-                std::mem::take(&mut *tasks)
-            };
-            for task in stale {
-                let _ = task.await;
-            }
-        }
-
         let subject_context = self
             .core_controller_subject
             .lock()
@@ -12942,7 +12928,13 @@ impl ZoneResourceRuntime {
             {
                 Ok(provider) => provider,
                 Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
-                    return Err(ResourceRuntimeError::ProviderPathUnavailable);
+                    if self
+                        .provider_resources_present(provider_ref_text, &["Credential"])
+                        .await?
+                    {
+                        return Err(ResourceRuntimeError::ProviderPathUnavailable);
+                    }
+                    continue;
                 }
                 Err(_) => return Err(ResourceRuntimeError::StoreReadFailed),
             };
@@ -12959,6 +12951,40 @@ impl ZoneResourceRuntime {
                 provider_ref.clone(),
                 provider.generation,
             ));
+        }
+        let expected_task_count = provider_inputs.len();
+        let (task_count, live_count) = {
+            let tasks = self
+                .u10_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            (
+                tasks.len(),
+                tasks.iter().filter(|task| !task.is_finished()).count(),
+            )
+        };
+        if task_count == expected_task_count && live_count == expected_task_count {
+            self.u10_required
+                .store(expected_task_count != 0, Ordering::Release);
+            return Ok(());
+        }
+        if live_count != 0 {
+            self.stop_u10_controller_runners_locked().await?;
+        } else {
+            let stale = {
+                let mut tasks = self
+                    .u10_runner_tasks
+                    .lock()
+                    .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+                std::mem::take(&mut *tasks)
+            };
+            for task in stale {
+                let _ = task.await;
+            }
+        }
+        if expected_task_count == 0 {
+            self.u10_required.store(false, Ordering::Release);
+            return Ok(());
         }
         let mut new_tasks = Vec::new();
         let build_result: Result<(), ResourceRuntimeError> = async {
@@ -13113,7 +13139,7 @@ impl ZoneResourceRuntime {
             self.u10_required.store(false, Ordering::Release);
             return Err(error);
         }
-        let required = new_tasks.len() == U10_PROVIDER_COUNT;
+        let required = new_tasks.len() == expected_task_count;
         match self.u10_runner_tasks.lock() {
             Ok(mut tasks) => tasks.extend(new_tasks),
             Err(_) => {
@@ -13656,9 +13682,10 @@ impl ZoneResourceRuntime {
                             .into_iter()
                             .filter(|resource_type| !resource_type.is_empty())
                             .collect::<Vec<_>>();
-                        if u12_provider_missing_with_resources(
-                            self.u12_resources_present(&resource_types).await?,
-                        ) {
+                        if self
+                            .provider_resources_present(provider_ref_text, &resource_types)
+                            .await?
+                        {
                             return Err(ResourceRuntimeError::ProviderPathUnavailable);
                         }
                         continue;
@@ -13850,40 +13877,6 @@ impl ZoneResourceRuntime {
         }
         self.u12_required.store(required, Ordering::Release);
         Ok(())
-    }
-
-    async fn u12_resources_present(
-        &self,
-        resource_types: &[&str],
-    ) -> Result<bool, ResourceRuntimeError> {
-        let resource_types = resource_types
-            .iter()
-            .map(|resource_type| {
-                ResourceTypeName::parse((*resource_type).to_owned())
-                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let page = self
-            .store
-            .list(StoreListRequest {
-                operation: StoreOperationContext {
-                    operation_id: "u12-provider-presence".to_owned(),
-                    idempotency_key: None,
-                    correlation_id: "u12-provider-presence".to_owned(),
-                    trace_id: None,
-                    deadline_ms: 10_000,
-                },
-                zone: self.zone.clone(),
-                resource_types,
-                resource_names: Vec::new(),
-                filters: Vec::new(),
-                page_size: 1,
-                cursor: None,
-                projection: StoreProjection::MetadataOnly,
-            })
-            .await
-            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        Ok(!page.resources.is_empty())
     }
 
     async fn u12_controller_assignments(
@@ -22172,8 +22165,6 @@ mod tests {
 
     #[test]
     fn accepted_u12_resources_cannot_run_without_their_provider() {
-        assert!(u12_provider_missing_with_resources(true));
-        assert!(!u12_provider_missing_with_resources(false));
         assert!(!u12_runner_readiness(true, 0, false));
         assert!(!u12_runner_readiness(true, 1, true));
         assert!(u12_runner_readiness(true, 2, false));
@@ -24709,7 +24700,7 @@ mod tests {
 
     #[tokio::test]
     async fn sparse_seven_row_bundle_starts_only_present_shared_provider_runners() {
-        let (_directory, runtime, _broker_evidence) =
+        let (_directory, mut runtime, _broker_evidence) =
             open_production_guest_runtime_for_test().await;
         let zone = runtime.zone.clone();
         let resources = vec![
@@ -24777,6 +24768,77 @@ mod tests {
                 .await
                 .expect("sparse runner fixture must stop cleanly");
         }
+        runtime
+            .start_u10_controller_runners()
+            .await
+            .expect("sparse bundles must skip absent Credential Providers");
+        assert!(!runtime.u10_required.load(Ordering::Acquire));
+        assert!(runtime.u10_runner_tasks.lock().unwrap().is_empty());
+        runtime.set_provider_path_ready(true);
+        runtime
+            .require_ready()
+            .expect("sparse bundle must reach Host readiness");
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn referenced_missing_credential_provider_fails_closed() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let mut credential: Value = serde_json::from_str(&credential_spec("Guest/gateway"))
+            .expect("credential fixture");
+        credential["providerRef"] =
+            Value::String("Provider/credential-entra".to_owned());
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Credential",
+                "missing-provider",
+                &zone,
+                &serde_json::to_string(&credential).expect("credential JSON"),
+            )],
+        )
+        .await;
+        assert_eq!(
+            runtime.start_u10_controller_runners().await,
+            Err(ResourceRuntimeError::ProviderPathUnavailable)
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn present_credential_provider_keeps_empty_watch_live() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Provider",
+                "credential-entra",
+                &zone,
+                r#"{"artifactId":"credential-entra","config":{}}"#,
+            )],
+        )
+        .await;
+        {
+            let _runner_guard = runtime.core_runner_lock.lock().await;
+            runtime
+                .stop_core_controller_runners_locked()
+                .await
+                .expect("core runner fixture must stop cleanly");
+        }
+        runtime
+            .start_u10_controller_runners()
+            .await
+            .expect("present Credential Provider must attach its watch");
+        assert!(runtime.u10_required.load(Ordering::Acquire));
+        assert_eq!(runtime.u10_runner_tasks.lock().unwrap().len(), 1);
+        runtime
+            .stop_u10_controller_runners_locked()
+            .await
+            .expect("Credential runner fixture must stop cleanly");
         runtime.shutdown().await.unwrap();
     }
 
