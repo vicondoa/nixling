@@ -14,6 +14,8 @@
   U9 Providers on filtered watches while refusing incomplete identity, accepted
   schema-valid system-core Users without a synthetic providerRef, and withheld
   daemon readiness on mandatory Process runner failure with bounded diagnostics.
+- Bound Process assignment fences to the Core controller identity and aligned
+  system Process finalizers with the canonical Provider finalizer namespace.
 - Kept authenticated system-core status and finalizer projections local to
   resource audit while retaining broker evidence for desired-state mutations.
 - Preserved that broker-evidence classification when pending audit outboxes

@@ -769,7 +769,7 @@ claim it as fresh).
 ### 8.6 Stop and finalize
 
 The owning Provider controller registers finalizer
-`process.system-minijail/cleanup` on every Process and EphemeralProcess it
+`process-system-minijail.d2bus.org/cleanup` on every Process and EphemeralProcess it
 manages.
 
 Finalizer algorithm on `deletion-requested`:

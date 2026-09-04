@@ -62,8 +62,8 @@ const EPHEMERAL_PROCESS_TYPE: &str = "EphemeralProcess";
 const MINIJAIL_PROVIDER: &str = "system-minijail";
 const SYSTEMD_PROVIDER: &str = "system-systemd";
 const PROCESS_RUNTIME_FINALIZER: &str = "process-runtime.d2bus.org/cleanup";
-const MINIJAIL_PROCESS_FINALIZER: &str = "process.system-minijail/cleanup";
-const SYSTEMD_PROCESS_FINALIZER: &str = "process.system-systemd/cleanup";
+const MINIJAIL_PROCESS_FINALIZER: &str = "process-system-minijail.d2bus.org/cleanup";
+const SYSTEMD_PROCESS_FINALIZER: &str = "process-system-systemd.d2bus.org/cleanup";
 pub(crate) const PROCESS_RESTART_ANNOTATION: &str = "d2b.d2bus.org/restart-generation";
 const GUEST_RUNTIME_PROCESS_TEMPLATES: &[(&str, &str)] = &[
     ("cloud-hypervisor-runner", "-vmm"),
