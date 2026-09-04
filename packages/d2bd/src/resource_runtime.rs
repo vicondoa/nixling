@@ -20146,7 +20146,7 @@ fn process_assignment_fence_resolver(
             if execution_ref.resource_type().as_str() != expected_target {
                 return Err(integrity(&target, "process-execution-ref-wrong-domain"));
             }
-            let provider = store
+            let provider_generation = match store
                 .get(StoreGetRequest {
                     operation: StoreOperationContext {
                         operation_id: "process-assignment-provider".to_owned(),
@@ -20156,19 +20156,34 @@ fn process_assignment_fence_resolver(
                         deadline_ms: 10_000,
                     },
                     zone: store.identity().zone().clone(),
-                    target: provider_ref,
+                    target: provider_ref.clone(),
                     expected_uid: None,
                     projection: StoreProjection::MetadataOnly,
                 })
                 .await
-                .map_err(|error| match error.kind() {
-                    StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure => {
-                        SourceError::Backpressure
+                {
+                    Ok(provider) => provider.generation,
+                    Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                        let current_revision = store
+                            .runtime_metadata()
+                            .await
+                            .map_err(|_| SourceError::Unavailable)?
+                            .current_revision;
+                        return Err(SourceError::Conflict(current_revision));
                     }
-                    StoreErrorKind::Timeout => SourceError::Timeout,
-                    StoreErrorKind::ResourceNotFound => SourceError::Unavailable,
-                    _ => SourceError::Integrity,
-                })?;
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure
+                        ) =>
+                    {
+                        return Err(SourceError::Backpressure);
+                    }
+                    Err(error) if error.kind() == StoreErrorKind::Timeout => {
+                        return Err(SourceError::Timeout);
+                    }
+                    Err(_) => return Err(SourceError::Integrity),
+                };
             let controller_generation = store
                 .runtime_metadata()
                 .await
@@ -20183,7 +20198,7 @@ fn process_assignment_fence_resolver(
             Ok(ResourceAssignmentFence {
                 resource_uid: uid,
                 resource_revision: revision,
-                provider_generation: provider.generation,
+                provider_generation,
                 controller_generation,
                 controller_role,
                 target: execution_ref,
