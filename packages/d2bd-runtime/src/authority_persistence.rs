@@ -415,6 +415,8 @@ mod tests {
     use std::{fs::OpenOptions, sync::Arc};
 
     use d2b_contracts_resource::v3::{ConfigurationGeneration, ResourceUid, Timestamp, ZoneId};
+    use d2b_core_controller::authority::DurableAuthorityClaim;
+    use d2b_core_controller::authority_persistence::AuthorityRecoveryCoordinator;
     use d2b_resource_store::{PolicySnapshot, StoreSlot, mutation_seal::mutation_seal_pair};
     use d2b_resource_store_redb::{StoreIdentity, write_provisioning_marker};
 
@@ -445,15 +447,15 @@ mod tests {
         })
     }
 
-    fn valid_host_global_payload(store: &RedbResourceStore) -> Vec<u8> {
-        let claim = serde_json::from_value::<AuthorityStorageClaim>(serde_json::json!({
+    fn valid_host_global_claim() -> DurableAuthorityClaim {
+        match serde_json::from_value::<AuthorityStorageClaim>(serde_json::json!({
             "generic": {
                 "scope": {
                     "host": "11111111-1111-4111-8111-111111111111"
                 },
                 "class": "kvm",
                 "opaqueDigest": format!("sha256:{}", "d".repeat(64)),
-                "arbitration": "exclusive",
+                "arbitration": "shared",
                 "maxHolders": 1,
                 "providerCardinality": null,
                 "ownerProof": {
@@ -464,21 +466,48 @@ mod tests {
                 "dependentGuest": null
             }
         }))
-        .expect("Host-global claim");
-        let claim_digest = claim_digest(&claim).expect("Host-global claim digest");
-        serde_json::to_vec(&AuthorityStorageOperation {
-            operation_id: "host-operation".to_owned(),
-            claim,
-            state: AuthorityOperationState::Closed,
-            claim_digest: claim_digest.clone(),
-            store_binding_digest: store.authority_binding_digest(&claim_digest),
-        })
-        .expect("Host-global authority payload")
+        .expect("Host-global claim")
+        {
+            AuthorityStorageClaim::Generic(claim) => claim,
+            AuthorityStorageClaim::ExternalNic(_) => unreachable!("generic Host claim"),
+        }
     }
 
-    async fn test_store() -> (tempfile::TempDir, Arc<RedbResourceStore>) {
-        let directory = tempfile::tempdir().expect("store directory");
-        let identity = StoreIdentity::new(
+    fn valid_host_global_operation(
+        store: &RedbResourceStore,
+        claim: DurableAuthorityClaim,
+    ) -> AuthorityStorageOperation {
+        let claim = AuthorityStorageClaim::Generic(claim);
+        let claim_digest = claim_digest(&claim).expect("Host-global claim digest");
+        AuthorityStorageOperation {
+            operation_id: "host-operation".to_owned(),
+            claim,
+            state: AuthorityOperationState::Pending,
+            claim_digest: claim_digest.clone(),
+            store_binding_digest: store.authority_binding_digest(&claim_digest),
+        }
+    }
+
+    fn persisted_controller_effect_payload(
+        store: &RedbResourceStore,
+        operation_id: &str,
+    ) -> (String, Vec<u8>) {
+        let mut payload = valid_controller_effect_payload(operation_id);
+        let claim_digest = payload
+            .get("claimDigest")
+            .and_then(serde_json::Value::as_str)
+            .expect("controller-effect claim digest")
+            .to_owned();
+        payload["storeBindingDigest"] =
+            serde_json::json!(store.authority_binding_digest(&claim_digest));
+        (
+            claim_digest,
+            serde_json::to_vec(&payload).expect("controller-effect authority payload"),
+        )
+    }
+
+    fn test_store_identity() -> StoreIdentity {
+        StoreIdentity::new(
             StoreSlot::new(0).expect("store slot"),
             ResourceUid::parse("11111111-1111-4111-8111-111111111111").expect("store UID"),
             ZoneId::parse("work").expect("Zone"),
@@ -491,7 +520,12 @@ mod tests {
                     .expect("configuration generation"),
                 controller_generation: None,
             },
-        );
+        )
+    }
+
+    async fn test_store() -> (tempfile::TempDir, Arc<RedbResourceStore>) {
+        let directory = tempfile::tempdir().expect("store directory");
+        let identity = test_store_identity();
         let file = OpenOptions::new()
             .create_new(true)
             .read(true)
@@ -510,6 +544,17 @@ mod tests {
             .await
             .expect("provision store");
         (directory, Arc::new(store))
+    }
+
+    struct TestRecoveryProvenance;
+
+    impl AuthorityRecoveryProvenance for TestRecoveryProvenance {
+        fn validate<'a>(
+            &'a self,
+            _operation: &'a AuthorityStorageOperation,
+        ) -> AuthorityFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     #[test]
@@ -596,36 +641,114 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_authority_ledger_recovers_host_claim_and_skips_controller_effect() {
-        let (_directory, store) = test_store().await;
-        let rows = vec![
-            AuthorityOperation {
-                operation_id: "host-operation".to_owned(),
-                payload: valid_host_global_payload(&store),
-                state: StoreAuthorityOperationState::Closed,
-            },
-            controller_effect_row(
-                "effect:controller",
-                valid_controller_effect_payload("effect:controller"),
-                StoreAuthorityOperationState::Pending,
-            ),
-        ];
-
-        let recovered = recovery_receipt(rows, &store, &Mutex::new(BTreeMap::new()))
+        let (directory, store) = test_store().await;
+        let host_claim = valid_host_global_claim();
+        let host_operation = valid_host_global_operation(&store, host_claim.clone());
+        store
+            .prepare_authority_operation(
+                host_operation.operation_id.clone(),
+                serde_json::to_vec(&host_operation).expect("Host-global authority payload"),
+                &host_operation.claim_digest,
+            )
             .await
-            .expect("mixed authority ledger recovery");
-        let _ = recovered;
+            .expect("persist Host-global authority");
+
+        let (effect_claim_digest, effect_payload) =
+            persisted_controller_effect_payload(&store, "effect:controller");
+        store
+            .prepare_authority_operation(
+                "effect:controller".to_owned(),
+                effect_payload,
+                &effect_claim_digest,
+            )
+            .await
+            .expect("persist controller-effect authority");
+
+        let rows = store
+            .authority_operations()
+            .await
+            .expect("list persisted authority operations");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row.operation_id == "host-operation"
+                && row.state == StoreAuthorityOperationState::Pending
+        }));
+        assert!(rows.iter().any(|row| {
+            row.operation_id == "effect:controller"
+                && row.state == StoreAuthorityOperationState::Pending
+        }));
 
         Arc::try_unwrap(store)
             .expect("only test owner remains")
             .shutdown()
             .await
             .expect("shutdown store");
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join("store.redb"))
+            .expect("reopened store file");
+        let identity = test_store_identity();
+        let (_, acceptor) = mutation_seal_pair(identity.seal_identity());
+        let reopened = Arc::new(
+            RedbResourceStore::open_owned(file, identity, acceptor)
+                .await
+                .expect("reopen store"),
+        );
+
+        {
+            let persistence: Arc<dyn AuthorityPersistence> =
+                Arc::new(RedbAuthorityPersistence::new(Arc::clone(&reopened)));
+            let coordinator = AuthorityRecoveryCoordinator::recover_with_provenance(
+                persistence,
+                &TestRecoveryProvenance,
+            )
+            .await
+            .expect("recover mixed authority ledger");
+            let index = coordinator.index();
+            let index = index.lock().await;
+            assert_eq!(index.durable_claims(), vec![host_claim]);
+            assert!(!index.is_ready_for_readiness());
+            drop(index);
+
+            coordinator
+                .resolve_observed_closed("host-operation")
+                .await
+                .expect("host operation has a prepared recovery capability");
+            assert!(coordinator.is_ready_for_readiness().await);
+            assert_eq!(
+                coordinator
+                    .resolve_observed_closed("effect:controller")
+                    .await,
+                Err(AuthorityPersistenceError::StateInvalid)
+            );
+        }
+
+        let rows = reopened
+            .authority_operations()
+            .await
+            .expect("list authority operations after recovery");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row.operation_id == "host-operation"
+                && row.state == StoreAuthorityOperationState::Released
+        }));
+        assert!(rows.iter().any(|row| {
+            row.operation_id == "effect:controller"
+                && row.state == StoreAuthorityOperationState::Pending
+        }));
+
+        Arc::try_unwrap(reopened)
+            .expect("only reopened store owner remains")
+            .shutdown()
+            .await
+            .expect("shutdown reopened store");
     }
 
     #[tokio::test]
     async fn malformed_or_unknown_controller_effect_rows_fail_closed() {
-        let (_directory, store) = test_store().await;
-        for payload in [
+        for (suffix, mut payload) in [
             serde_json::json!({
                 "version": 1,
                 "kind": "controller-effect",
@@ -643,29 +766,40 @@ mod tests {
                 "claimDigest": format!("sha256:{}", "a".repeat(64)),
                 "storeBindingDigest": format!("sha256:{}", "b".repeat(64)),
             }),
-        ] {
-            let error = match recovery_receipt(
-                vec![controller_effect_row(
-                    "effect:controller",
-                    payload,
-                    StoreAuthorityOperationState::Pending,
-                )],
-                &store,
-                &Mutex::new(BTreeMap::new()),
-            )
-            .await
-            {
-                Ok(_) => panic!("malformed controller effect row must fail closed"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_directory, store) = test_store().await;
+            let operation_id = format!("effect:controller-lookalike-{suffix}");
+            let claim_digest = format!("sha256:{}", "c".repeat(64));
+            payload["operationId"] = serde_json::json!(operation_id);
+            payload["claimDigest"] = serde_json::json!(claim_digest.clone());
+            payload["storeBindingDigest"] =
+                serde_json::json!(store.authority_binding_digest(&claim_digest));
+            store
+                .prepare_authority_operation(
+                    operation_id,
+                    serde_json::to_vec(&payload).expect("lookalike payload"),
+                    &claim_digest,
+                )
+                .await
+                .expect("persist controller-effect lookalike");
+
+            let persistence = RedbAuthorityPersistence::new(Arc::clone(&store));
+            let error = match AuthorityPersistence::recover(&persistence).await {
+                Ok(_) => panic!("controller-effect lookalike must fail closed"),
                 Err(error) => error,
             };
             assert_eq!(error, AuthorityPersistenceError::RowInvalid);
-        }
 
-        Arc::try_unwrap(store)
-            .expect("only test owner remains")
-            .shutdown()
-            .await
-            .expect("shutdown store");
+            drop(persistence);
+            Arc::try_unwrap(store)
+                .expect("only test owner remains")
+                .shutdown()
+                .await
+                .expect("shutdown store");
+        }
     }
 
     #[tokio::test]
