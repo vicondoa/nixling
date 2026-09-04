@@ -1088,6 +1088,10 @@ impl RedbResourceStore {
 }
 
 impl AuthorityOperationCapability {
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
     pub async fn record_effect(&self, state: AuthorityOperationState) -> Result<(), StoreError> {
         self.store
             .writer

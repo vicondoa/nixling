@@ -856,6 +856,15 @@ impl RedbRegisteredControllerApi {
         &self,
         projection: &ReconcileProjection,
     ) -> Result<(), SourceError> {
+        self.persist_projection_status_with_operation(projection, None)
+            .await
+    }
+
+    async fn persist_projection_status_with_operation(
+        &self,
+        projection: &ReconcileProjection,
+        operation_id: Option<&str>,
+    ) -> Result<(), SourceError> {
         if projection.event_only() {
             return Ok(());
         }
@@ -916,21 +925,28 @@ impl RedbRegisteredControllerApi {
             configuration_generation: None,
             assignment: None,
         };
-        let operation_id = format!(
-            "projection-{}-{}",
-            projection.revision().get(),
-            current.uid.as_str()
-        );
-        let operation = StoreOperationContext {
-            operation_id,
-            idempotency_key: None,
-            correlation_id: canonical_digest(
-                "d2b:projection-correlation/v1",
-                projection.reason_code().as_bytes(),
-            ),
-            trace_id: None,
-            deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
-        };
+        let operation = operation_id
+            .map(|operation_id| StoreOperationContext {
+                operation_id: operation_id.to_owned(),
+                idempotency_key: Some(operation_id.to_owned()),
+                correlation_id: operation_id.to_owned(),
+                trace_id: None,
+                deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
+            })
+            .unwrap_or_else(|| StoreOperationContext {
+                operation_id: format!(
+                    "projection-{}-{}",
+                    projection.revision().get(),
+                    current.uid.as_str()
+                ),
+                idempotency_key: None,
+                correlation_id: canonical_digest(
+                    "d2b:projection-correlation/v1",
+                    projection.reason_code().as_bytes(),
+                ),
+                trace_id: None,
+                deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
+            });
         match self
             .commit_store_mutations(
                 &current.zone,
@@ -1427,7 +1443,17 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
         operation: &OperationContext,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
         async move {
-            self.persist_projection_status(projection).await?;
+            let accepted_operation_id = self
+                .accepted
+                .lock()
+                .map_err(|_| SourceError::Integrity)?
+                .get(operation.operation_id())
+                .map(|capability| capability.operation_id().to_owned());
+            self.persist_projection_status_with_operation(
+                projection,
+                accepted_operation_id.as_deref(),
+            )
+                .await?;
             self.record_effect_state(
                 operation.operation_id(),
                 projection.revision(),

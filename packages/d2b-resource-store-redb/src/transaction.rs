@@ -2589,6 +2589,51 @@ fn request_digest_matches(persisted: &str, candidates: &[String; 2]) -> bool {
     candidates.iter().any(|candidate| candidate == persisted)
 }
 
+fn authority_status_continuation_allowed(
+    authority: &AuthorityOperationStorage,
+    verified: &VerifiedWrite,
+) -> bool {
+    if !matches!(authority.state.as_str(), "pending" | "effect-retryable")
+        || verified.mutations.len() != 1
+    {
+        return false;
+    }
+    let prepared = &verified.mutations[0];
+    if prepared.mutation.kind != ResourceMutationKind::UpdateStatus
+        || prepared.mutation.assignment.is_none()
+    {
+        return false;
+    }
+    let Some(expected_uid) = prepared.resource_uid.as_ref() else {
+        return false;
+    };
+    let Some(canonical_resource) = prepared.mutation.canonical_resource.as_ref() else {
+        return false;
+    };
+    let Ok(resource) = serde_json::from_slice::<serde_json::Value>(canonical_resource) else {
+        return false;
+    };
+    let Some(payload) = serde_json::from_slice::<serde_json::Value>(&authority.payload).ok()
+    else {
+        return false;
+    };
+    payload
+        .get("operationId")
+        .and_then(serde_json::Value::as_str)
+        == Some(verified.operation.operation_id.as_str())
+        && payload
+            .get("resourceUid")
+            .and_then(serde_json::Value::as_str)
+            == Some(expected_uid.as_str())
+        && payload
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
+            == resource
+                .get("metadata")
+                .and_then(|metadata| metadata.get("generation"))
+                .and_then(serde_json::Value::as_u64)
+}
+
 #[cfg(test)]
 pub(crate) fn apply_group(
     database: &Database,
@@ -2637,6 +2682,7 @@ pub(crate) fn apply_group_with_hook(
         let request_digests = operation_digests(&verified)?;
         let request_digest = request_digests[0].clone();
         let operation_key_bytes = operation_key(&operation_id)?;
+        let mut retained_authority = None;
         if let Some(previous_digest) =
             seen_operations.insert(operation_id.clone(), request_digest.clone())
         {
@@ -2655,25 +2701,31 @@ pub(crate) fn apply_group_with_hook(
                 .map_err(integrity)?
             {
                 let prior: OperationRecord = decode(ValueKind::OperationRecord, bytes.value())?;
-                if !request_digest_matches(&prior.request_digest, &request_digests) {
-                    results.push(Err(conflict(
-                        meta.current_revision,
-                        0,
-                        "operation-id-reused",
-                    )));
-                } else if prior.outcome == "committed" {
-                    results.push(Ok(StoreCommitResult {
-                        resources: prior
-                            .resources
-                            .iter()
-                            .map(operation_resource)
-                            .collect::<Result<Vec<_>, _>>()?,
-                        revision: ZoneRevision::new(prior.finished_revision),
-                    }));
+                if let Some(authority) = prior.authority.as_ref()
+                    && authority_status_continuation_allowed(authority, &verified)
+                {
+                    retained_authority = Some(authority.clone());
                 } else {
-                    results.push(Err(replayed_operation_failure(&prior)));
+                    if !request_digest_matches(&prior.request_digest, &request_digests) {
+                        results.push(Err(conflict(
+                            meta.current_revision,
+                            0,
+                            "operation-id-reused",
+                        )));
+                    } else if prior.outcome == "committed" {
+                        results.push(Ok(StoreCommitResult {
+                            resources: prior
+                                .resources
+                                .iter()
+                                .map(operation_resource)
+                                .collect::<Result<Vec<_>, _>>()?,
+                            revision: ZoneRevision::new(prior.finished_revision),
+                        }));
+                    } else {
+                        results.push(Err(replayed_operation_failure(&prior)));
+                    }
+                    continue;
                 }
-                continue;
             }
         }
 
@@ -2717,25 +2769,30 @@ pub(crate) fn apply_group_with_hook(
                 .map_err(integrity)?
             {
                 let prior: OperationRecord = decode(ValueKind::OperationRecord, bytes.value())?;
-                if request_digest_matches(&prior.request_digest, &request_digests) {
-                    if prior.outcome != "committed" {
-                        results.push(Err(replayed_operation_failure(&prior)));
-                        continue;
-                    }
-                    results.push(Ok(StoreCommitResult {
-                        resources: prior
-                            .resources
-                            .iter()
-                            .map(operation_resource)
-                            .collect::<Result<Vec<_>, _>>()?,
-                        revision: ZoneRevision::new(prior.finished_revision),
-                    }));
+                if let Some(authority) = prior.authority.as_ref()
+                    && authority_status_continuation_allowed(authority, &verified)
+                {
+                    retained_authority = Some(authority.clone());
                 } else {
-                    let error = conflict(meta.current_revision, 0, "operation-id-reused");
-                    results.push(Err(error.clone()));
+                    if request_digest_matches(&prior.request_digest, &request_digests) {
+                        if prior.outcome != "committed" {
+                            results.push(Err(replayed_operation_failure(&prior)));
+                            continue;
+                        }
+                        results.push(Ok(StoreCommitResult {
+                            resources: prior
+                                .resources
+                                .iter()
+                                .map(operation_resource)
+                                .collect::<Result<Vec<_>, _>>()?,
+                            revision: ZoneRevision::new(prior.finished_revision),
+                        }));
+                    } else {
+                        let error = conflict(meta.current_revision, 0, "operation-id-reused");
+                        results.push(Err(error.clone()));
+                    }
+                    continue;
                 }
-
-                continue;
             }
         }
 
@@ -2819,7 +2876,7 @@ pub(crate) fn apply_group_with_hook(
                 revision,
                 audit_now_ms(),
             )?),
-            authority: None,
+            authority: retained_authority,
         };
         let operation_value = encode(ValueKind::OperationRecord, &operation)?;
         write

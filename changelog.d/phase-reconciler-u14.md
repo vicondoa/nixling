@@ -33,6 +33,8 @@
 - Classified transient persistence timeouts as bounded status retries, kept
   integrity failures fail-closed, and threaded accepted effect identity into
   the production Core/Resource API ledger update.
+- Continued status mutations under the accepted effect operation identity and
+  retained the authority row across durable status retry and reopen.
 
 ### Removed
 
