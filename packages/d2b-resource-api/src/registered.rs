@@ -1393,6 +1393,22 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
         self.persist_projection_status(projection)
     }
 
+    fn persist_outcome_with_operation(
+        &self,
+        projection: &ReconcileProjection,
+        operation: &OperationContext,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        async move {
+            self.record_effect_state(
+                operation.operation_id(),
+                projection.revision(),
+                projection_state(projection.disposition(), projection.reason()),
+            )
+            .await?;
+            self.persist_projection_status(projection).await
+        }
+    }
+
     fn checkpoint(
         &self,
         context: &ReconcileContext,
@@ -3456,7 +3472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relist_rejoins_a_pending_effect_without_creating_a_duplicate_row() {
+    async fn exhausted_effect_marks_one_terminal_row_without_replacement() {
         let (_directory, store, service, subject, state, issuer_slot) =
             authorized_test_setup().await;
         let target = ResourceRef::parse("Host/owner").unwrap();
@@ -3487,7 +3503,6 @@ mod tests {
             .await
             .unwrap();
         let assignment = primary_assignment(stored.uid.clone(), stored.revision);
-        let second_subject = issue_test_subject(subject.claims().clone(), state.clone());
         let api = Arc::new(
             service
                 .registered_controller_api(
@@ -3521,7 +3536,8 @@ mod tests {
             loop {
                 let rows = store.authority_operations().await.unwrap();
                 if rows.len() == 1
-                    && rows[0].state == d2b_resource_store_redb::AuthorityOperationState::Pending
+                    && rows[0].state
+                        == d2b_resource_store_redb::AuthorityOperationState::EffectTerminal
                 {
                     break;
                 }
@@ -3532,56 +3548,18 @@ mod tests {
         .unwrap();
         source.close_watch().unwrap();
         first_task.await.unwrap().unwrap();
-
-        let api = Arc::new(
-            service
-                .registered_controller_api(
-                    second_subject,
-                    state,
-                    vec![(target.clone(), assignment)],
-                )
-                .unwrap(),
-        );
-        let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
-        let second_task = tokio::spawn(
-            d2b_core_controller::Runner::new(
-                Arc::new(MutationHandler {
-                    descriptor: descriptor.clone(),
-                    effect_only: true,
-                    fail_effect: None,
-                }),
-                Arc::clone(&source),
-                d2b_core_controller::RunnerConfig {
-                    policy_revision: 7,
-                    api_revision: 8,
-                    configuration_revision: ConfigurationGeneration::new(9).unwrap(),
-                    deadline_tick: 5_000,
-                    max_attempts: 1,
-                },
-            )
-            .run(),
-        );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let rows = store.authority_operations().await.unwrap();
-                if rows.len() == 1
-                    && rows[0].state
-                        == d2b_resource_store_redb::AuthorityOperationState::EffectConfirmed
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        source.close_watch().unwrap();
-        second_task.await.unwrap().unwrap();
         let rows = store.authority_operations().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].state,
-            d2b_resource_store_redb::AuthorityOperationState::EffectConfirmed
+            d2b_resource_store_redb::AuthorityOperationState::EffectTerminal
+        );
+        assert!(rows[0].operation_id.starts_with("effect:"));
+        assert!(!rows[0].operation_id.starts_with("projection-"));
+        let payload: serde_json::Value = serde_json::from_slice(&rows[0].payload).unwrap();
+        assert_eq!(
+            payload["operationId"].as_str(),
+            Some(rows[0].operation_id.as_str())
         );
     }
 

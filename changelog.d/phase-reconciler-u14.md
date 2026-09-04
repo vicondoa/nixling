@@ -30,6 +30,9 @@
   projections to the exact target revision without killing the healthy runner.
 - Kept exhausted status conflicts inside a bounded persistence-only loop so
   retries retain effect identity without re-running accepted Process effects.
+- Classified transient persistence timeouts as bounded status retries, kept
+  integrity failures fail-closed, and threaded accepted effect identity into
+  the production Core/Resource API ledger update.
 
 ### Removed
 

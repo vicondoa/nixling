@@ -166,6 +166,14 @@ pub trait RegisteredControllerApi: Send + Sync + 'static {
         projection: &ReconcileProjection,
     ) -> impl Future<Output = Result<(), SourceError>> + Send;
 
+    fn persist_outcome_with_operation(
+        &self,
+        projection: &ReconcileProjection,
+        _operation: &OperationContext,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.persist_outcome(projection)
+    }
+
     fn checkpoint(
         &self,
         context: &ReconcileContext,
@@ -552,6 +560,15 @@ where
         projection: &ReconcileProjection,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
         self.api.persist_outcome(projection)
+    }
+
+    fn persist_outcome_with_operation(
+        &self,
+        projection: &ReconcileProjection,
+        operation: &OperationContext,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.api
+            .persist_outcome_with_operation(projection, operation)
     }
 
     fn checkpoint(

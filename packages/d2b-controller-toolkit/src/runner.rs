@@ -1691,6 +1691,16 @@ impl FailureProjectionFields {
     }
 }
 
+const fn retryable_persistence_source_error(error: SourceError) -> bool {
+    matches!(
+        error,
+        SourceError::Conflict(_)
+            | SourceError::Timeout
+            | SourceError::Backpressure
+            | SourceError::Unavailable
+    )
+}
+
 async fn persist_failure_projection_once<S>(
     source: &S,
     clock: &dyn MonotonicClock,
@@ -1716,7 +1726,7 @@ where
     .await
     {
         Ok(fresh) => fresh,
-        Err(RunnerError::Source(SourceError::Conflict(_))) => {
+        Err(RunnerError::Source(error)) if retryable_persistence_source_error(error) => {
             return Ok(FailurePersistenceAttempt::Conflict);
         }
         Err(error) => return Err(error),
@@ -1749,7 +1759,7 @@ where
     .await
     {
         Ok(()) => Ok(FailurePersistenceAttempt::Persisted),
-        Err(RunnerError::Source(SourceError::Conflict(_))) => {
+        Err(RunnerError::Source(error)) if retryable_persistence_source_error(error) => {
             Ok(FailurePersistenceAttempt::Conflict)
         }
         Err(error) => Err(error),
@@ -2689,6 +2699,7 @@ mod tests {
         persisted_outcomes: Mutex<Vec<ReconcileProjection>>,
         enforce_projection_revision: AtomicBool,
         persist_conflicts_remaining: AtomicUsize,
+        persist_timeouts_remaining: AtomicUsize,
         checkpoints: AtomicUsize,
         starting: AtomicUsize,
         requeues: AtomicUsize,
@@ -2731,6 +2742,7 @@ mod tests {
                     persisted_outcomes: Mutex::new(Vec::new()),
                     enforce_projection_revision: AtomicBool::new(false),
                     persist_conflicts_remaining: AtomicUsize::new(0),
+                    persist_timeouts_remaining: AtomicUsize::new(0),
                     checkpoints: AtomicUsize::new(0),
                     starting: AtomicUsize::new(0),
                     requeues: AtomicUsize::new(0),
@@ -2756,6 +2768,19 @@ mod tests {
             &self,
             projection: &ReconcileProjection,
         ) -> Result<(), SourceError> {
+            if self
+                .persist_timeouts_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return Err(SourceError::Timeout);
+            }
             if self.enforce_projection_revision.load(Ordering::SeqCst) {
                 let current_revision = self
                     .fresh
@@ -4366,16 +4391,19 @@ mod tests {
         let (reconciler, _entered, source, watch_tx) =
             harness_with_revisions(vec![target.clone()], 1, 11, 2);
         reconciler.block_handlers.store(false, Ordering::SeqCst);
-        source.conflicts_remaining.store(3, Ordering::SeqCst);
+        source.conflicts_remaining.store(1, Ordering::SeqCst);
         source
             .enforce_projection_revision
             .store(true, Ordering::SeqCst);
         source
             .persist_conflicts_remaining
             .store(1, Ordering::SeqCst);
-        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+        let mut runner_config = config();
+        runner_config.max_attempts = 1;
+        let runner =
+            run_with_config_in_thread(Arc::clone(&reconciler), Arc::clone(&source), runner_config);
 
-        wait_for(&reconciler.execute_effect_calls, 3);
+        wait_for(&reconciler.execute_effect_calls, 1);
         watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
 
         let report = runner
@@ -4383,15 +4411,15 @@ mod tests {
             .expect("runner thread")
             .expect("persistence-only retry avoids a terminal source conflict");
         assert_eq!(report.handler_failures, 1);
-        assert_eq!(source.commits.load(Ordering::SeqCst), 3);
-        assert_eq!(reconciler.reconcile_calls.load(Ordering::SeqCst), 3);
-        assert_eq!(reconciler.execute_effect_calls.load(Ordering::SeqCst), 3);
-        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 3);
+        assert_eq!(source.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(reconciler.reconcile_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(reconciler.execute_effect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 1);
         let accepted = source
             .accepted_operation_ids
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(accepted.len(), 3);
+        assert_eq!(accepted.len(), 1);
         assert_eq!(
             accepted
                 .iter()
@@ -4467,6 +4495,43 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(outcomes[0].revision(), ZoneRevision::new(2));
+    }
+
+    #[test]
+    fn exhausted_persistence_timeout_retries_status_without_starting_new_effect() {
+        let target = key("app", 1);
+        let (reconciler, _entered, source, watch_tx) =
+            harness_with_revisions(vec![target], 1, 11, 2);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        reconciler
+            .handler_failures_remaining
+            .store(8, Ordering::SeqCst);
+        source
+            .enforce_projection_revision
+            .store(true, Ordering::SeqCst);
+        source.persist_timeouts_remaining.store(1, Ordering::SeqCst);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+
+        wait_for_outcomes(&source, 1);
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let report = runner
+            .join()
+            .expect("runner thread")
+            .expect("transient persistence timeout must not stop the runner");
+        assert_eq!(report.handler_failures, 1);
+        assert_eq!(report.persistence_uncertain, 0);
+        assert_eq!(reconciler.reconcile_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(reconciler.execute_effect_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            source
+                .persisted_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())[0]
+                .revision(),
+            ZoneRevision::new(2)
+        );
     }
 
     #[test]
