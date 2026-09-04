@@ -17068,12 +17068,8 @@ impl ZoneResourceRuntime {
             .runtime_metadata()
             .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let controller_generation = store_metadata
-            .policy_snapshot
-            .controller_generation
-            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
-        let (_, provider_generation, _, session_generation, _) =
-            self.core_assignment_fences(false).await?;
+        let core_authority = self.core_assignment_fences(false).await?.4;
+        let controller_generation = core_authority.controller_generation;
         let stale_task = {
             let mut task = self
                 .process_runner_task
@@ -17131,7 +17127,7 @@ impl ZoneResourceRuntime {
                 controller_ref.clone(),
                 controller_generation,
                 provider_ref,
-                provider_generation,
+                core_authority.provider_generation,
                 controller_ref.clone(),
                 host_ref,
                 None,
@@ -17150,9 +17146,7 @@ impl ZoneResourceRuntime {
                 .with_assignment_fence_resolver(process_assignment_fence_resolver(
                     Arc::clone(&self.store),
                     providers.mode(),
-                    controller_ref,
-                    session_generation,
-                    Arc::clone(&self.core_assignment_epoch),
+                    core_authority,
                 ));
             let watch_task_slot = Arc::clone(&self.controller_session_reconcile_task);
             let watch_wake = Arc::clone(&self.controller_session_reconcile_wake);
@@ -20071,9 +20065,7 @@ fn map_process_runtime_error(error: ProcessResourceRuntimeError) -> ResourceRunt
 fn process_assignment_fence_resolver(
     store: Arc<RedbResourceStore>,
     mode: DaemonMode,
-    controller_role: ResourceRef,
-    session_generation: ReconnectGeneration,
-    epoch: Arc<AtomicU64>,
+    authority: Arc<CoreAssignmentAuthority>,
 ) -> AssignmentFenceResolver {
     fn integrity(target: &ResourceRef, reason: &'static str) -> SourceError {
         tracing::warn!(
@@ -20086,8 +20078,7 @@ fn process_assignment_fence_resolver(
 
     Arc::new(move |target, uid, revision| {
         let store = Arc::clone(&store);
-        let controller_role = controller_role.clone();
-        let epoch = Arc::clone(&epoch);
+        let authority = Arc::clone(&authority);
         Box::pin(async move {
             let resource = store
                 .get(StoreGetRequest {
@@ -20146,7 +20137,7 @@ fn process_assignment_fence_resolver(
             if execution_ref.resource_type().as_str() != expected_target {
                 return Err(integrity(&target, "process-execution-ref-wrong-domain"));
             }
-            let provider_generation = match store
+            let _target_provider = match store
                 .get(StoreGetRequest {
                     operation: StoreOperationContext {
                         operation_id: "process-assignment-provider".to_owned(),
@@ -20162,7 +20153,10 @@ fn process_assignment_fence_resolver(
                 })
                 .await
                 {
-                    Ok(provider) => provider.generation,
+                    Ok(provider) if provider.generation.get() > 0 => provider,
+                    Ok(_) => {
+                        return Err(integrity(&target, "target-provider-generation-invalid"));
+                    }
                     Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
                         let current_revision = store
                             .runtime_metadata()
@@ -20184,26 +20178,15 @@ fn process_assignment_fence_resolver(
                     }
                     Err(_) => return Err(SourceError::Integrity),
                 };
-            let controller_generation = store
-                .runtime_metadata()
-                .await
-                .map_err(|_| SourceError::Unavailable)?
-                .policy_snapshot
-                .controller_generation
-                .ok_or_else(|| integrity(&target, "controller-generation-missing"))?;
-            let assignment_epoch = epoch.load(Ordering::Acquire);
-            if assignment_epoch == 0 {
-                return Err(integrity(&target, "assignment-epoch-zero"));
-            }
             Ok(ResourceAssignmentFence {
                 resource_uid: uid,
                 resource_revision: revision,
-                provider_generation,
-                controller_generation,
-                controller_role,
+                provider_generation: authority.provider_generation,
+                controller_generation: authority.controller_generation,
+                controller_role: authority.controller_role.clone(),
                 target: execution_ref,
-                session_generation,
-                epoch: assignment_epoch,
+                session_generation: authority.session_generation,
+                epoch: authority.epoch,
                 scope: ResourceAssignmentScope::Primary,
             })
         })
@@ -21651,6 +21634,202 @@ mod tests {
     use d2b_resource_store_redb::write_provisioning_marker;
     use d2b_session_unix::{CreditPool, CreditScopeSet, OutboundPacket, prearmed_seqpacket_pair};
 
+    const TEST_PROCESS_FINALIZER: &str = "process-system-minijail.d2bus.org/cleanup";
+
+    #[derive(Debug)]
+    struct AssignmentTestError;
+
+    impl core::fmt::Display for AssignmentTestError {
+        fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter.write_str("assignment test handler failed")
+        }
+    }
+
+    impl std::error::Error for AssignmentTestError {}
+
+    struct AssignmentTestReconciler {
+        descriptor: ControllerDescriptor,
+    }
+
+    fn has_test_process_finalizer(resource: &ResourceSnapshot) -> bool {
+        serde_json::from_slice::<Value>(resource.canonical_json())
+            .ok()
+            .and_then(|value| value.pointer("/metadata/finalizers").cloned())
+            .and_then(|value| value.as_array().cloned())
+            .is_some_and(|finalizers| {
+                finalizers
+                    .iter()
+                    .any(|value| value.as_str() == Some(TEST_PROCESS_FINALIZER))
+            })
+    }
+
+    impl ResourceReconciler for AssignmentTestReconciler {
+        type Error = AssignmentTestError;
+
+        fn classify_error(
+            &self,
+            _error: &Self::Error,
+        ) -> d2b_core_controller::HandlerFailure {
+            d2b_core_controller::HandlerFailure::terminal()
+        }
+
+        fn describe(
+            &self,
+        ) -> impl std::future::Future<
+            Output = Result<ControllerDescriptor, Self::Error>,
+        > + Send {
+            std::future::ready(Ok(self.descriptor.clone()))
+        }
+
+        fn validate_spec(
+            &self,
+            _context: &ReconcileContext,
+            _resource: &ResourceSnapshot,
+        ) -> impl std::future::Future<Output = Result<ValidationResult, Self::Error>> + Send {
+            std::future::ready(Ok(ValidationResult::Valid))
+        }
+
+        fn plan(
+            &self,
+            _context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+        ) -> impl std::future::Future<Output = Result<ReconcilePlan, Self::Error>> + Send {
+            let steps = if has_test_process_finalizer(resource) {
+                Vec::new()
+            } else {
+                vec!["finalizer".to_owned()]
+            };
+            std::future::ready(
+                ReconcilePlan::new(steps, false).map_err(|_| AssignmentTestError),
+            )
+        }
+
+        fn reconcile(
+            &self,
+            _context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+            _plan: &ReconcilePlan,
+        ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+            if has_test_process_finalizer(resource) {
+                return std::future::ready(Ok(ReconcileResult::converged(
+                    resource.revision(),
+                    resource.generation(),
+                )));
+            }
+            let canonical = finalizer_candidate(
+                resource.canonical_json(),
+                TEST_PROCESS_FINALIZER,
+                true,
+            )
+            .map_err(|_| AssignmentTestError);
+            let result = canonical
+                .and_then(|canonical| {
+                    let mutation = d2b_core_controller::MutationIntent::new(
+                        resource.key().resource_ref().clone(),
+                        Some(resource.key().uid().clone()),
+                        Some(resource.revision()),
+                        d2b_core_controller::MutationIntentKind::UpdateFinalizers,
+                        Some(canonical),
+                    )
+                    .map_err(|_| AssignmentTestError)?;
+                    let batch = ResourceMutationBatch::new(vec![mutation])
+                        .map_err(|_| AssignmentTestError)?;
+                    ReconcileResult::new(
+                        resource.revision(),
+                        resource.generation(),
+                        Some(batch),
+                        None,
+                        ReconcileDisposition::Pending,
+                        None,
+                        None,
+                        StatusPersistence::NotRequested,
+                    )
+                    .map_err(|_| AssignmentTestError)
+                });
+            std::future::ready(result)
+        }
+
+        fn observe(
+            &self,
+            _context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+        ) -> impl std::future::Future<Output = Result<ObservationResult, Self::Error>> + Send {
+            std::future::ready(Ok(ObservationResult::new(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ))))
+        }
+
+        fn finalize(
+            &self,
+            _context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+        ) -> impl std::future::Future<Output = Result<FinalizeResult, Self::Error>> + Send {
+            std::future::ready(Ok(FinalizeResult::new(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ))))
+        }
+
+        fn health(
+            &self,
+        ) -> impl std::future::Future<
+            Output = Result<d2b_core_controller::ControllerHealth, Self::Error>,
+        > + Send {
+            std::future::ready(Ok(d2b_core_controller::ControllerHealth::Healthy))
+        }
+
+        fn drain(
+            &self,
+            _deadline_tick: u64,
+        ) -> impl std::future::Future<Output = Result<DrainResult, Self::Error>> + Send {
+            std::future::ready(Ok(DrainResult::Drained))
+        }
+
+        fn assess_update(
+            &self,
+            _context: &ReconcileContext,
+            _resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+        ) -> impl std::future::Future<Output = Result<UpdateAssessment, Self::Error>> + Send {
+            std::future::ready(
+                UpdateAssessment::new(UpdateAssessmentState::Current, Vec::new(), true)
+                    .map_err(|_| AssignmentTestError),
+            )
+        }
+
+        fn plan_upgrade(
+            &self,
+            _context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+        ) -> impl std::future::Future<Output = Result<UpgradePlan, Self::Error>> + Send {
+            std::future::ready(
+                UpgradePlan::new(
+                    DisruptionClass::None,
+                    true,
+                    vec![UpgradeStage::Recycle(resource.key().resource_ref().clone())],
+                )
+                .map_err(|_| AssignmentTestError),
+            )
+        }
+
+        fn execute_upgrade(
+            &self,
+            _context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+            _plan: &UpgradePlan,
+        ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+            std::future::ready(Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            )))
+        }
+    }
+
     struct RecordingSharedProviderEffects {
         reconciles: AtomicUsize,
         finalizes: AtomicUsize,
@@ -22999,7 +23178,7 @@ mod tests {
                 "start-exit"
             ]
         );
-        runtime.shutdown().await.unwrap();
+        let _ = runtime.shutdown().await;
     }
 
     #[tokio::test]
@@ -25062,13 +25241,18 @@ mod tests {
             })
             .await
             .unwrap();
-        let assignment_epoch = Arc::new(AtomicU64::new(1));
+        let authority = Arc::new(CoreAssignmentAuthority {
+            provider_generation: ResourceGeneration::new(17).unwrap(),
+            controller_generation: ControllerGeneration::new(23).unwrap(),
+            session_generation: ReconnectGeneration::new(19).unwrap(),
+            controller_role: ResourceRef::parse("Process/d2b-core-controller").unwrap(),
+            target: ResourceRef::parse("Zone/work").unwrap(),
+            epoch: 29,
+        });
         let resolver = process_assignment_fence_resolver(
             Arc::clone(&runtime.store),
             DaemonMode::Host,
-            ResourceRef::parse("Process/d2b-core-controller").unwrap(),
-            ReconnectGeneration::new(1).unwrap(),
-            assignment_epoch,
+            Arc::clone(&authority),
         );
         let fence = resolver(
             process.resource_ref.clone(),
@@ -25078,9 +25262,309 @@ mod tests {
         .await
         .expect("fixed Provider appearance must requeue assignment admission");
         assert_eq!(fence.resource_uid, process.uid);
-        assert!(fence.provider_generation.get() > 0);
+        assert_eq!(fence.provider_generation, authority.provider_generation);
+        assert_eq!(fence.controller_generation, authority.controller_generation);
+        assert_eq!(fence.session_generation, authority.session_generation);
+        assert_eq!(fence.controller_role, authority.controller_role);
+        assert_eq!(
+            fence.target,
+            ResourceRef::parse("Host/host-system").unwrap()
+        );
+        assert_eq!(fence.epoch, authority.epoch);
         drop(resolver);
         runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generated_controller_process_assignment_uses_core_authority_identity() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Provider",
+                "network-local",
+                &zone,
+                r#"{"artifactId":"acceptance-provider","config":{}}"#,
+            )],
+        )
+        .await;
+        let owner = ResourceRef::parse("Provider/network-local").unwrap();
+        let process = BundleResource::new(
+            ResourceTypeName::parse("Process").unwrap(),
+            BundleResourceMetadata::new(
+                ResourceName::parse("controller-e1e6335ae78671758ea381fce5d44fdd").unwrap(),
+                zone.clone(),
+                Some(owner),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            CanonicalJsonObject::parse(
+                br#"{"executionRef":"Host/host-system","processClass":"controller","providerRef":"Provider/system-minijail","template":"acceptance-controller"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        materialize_test_bundle(&runtime, vec![process]).await;
+        let process_ref =
+            ResourceRef::parse("Process/controller-e1e6335ae78671758ea381fce5d44fdd").unwrap();
+        let stored = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "generated-controller-process-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "generated-controller-process-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: process_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let authority = Arc::new(CoreAssignmentAuthority {
+            provider_generation: ResourceGeneration::new(17).unwrap(),
+            controller_generation: ControllerGeneration::new(23).unwrap(),
+            session_generation: ReconnectGeneration::new(19).unwrap(),
+            controller_role: ResourceRef::parse("Process/d2b-core-controller").unwrap(),
+            target: ResourceRef::parse("Zone/work").unwrap(),
+            epoch: 29,
+        });
+        let system_minijail = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "generated-controller-process-provider-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "generated-controller-process-provider-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: ResourceRef::parse("Provider/system-minijail").unwrap(),
+                expected_uid: None,
+                projection: StoreProjection::MetadataOnly,
+            })
+            .await
+            .unwrap();
+        assert_ne!(
+            authority.provider_generation,
+            system_minijail.generation,
+            "test must distinguish Core Provider from Process effect Provider",
+        );
+        let resolver = process_assignment_fence_resolver(
+            Arc::clone(&runtime.store),
+            DaemonMode::Host,
+            Arc::clone(&authority),
+        );
+        let fence = resolver(
+            process_ref.clone(),
+            stored.uid.clone(),
+            stored.revision,
+        )
+        .await
+        .expect("generated controller Process assignment");
+        assert_eq!(fence.provider_generation, authority.provider_generation);
+        assert_eq!(fence.controller_generation, authority.controller_generation);
+        assert_eq!(fence.session_generation, authority.session_generation);
+        assert_eq!(fence.controller_role, authority.controller_role);
+        assert_eq!(
+            fence.target,
+            ResourceRef::parse("Host/host-system").unwrap()
+        );
+        assert_eq!(fence.epoch, authority.epoch);
+
+        let wrong_process = bundle_resource(
+            "Process",
+            "wrong-controller-provider",
+            &zone,
+            r#"{"executionRef":"Host/host-system","processClass":"controller","providerRef":"Provider/not-a-process-provider","template":"acceptance-controller"}"#,
+        );
+        materialize_test_bundle(&runtime, vec![wrong_process]).await;
+        let wrong_ref = ResourceRef::parse("Process/wrong-controller-provider").unwrap();
+        let wrong = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "wrong-controller-provider-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "wrong-controller-provider-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: wrong_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            resolver(wrong_ref, wrong.uid, wrong.revision).await,
+            Err(SourceError::Integrity)
+        ));
+
+        let missing_target = ResourceRef::parse("Process/missing-controller").unwrap();
+        assert!(
+            resolver(
+                missing_target,
+                ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+                ZoneRevision::new(1),
+            )
+            .await
+            .is_err(),
+            "missing Process target must fail closed"
+        );
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn production_runner_persists_core_assignment_for_generated_controller_process() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let owner_ref = ResourceRef::parse("Provider/network-local").unwrap();
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "Provider",
+                    "network-local",
+                    &zone,
+                    r#"{"artifactId":"acceptance-provider","config":{}}"#,
+                ),
+                {
+                    let metadata = BundleResourceMetadata::new(
+                        ResourceName::parse(
+                            "controller-e1e6335ae78671758ea381fce5d44fdd",
+                        )
+                        .unwrap(),
+                        zone.clone(),
+                        Some(owner_ref.clone()),
+                        BTreeMap::new(),
+                        BTreeMap::new(),
+                    );
+                    BundleResource::new(
+                        ResourceTypeName::parse("Process").unwrap(),
+                        metadata,
+                        CanonicalJsonObject::parse(
+                            br#"{"executionRef":"Host/host-system","processClass":"controller","providerRef":"Provider/system-minijail","template":"acceptance-controller"}"#,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap()
+                },
+            ],
+        )
+        .await;
+        let process_ref =
+            ResourceRef::parse("Process/controller-e1e6335ae78671758ea381fce5d44fdd").unwrap();
+        let process = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "runner-generated-process-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "runner-generated-process-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: process_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let authority = Arc::new(CoreAssignmentAuthority {
+            provider_generation: ResourceGeneration::new(17).unwrap(),
+            controller_generation: ControllerGeneration::new(23).unwrap(),
+            session_generation: ReconnectGeneration::new(19).unwrap(),
+            controller_role: ResourceRef::parse("Process/d2b-core-controller").unwrap(),
+            target: ResourceRef::parse("Zone/work").unwrap(),
+            epoch: 29,
+        });
+        let authz_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let subject_context = runtime
+            .core_controller_subject
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let subject = runtime
+            .authorizer
+            .issue_authenticated_subject(subject_context, authz_state.clone())
+            .unwrap();
+        let api = runtime
+            .api
+            .registered_controller_api(subject, authz_state.clone(), Vec::new())
+            .unwrap()
+            .with_assignment_fence_resolver(process_assignment_fence_resolver(
+                Arc::clone(&runtime.store),
+                DaemonMode::Host,
+                Arc::clone(&authority),
+            ));
+        let identity = ControllerIdentity::new(
+            zone.clone(),
+            authority.controller_role.clone(),
+            authority.controller_generation,
+            ResourceRef::parse("Provider/system-core").unwrap(),
+            authority.provider_generation,
+            authority.controller_role.clone(),
+            ResourceRef::parse("Host/host-system").unwrap(),
+            None,
+        )
+        .unwrap();
+        let descriptor = process_controller_descriptor(identity).unwrap();
+        let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+        let runner = Runner::new(
+            Arc::new(AssignmentTestReconciler { descriptor }),
+            Arc::clone(&source),
+            RunnerConfig {
+                policy_revision: authz_state.snapshot.policy_revision,
+                api_revision: authz_state.snapshot.api_catalog_revision,
+                configuration_revision: authz_state.snapshot.active_configuration_revision,
+                deadline_tick: 5_000,
+                max_attempts: 3,
+            },
+        )
+        .run();
+        let runner_task = tokio::spawn(runner);
+        let fence = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(fence) = runtime
+                    .store
+                    .assignment_fence(zone.clone(), process_ref.clone())
+                    .await
+                    .unwrap()
+                {
+                    break fence;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("generated Process finalizer assignment timeout");
+        assert_eq!(fence.resource_uid, process.uid);
+        assert_eq!(fence.provider_generation, authority.provider_generation);
+        assert_eq!(fence.controller_generation, authority.controller_generation);
+        assert_eq!(fence.session_generation, authority.session_generation);
+        assert_eq!(fence.controller_role, authority.controller_role);
+        assert_eq!(fence.target, ResourceRef::parse("Host/host-system").unwrap());
+        assert_eq!(fence.epoch, authority.epoch);
+        source.close_watch().unwrap();
+        runner_task.abort();
+        let _ = runner_task.await;
+        let _ = runtime.shutdown().await;
     }
 
     #[tokio::test]
