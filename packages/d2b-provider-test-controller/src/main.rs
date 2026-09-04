@@ -46,7 +46,7 @@ async fn run() -> Result<(), ()> {
     let expected_peer = bootstrap.acceptor_peer_credentials().map_err(|_| ())?;
     loop {
         match run_session(&bootstrap, expected_peer).await? {
-            SessionDisposition::Reconnect => {}
+            SessionDisposition::Reconnect => tokio::time::sleep(Duration::from_millis(100)).await,
             SessionDisposition::Shutdown => return Ok(()),
         }
     }
