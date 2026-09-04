@@ -185,13 +185,24 @@ pkgs.testers.runNixOSTest {
         "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
         "d2b --zone work --json list Process "
         ">/run/d2b-process-before.json && "
-        "jq -e '.resources[] | select(.type == \"Process\" and "
+        "jq -e '([.resources[] | select(.type == \"Process\" and "
+        ".metadata.ownerRef == \"Provider/network-local\")] | length == 1) and "
+        "(.resources[] | select(.type == \"Process\" and "
         ".metadata.ownerRef == \"Provider/network-local\") | "
         "(.status.phase == \"Ready\" and "
-        ".status.observedGeneration == .metadata.generation)' "
+        ".status.observedGeneration == .metadata.generation and "
+        ".status.resource.adopted == false))' "
         "/run/d2b-process-before.json",
         timeout=60,
     )
+    machine.wait_until_succeeds(
+        "test \"$(ps -eo pid=,args= | awk '$NF ~ /acceptance-controller$/ {print $1}' "
+        "| wc -l)\" -eq 1",
+        timeout=30,
+    )
+    controller_pid_before = machine.succeed(
+        "ps -eo pid=,args= | awk '$NF ~ /acceptance-controller$/ {print $1; exit}'"
+    ).strip()
     machine.fail(
         "runuser -u bob -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
         "d2b --zone work --json list Process "
@@ -205,11 +216,42 @@ pkgs.testers.runNixOSTest {
         "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
         "d2b --zone work --json list Process "
         ">/run/d2b-process-after.json && "
-        "jq -e '.resources[] | select(.type == \"Process\" and "
+        "test \"$(ps -eo pid=,args= | awk '$NF ~ /acceptance-controller$/ {print $1}' "
+        "| wc -l)\" -eq 1 && "
+        "jq -e '([.resources[] | select(.type == \"Process\" and "
+        ".metadata.ownerRef == \"Provider/network-local\")] | length == 1) and "
+        "(.resources[] | select(.type == \"Process\" and "
         ".metadata.ownerRef == \"Provider/network-local\") | "
         "(.status.phase == \"Ready\" and .status.observedGeneration == "
-        ".metadata.generation and .status.resource.adopted == true)' "
+        ".metadata.generation and .status.resource.adopted == false))' "
         "/run/d2b-process-after.json",
+        timeout=60,
+    )
+    controller_pid_after = machine.succeed(
+        "ps -eo pid=,args= | awk '$NF ~ /acceptance-controller$/ {print $1; exit}'"
+    ).strip()
+    assert controller_pid_after == controller_pid_before, (
+        f"controller PID changed across d2bd restart: "
+        f"{controller_pid_before} -> {controller_pid_after}"
+    )
+    machine.succeed(
+        "date +%s >/run/d2b-resource-restart-observed-at && "
+        "! journalctl -u d2bd.service --no-pager -o cat "
+        "| grep -F 'Process Provider shared runner stopped'"
+    )
+    machine.wait_until_succeeds(
+        "test $(( $(date +%s) - $(cat /run/d2b-resource-restart-observed-at) )) -ge 20 && "
+        "! journalctl -u d2bd.service --no-pager -o cat "
+        "| grep -F 'Process Provider shared runner stopped' && "
+        "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
+        "d2b --zone work --json list Process "
+        ">/run/d2b-process-after-resync.json && "
+        "jq -e '([.resources[] | select(.type == \"Process\" and "
+        ".metadata.ownerRef == \"Provider/network-local\")] | length == 1) and "
+        "(.resources[] | select(.type == \"Process\" and "
+        ".metadata.ownerRef == \"Provider/network-local\") | "
+        "(.status.phase == \"Ready\" and .status.resource.adopted == false))' "
+        "/run/d2b-process-after-resync.json",
         timeout=60,
     )
     machine.succeed("runuser -u alice -- d2b auth status --json >/run/d2b-auth-after.json")

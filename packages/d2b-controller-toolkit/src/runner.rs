@@ -1007,7 +1007,11 @@ where
                             report.checkpointed += usize::from(checkpointed);
                             report.committed_status_pending += usize::from(status_pending);
                         }
-                        WorkerOutcome::Retry { revision, reason } => {
+                        WorkerOutcome::Retry {
+                            revision,
+                            generation,
+                            reason,
+                        } => {
                             if completion.work.attempt()
                                 >= descriptor_attempt_bound(
                                     &descriptor,
@@ -1021,30 +1025,50 @@ where
                                     } else {
                                         reason
                                     };
-                                persist_exhaustion(
+                                let persistence = persist_exhaustion(
                                     self.source.as_ref(),
                                     self.clock.as_ref(),
                                     phase_deadline(self.clock.as_ref(), self.config.deadline_tick),
                                     &shutdown,
                                     completion.work.key(),
-                                    revision.max(completion.work.high_water_revision()),
                                     persisted_reason,
-                                ).await?;
-                                queue.finish(&key)?;
-                                report.handler_failures += 1;
-                                observe_counter(
-                                    self.observer.as_ref(),
-                                    RunnerCounter::Exhaustion,
-                                    Some(completion.work.lane()),
-                                    RunnerOutcome::Exhausted,
-                                    if reason == ReconcileReason::ConflictExhausted {
-                                        RunnerObservationReason::Conflict
-                                    } else {
-                                        RunnerObservationReason::Handler
-                                    },
-                                    queue.resource_count(),
-                                    workers.len(),
-                                );
+                                    generation,
+                                )
+                                .await?;
+                                match persistence {
+                                    FailurePersistence::Persisted
+                                    | FailurePersistence::Skipped => {
+                                        queue.finish(&key)?;
+                                        report.handler_failures += 1;
+                                        observe_counter(
+                                            self.observer.as_ref(),
+                                            RunnerCounter::Exhaustion,
+                                            Some(completion.work.lane()),
+                                            RunnerOutcome::Exhausted,
+                                            if reason == ReconcileReason::ConflictExhausted {
+                                                RunnerObservationReason::Conflict
+                                            } else {
+                                                RunnerObservationReason::Handler
+                                            },
+                                            queue.resource_count(),
+                                            workers.len(),
+                                        );
+                                    }
+                                    FailurePersistence::Requeue(retry_revision) => {
+                                        let lane = completion.work.lane();
+                                        queue.retry(completion.work, retry_revision)?;
+                                        report.conflicts_retried += 1;
+                                        observe_counter(
+                                            self.observer.as_ref(),
+                                            RunnerCounter::Retry,
+                                            Some(lane),
+                                            RunnerOutcome::Retrying,
+                                            RunnerObservationReason::Conflict,
+                                            queue.resource_count(),
+                                            workers.len(),
+                                        );
+                                    }
+                                }
                             } else {
                                 let lane = completion.work.lane();
                                 queue.retry(completion.work, revision)?;
@@ -1068,24 +1092,49 @@ where
                                 );
                             }
                         }
-                        WorkerOutcome::Terminal { projection } => {
-                            bounded_source(
+                        WorkerOutcome::Terminal {
+                            projection,
+                            generation,
+                        } => {
+                            let persistence = persist_failure_projection(
+                                self.source.as_ref(),
                                 self.clock.as_ref(),
                                 phase_deadline(self.clock.as_ref(), self.config.deadline_tick),
                                 &shutdown,
-                                self.source.persist_outcome(&projection),
-                            ).await?;
-                            queue.finish(&key)?;
-                            report.handler_failures += 1;
-                            observe_counter(
-                                self.observer.as_ref(),
-                                RunnerCounter::Exhaustion,
-                                Some(completion.work.lane()),
-                                RunnerOutcome::Exhausted,
-                                RunnerObservationReason::Handler,
-                                queue.resource_count(),
-                                workers.len(),
-                            );
+                                projection.target(),
+                                FailureProjectionFields::from_projection(&projection),
+                                generation,
+                            )
+                            .await?;
+                            match persistence {
+                                FailurePersistence::Persisted | FailurePersistence::Skipped => {
+                                    queue.finish(&key)?;
+                                    report.handler_failures += 1;
+                                    observe_counter(
+                                        self.observer.as_ref(),
+                                        RunnerCounter::Exhaustion,
+                                        Some(completion.work.lane()),
+                                        RunnerOutcome::Exhausted,
+                                        RunnerObservationReason::Handler,
+                                        queue.resource_count(),
+                                        workers.len(),
+                                    );
+                                }
+                                FailurePersistence::Requeue(retry_revision) => {
+                                    let lane = completion.work.lane();
+                                    queue.retry(completion.work, retry_revision)?;
+                                    report.conflicts_retried += 1;
+                                    observe_counter(
+                                        self.observer.as_ref(),
+                                        RunnerCounter::Retry,
+                                        Some(lane),
+                                        RunnerOutcome::Retrying,
+                                        RunnerObservationReason::Conflict,
+                                        queue.resource_count(),
+                                        workers.len(),
+                                    );
+                                }
+                            }
                         }
                         WorkerOutcome::SourceFailed { error, operation } => {
                             *failed_key = Some(key.clone());
@@ -1375,10 +1424,12 @@ enum WorkerOutcome {
     },
     Retry {
         revision: ZoneRevision,
+        generation: Option<ResourceGeneration>,
         reason: ReconcileReason,
     },
     Terminal {
         projection: ReconcileProjection,
+        generation: Option<ResourceGeneration>,
     },
     SourceFailed {
         error: SourceError,
@@ -1434,6 +1485,7 @@ impl OwnedWorkers {
                     cancellation.cancel();
                     WorkerOutcome::Retry {
                         revision: work.high_water_revision(),
+                        generation: None,
                         reason: ReconcileReason::DeadlineExceeded,
                     }
                 }
@@ -1445,6 +1497,7 @@ impl OwnedWorkers {
                             work.high_water_revision(),
                             ReconcileReason::Cancelled,
                         ),
+                        generation: None,
                     }
                 }
             };
@@ -1590,24 +1643,121 @@ fn failure_projection(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailurePersistence {
+    Persisted,
+    Skipped,
+    Requeue(ZoneRevision),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FailureProjectionFields {
+    phase: ResourcePhase,
+    disposition: ProjectionDisposition,
+    reason: ReconcileReason,
+    event_only: bool,
+}
+
+impl FailureProjectionFields {
+    fn from_projection(projection: &ReconcileProjection) -> Self {
+        Self {
+            phase: projection.phase(),
+            disposition: projection.disposition(),
+            reason: projection.reason(),
+            event_only: projection.event_only(),
+        }
+    }
+}
+
+async fn persist_failure_projection<S>(
+    source: &S,
+    clock: &dyn MonotonicClock,
+    deadline_tick: u64,
+    cancellation: &Cancellation,
+    target: &ResourceKey,
+    fields: FailureProjectionFields,
+    expected_generation: Option<ResourceGeneration>,
+) -> Result<FailurePersistence, RunnerError>
+where
+    S: ControllerSource,
+{
+    if fields.event_only {
+        return Ok(FailurePersistence::Skipped);
+    }
+    let fresh = match bounded_source(
+        clock,
+        deadline_tick,
+        cancellation,
+        source.read_fresh(target),
+    )
+    .await
+    {
+        Ok(fresh) => fresh,
+        Err(RunnerError::Source(SourceError::Conflict(revision))) => {
+            return Ok(FailurePersistence::Requeue(revision));
+        }
+        Err(error) => return Err(error),
+    };
+    let current = match fresh {
+        FreshSnapshot::Present {
+            target: current, ..
+        } => current,
+        FreshSnapshot::Deleted { .. } => return Ok(FailurePersistence::Skipped),
+    };
+    if current.key() != target
+        || expected_generation.is_some_and(|generation| current.generation() != generation)
+    {
+        return Ok(FailurePersistence::Requeue(current.revision()));
+    }
+    let projection = ReconcileProjection::new(
+        current.key().clone(),
+        current.revision(),
+        fields.phase,
+        fields.disposition,
+        fields.reason,
+        false,
+    );
+    match bounded_source(
+        clock,
+        deadline_tick,
+        cancellation,
+        source.persist_outcome(&projection),
+    )
+    .await
+    {
+        Ok(()) => Ok(FailurePersistence::Persisted),
+        Err(RunnerError::Source(SourceError::Conflict(revision))) => {
+            Ok(FailurePersistence::Requeue(revision))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn persist_exhaustion<S>(
     source: &S,
     clock: &dyn MonotonicClock,
     deadline_tick: u64,
     cancellation: &Cancellation,
     key: &ResourceKey,
-    revision: ZoneRevision,
     reason: ReconcileReason,
-) -> Result<(), RunnerError>
+    expected_generation: Option<ResourceGeneration>,
+) -> Result<FailurePersistence, RunnerError>
 where
     S: ControllerSource,
 {
-    let projection = failure_projection(key.clone(), revision, reason);
-    bounded_source(
+    persist_failure_projection(
+        source,
         clock,
         deadline_tick,
         cancellation,
-        source.persist_outcome(&projection),
+        key,
+        FailureProjectionFields {
+            phase: ResourcePhase::Failed,
+            disposition: ProjectionDisposition::Failed,
+            reason,
+            event_only: false,
+        },
+        expected_generation,
     )
     .await
 }
@@ -1647,6 +1797,7 @@ fn handler_outcome<R>(
     error: &R::Error,
     key: &ResourceKey,
     revision: ZoneRevision,
+    generation: ResourceGeneration,
 ) -> WorkerOutcome
 where
     R: ResourceReconciler,
@@ -1655,10 +1806,12 @@ where
     match failure.class() {
         HandlerErrorClass::Retryable => WorkerOutcome::Retry {
             revision,
+            generation: Some(generation),
             reason: failure.reason(),
         },
         HandlerErrorClass::Terminal => WorkerOutcome::Terminal {
             projection: failure_projection(key.clone(), revision, failure.reason()),
+            generation: Some(generation),
         },
     }
 }
@@ -1681,6 +1834,7 @@ where
         Err(SourceError::Conflict(revision)) => {
             return WorkerOutcome::Retry {
                 revision,
+                generation: None,
                 reason: ReconcileReason::ConflictExhausted,
             };
         }
@@ -1765,12 +1919,12 @@ where
                     target.revision(),
                     ReconcileReason::HandlerTerminal,
                 ),
+                generation: Some(target.generation()),
             };
         }
     };
 
-    let deleting = target.deleting()
-        || work.reasons().contains(TriggerReason::DeletionRequested);
+    let deleting = target.deleting() || work.reasons().contains(TriggerReason::DeletionRequested);
     let validation = if deleting {
         ValidationResult::Valid
     } else {
@@ -1782,6 +1936,7 @@ where
                     &error,
                     target.key(),
                     target.revision(),
+                    target.generation(),
                 );
             }
         }
@@ -1798,6 +1953,7 @@ where
                     &error,
                     target.key(),
                     target.revision(),
+                    target.generation(),
                 );
             }
         }
@@ -1817,6 +1973,7 @@ where
                                 target.revision(),
                                 ReconcileReason::HandlerTerminal,
                             ),
+                            generation: Some(target.generation()),
                         };
                     }
                 };
@@ -1860,6 +2017,7 @@ where
                     &error,
                     target.key(),
                     target.revision(),
+                    target.generation(),
                 );
             }
         };
@@ -1874,6 +2032,7 @@ where
                 Err(SourceError::Conflict(revision)) => {
                     return WorkerOutcome::Retry {
                         revision,
+                        generation: Some(target.generation()),
                         reason: ReconcileReason::ConflictExhausted,
                     };
                 }
@@ -1893,6 +2052,7 @@ where
                     &error,
                     target.key(),
                     target.revision(),
+                    target.generation(),
                 );
             }
         };
@@ -1911,6 +2071,7 @@ where
                     target.revision(),
                     ReconcileReason::HandlerTerminal,
                 ),
+                generation: Some(target.generation()),
             };
         }
         return persist_result(source.as_ref(), &context, result).await;
@@ -1928,6 +2089,7 @@ where
                     &error,
                     target.key(),
                     target.revision(),
+                    target.generation(),
                 );
             }
         };
@@ -1938,6 +2100,7 @@ where
             Err(SourceError::Conflict(revision)) => {
                 return WorkerOutcome::Retry {
                     revision,
+                    generation: Some(target.generation()),
                     reason: ReconcileReason::ConflictExhausted,
                 };
             }
@@ -1959,6 +2122,7 @@ where
                     &error,
                     target.key(),
                     target.revision(),
+                    target.generation(),
                 );
             }
         };
@@ -1969,6 +2133,7 @@ where
                     target.revision(),
                     ReconcileReason::HandlerTerminal,
                 ),
+                generation: Some(target.generation()),
             };
         }
         return persist_result(source.as_ref(), &context, result).await;
@@ -1983,6 +2148,7 @@ where
                     &error,
                     target.key(),
                     target.revision(),
+                    target.generation(),
                 );
             }
         };
@@ -2001,6 +2167,7 @@ where
                     &error,
                     target.key(),
                     target.revision(),
+                    target.generation(),
                 );
             }
         };
@@ -2041,6 +2208,7 @@ where
                     &error,
                     target.key(),
                     target.revision(),
+                    target.generation(),
                 );
             }
         }
@@ -2061,7 +2229,13 @@ where
     {
         Ok(result) => result,
         Err(error) => {
-            return handler_outcome(reconciler.as_ref(), &error, target.key(), target.revision());
+            return handler_outcome(
+                reconciler.as_ref(),
+                &error,
+                target.key(),
+                target.revision(),
+                target.generation(),
+            );
         }
     };
     if prepared.requires_commit() {
@@ -2074,6 +2248,7 @@ where
             Err(SourceError::Conflict(revision)) => {
                 return WorkerOutcome::Retry {
                     revision,
+                    generation: Some(target.generation()),
                     reason: ReconcileReason::ConflictExhausted,
                 };
             }
@@ -2095,6 +2270,7 @@ where
                     &error,
                     target.key(),
                     target.revision(),
+                    target.generation(),
                 );
             }
         }
@@ -2108,6 +2284,7 @@ where
                 target.revision(),
                 ReconcileReason::HandlerTerminal,
             ),
+            generation: Some(target.generation()),
         };
     }
     persist_result(source.as_ref(), &context, result).await
@@ -2138,6 +2315,7 @@ where
                 context.revision(),
                 ReconcileReason::HandlerTerminal,
             ),
+            generation: Some(context.generation()),
         };
     }
     if result.projection().is_none()
@@ -2184,6 +2362,7 @@ where
                     context.revision(),
                     ReconcileReason::HandlerTerminal,
                 ),
+                generation: Some(context.generation()),
             };
         }
     }
@@ -2202,6 +2381,13 @@ where
                     && result.mutation_batch().is_none()
                     && let Err(error) = persist_projection(source, context, &result, None).await
                 {
+                    if let SourceError::Conflict(revision) = error {
+                        return WorkerOutcome::Retry {
+                            revision,
+                            generation: Some(context.generation()),
+                            reason: ReconcileReason::ConflictExhausted,
+                        };
+                    }
                     return WorkerOutcome::SourceFailed {
                         error,
                         operation: "persist_projection_expedited",
@@ -2272,6 +2458,7 @@ where
             Ok(CommitOutcome::Conflict(revision)) | Err(SourceError::Conflict(revision)) => {
                 return WorkerOutcome::Retry {
                     revision,
+                    generation: Some(context.generation()),
                     reason: ReconcileReason::ConflictExhausted,
                 };
             }
@@ -2285,6 +2472,13 @@ where
     }
 
     if let Err(error) = persist_projection(source, context, &result, None).await {
+        if let SourceError::Conflict(revision) = error {
+            return WorkerOutcome::Retry {
+                revision,
+                generation: Some(context.generation()),
+                reason: ReconcileReason::ConflictExhausted,
+            };
+        }
         return WorkerOutcome::SourceFailed {
             error,
             operation: "persist_projection",
@@ -2320,6 +2514,7 @@ where
     if result.disposition() == ReconcileDisposition::FailedRetryable {
         return WorkerOutcome::Retry {
             revision: result.processed_revision(),
+            generation: Some(context.generation()),
             reason: ReconcileReason::HandlerRetryable,
         };
     }
@@ -2361,7 +2556,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, VecDeque},
+        collections::{BTreeMap, BTreeSet, VecDeque},
         sync::{
             Mutex,
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -2414,6 +2609,8 @@ mod tests {
         abort_expedited: AtomicBool,
         expedited_gate_error: AtomicBool,
         effect_acceptance_conflicts_remaining: AtomicUsize,
+        deduplicate_effect_acceptance: AtomicBool,
+        accepted_operations: Mutex<BTreeSet<String>>,
         conflicts_remaining: AtomicUsize,
         commit_status_pending: AtomicBool,
         commit_revision: AtomicU64,
@@ -2422,6 +2619,8 @@ mod tests {
         expedited_completions: AtomicUsize,
         pending_completions: AtomicUsize,
         persisted_outcomes: Mutex<Vec<ReconcileProjection>>,
+        enforce_projection_revision: AtomicBool,
+        persist_conflicts_remaining: AtomicUsize,
         checkpoints: AtomicUsize,
         starting: AtomicUsize,
         requeues: AtomicUsize,
@@ -2452,6 +2651,8 @@ mod tests {
                     abort_expedited: AtomicBool::new(false),
                     expedited_gate_error: AtomicBool::new(false),
                     effect_acceptance_conflicts_remaining: AtomicUsize::new(0),
+                    deduplicate_effect_acceptance: AtomicBool::new(false),
+                    accepted_operations: Mutex::new(BTreeSet::new()),
                     conflicts_remaining: AtomicUsize::new(0),
                     commit_status_pending: AtomicBool::new(false),
                     commit_revision: AtomicU64::new(10),
@@ -2460,6 +2661,8 @@ mod tests {
                     expedited_completions: AtomicUsize::new(0),
                     pending_completions: AtomicUsize::new(0),
                     persisted_outcomes: Mutex::new(Vec::new()),
+                    enforce_projection_revision: AtomicBool::new(false),
+                    persist_conflicts_remaining: AtomicUsize::new(0),
                     checkpoints: AtomicUsize::new(0),
                     starting: AtomicUsize::new(0),
                     requeues: AtomicUsize::new(0),
@@ -2574,7 +2777,7 @@ mod tests {
 
         fn accept_effect(
             &self,
-            _context: &ReconcileContext,
+            context: &ReconcileContext,
             _plan: &ReconcilePlan,
         ) -> impl Future<Output = Result<(), SourceError>> + Send {
             let remaining = self
@@ -2584,6 +2787,15 @@ mod tests {
                 self.effect_acceptance_conflicts_remaining
                     .fetch_sub(1, Ordering::SeqCst);
                 return std::future::ready(Err(SourceError::Conflict(ZoneRevision::new(9))));
+            }
+            if self.deduplicate_effect_acceptance.load(Ordering::SeqCst)
+                && !self
+                    .accepted_operations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(context.operation().operation_id().to_owned())
+            {
+                return std::future::ready(Ok(()));
             }
             self.effect_acceptances.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(()))
@@ -2666,6 +2878,37 @@ mod tests {
             &self,
             projection: &ReconcileProjection,
         ) -> impl Future<Output = Result<(), SourceError>> + Send {
+            if self.enforce_projection_revision.load(Ordering::SeqCst) {
+                let current_revision = self
+                    .fresh
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(projection.target())
+                    .map(|snapshot| match snapshot {
+                        FreshSnapshot::Present { target, .. } => target.revision(),
+                        FreshSnapshot::Deleted { revision, .. } => *revision,
+                    });
+                if current_revision != Some(projection.revision()) {
+                    return std::future::ready(Err(SourceError::Conflict(
+                        current_revision.unwrap_or(ZoneRevision::new(11)),
+                    )));
+                }
+                if self
+                    .persist_conflicts_remaining
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        if remaining > 0 {
+                            Some(remaining - 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .is_ok()
+                {
+                    return std::future::ready(Err(SourceError::Conflict(
+                        current_revision.unwrap_or(ZoneRevision::new(11)),
+                    )));
+                }
+            }
             self.persisted_outcomes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3115,24 +3358,38 @@ mod tests {
         }
     }
 
-    fn initial(keys: &[ResourceKey]) -> InitialList {
+    fn initial_at_revision(keys: &[ResourceKey], revision: u64) -> InitialList {
         InitialList {
             resources: keys
                 .iter()
                 .cloned()
-                .map(|key| InitialResource::new(key, ZoneRevision::new(1)))
+                .map(|key| InitialResource::new(key, ZoneRevision::new(revision)))
                 .collect(),
-            snapshot_revision: ZoneRevision::new(1),
+            snapshot_revision: ZoneRevision::new(revision),
         }
     }
 
+    fn initial(keys: &[ResourceKey]) -> InitialList {
+        initial_at_revision(keys, 1)
+    }
+
     fn harness(keys: Vec<ResourceKey>, concurrency: usize) -> Harness {
+        harness_with_revisions(keys, concurrency, 1, 1)
+    }
+
+    fn harness_with_revisions(
+        keys: Vec<ResourceKey>,
+        concurrency: usize,
+        initial_revision: u64,
+        fresh_revision: u64,
+    ) -> Harness {
         let fresh = keys
             .iter()
             .cloned()
-            .map(|key| (key.clone(), resource(key, 1)))
+            .map(|key| (key.clone(), resource(key, fresh_revision)))
             .collect();
-        let (source, watch_tx) = FakeSource::new(vec![initial(&keys)], fresh);
+        let (source, watch_tx) =
+            FakeSource::new(vec![initial_at_revision(&keys, initial_revision)], fresh);
         let (entered_tx, entered_rx) = mpsc::channel();
         let reconciler = Arc::new(FakeReconciler {
             descriptor: descriptor(
@@ -3430,13 +3687,13 @@ mod tests {
             .clear();
         let startup = Arc::new(Mutex::new(None));
         let startup_result = Arc::clone(&startup);
-        let result = block_on(
-            Runner::new(reconciler, source, config()).run_with_startup(move |result| {
+        let result = block_on(Runner::new(reconciler, source, config()).run_with_startup(
+            move |result| {
                 *startup_result
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
-            }),
-        );
+            },
+        ));
         assert_eq!(
             startup
                 .lock()
@@ -3957,7 +4214,7 @@ mod tests {
         let target = key("app", 1);
         let (reconciler, _entered, source, watch_tx) = harness(vec![target], 1);
         reconciler.block_handlers.store(false, Ordering::SeqCst);
-        source.conflicts_remaining.store(8, Ordering::SeqCst);
+        source.conflicts_remaining.store(3, Ordering::SeqCst);
         let runner = run_in_thread(reconciler, Arc::clone(&source));
         watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
 
@@ -4013,6 +4270,70 @@ mod tests {
         drop(outcomes);
         watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
         assert_eq!(runner.join().unwrap().unwrap().handler_failures, 1);
+    }
+
+    #[test]
+    fn exhausted_failure_rebases_to_exact_target_revision_below_zone_high_water() {
+        let target = key("app", 1);
+        let (reconciler, _entered, source, watch_tx) =
+            harness_with_revisions(vec![target.clone()], 1, 11, 2);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source.conflicts_remaining.store(3, Ordering::SeqCst);
+        source
+            .enforce_projection_revision
+            .store(true, Ordering::SeqCst);
+        let runner = run_in_thread(reconciler, Arc::clone(&source));
+
+        wait_for_outcomes(&source, 1);
+        let outcomes = source
+            .persisted_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(outcomes[0].target(), &target);
+        assert_eq!(outcomes[0].revision(), ZoneRevision::new(2));
+        drop(outcomes);
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let report = runner
+            .join()
+            .expect("runner thread")
+            .expect("exact target revision avoids a terminal source conflict");
+        assert_eq!(report.handler_failures, 1);
+        assert_eq!(source.commits.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn exhausted_failure_requeues_status_race_without_killing_runner_or_repeating_effects() {
+        let target = key("app", 1);
+        let (reconciler, _entered, source, watch_tx) =
+            harness_with_revisions(vec![target.clone()], 1, 11, 2);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source.conflicts_remaining.store(3, Ordering::SeqCst);
+        source
+            .enforce_projection_revision
+            .store(true, Ordering::SeqCst);
+        source
+            .persist_conflicts_remaining
+            .store(1, Ordering::SeqCst);
+        source
+            .deduplicate_effect_acceptance
+            .store(true, Ordering::SeqCst);
+        let runner = run_in_thread(reconciler, Arc::clone(&source));
+
+        wait_for(&source.effect_acceptances, 1);
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let report = runner
+            .join()
+            .expect("runner thread")
+            .expect("status race must requeue instead of stopping the runner");
+        assert!(report.conflicts_retried >= 1);
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 1);
+        let outcomes = source
+            .persisted_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(outcomes.is_empty());
     }
 
     #[test]
@@ -4412,10 +4733,7 @@ mod tests {
                     snapshot_revision: ZoneRevision::new(2),
                 },
                 InitialList {
-                    resources: vec![InitialResource::new(
-                        key("app", 1),
-                        ZoneRevision::new(2),
-                    )],
+                    resources: vec![InitialResource::new(key("app", 1), ZoneRevision::new(2))],
                     snapshot_revision: ZoneRevision::new(2),
                 },
             ],

@@ -1255,50 +1255,6 @@ impl ProcessResourceRuntime {
         delete_resource(client.as_ref(), record).await
     }
 
-    async fn observe_existing_record(
-        &mut self,
-        record: &DesiredRecord,
-    ) -> Result<ProviderLiveness, ProcessResourceRuntimeError> {
-        let adoption = match &record.process {
-            DesiredProcess::Process(spec) => self
-                .providers
-                .adopt_resource(self.context(record), spec)
-                .await
-                .map_err(map_provider_error)?,
-            DesiredProcess::Ephemeral(spec) => self
-                .providers
-                .adopt_ephemeral_resource(self.context(record), spec)
-                .await
-                .map_err(map_provider_error)?,
-        };
-        match adoption {
-            ProviderAdoption::Adopted(report) => {
-                self.last_adopted = Some(true);
-                self.register_liveness_waiter(record, report.identity)?;
-                Ok(ProviderLiveness::Alive)
-            }
-            ProviderAdoption::Absent => Ok(ProviderLiveness::Exited),
-            ProviderAdoption::Stale { candidate } => {
-                self.providers
-                    .stop_stale_resource(&record.provider_ref, &candidate)
-                    .await
-                    .map_err(map_provider_error)?;
-                Ok(ProviderLiveness::Exited)
-            }
-            ProviderAdoption::ControllerBootstrapMissing => {
-                if matches!(&record.process, DesiredProcess::Process(_)) {
-                    self.stop_record(record).await?;
-                    self.providers
-                        .finalize_resource(self.context(record))
-                        .await
-                        .map_err(map_provider_error)?;
-                }
-                Ok(ProviderLiveness::Exited)
-            }
-            ProviderAdoption::Quarantined(_) => Ok(ProviderLiveness::Unknown),
-        }
-    }
-
     async fn probe_record(
         &self,
         record: &DesiredRecord,
@@ -1653,7 +1609,7 @@ impl ProcessResourceReconciler {
         };
         let mut runtime = self.runtime.for_pass();
         runtime.without_status_client();
-        match runtime.observe_existing_record(&record).await? {
+        match runtime.probe_record(&record).await? {
             ProviderLiveness::Alive => Ok(ReconcileResult::converged(
                 resource.revision(),
                 resource.generation(),

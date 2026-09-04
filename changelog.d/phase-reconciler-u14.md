@@ -25,6 +25,9 @@
   and retried bounded watch revision conflicts during relist/open-watch recovery.
 - Routed the acceptance controller through the Bazel-built host-tool bundle so
   the host VM lane does not rebuild its fixture controller through Nix.
+- Reconnected the fd10 acceptance controller across daemon restarts, kept
+  Ready Process observation read-only, and rebased exhausted Runner status
+  projections to the exact target revision without killing the healthy runner.
 
 ### Removed
 

@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use d2b_contracts_zone_session::v3::component_session::CloseReason;
 use d2b_core_controller::{CONTROLLER_ASSIGNMENT_STREAM_CREDIT, CONTROLLER_ASSIGNMENT_STREAM_ID};
 use d2b_session::{HandshakeCredentials, SessionEngine, SessionEvent, StreamEvent, StreamId};
 use d2b_session_unix::{
@@ -20,6 +21,12 @@ use d2b_session_unix::{
 
 const CONTROLLER_BOOTSTRAP_FD: i32 = 10;
 const RUNTIME_FAILURE_EXIT: i32 = 78;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionDisposition {
+    Reconnect,
+    Shutdown,
+}
 
 fn main() {
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -37,6 +44,18 @@ fn main() {
 async fn run() -> Result<(), ()> {
     let bootstrap = SeqpacketSocket::from_inherited_fd(CONTROLLER_BOOTSTRAP_FD).map_err(|_| ())?;
     let expected_peer = bootstrap.acceptor_peer_credentials().map_err(|_| ())?;
+    loop {
+        match run_session(&bootstrap, expected_peer).await? {
+            SessionDisposition::Reconnect => {}
+            SessionDisposition::Shutdown => return Ok(()),
+        }
+    }
+}
+
+async fn run_session(
+    bootstrap: &SeqpacketSocket,
+    expected_peer: d2b_session_unix::PeerCredentials,
+) -> Result<SessionDisposition, ()> {
     let policy = controller_resource_endpoint_policy();
     let poll_interval = Duration::from_millis(u64::from(
         policy
@@ -49,14 +68,17 @@ async fn run() -> Result<(), ()> {
         SeqpacketSocket::from_parent_prearmed(controller_endpoint).map_err(|_| ())?;
     send_bootstrap(&bootstrap, daemon_endpoint).await?;
     let transport = controller_transport(controller_socket, &policy, expected_peer)?;
-    let mut session = SessionEngine::establish_initiator(
+    let mut session = match SessionEngine::establish_initiator(
         transport,
         policy,
         HandshakeCredentials::Nn,
         Instant::now(),
     )
     .await
-    .map_err(|_| ())?;
+    {
+        Ok(session) => session,
+        Err(_) => return Ok(SessionDisposition::Reconnect),
+    };
     let assignment_stream = StreamId::new(CONTROLLER_ASSIGNMENT_STREAM_ID).map_err(|_| ())?;
     session
         .open_named_stream(
@@ -68,7 +90,13 @@ async fn run() -> Result<(), ()> {
 
     loop {
         match tokio::time::timeout(poll_interval, session.receive()).await {
-            Ok(Ok(SessionEvent::Close(_))) => return Ok(()),
+            Ok(Ok(SessionEvent::Close(close))) => {
+                return Ok(if should_reconnect(close.reason) {
+                    SessionDisposition::Reconnect
+                } else {
+                    SessionDisposition::Shutdown
+                });
+            }
             Ok(Ok(SessionEvent::NamedStream(StreamEvent::Data { stream, bytes })))
                 if stream == assignment_stream =>
             {
@@ -91,13 +119,16 @@ async fn run() -> Result<(), ()> {
             }
             Ok(Ok(SessionEvent::NamedStream(_))) => return Err(()),
             Ok(Ok(_)) | Err(_) => {}
-            Ok(Err(_)) => return Ok(()),
+            Ok(Err(_)) => return Ok(SessionDisposition::Reconnect),
         }
-        session
-            .drive_keepalive(Instant::now())
-            .await
-            .map_err(|_| ())?;
+        if session.drive_keepalive(Instant::now()).await.is_err() {
+            return Ok(SessionDisposition::Reconnect);
+        }
     }
+}
+
+fn should_reconnect(reason: CloseReason) -> bool {
+    !matches!(reason, CloseReason::Normal | CloseReason::PeerRequested)
 }
 
 async fn send_bootstrap(bootstrap: &SeqpacketSocket, daemon_endpoint: OwnedFd) -> Result<(), ()> {
@@ -146,4 +177,17 @@ fn controller_transport(
         PeerIdentityPolicy::inherited_socketpair(expected_peer),
     )
     .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_loss_reconnects_but_peer_shutdown_is_graceful() {
+        assert!(should_reconnect(CloseReason::RoleMismatch));
+        assert!(should_reconnect(CloseReason::SessionLost));
+        assert!(!should_reconnect(CloseReason::Normal));
+        assert!(!should_reconnect(CloseReason::PeerRequested));
+    }
 }
