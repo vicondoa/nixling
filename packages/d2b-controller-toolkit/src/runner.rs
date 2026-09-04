@@ -687,10 +687,11 @@ impl From<ContextError> for RunnerError {
 }
 
 /// Terminal runner failure with the complete report accumulated before exit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerFailure {
     error: RunnerError,
     report: RunnerReport,
+    failed_key: Option<ResourceKey>,
 }
 
 impl RunnerFailure {
@@ -702,6 +703,11 @@ impl RunnerFailure {
     /// Return the final report snapshot.
     pub const fn report(&self) -> RunnerReport {
         self.report
+    }
+
+    /// Return the resource whose worker surfaced a source failure, if any.
+    pub fn failed_key(&self) -> Option<&ResourceKey> {
+        self.failed_key.as_ref()
     }
 }
 
@@ -824,13 +830,21 @@ where
         startup: &mut Option<RunnerStartupCallback>,
     ) -> Result<RunnerReport, RunnerFailure> {
         let mut report = RunnerReport::default();
-        match self.run_loop(shutdown, &mut report, startup).await {
+        let mut failed_key = None;
+        match self
+            .run_loop(shutdown, &mut report, startup, &mut failed_key)
+            .await
+        {
             Ok(()) => Ok(report),
             Err(error) => {
                 if let Some(startup) = startup.take() {
                     startup(Err(error));
                 }
-                Err(RunnerFailure { error, report })
+                Err(RunnerFailure {
+                    error,
+                    report,
+                    failed_key,
+                })
             }
         }
     }
@@ -840,6 +854,7 @@ where
         shutdown: Cancellation,
         report: &mut RunnerReport,
         startup: &mut Option<RunnerStartupCallback>,
+        failed_key: &mut Option<ResourceKey>,
     ) -> Result<(), RunnerError> {
         let startup_deadline = phase_deadline(self.clock.as_ref(), self.config.deadline_tick);
         let descriptor = bounded_phase(
@@ -1056,6 +1071,7 @@ where
                             );
                         }
                         WorkerOutcome::SourceFailed(error) => {
+                            *failed_key = Some(key.clone());
                             queue.finish(&key)?;
                             return Err(RunnerError::Source(error));
                         }

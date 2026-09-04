@@ -13678,6 +13678,9 @@ impl ZoneResourceRuntime {
                                 dispatched = report.dispatched,
                                 relists = report.relists,
                                 checkpointed = report.checkpointed,
+                                failed_resource = ?error
+                                    .failed_key()
+                                    .map(|key| key.resource_ref().to_canonical_string()),
                                 "U9 interaction shared Runner failed",
                             );
                         }
@@ -17304,6 +17307,9 @@ impl ZoneResourceRuntime {
                             dispatched = report.dispatched,
                             relists = report.relists,
                             checkpointed = report.checkpointed,
+                            failed_resource = ?error
+                                .failed_key()
+                                .map(|key| key.resource_ref().to_canonical_string()),
                             "Process Provider shared runner failed",
                         );
                     }
