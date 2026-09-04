@@ -12414,6 +12414,33 @@ impl ZoneResourceRuntime {
         Ok(resource.generation)
     }
 
+    async fn u8_provider_resources_present(
+        &self,
+        registration: SharedProviderRunnerRegistration,
+    ) -> Result<bool, ResourceRuntimeError> {
+        let resources = self
+            .committed_resources_of_type(registration.resource_type)
+            .await?;
+        if resources.iter().any(|resource| {
+            resource
+                .pointer("/spec/providerRef")
+                .and_then(Value::as_str)
+                == Some(registration.provider_ref)
+        }) {
+            return Ok(true);
+        }
+        Ok(self
+            .committed_resources_of_type("Process")
+            .await?
+            .iter()
+            .any(|resource| {
+                resource
+                    .pointer("/metadata/ownerRef")
+                    .and_then(Value::as_str)
+                    == Some(registration.provider_ref)
+            }))
+    }
+
     async fn start_core_controller_runners(&self) -> Result<(), ResourceRuntimeError> {
         let _runner_guard = self.core_runner_lock.lock().await;
         #[cfg(test)]
@@ -12438,7 +12465,6 @@ impl ZoneResourceRuntime {
             return Ok(());
         }
         let mut provider_generations = BTreeMap::new();
-        let mut provider_missing = false;
         for registration in U8_SHARED_PROVIDER_RUNNERS {
             let provider_ref = ResourceRef::parse(registration.provider_ref)
                 .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
@@ -12450,13 +12476,12 @@ impl ZoneResourceRuntime {
                     provider_generations.insert(provider_ref, generation);
                 }
                 Err(ResourceRuntimeError::HandlerNotReady) => {
-                    provider_missing = true;
+                    if self.u8_provider_resources_present(registration).await? {
+                        return Err(ResourceRuntimeError::ProviderPathUnavailable);
+                    }
                 }
                 Err(error) => return Err(error),
             }
-        }
-        if provider_missing && !provider_generations.is_empty() {
-            return Err(ResourceRuntimeError::ProviderPathUnavailable);
         }
         let stale = {
             let mut tasks = self
@@ -12655,7 +12680,15 @@ impl ZoneResourceRuntime {
             Vec::new()
         } else {
             compose_shared_provider_runner_descriptors(
-                U8_SHARED_PROVIDER_RUNNERS,
+                U8_SHARED_PROVIDER_RUNNERS
+                    .into_iter()
+                    .filter(|registration| {
+                        ResourceRef::parse(registration.provider_ref)
+                            .ok()
+                            .is_some_and(|provider_ref| {
+                                provider_generations.contains_key(&provider_ref)
+                            })
+                    }),
                 self.zone.clone(),
                 controller_generation,
                 &provider_generations,
@@ -24671,6 +24704,72 @@ mod tests {
         assert_eq!(fence.resource_uid, process.uid);
         assert!(fence.provider_generation.get() > 0);
         drop(resolver);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sparse_seven_row_bundle_starts_only_present_shared_provider_runners() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let resources = vec![
+            bundle_resource(
+                "Provider",
+                "network-local",
+                &zone,
+                r#"{"artifactId":"acceptance-provider","config":{}}"#,
+            ),
+            bundle_resource(
+                "Provider",
+                "runtime-qemu-media",
+                &zone,
+                r#"{"artifactId":"runtime-qemu-media","config":{"controllerExecutionRef":"Host/host-system","networkProviderRef":"Provider/network-local","volumeProviderRef":"Provider/volume-local"}}"#,
+            ),
+            bundle_resource(
+                "User",
+                "alice",
+                &zone,
+                r#"{"displayName":"Alice","groups":[],"osUsername":"alice"}"#,
+            ),
+            bundle_resource(
+                "User",
+                "d2bd",
+                &zone,
+                r#"{"displayName":"d2bd","groups":[],"osUsername":"d2bd"}"#,
+            ),
+            bundle_resource(
+                "Device",
+                "host-kvm",
+                &zone,
+                r#"{"deviceClass":"emulated","arbitration":"exclusive","maxConcurrentClaims":1,"inventory":{}}"#,
+            ),
+            bundle_resource(
+                "Guest",
+                "qemu",
+                &zone,
+                r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[{"deviceRef":"Device/host-kvm","exclusive":false}],"networkAttachments":[],"providerRef":"Provider/runtime-qemu-media","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+            ),
+            bundle_resource(
+                "Provider",
+                "acceptance-extra",
+                &zone,
+                r#"{"artifactId":"acceptance-provider","config":{}}"#,
+            ),
+        ];
+        assert_eq!(resources.len(), 7);
+        materialize_test_bundle(&runtime, resources).await;
+        assert_eq!(
+            runtime
+                .committed_resources_of_type("Provider")
+                .await
+                .unwrap()
+                .len(),
+            4
+        );
+        runtime
+            .start_core_controller_runners()
+            .await
+            .expect("sparse bundles must skip absent optional shared Providers");
         runtime.shutdown().await.unwrap();
     }
 

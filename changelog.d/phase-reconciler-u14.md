@@ -6,6 +6,8 @@
 - Materialized fixed Process Provider identities, re-armed controller-session
   reconciliation on Process changes, and gated Guest sessions on live VMM
   identity and Cloud Hypervisor API readiness.
+- Allowed sparse Zones to attach only shared Provider runners backed by
+  committed resources, while still refusing a missing Provider that owns work.
 
 ### Removed
 
