@@ -609,16 +609,21 @@ impl DaemonVolumeProviderEffects {
             .pointer("/metadata/ownerRef")
             .and_then(Value::as_str)
             .and_then(|owner| ResourceRef::parse(owner).ok());
-        let guest_ref = (spec.source().settings().kind() == SourceKind::NixClosure)
-            .then(|| store_view_guest_ref(resource.key().resource_ref(), &value, &spec))
+        let nix_identity = (spec.source().settings().kind() == SourceKind::NixClosure)
+            .then(|| nix_closure_volume_identity(resource.key().resource_ref(), &value, &spec))
             .transpose()
             .map_err(|_| SharedVolumeEffectError::InvalidResource)?;
+        let guest_ref = nix_identity
+            .as_ref()
+            .map(|identity| identity.guest_ref.clone());
+        let nix_closure_role = nix_identity.as_ref().map(|identity| identity.role);
         let resolver = DaemonVolumeRootResolver::new(
             &self.state,
             self.zone.clone(),
             resource.key().resource_ref().clone(),
             resource.key().uid().clone(),
             guest_ref,
+            nix_closure_role,
         )
         .map_err(|_| SharedVolumeEffectError::Unavailable)?;
         let adapter = AnchoredVolumeEffectAdapter::new(resolver);
@@ -700,19 +705,40 @@ impl DaemonVolumeProviderEffects {
         let plan = VirtiofsdWorkerPlan::for_export(&export, view, vcpu_count, principal.clone())
             .map_err(|_| SharedVolumeEffectError::InvalidResource)?;
         let store_view_marker_ready = if export.view().as_str() == "ro-store" {
-            let guest_ref = (volume_spec.source().settings().kind() == SourceKind::NixClosure)
-                .then(|| store_view_guest_ref(export.volume_ref(), &volume_value, &volume_spec))
+            let nix_identity =
+                (volume_spec.source().settings().kind() == SourceKind::NixClosure)
+                .then(|| nix_closure_volume_identity(export.volume_ref(), &volume_value, &volume_spec))
                 .transpose()
                 .map_err(|_| SharedVolumeEffectError::InvalidResource)?;
-            if guest_ref.as_ref() != Some(export.execution_ref()) {
+            if volume_spec.source().settings().kind() == SourceKind::NixClosure
+                && nix_identity
+                    .as_ref()
+                    .is_none_or(|identity| identity.role != NixClosureVolumeRole::StoreView)
+            {
                 return Err(SharedVolumeEffectError::InvalidResource);
             }
+            let guest_ref = (volume_spec.source().settings().kind() == SourceKind::NixClosure)
+                .then(|| {
+                    nix_identity
+                        .as_ref()
+                        .map(|identity| identity.guest_ref.clone())
+                })
+                .flatten();
+            if volume_spec.source().settings().kind() == SourceKind::NixClosure
+                && guest_ref.as_ref() != Some(export.execution_ref())
+            {
+                return Err(SharedVolumeEffectError::InvalidResource);
+            }
+            let nix_closure_role = nix_identity
+                .as_ref()
+                .map(|identity| identity.role);
             let resolver = DaemonVolumeRootResolver::new(
                 &self.state,
                 self.zone.clone(),
                 export.volume_ref().clone(),
                 volume_resource.uid.clone(),
                 guest_ref,
+                nix_closure_role,
             )
             .map_err(|_| SharedVolumeEffectError::Unavailable)?;
             let adapter = AnchoredVolumeEffectAdapter::new(resolver);
@@ -837,16 +863,21 @@ impl DaemonVolumeProviderEffects {
         if !converged.contains(context.target.resource_ref()) {
             return Err(SharedVolumeEffectError::Unavailable);
         }
-        let guest_ref = (spec.source().settings().kind() == SourceKind::NixClosure)
-            .then(|| store_view_guest_ref(resource.key().resource_ref(), &value, &spec))
+        let nix_identity = (spec.source().settings().kind() == SourceKind::NixClosure)
+            .then(|| nix_closure_volume_identity(resource.key().resource_ref(), &value, &spec))
             .transpose()
             .map_err(|_| SharedVolumeEffectError::InvalidResource)?;
+        let guest_ref = nix_identity
+            .as_ref()
+            .map(|identity| identity.guest_ref.clone());
+        let nix_closure_role = nix_identity.as_ref().map(|identity| identity.role);
         let resolver = DaemonVolumeRootResolver::new(
             &self.state,
             self.zone.clone(),
             resource.key().resource_ref().clone(),
             resource.key().uid().clone(),
             guest_ref,
+            nix_closure_role,
         )
         .map_err(|_| SharedVolumeEffectError::Unavailable)?;
         let adapter = AnchoredVolumeEffectAdapter::new(resolver);
@@ -1005,11 +1036,23 @@ fn child_phase(children: &[StoredResource], target: &ResourceRef) -> Option<Stri
         })
 }
 
-fn store_view_guest_ref(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NixClosureVolumeRole {
+    StoreView,
+    SystemVolume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NixClosureVolumeIdentity {
+    guest_ref: ResourceRef,
+    role: NixClosureVolumeRole,
+}
+
+fn nix_closure_volume_identity(
     volume_ref: &ResourceRef,
     value: &Value,
     spec: &VolumeSpec,
-) -> Result<ResourceRef, d2b_provider_volume_local::VolumeLocalError> {
+) -> Result<NixClosureVolumeIdentity, d2b_provider_volume_local::VolumeLocalError> {
     let owner_ref = value
         .pointer("/metadata/ownerRef")
         .and_then(Value::as_str)
@@ -1018,13 +1061,6 @@ fn store_view_guest_ref(
                 .map_err(|_| d2b_provider_volume_local::VolumeLocalError::InvalidSpec)
         })
         .transpose()?;
-    if owner_ref
-        .as_ref()
-        .is_some_and(|owner| owner.resource_type().as_str() != "Guest")
-    {
-        return Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec);
-    }
-
     let mut attachment_guest = None;
     for attachment in spec.attachments() {
         if attachment.execution_ref().resource_type().as_str() != "Guest" {
@@ -1038,33 +1074,26 @@ fn store_view_guest_ref(
         }
     }
 
-    let guest_ref = match (owner_ref, attachment_guest) {
-        (Some(owner), Some(attachment)) if owner != attachment => {
-            return Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec);
+    match (owner_ref, attachment_guest) {
+        (Some(owner), None)
+            if owner.resource_type().as_str() == "Guest"
+                && volume_ref.name().as_str() == format!("{}-system", owner.name().as_str()) =>
+        {
+            Ok(NixClosureVolumeIdentity {
+                guest_ref: owner,
+                role: NixClosureVolumeRole::SystemVolume,
+            })
         }
-        (Some(owner), _) => owner,
-        (None, Some(attachment)) => attachment,
-        (None, None) => return Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec),
-    };
-
-    if value
-        .pointer("/metadata/ownerRef")
-        .and_then(Value::as_str)
-        .is_some()
-    {
-        let expected = d2b_provider_runtime_cloud_hypervisor::deterministic_child_ref(
-            &guest_ref,
-            d2b_provider_runtime_cloud_hypervisor::ChildRole::SystemVolume,
-        )
-        .map_err(|_| d2b_provider_volume_local::VolumeLocalError::InvalidSpec)?;
-        if &expected != volume_ref {
-            return Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec);
+        (None, Some(guest))
+            if volume_ref.name().as_str() == format!("store-view-{}", guest.name().as_str()) =>
+        {
+            Ok(NixClosureVolumeIdentity {
+                guest_ref: guest,
+                role: NixClosureVolumeRole::StoreView,
+            })
         }
-    } else if volume_ref.name().as_str() != format!("store-view-{}", guest_ref.name().as_str()) {
-        return Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec);
+        _ => Err(d2b_provider_volume_local::VolumeLocalError::InvalidSpec),
     }
-
-    Ok(guest_ref)
 }
 
 fn validate_store_view_identity(
@@ -1093,6 +1122,7 @@ struct DaemonVolumeRootResolver {
     volume_ref: ResourceRef,
     volume_uid: ResourceUid,
     guest_ref: Option<ResourceRef>,
+    nix_closure_role: Option<NixClosureVolumeRole>,
 }
 
 impl DaemonVolumeRootResolver {
@@ -1102,6 +1132,7 @@ impl DaemonVolumeRootResolver {
         volume_ref: ResourceRef,
         volume_uid: ResourceUid,
         guest_ref: Option<ResourceRef>,
+        nix_closure_role: Option<NixClosureVolumeRole>,
     ) -> Result<Self, super::ResourceRuntimeError> {
         Ok(Self {
             state: Arc::clone(state),
@@ -1111,6 +1142,7 @@ impl DaemonVolumeRootResolver {
             volume_ref,
             volume_uid,
             guest_ref,
+            nix_closure_role,
         })
     }
 
@@ -1158,6 +1190,18 @@ impl DaemonVolumeRootResolver {
         }
         let generation_token = u32::try_from(intent.generation)
             .map_err(|_| d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
+        if self.nix_closure_role == Some(NixClosureVolumeRole::SystemVolume) {
+            let system_path = d2b_host::hardlink_farm::system_store_path(&intent.closure_paths)
+                .ok_or(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
+            let file = open_anchored_directory(system_path)
+                .map_err(|_| d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
+            let marker_root = self.marker_root()?;
+            return Ok(
+                ResolvedVolumeRoot::new(file, self.volume_uid.clone())?
+                    .with_marker_root(marker_root)?
+                    .with_preexisting_state(),
+            );
+        }
         let response = crate::dispatch_broker_request_as(
             &self.state,
             d2b_contracts_broker::broker_wire::BrokerRequest::StoreSync(
@@ -1315,9 +1359,12 @@ fn open_anchored_directory(path: &Path) -> std::io::Result<OwnedFd> {
 
 #[cfg(test)]
 mod store_view_identity_tests {
-    use super::validate_store_view_identity;
+    use super::{
+        NixClosureVolumeRole, nix_closure_volume_identity, validate_store_view_identity,
+    };
     use d2b_contracts_resource::v3::{ResourceRef, ZoneId, execution_policy::BoundedToken};
     use d2b_core::bundle_resolver::{ResolvedStoreViewIntent, intent_id_store_view};
+    use d2b_provider_volume_local::testing::fixtures;
     use std::path::PathBuf;
 
     fn intent(zone: &ZoneId, guest: &str) -> ResolvedStoreViewIntent {
@@ -1374,6 +1421,41 @@ mod store_view_identity_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn only_the_canonical_store_view_name_can_claim_the_guest_farm() {
+        let mut system_volume = serde_json::to_value(fixtures::nix_closure_store_view_volume())
+            .expect("Volume fixture");
+        system_volume["attachments"] = serde_json::json!([]);
+        let system_spec = serde_json::from_value(system_volume).expect("system Volume spec");
+        let system_value = serde_json::json!({
+            "metadata": {
+                "name": "work-vm-system",
+                "ownerRef": "Guest/work-vm"
+            }
+        });
+        let system_identity = nix_closure_volume_identity(
+            &ResourceRef::parse("Volume/work-vm-system").expect("Volume"),
+            &system_value,
+            &system_spec,
+        )
+        .expect("system Volume identity");
+        assert_eq!(system_identity.role, NixClosureVolumeRole::SystemVolume);
+
+        let store_value = serde_json::json!({
+            "metadata": {
+                "name": "store-view-work-vm",
+                "ownerRef": null
+            }
+        });
+        let store_identity = nix_closure_volume_identity(
+            &ResourceRef::parse("Volume/store-view-work-vm").expect("Volume"),
+            &store_value,
+            &fixtures::nix_closure_store_view_volume(),
+        )
+        .expect("store-view Volume identity");
+        assert_eq!(store_identity.role, NixClosureVolumeRole::StoreView);
     }
 }
 

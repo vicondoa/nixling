@@ -620,6 +620,7 @@ pkgs.testers.runNixOSTest {
         "jq -e '"
         "([.resources[] | select(.type == \"Volume\" and "
         ".metadata.name == \"store-view-acceptance-guest\" and "
+        ".metadata.ownerRef == null and "
         ".spec.source.settings.kind == \"nix-closure\" and "
         ".spec.source.settings.sourcePolicyId == null and "
         ".spec.source.settings.systemArtifactId == \"acceptance-system\" and "
