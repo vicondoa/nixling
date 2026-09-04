@@ -321,11 +321,63 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     start_all()
-    machine.wait_for_unit("d2bd.service")
-    machine.wait_for_unit("d2b-broker.socket")
-    machine.wait_for_file("/run/d2b/public.sock")
-    machine.wait_for_file(
-        "/var/lib/d2b/zones/work/guests/acceptance-guest/acceptance-guest.sock"
+    machine.wait_for_unit("d2bd.service", timeout=180)
+    machine.wait_for_unit("d2b-broker.socket", timeout=30)
+    machine.wait_for_file("/run/d2b/public.sock", timeout=30)
+    machine.succeed("systemctl start d2b-broker.service")
+    machine.wait_for_unit("d2b-broker.service", timeout=30)
+
+    # Capture only the public, redacted Resource projection before waiting on
+    # the nested VMM. This keeps a missing API socket diagnostic without
+    # waiting for unrelated fixture controller sessions.
+    machine.succeed(
+        "set -o pipefail; "
+        ": > /run/d2b-preflight-summary.log; "
+        "for resource_type in Guest Process Endpoint Volume Provider; do "
+        "printf '%s: ' \"$resource_type\" >> /run/d2b-preflight-summary.log; "
+        "timeout 5s runuser -u alice -- env "
+        "D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
+        "d2b --zone work --json list \"$resource_type\" "
+        "2>/dev/null | "
+        "jq -c '[.resources[] | "
+        "{type: .type, "
+        "metadata: {name: .metadata.name, uid: .metadata.uid, "
+        "generation: .metadata.generation, ownerRef: .metadata.ownerRef, "
+        "zone: .metadata.zone}, "
+        "spec: {providerRef: .spec.providerRef, "
+        "executionRef: .spec.executionRef, "
+        "processClass: .spec.processClass, template: .spec.template}, "
+        "status: {phase: .status.phase, "
+        "observedGeneration: .status.observedGeneration, "
+        "conditions: [.status.conditions[]? | "
+        "{type: .type, status: .status, reason: .reason}], "
+        "outcome: (.status.outcome | "
+        "if . == null then null else "
+        "{code: .code, retryable: .retryable} end), "
+        "resource: .status.resource}}]' "
+        ">> /run/d2b-preflight-summary.log 2>/dev/null || "
+        "printf 'unavailable\\n' >> /run/d2b-preflight-summary.log; "
+        "done; "
+        "session_errors=$(journalctl -u d2bd.service --no-pager -b "
+        "2>/dev/null | grep -Ec "
+        "'session-authentication-failed|session-generation-stale' || true); "
+        "printf 'ComponentSession terminal error count: %s\\n' \"$session_errors\" "
+        ">> /run/d2b-preflight-summary.log; "
+        "cat /run/d2b-preflight-summary.log >&2"
+    )
+
+    # The VMM API socket is the first nested-VM proof. Its 30-second bound is
+    # deliberately shorter than Guest boot/readiness, which has its own
+    # bounded checks below, so a missing socket cannot consume 900 seconds.
+    machine.succeed(
+        "for attempt in $(seq 1 30); do "
+        "test -S /var/lib/d2b/zones/work/guests/acceptance-guest/acceptance-guest.sock "
+        "&& exit 0; "
+        "sleep 1; "
+        "done; "
+        "echo 'Cloud Hypervisor API socket did not become ready within 30s' >&2; "
+        "cat /run/d2b-preflight-summary.log >&2; "
+        "exit 1"
     )
     machine.wait_until_succeeds(
         "journalctl --no-pager -b "
@@ -471,23 +523,44 @@ pkgs.testers.runNixOSTest {
         "echo 'Guest readiness failed:' >&2; "
         "jq -c '.resources[] | select(.type == \"Guest\" and "
         ".metadata.name == \"acceptance-guest\") | "
-        "{phase: .status.phase, conditions: .status.conditions, "
-        "outcome: .status.outcome, resource: .status.resource}' "
+        "{name: .metadata.name, uid: .metadata.uid, "
+        "owner: .metadata.ownerRef, phase: .status.phase, "
+        "observedGeneration: .status.observedGeneration, "
+        "conditions: [.status.conditions[]? | "
+        "{type: .type, status: .status, reason: .reason}], "
+        "outcome: (.status.outcome | "
+        "if . == null then null else "
+        "{code: .code, retryable: .retryable} end), "
+        "resource: .status.resource}' "
         "/run/d2b-guest-ready.json >&2; "
         "echo 'Dependent Process status:' >&2; "
         "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
         "d2b --zone work --json list Process | "
         "jq -c '.resources[] | "
-        "{name: .metadata.name, owner: .metadata.ownerRef, phase: .status.phase, "
-        "spec: .spec, "
-        "conditions: .status.conditions, outcome: .status.outcome, "
+        "{name: .metadata.name, uid: .metadata.uid, "
+        "owner: .metadata.ownerRef, provider: .spec.providerRef, "
+        "execution: .spec.executionRef, processClass: .spec.processClass, "
+        "template: .spec.template, phase: .status.phase, "
+        "observedGeneration: .status.observedGeneration, "
+        "conditions: [.status.conditions[]? | "
+        "{type: .type, status: .status, reason: .reason}], "
+        "outcome: (.status.outcome | "
+        "if . == null then null else "
+        "{code: .code, retryable: .retryable} end), "
         "resource: .status.resource}' >&2; "
         "for resource_type in Endpoint Volume Provider; do "
         "echo \"$resource_type status:\" >&2; "
         "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
         "d2b --zone work --json list \"$resource_type\" | "
-        "jq -c '.resources[] | {name: .metadata.name, phase: .status.phase, "
-        "conditions: .status.conditions, outcome: .status.outcome, "
+        "jq -c '.resources[] | {name: .metadata.name, uid: .metadata.uid, "
+        "owner: .metadata.ownerRef, provider: .spec.providerRef, "
+        "execution: .spec.executionRef, phase: .status.phase, "
+        "observedGeneration: .status.observedGeneration, "
+        "conditions: [.status.conditions[]? | "
+        "{type: .type, status: .status, reason: .reason}], "
+        "outcome: (.status.outcome | "
+        "if . == null then null else "
+        "{code: .code, retryable: .retryable} end), "
         "resource: .status.resource}' >&2; done; exit 1"
     )
     machine.wait_until_succeeds(
@@ -539,8 +612,10 @@ pkgs.testers.runNixOSTest {
         "/run/d2b-volume-ready.json",
         timeout=180,
     )
-    machine.wait_for_file(
-        "/var/lib/d2b/zones/work/guests/acceptance-guest/acceptance-guest.sock"
+    machine.wait_until_succeeds(
+        "test -S "
+        "/var/lib/d2b/zones/work/guests/acceptance-guest/acceptance-guest.sock",
+        timeout=30,
     )
     machine.succeed(
         "test -S /var/lib/d2b/zones/work/guests/acceptance-guest/acceptance-guest.sock && "
@@ -571,8 +646,8 @@ pkgs.testers.runNixOSTest {
     )
 
     machine.succeed("systemctl restart d2bd.service")
-    machine.wait_for_unit("d2bd.service")
-    machine.wait_for_file("/run/d2b/public.sock")
+    machine.wait_for_unit("d2bd.service", timeout=180)
+    machine.wait_for_file("/run/d2b/public.sock", timeout=30)
     machine.succeed(f"test -d /proc/{runner_pid}")
     machine.succeed(
         f"test \"$(awk '{{print $22}}' /proc/{runner_pid}/stat)\" = {runner_start}"
@@ -580,23 +655,65 @@ pkgs.testers.runNixOSTest {
     machine.succeed(
         "for attempt in $(seq 1 60); do "
         "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
+        "d2b --zone work --json list Guest "
+        ">/run/d2b-guest-adopted.json && "
+        "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
         "d2b --zone work --json list Process "
         ">/run/d2b-process-adopted.json && "
         "jq -e '"
         "([.resources[] | select(.type == \"Process\" and "
         ".metadata.name == \"acceptance-guest-vmm\" and "
         ".metadata.ownerRef == \"Guest/acceptance-guest\" and "
+        ".spec.providerRef == \"Provider/system-minijail\" and "
+        ".spec.executionRef == \"Host/host-system\" and "
+        ".spec.processClass == \"worker\" and "
+        ".spec.template == \"cloud-hypervisor-runner\" and "
         ".status.phase == \"Ready\")] | length == 1) and "
         "([.resources[] | select(.type == \"Process\" and "
         ".metadata.ownerRef == \"Provider/runtime-cloud-hypervisor\" and "
+        ".spec.providerRef == \"Provider/system-minijail\" and "
+        ".spec.executionRef == \"Host/host-system\" and "
+        ".spec.processClass == \"controller\" and "
         ".spec.template == \"controller-runtime-cloud-hypervisor-cloud-hypervisor-controller\" and "
         ".status.phase == \"Ready\")] | length == 1)' "
-        "/run/d2b-process-adopted.json && exit 0; "
+        "/run/d2b-process-adopted.json && "
+        "jq -e 'any(.resources[]; "
+        ".type == \"Guest\" and "
+        ".metadata.name == \"acceptance-guest\" and "
+        ".status.phase == \"Ready\" and "
+        ".status.observedGeneration == .metadata.generation and "
+        ".status.resource.runtimeReady == true and "
+        ".status.resource.bootstrapReady == true and "
+        ".status.resource.activeProcessCount == 1)' "
+        "/run/d2b-guest-adopted.json && exit 0; "
         "sleep 1; done; "
+        "echo 'Post-restart Guest readiness failed:' >&2; "
+        "jq -c '.resources[] | select(.type == \"Guest\" and "
+        ".metadata.name == \"acceptance-guest\") | "
+        "{name: .metadata.name, uid: .metadata.uid, "
+        "owner: .metadata.ownerRef, phase: .status.phase, "
+        "observedGeneration: .status.observedGeneration, "
+        "conditions: [.status.conditions[]? | "
+        "{type: .type, status: .status, reason: .reason}], "
+        "outcome: (.status.outcome | "
+        "if . == null then null else "
+        "{code: .code, retryable: .retryable} end), "
+        "resource: .status.resource}' "
+        "/run/d2b-guest-adopted.json >&2 || true; "
         "echo 'Post-restart Process readiness failed:' >&2; "
-        "jq -c '.resources[] | {name: .metadata.name, owner: .metadata.ownerRef, "
-        "phase: .status.phase, outcome: .status.outcome, "
-        "resource: .status.resource}' /run/d2b-process-adopted.json >&2; "
+        "jq -c '.resources[] | "
+        "{name: .metadata.name, uid: .metadata.uid, "
+        "owner: .metadata.ownerRef, provider: .spec.providerRef, "
+        "execution: .spec.executionRef, processClass: .spec.processClass, "
+        "template: .spec.template, phase: .status.phase, "
+        "observedGeneration: .status.observedGeneration, "
+        "conditions: [.status.conditions[]? | "
+        "{type: .type, status: .status, reason: .reason}], "
+        "outcome: (.status.outcome | "
+        "if . == null then null else "
+        "{code: .code, retryable: .retryable} end), "
+        "resource: .status.resource}' "
+        "/run/d2b-process-adopted.json >&2 || true; "
         "exit 1"
     )
     machine.succeed(
@@ -611,12 +728,6 @@ pkgs.testers.runNixOSTest {
         f"test \"$#\" -eq 2 && test \"$1\" = {runner_pid} && "
         f"test \"$2\" = {runner_start}"
     )
-    machine.wait_until_succeeds(
-        "test \"$(journalctl -u d2bd.service --no-pager -b "
-        "| grep -c 'post-publication Guest session connected')\" -ge 2",
-        timeout=60,
-    )
-
     machine.succeed(
         "for attempt in $(seq 1 30); do "
         "guest_revision=$(runuser -u alice -- env "
@@ -629,8 +740,23 @@ pkgs.testers.runNixOSTest {
         "--revision \"$guest_revision\" "
         ">/run/d2b-guest-delete.json 2>/run/d2b-guest-delete.err && exit 0; "
         "sleep 1; done; "
-        "cat /run/d2b-guest-delete.json >&2 || true; "
-        "cat /run/d2b-guest-delete.err >&2 || true; exit 1"
+        "echo 'Guest deletion did not complete within 30s:' >&2; "
+        "jq -c '{resourceRef: .resourceRef, revision: .revision}' "
+        "/run/d2b-guest-delete.json >&2 || true; "
+        "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
+        "d2b --zone work --json list Guest | "
+        "jq -c '.resources[] | select(.type == \"Guest\" and "
+        ".metadata.name == \"acceptance-guest\") | "
+        "{name: .metadata.name, uid: .metadata.uid, "
+        "owner: .metadata.ownerRef, phase: .status.phase, "
+        "observedGeneration: .status.observedGeneration, "
+        "conditions: [.status.conditions[]? | "
+        "{type: .type, status: .status, reason: .reason}], "
+        "outcome: (.status.outcome | "
+        "if . == null then null else "
+        "{code: .code, retryable: .retryable} end), "
+        "resource: .status.resource}' >&2 || true; "
+        "exit 1"
     )
     machine.succeed(
         "jq -e '.resourceRef == \"Guest/acceptance-guest\" and "
