@@ -36,3 +36,5 @@
   Provider's cryptographic dependency.
 - Retained support-only config-nixos and typed ComponentSession
   stream/transport services outside the retired daemon reconciler paths.
+- Keep controller-effect ledger rows in their Resource API owner instead of
+  treating them as Host-global authority claims during restart recovery.
