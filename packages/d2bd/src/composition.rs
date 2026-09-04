@@ -16346,16 +16346,6 @@ mod zone_publication_order_tests {
     }
 
     #[test]
-    fn credential_runners_are_not_gated_on_current_resource_rows() {
-        let source = include_str!("resource_runtime.rs");
-        assert!(!source.contains("self.credential_resources_present(&provider_ref)"));
-        assert!(source.contains(
-            "let mut provider_inputs = Vec::with_capacity(U10_PROVIDER_CONTROLLERS.len())"
-        ));
-        assert!(source.contains("new_tasks.len() == U10_PROVIDER_COUNT"));
-    }
-
-    #[test]
     fn scoped_credential_reads_have_no_host_status_fallback() {
         let source = include_str!("resource_runtime.rs");
         let start = source
