@@ -628,6 +628,15 @@ pkgs.testers.runNixOSTest {
         ".status.observedGeneration == .metadata.generation)] | length == 1)' "
         "/run/d2b-volume-ready.json"
     )
+    machine.succeed(
+        "jq -e '"
+        "([.resources[] | select(.type == \"Volume\" and "
+        "(.metadata.name == \"store-view-acceptance-guest\" or "
+        ".metadata.name == \"acceptance-guest-system\")) "
+        "| .metadata.uid]) as $uids | "
+        "$uids | length == 2 and (unique | length == 2)' "
+        "/run/d2b-volume-ready.json"
+    )
     machine.wait_until_succeeds(
         "test -S "
         "/var/lib/d2b/zones/work/guests/acceptance-guest/acceptance-guest.sock",
