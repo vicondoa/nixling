@@ -35,6 +35,10 @@
   the production Core/Resource API ledger update.
 - Continued status mutations under the accepted effect operation identity and
   retained the authority row across durable status retry and reopen.
+- Reused the supplied effect operation on capability-miss status retries,
+  rejecting identity mismatches instead of falling back to projection IDs.
+- Validated capability-miss retries against the durable effect row and exact
+  UID/generation/revision before reusing the supplied effect operation.
 
 ### Removed
 

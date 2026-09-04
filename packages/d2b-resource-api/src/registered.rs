@@ -975,6 +975,59 @@ impl RedbRegisteredControllerApi {
             .map(|mut accepted| accepted.remove(operation_id))
     }
 
+    async fn validate_status_operation(
+        &self,
+        operation_id: &str,
+        projection: &ReconcileProjection,
+    ) -> Result<(), SourceError> {
+        let row = self
+            .store
+            .authority_operations()
+            .await
+            .map_err(|_| SourceError::Integrity)?
+            .into_iter()
+            .find(|row| row.operation_id == operation_id)
+            .ok_or(SourceError::Integrity)?;
+        if matches!(
+            row.state,
+            d2b_resource_store_redb::AuthorityOperationState::Released
+                | d2b_resource_store_redb::AuthorityOperationState::Closed
+        ) {
+            return Err(SourceError::Integrity);
+        }
+        let payload: serde_json::Value =
+            serde_json::from_slice(&row.payload).map_err(|_| SourceError::Integrity)?;
+        if payload.get("operationId").and_then(serde_json::Value::as_str)
+            != Some(operation_id)
+            || payload
+                .get("resourceUid")
+                .and_then(serde_json::Value::as_str)
+                != Some(projection.target().uid().as_str())
+        {
+            return Err(SourceError::Integrity);
+        }
+        let current = match self.read_target(projection.target()).await? {
+            Ok(resource) => resource,
+            Err(revision) => return Err(SourceError::Conflict(revision)),
+        };
+        if current.uid != *projection.target().uid()
+            || current.revision != projection.revision()
+        {
+            return Err(SourceError::Conflict(current.revision));
+        }
+        let resource: serde_json::Value =
+            serde_json::from_slice(&current.canonical_json).map_err(|_| SourceError::Integrity)?;
+        if payload.get("generation").and_then(serde_json::Value::as_u64)
+            != resource
+                .get("metadata")
+                .and_then(|metadata| metadata.get("generation"))
+                .and_then(serde_json::Value::as_u64)
+        {
+            return Err(SourceError::Integrity);
+        }
+        Ok(())
+    }
+
     async fn record_effect_state(
         &self,
         operation_id: &str,
@@ -1449,9 +1502,18 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
                 .map_err(|_| SourceError::Integrity)?
                 .get(operation.operation_id())
                 .map(|capability| capability.operation_id().to_owned());
+            let status_operation_id = if let Some(accepted_operation_id) =
+                accepted_operation_id
+            {
+                accepted_operation_id
+            } else {
+                self.validate_status_operation(operation.operation_id(), projection)
+                    .await?;
+                operation.operation_id().to_owned()
+            };
             self.persist_projection_status_with_operation(
                 projection,
-                accepted_operation_id.as_deref(),
+                Some(status_operation_id.as_str()),
             )
                 .await?;
             self.record_effect_state(
@@ -3635,6 +3697,38 @@ mod tests {
         let status: serde_json::Value =
             serde_json::from_slice(&updated.canonical_json).unwrap();
         assert_eq!(status["status"]["phase"], "Failed");
+        let retry_operation = OperationContext::new(
+            rows[0].operation_id.clone(),
+            rows[0].operation_id.clone(),
+            rows[0].operation_id.clone(),
+            None,
+        )
+        .unwrap();
+        let retry_projection = ReconcileProjection::new(
+            ResourceKey::new(
+                updated.zone.clone(),
+                updated.resource_ref.clone(),
+                updated.uid.clone(),
+            ),
+            updated.revision,
+            ResourcePhase::Failed,
+            d2b_core_controller::ProjectionDisposition::Failed,
+            d2b_core_controller::ReconcileReason::HandlerExhausted,
+            false,
+        );
+        api.persist_outcome_with_operation(&retry_projection, &retry_operation)
+            .await
+            .unwrap();
+        let rows_after_retry = store.authority_operations().await.unwrap();
+        assert_eq!(rows_after_retry.len(), 1);
+        assert_eq!(rows_after_retry[0].operation_id, rows[0].operation_id);
+        assert_eq!(
+            rows_after_retry[0].state,
+            d2b_resource_store_redb::AuthorityOperationState::EffectTerminal
+        );
+        assert!(!rows_after_retry[0]
+            .operation_id
+            .starts_with("projection-"));
     }
 
     #[tokio::test]

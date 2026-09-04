@@ -2593,7 +2593,10 @@ fn authority_status_continuation_allowed(
     authority: &AuthorityOperationStorage,
     verified: &VerifiedWrite,
 ) -> bool {
-    if !matches!(authority.state.as_str(), "pending" | "effect-retryable")
+    if !matches!(
+        authority.state.as_str(),
+        "pending" | "effect-retryable" | "effect-confirmed" | "effect-terminal"
+    )
         || verified.mutations.len() != 1
     {
         return false;
