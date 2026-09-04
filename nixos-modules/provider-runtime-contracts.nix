@@ -24,7 +24,8 @@ let
         if path == null
         then { success = true; value = { }; }
         else builtins.tryEval
-          (builtins.fromJSON (builtins.readFile path));
+          (builtins.fromJSON
+            (builtins.unsafeDiscardStringContext (builtins.readFile path)));
     in
     if parsed.success && builtins.isAttrs parsed.value
     then attrOr parsed.value "artifactCatalogDigest" null

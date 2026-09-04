@@ -36,7 +36,11 @@ in
         lib.hasInfix "d2b-resource-compiler compile" h.compilerSource
         && !(lib.hasInfix "python3 -" h.compilerSource);
       sourceWiresCompilerInput =
-        lib.hasInfix "compilerInput = pkgs.writeText" h.compilerSource
+        lib.hasInfix ("compilerInput = " + "pkgs." + "runCommand") h.compilerSource
+        && lib.hasInfix "compilerClosureInputs =" h.compilerSource
+        && lib.hasInfix
+          "passAsFile = [ \"compilerInputJson\" \"compilerClosureInputPaths\" ]"
+          h.compilerSource
         && lib.hasInfix
           ("nativeBuildInputs = [ " + "compilerPackage ]")
           h.compilerSource;

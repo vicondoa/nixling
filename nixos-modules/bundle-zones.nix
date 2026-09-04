@@ -408,26 +408,43 @@ let
 
   bundlePath = zoneName: data:
     let
-      compilerInput = pkgs.writeText "d2b-resource-compiler-${zoneName}.json"
-        (builtins.toJSON {
-          zone = zoneName;
-          zoneUid = data.zoneUid;
-          resources = data.resources;
-          providerSchemaDigests = data.providerSchemaDigests;
-          providers = providerInputs cfg.zones.${zoneName};
-          artifactCatalogPath =
-            if catalogPath == null then null else "${catalogPath}";
-          expectedArtifactCatalogDigest = catalogDigest;
-          schemaRoot = "${schemaRoot}";
-          # The compiler appends signed static Provider controller Processes
-          # and their private processTemplates metadata. Those generated rows
-          # stay out of the processes.json projection.
-          expectedContentHash = data.contentHash;
-          inherit strictSecrets;
-        });
+      providers = providerInputs cfg.zones.${zoneName};
+      providerPackages = map
+        (provider: cfg.artifacts.${provider.artifactId}.package)
+        providers;
+      compilerClosureInputs =
+        providerPackages
+        ++ [ schemaRoot ]
+        ++ lib.optional (catalogPath != null) catalogPath;
+      compilerClosureInputPaths =
+        builtins.concatStringsSep "\n" (map toString compilerClosureInputs);
+      compilerInputJson = builtins.toJSON {
+        zone = zoneName;
+        zoneUid = data.zoneUid;
+        resources = data.resources;
+        providerSchemaDigests = data.providerSchemaDigests;
+        inherit providers;
+        artifactCatalogPath =
+          if catalogPath == null then null else "${catalogPath}";
+        expectedArtifactCatalogDigest = catalogDigest;
+        schemaRoot = "${schemaRoot}";
+        # The compiler appends signed static Provider controller Processes
+        # and their private processTemplates metadata. Those generated rows
+        # stay out of the processes.json projection.
+        expectedContentHash = data.contentHash;
+        inherit strictSecrets;
+      };
+      compilerInput = pkgs.runCommand "d2b-resource-compiler-${zoneName}.json"
+        {
+          inherit compilerInputJson compilerClosureInputPaths;
+          passAsFile = [ "compilerInputJson" "compilerClosureInputPaths" ];
+        } ''
+          cp "$compilerInputJsonPath" "$out"
+        '';
     in pkgs.runCommand "d2b-zone-${zoneName}-resource-bundle.json"
       {
-        inherit compilerInput;
+        inherit compilerInput compilerClosureInputPaths;
+        passAsFile = [ "compilerClosureInputPaths" ];
         nativeBuildInputs = [ compilerPackage ];
       } ''
         set -euo pipefail
