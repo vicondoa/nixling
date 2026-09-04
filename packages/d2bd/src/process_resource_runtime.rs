@@ -83,7 +83,9 @@ pub(crate) enum ProcessResourceRuntimeError {
     IdentityAmbiguous,
     /// A Provider effect failed.
     ProviderEffect,
-    /// A static controller has no committed Provider identity projection.
+    /// A Provider controller bootstrap endpoint did not become readable.
+    ControllerBootstrapUnavailable,
+    /// A required Process Provider has no committed identity projection.
     ProviderIdentityUnavailable,
     /// The durable store could not be listed or watched.
     Store,
@@ -97,6 +99,9 @@ impl core::fmt::Display for ProcessResourceRuntimeError {
             Self::TemplateUnavailable => "process-resource-template-unavailable",
             Self::IdentityAmbiguous => "process-resource-identity-ambiguous",
             Self::ProviderEffect => "process-resource-provider-effect-failed",
+            Self::ControllerBootstrapUnavailable => {
+                "process-resource-controller-bootstrap-unavailable"
+            }
             Self::ProviderIdentityUnavailable => "process-resource-provider-identity-unavailable",
             Self::Store => "process-resource-store-failed",
         })
@@ -1116,7 +1121,6 @@ impl ProcessResourceRuntime {
         let identity_failure = matches!(
             error,
             ProcessResourceRuntimeError::IdentityAmbiguous
-                | ProcessResourceRuntimeError::ProviderIdentityUnavailable
                 | ProcessResourceRuntimeError::TemplateUnavailable
         );
         let restart = !identity_failure
@@ -1790,6 +1794,13 @@ impl ResourceReconciler for ProcessResourceReconciler {
             return Ok(ReconcilePlan::new(Vec::new(), false)
                 .expect("finalizer enrollment plan is bounded"));
         }
+        if self
+            .desired_record(resource)?
+            .is_some_and(|record| !controller_provider_identity_available(&record))
+        {
+            return Ok(ReconcilePlan::new(Vec::new(), false)
+                .expect("Provider identity retry plan is bounded"));
+        }
         if static_controller_waits_for_workload_cleanup(resource, dependencies) {
             return Ok(self.no_op());
         }
@@ -1853,6 +1864,22 @@ impl ResourceReconciler for ProcessResourceReconciler {
                     None,
                     ReconcileDisposition::Pending,
                     None,
+                    None,
+                    StatusPersistence::NotRequested,
+                )
+                .map_err(|_| ProcessResourceRuntimeError::InvalidResource);
+            }
+            if self
+                .desired_record(resource)?
+                .is_some_and(|record| !controller_provider_identity_available(&record))
+            {
+                return ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    None,
+                    None,
+                    ReconcileDisposition::RequeueAt,
+                    Some(context.now_tick().saturating_add(1_000)),
                     None,
                     StatusPersistence::NotRequested,
                 )
@@ -2599,6 +2626,9 @@ fn start_failure_code(error: ProcessResourceRuntimeError) -> &'static str {
     match error {
         ProcessResourceRuntimeError::TemplateUnavailable => "template-unavailable",
         ProcessResourceRuntimeError::IdentityAmbiguous => "identity-ambiguous",
+        ProcessResourceRuntimeError::ControllerBootstrapUnavailable => {
+            "controller-bootstrap-unavailable"
+        }
         ProcessResourceRuntimeError::UnsupportedProvider => "provider-unsupported",
         ProcessResourceRuntimeError::InvalidResource => "resource-invalid",
         ProcessResourceRuntimeError::ProviderEffect => "provider-start-failed",
@@ -2614,6 +2644,9 @@ fn start_failure_message(error: ProcessResourceRuntimeError) -> &'static str {
         }
         ProcessResourceRuntimeError::IdentityAmbiguous => {
             "the process identity could not be verified safely"
+        }
+        ProcessResourceRuntimeError::ControllerBootstrapUnavailable => {
+            "the controller bootstrap endpoint was not available"
         }
         ProcessResourceRuntimeError::UnsupportedProvider => {
             "the process Provider is not owned by the daemon"
@@ -3058,6 +3091,14 @@ fn process_mutation_operation_id(record: &DesiredRecord, action: &str) -> String
 fn map_provider_error(error: String) -> ProcessResourceRuntimeError {
     if error.contains("template-not-found") {
         ProcessResourceRuntimeError::TemplateUnavailable
+    } else if matches!(
+        error.as_str(),
+        "provider-controller-bootstrap-missing"
+            | "provider-controller-bootstrap-timeout"
+            | "provider-controller-bootstrap-wait-failed"
+            | "provider-controller-bootstrap-timeout-invalid"
+    ) {
+        ProcessResourceRuntimeError::ControllerBootstrapUnavailable
     } else if error.contains("quarantined")
         || error.contains("identity")
         || error.contains("ambiguous")
@@ -3081,9 +3122,7 @@ fn is_static_controller(record: &DesiredRecord) -> bool {
 }
 
 fn controller_provider_identity_available(record: &DesiredRecord) -> bool {
-    !is_static_controller(record)
-        || (record.controller_provider_uid.is_some()
-            && record.controller_provider_generation.is_some())
+    record.controller_provider_uid.is_some() && record.controller_provider_generation.is_some()
 }
 
 fn controller_requires_stop(record: &DesiredRecord, bootstrap_present: bool) -> bool {
@@ -4946,6 +4985,20 @@ mod tests {
         assert_ne!(
             process_mutation_operation_id(&first, "status"),
             process_mutation_operation_id(&second, "status")
+        );
+    }
+
+    #[test]
+    fn missing_process_provider_identity_is_not_treated_as_terminal() {
+        let record = identity_record(1);
+        assert!(!controller_provider_identity_available(&record));
+        assert_eq!(
+            start_failure_code(ProcessResourceRuntimeError::ProviderIdentityUnavailable),
+            "provider-identity-unavailable"
+        );
+        assert_eq!(
+            start_failure_message(ProcessResourceRuntimeError::ProviderIdentityUnavailable),
+            "the committed Provider identity is unavailable"
         );
     }
 

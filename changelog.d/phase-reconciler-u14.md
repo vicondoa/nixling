@@ -3,6 +3,9 @@
 - Finalized the Zone Provider cutover with target-scoped activation and
   telemetry reconciliation, exact 27-Provider composition proof, and
   Provider-filtered descriptor validation.
+- Materialized fixed Process Provider identities, re-armed controller-session
+  reconciliation on Process changes, and gated Guest sessions on live VMM
+  identity and Cloud Hypervisor API readiness.
 
 ### Removed
 

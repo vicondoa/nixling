@@ -546,6 +546,18 @@ mod tests {
         let pending = bound_evidence(3, false);
         assert_eq!(pending.health(), GuestSessionHealth::Degraded);
         assert!(!pending.ready_for(&binding(3)));
+        let spawned_only = GuestSessionEvidence::current_bound(
+            guest_ref(),
+            BOOT_DIGEST,
+            vec!["resource-read".to_owned()],
+            false,
+            true,
+            true,
+            binding(3),
+        )
+        .expect("spawned process without VMM readiness is representable");
+        assert_eq!(spawned_only.health(), GuestSessionHealth::Degraded);
+        assert!(!spawned_only.ready_for(&binding(3)));
     }
 
     #[test]

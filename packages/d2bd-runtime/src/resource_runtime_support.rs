@@ -25,18 +25,18 @@ use d2b_contracts_resource::v3::identity::{
     TransportBinding,
 };
 use d2b_contracts_resource::v3::{
-    CanonicalJsonValue, ConfigurationGeneration, ControllerGeneration, MAX_PAGE_CURSOR_BYTES,
-    MAX_RESPONSE_CANONICAL_BYTES, ManagedBy, ResourceEnvelope, ResourceError, ResourceErrorKind,
-    ResourceErrorReason, ResourceGeneration, ResourceName, ResourcePhase, ResourceRef,
-    ResourceTypeName, ResourceUid, RetryClass, SchemaFingerprint, Timestamp, ZoneId, ZoneRevision,
-    host::HOST_PROVIDER_REF, user::UserSpec,
+    CanonicalJsonObject, CanonicalJsonValue, ConfigurationGeneration, ControllerGeneration,
+    MAX_PAGE_CURSOR_BYTES, MAX_RESPONSE_CANONICAL_BYTES, ManagedBy, ResourceEnvelope,
+    ResourceError, ResourceErrorKind, ResourceErrorReason, ResourceGeneration, ResourceName,
+    ResourcePhase, ResourceRef, ResourceTypeName, ResourceUid, RetryClass, SchemaFingerprint,
+    Timestamp, ZoneId, ZoneRevision, host::HOST_PROVIDER_REF, user::UserSpec,
 };
 pub use d2b_contracts_resource::v3::{
     RESOURCE_BUNDLE_MATERIALIZATION_OPERATION_PREFIX, SYSTEM_CORE_BOOTSTRAP_ZONE_OPERATION_ID,
 };
 use d2b_contracts_zone_session::v3::{
     component_session::{EndpointPolicy, EndpointRole},
-    resource_bundle::ResourceBundle,
+    resource_bundle::{BundleResource, BundleResourceMetadata, ResourceBundle},
     role::RoleSpec,
     role_binding::RoleBindingSpec,
     zone::validate_self_resource,
@@ -55,6 +55,15 @@ use d2b_core_controller::{
 /// Provider-neutral Core assignment registry shared by Resource API and bus
 /// admission for one Zone runtime.
 pub type AssignmentRegistry = Arc<Mutex<ControllerAssignmentRegistry>>;
+
+/// Fixed Provider identities required by the generated Process resources.
+///
+/// These rows are runtime-owned bootstrap materialization, not Nix-authored
+/// declarations. Their durable UIDs and generations come from the Resource
+/// API store while the materialization operation remains bound to the
+/// verified bundle and active configuration generation.
+pub const FIXED_BOOTSTRAP_PROVIDER_IDS: [&str; 3] =
+    ["system-core", "system-minijail", "system-systemd"];
 
 /// Construct one empty Zone assignment registry.
 pub fn new_assignment_registry() -> AssignmentRegistry {
@@ -1584,7 +1593,9 @@ async fn plan_zone_resource_bundle(
     }
     reject_stale_guest_network_rows(&existing, bundle)?;
 
+    let fixed_bootstrap_resources = fixed_bootstrap_provider_resources(zone, bundle)?;
     let mut pending = bundle.resources.iter().collect::<Vec<_>>();
+    pending.extend(fixed_bootstrap_resources.iter());
     let mut ordered = Vec::with_capacity(pending.len());
     let mut admitted_refs = existing.keys().cloned().collect::<BTreeSet<_>>();
     while !pending.is_empty() {
@@ -1668,6 +1679,52 @@ async fn plan_zone_resource_bundle(
         }
     }
     Ok(mutations)
+}
+
+fn fixed_bootstrap_provider_resources(
+    zone: &ZoneId,
+    bundle: &ResourceBundle,
+) -> Result<Vec<BundleResource>, ResourceRuntimeError> {
+    let provider_type =
+        ResourceTypeName::parse("Provider").map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+    let mut resources = Vec::new();
+    for provider_name in FIXED_BOOTSTRAP_PROVIDER_IDS {
+        let existing = bundle.resources.iter().find(|resource| {
+            resource.resource_type() == &provider_type
+                && resource.metadata().name().as_str() == provider_name
+        });
+        if let Some(resource) = existing {
+            let artifact_id = resource
+                .spec()
+                .get("artifactId")
+                .and_then(|value| match value {
+                    CanonicalJsonValue::String(value) => Some(value.as_str()),
+                    _ => None,
+                })
+                .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+            if artifact_id != provider_name {
+                return Err(ResourceRuntimeError::HandlerNotReady);
+            }
+            continue;
+        }
+        let metadata = BundleResourceMetadata::new(
+            ResourceName::parse(provider_name.to_owned())
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+            zone.clone(),
+            None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let spec = CanonicalJsonObject::parse(
+            format!(r#"{{"artifactId":"{provider_name}","config":{{}}}}"#).as_bytes(),
+        )
+        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        resources.push(
+            BundleResource::new(provider_type.clone(), metadata, spec)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+        );
+    }
+    Ok(resources)
 }
 
 fn reject_stale_guest_network_rows(

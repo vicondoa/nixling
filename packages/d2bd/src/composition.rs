@@ -11577,6 +11577,12 @@ fn cloud_hypervisor_vsock_socket(argv: &[String]) -> Option<PathBuf> {
     })
 }
 
+fn cloud_hypervisor_api_socket(argv: &[String]) -> Option<PathBuf> {
+    argv.windows(2).find_map(|pair| {
+        (pair[0] == "--api-socket").then(|| PathBuf::from(&pair[1]))
+    })
+}
+
 fn status_generation(value: &Value) -> Option<ResourceGeneration> {
     value
         .pointer("/status/resource/endpointGeneration")
@@ -11699,7 +11705,7 @@ pub(crate) async fn resolve_committed_guest_session_target(
 /// Resolve the private ComponentSession carriage for a committed Guest
 /// target. The public Guest and Endpoint resources fence the lookup; only the
 /// trusted private VMM intent supplies the socket and peer credentials.
-async fn resolve_component_session_endpoint_for_guest(
+pub(crate) async fn resolve_component_session_endpoint_for_guest(
     state: &ServerState,
     resolver: &BundleResolver,
     runtime: &resource_runtime::ZoneResourceRuntime,
@@ -11826,9 +11832,18 @@ async fn resolve_component_session_endpoint_for_guest(
     let process_spec =
         serde_json::from_slice::<ProcessSpec>(&process.spec().base().to_canonical_bytes())
             .map_err(|_| "guest-session:process-spec-invalid".to_owned())?;
+    let process_provider_ref = process
+        .spec()
+        .provider_ref()
+        .ok_or_else(|| "guest-session:process-provider-missing".to_owned())?;
     let execution = process_spec.execution();
     if execution.execution_ref().resource_type().as_str() != "Host" {
         return Err("guest-session:process-execution-invalid".to_owned());
+    }
+    if process_spec.desired_lifecycle()
+        != d2b_contracts_resource::v3::process::DesiredLifecycle::Running
+    {
+        return Err("guest-session:process-not-running".to_owned());
     }
     let execution_domain = match execution
         .domain()
@@ -11851,6 +11866,37 @@ async fn resolve_component_session_endpoint_for_guest(
             execution.template().as_str(),
         )
         .ok_or_else(|| "guest-session:vmm-intent-unavailable".to_owned())?;
+    let providers = state
+        .provider_runtime
+        .process_providers()
+        .ok_or_else(|| "guest-session:process-provider-unavailable".to_owned())?;
+    let zone_uid = runtime
+        .authority_zone_uid()
+        .ok_or_else(|| "guest-session:zone-identity-unavailable".to_owned())?;
+    if !providers.resource_identity_is_active(
+        runtime.zone(),
+        zone_uid,
+        &process_ref,
+        process.metadata().uid(),
+        process.metadata().generation(),
+        process_provider_ref,
+        target.guest_ref(),
+        target.guest_uid(),
+        execution.execution_ref(),
+    ) {
+        return Err("guest-session:process-identity-not-live".to_owned());
+    }
+    let api_socket = cloud_hypervisor_api_socket(&intent.argv)
+        .ok_or_else(|| "guest-session:vmm-api-socket-unavailable".to_owned())?;
+    let api_socket = api_socket.to_string_lossy().into_owned();
+    let api_ready = tokio::task::spawn_blocking(move || {
+        d2bd_runtime::readiness::api_socket_info_ready(&api_socket)
+    })
+    .await
+    .map_err(|_| "guest-session:vmm-api-socket-probe-failed".to_owned())?;
+    if !api_ready {
+        return Err("guest-session:vmm-api-socket-not-ready".to_owned());
+    }
     let socket_path = cloud_hypervisor_vsock_socket(&intent.argv)
         .ok_or_else(|| "guest-session:vmm-socket-unavailable".to_owned())?;
     let state_root = socket_path
@@ -31168,6 +31214,32 @@ mod broker_dispatch_tests {
             "cid=42".to_owned(),
         ];
         assert_eq!(cloud_hypervisor_vsock_socket(&vsock_without_socket), None);
+    }
+
+    #[test]
+    fn cloud_hypervisor_api_socket_requires_an_explicit_argument() {
+        use super::cloud_hypervisor_api_socket;
+        use std::path::PathBuf;
+
+        let argv = vec![
+            "cloud-hypervisor".to_owned(),
+            "--vsock".to_owned(),
+            "cid=42,socket=/var/lib/d2b/vms/work/vsock.sock".to_owned(),
+            "--api-socket".to_owned(),
+            "/var/lib/d2b/vms/work/api.sock".to_owned(),
+        ];
+        assert_eq!(
+            cloud_hypervisor_api_socket(&argv),
+            Some(PathBuf::from("/var/lib/d2b/vms/work/api.sock"))
+        );
+        assert_eq!(
+            cloud_hypervisor_api_socket(&[
+                "cloud-hypervisor".to_owned(),
+                "--vsock".to_owned(),
+                "cid=42".to_owned(),
+            ]),
+            None
+        );
     }
 
     #[test]

@@ -58,6 +58,32 @@ type BrokerProcessSupervisor = ProviderSupervisor<BrokerProcessBackend<BundleBac
 type BrokerSystemdSupervisor = ProviderSupervisor<SystemdProcessBackend<BrokerSystemdEffectOwner>>;
 const RESOURCE_WAITER_POLL: Duration = Duration::from_millis(250);
 
+async fn wait_for_controller_bootstrap_endpoint(
+    endpoint: OwnedFd,
+    timeout: Duration,
+) -> Result<OwnedFd, String> {
+    tokio::task::spawn_blocking(move || {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+        let timeout = PollTimeout::try_from(timeout)
+            .map_err(|_| "provider-controller-bootstrap-timeout-invalid".to_owned())?;
+        let interests = PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP;
+        let mut descriptors = [PollFd::new(endpoint.as_fd(), interests)];
+        let ready = poll(&mut descriptors, timeout)
+            .map_err(|_| "provider-controller-bootstrap-wait-failed".to_owned())?;
+        let readable = descriptors[0]
+            .revents()
+            .is_some_and(|events| events.contains(PollFlags::POLLIN));
+        if ready > 0 && readable {
+            Ok(endpoint)
+        } else {
+            Err("provider-controller-bootstrap-timeout".to_owned())
+        }
+    })
+    .await
+    .map_err(|_| "provider-controller-bootstrap-wait-failed".to_owned())?
+}
+
 /// Probe the host posture needed by the daemon-owned minijail Provider.
 ///
 /// The Provider receives this bounded snapshot through its constructor; it
@@ -991,6 +1017,20 @@ impl ProductionProcessProviders {
         })
     }
 
+    async fn cleanup_failed_resource_launch(
+        &self,
+        context: &ProcessResourceContext<'_>,
+        provider: ManagedProvider,
+        identity: ProcessIdentityDigest,
+        execution_ref: &ResourceRef,
+    ) {
+        let _ = self
+            .stop_provider_identity(provider, &identity, StopClass::Terminate)
+            .await;
+        let _ = self.finalize_resource(context.clone()).await;
+        self.forget_resource_for_context(context, execution_ref);
+    }
+
     /// Launch one durable Process resource with the controller generation
     /// rehydrated from the owning Zone store.
     pub(crate) async fn launch_resource(
@@ -1104,13 +1144,48 @@ impl ProductionProcessProviders {
             ticket.runtime_scope(),
         )?;
         if controller_bootstrap {
-            let daemon_endpoint = self
+            let daemon_endpoint = match self
                 .minijail
                 .port()
                 .take_controller_bootstrap(&report.identity)
                 .await
-                .map_err(provider_error)?
-                .ok_or_else(|| "provider-controller-bootstrap-missing".to_owned())?;
+            {
+                Ok(Some(endpoint)) => endpoint,
+                Ok(None) => {
+                    self.cleanup_failed_resource_launch(
+                        &context,
+                        provider,
+                        report.identity,
+                        spec.execution().execution_ref(),
+                    )
+                    .await;
+                    return Err("provider-controller-bootstrap-missing".to_owned());
+                }
+                Err(error) => {
+                    self.cleanup_failed_resource_launch(
+                        &context,
+                        provider,
+                        report.identity,
+                        spec.execution().execution_ref(),
+                    )
+                    .await;
+                    return Err(provider_error(error));
+                }
+            };
+            let daemon_endpoint =
+                match wait_for_controller_bootstrap_endpoint(daemon_endpoint, timeout).await {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        self.cleanup_failed_resource_launch(
+                            &context,
+                            provider,
+                            report.identity,
+                            spec.execution().execution_ref(),
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
             let controller_context = match ControllerBootstrapContext::from_resource_context(
                 &context,
                 spec.execution().execution_ref(),
@@ -1673,6 +1748,38 @@ impl ProductionProcessProviders {
             .unwrap_or(false)
     }
 
+    /// Return whether a retained resource identity matches every Guest VMM
+    /// fence supplied by the authoritative Resource API.
+    pub(crate) fn resource_identity_is_active(
+        &self,
+        zone: &ZoneId,
+        zone_uid: &ResourceUid,
+        resource_ref: &ResourceRef,
+        resource_uid: &ResourceUid,
+        generation: ResourceGeneration,
+        provider_ref: &ResourceRef,
+        owner_ref: &ResourceRef,
+        owner_uid: &ResourceUid,
+        execution_ref: &ResourceRef,
+    ) -> bool {
+        self.managed_resources
+            .lock()
+            .ok()
+            .and_then(|managed| {
+                managed
+                    .get(&(zone.clone(), Some(zone_uid.clone()), resource_ref.clone()))
+                    .cloned()
+            })
+            .is_some_and(|managed| {
+                managed.uid == *resource_uid
+                    && managed.generation == generation
+                    && managed.provider_ref == *provider_ref
+                    && managed.owner_ref.as_ref() == Some(owner_ref)
+                    && managed.owner_uid.as_ref() == Some(owner_uid)
+                    && managed.execution_ref == *execution_ref
+            })
+    }
+
     pub(crate) fn has_controller_bootstrap(
         &self,
         resource_ref: &ResourceRef,
@@ -2074,6 +2181,15 @@ impl ProductionProcessProviders {
                     else {
                         return Ok(ProviderAdoption::ControllerBootstrapMissing);
                     };
+                    let bootstrap_timeout =
+                        Duration::from_millis(u64::from(ticket.operation().deadline_ms()));
+                    let daemon_endpoint =
+                        match wait_for_controller_bootstrap_endpoint(daemon_endpoint, bootstrap_timeout)
+                            .await
+                        {
+                            Ok(endpoint) => endpoint,
+                            Err(_) => return Ok(ProviderAdoption::ControllerBootstrapMissing),
+                        };
                     if ticket.inherited_fd_table().count() == 2 {
                         return Ok(ProviderAdoption::ControllerBootstrapMissing);
                     }
@@ -3611,6 +3727,7 @@ fn stable_token(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
     use d2b_contracts_provider::v3::{
         ArtifactDigest, BinaryRef, ComponentDescriptor, ComponentExecution,
         ComponentTargetCapability, ComponentType, ControllerInstanceScope, ControllerTargetKind,
@@ -3711,6 +3828,47 @@ mod tests {
             resource_readiness_expectation(None, Duration::from_secs(7))
                 .expect("ephemeral readiness"),
             ReadinessExpectation::None
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_bootstrap_wait_rearms_on_endpoint_readiness() {
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+
+        let (sender, receiver) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .expect("bootstrap socketpair");
+        let writer = std::thread::spawn(move || {
+            nix::sys::socket::send(sender.as_raw_fd(), b"ready", nix::sys::socket::MsgFlags::empty())
+                .expect("bootstrap readiness frame");
+        });
+        let endpoint = wait_for_controller_bootstrap_endpoint(receiver, Duration::from_secs(1))
+            .await
+            .expect("bootstrap endpoint should become readable");
+        writer.join().expect("bootstrap writer");
+        drop(endpoint);
+    }
+
+    #[tokio::test]
+    async fn controller_bootstrap_wait_fails_without_endpoint_readiness() {
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+
+        let (_sender, receiver) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .expect("bootstrap socketpair");
+        assert_eq!(
+            wait_for_controller_bootstrap_endpoint(receiver, Duration::from_millis(1))
+                .await
+                .expect_err("unreadable bootstrap endpoint must fail"),
+            "provider-controller-bootstrap-timeout"
         );
     }
 

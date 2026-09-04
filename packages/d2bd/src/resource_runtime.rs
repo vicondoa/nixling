@@ -91,7 +91,7 @@ use d2b_core_controller::controller_assignment::{
 };
 use d2b_core_controller::controllers::HandlerPhase;
 use d2b_core_controller::{
-    CORE_RESOURCE_CONTROLLER_REGISTRATIONS, ChangeField, ControllerDescriptor,
+    CORE_RESOURCE_CONTROLLER_REGISTRATIONS, ChangeField, ChangeRecord, ControllerDescriptor,
     ControllerExecutionPolicy, ControllerIdentity, ControllerSelector, ControllerVerb,
     CoreControllerSource, CoreResourceReconciler, DependencySnapshot, DisruptionClass, DrainResult,
     FinalizeResult, ObservationResult, ReconcileContext, ReconcileDisposition, ReconcilePlan,
@@ -8877,6 +8877,7 @@ fn guest_session_evidence(
     session: &d2bd_runtime::guest_component_session::GuestComponentSessionClient,
     descriptor: &VerifiedGuestSetupDescriptor,
     target: &crate::CommittedGuestSessionTarget,
+    vmm_ready: bool,
 ) -> Option<GuestSessionEvidence> {
     let identity = session.identity();
     if identity.zone() != target.zone()
@@ -8912,7 +8913,7 @@ fn guest_session_evidence(
         guest_ref.clone(),
         format!("sha256:{boot_digest}"),
         ["resource-commit".to_owned(), "resource-watch".to_owned()],
-        true,
+        vmm_ready,
         true,
         true,
         binding,
@@ -10284,6 +10285,7 @@ pub struct ZoneResourceRuntime {
     controller_deployment: ProviderDeployment,
     controller_sessions: Arc<Mutex<BTreeMap<ResourceRef, ControllerSession>>>,
     controller_session_reconcile_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    controller_session_reconcile_wake: Arc<tokio::sync::Notify>,
     controller_session_lock: Arc<tokio::sync::Mutex<()>>,
     controller_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
     cloud_hypervisor_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
@@ -11090,6 +11092,7 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::CoreStartupFailed)?,
             controller_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             controller_session_reconcile_task: Arc::new(Mutex::new(None)),
+            controller_session_reconcile_wake: Arc::new(tokio::sync::Notify::new()),
             controller_session_lock: Arc::new(tokio::sync::Mutex::new(())),
             controller_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             cloud_hypervisor_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -14537,9 +14540,29 @@ impl ZoneResourceRuntime {
                     .cloned(),
                 None => None,
             };
+            let session_vmm_ready = match (
+                guest_session_target.as_ref(),
+                guest_session.as_ref(),
+                crate::load_bundle_resolver(&state),
+            ) {
+                (Some(target), Some(_), Ok(resolver)) => {
+                    crate::resolve_component_session_endpoint_for_guest(
+                        &state, &resolver, self, target,
+                    )
+                    .await
+                    .is_ok()
+                }
+                _ => false,
+            };
             let session_evidence = guest_session.as_ref().and_then(|session| {
                 guest_session_target.as_ref().and_then(|target| {
-                    guest_session_evidence(&guest_ref, session.as_ref(), &descriptor, target)
+                    guest_session_evidence(
+                        &guest_ref,
+                        session.as_ref(),
+                        &descriptor,
+                        target,
+                        session_vmm_ready,
+                    )
                 })
             });
             let finalizer_clear_requested = Arc::new(AtomicBool::new(false));
@@ -15427,6 +15450,7 @@ impl ZoneResourceRuntime {
 
 fn schedule_controller_session_reconcile(
     task_slot: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    wake: Arc<tokio::sync::Notify>,
     coordinator: ControllerSessionCoordinator,
     providers: Arc<crate::process_provider_runtime::ProductionProcessProviders>,
 ) -> Result<(), ResourceRuntimeError> {
@@ -15434,17 +15458,22 @@ fn schedule_controller_session_reconcile(
         .lock()
         .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
     if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+        wake.notify_one();
         return Ok(());
     }
+    let wake_for_task = Arc::clone(&wake);
     *slot = Some(tokio::spawn(async move {
-        if let Err(error) = coordinator
-            .reconcile_controller_sessions(providers, true)
-            .await
-        {
-            tracing::warn!(
-                error = %error,
-                "external Provider controller session reconciliation degraded",
-            );
+        loop {
+            if let Err(error) = coordinator
+                .reconcile_controller_sessions(Arc::clone(&providers), true)
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    "external Provider controller session reconciliation degraded",
+                );
+            }
+            wake_for_task.notified().await;
         }
     }));
     Ok(())
@@ -16939,6 +16968,23 @@ impl ZoneResourceRuntime {
                     session_generation,
                     Arc::clone(&self.core_assignment_epoch),
                 ));
+            let watch_task_slot = Arc::clone(&self.controller_session_reconcile_task);
+            let watch_wake = Arc::clone(&self.controller_session_reconcile_wake);
+            let watch_coordinator = self.controller_session_coordinator();
+            let watch_providers = Arc::clone(&providers);
+            let api = api.with_watch_change_observer(Arc::new(move |change: &ChangeRecord| {
+                if matches!(
+                    change.target.resource_ref().resource_type().as_str(),
+                    "Process" | "EphemeralProcess"
+                ) {
+                    let _ = schedule_controller_session_reconcile(
+                        Arc::clone(&watch_task_slot),
+                        Arc::clone(&watch_wake),
+                        watch_coordinator.clone(),
+                        Arc::clone(&watch_providers),
+                    );
+                }
+            }));
             let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
             let controller_provider_identities = load_committed_controller_provider_identities(
                 &self.zone,
@@ -16996,10 +17042,20 @@ impl ZoneResourceRuntime {
                 runtime.set_target_scope(None, None);
             }
             let wake_source = Arc::downgrade(&source);
+            let liveness_task_slot = Arc::clone(&self.controller_session_reconcile_task);
+            let liveness_wake = Arc::clone(&self.controller_session_reconcile_wake);
+            let liveness_coordinator = self.controller_session_coordinator();
+            let liveness_providers = Arc::clone(&providers);
             runtime.set_liveness_waker(Arc::new(move |key, revision| {
                 if let Some(source) = wake_source.upgrade() {
                     let _ = source.dispatch_observation(key, revision);
                 }
+                let _ = schedule_controller_session_reconcile(
+                    Arc::clone(&liveness_task_slot),
+                    Arc::clone(&liveness_wake),
+                    liveness_coordinator.clone(),
+                    Arc::clone(&liveness_providers),
+                );
             }));
             runtime.set_status_client(self.status_client()?);
             let handler = ProcessResourceReconciler::new(descriptor, runtime);
@@ -17040,6 +17096,7 @@ impl ZoneResourceRuntime {
         }
         schedule_controller_session_reconcile(
             Arc::clone(&self.controller_session_reconcile_task),
+            Arc::clone(&self.controller_session_reconcile_wake),
             coordinator.clone(),
             Arc::clone(&providers),
         )?;
@@ -17206,19 +17263,10 @@ impl ZoneResourceRuntime {
         if !u7_ready {
             return Some(ResourceRuntimeError::HandlerNotReady);
         }
-        let u6_ready = if self.u6_required.load(Ordering::Acquire) {
-            self.u6_runner_tasks
-                .try_lock()
-                .map(|tasks| {
-                    !tasks.is_empty() && !tasks.iter().any(|task| task.is_finished())
-                })
-                .unwrap_or(false)
-        } else {
-            true
-        };
-        if !u6_ready {
-            return Some(ResourceRuntimeError::HandlerNotReady);
-        }
+        // Guest runtime readiness is status-first: a live Runner task is only
+        // internal scheduling capacity. Guest controllers publish readiness
+        // after their authenticated session, VMM identity, and API socket
+        // have all been observed.
         let u9_ready = if self.u9_required.load(Ordering::Acquire) {
             self.u9_runner_tasks
                 .try_lock()
@@ -19625,6 +19673,7 @@ fn map_process_runtime_error(error: ProcessResourceRuntimeError) -> ResourceRunt
         | ProcessResourceRuntimeError::TemplateUnavailable
         | ProcessResourceRuntimeError::IdentityAmbiguous
         | ProcessResourceRuntimeError::ProviderEffect
+        | ProcessResourceRuntimeError::ControllerBootstrapUnavailable
         | ProcessResourceRuntimeError::ProviderIdentityUnavailable
         | ProcessResourceRuntimeError::InvalidResource => {
             ResourceRuntimeError::CapabilityUnavailable
@@ -19716,7 +19765,14 @@ fn process_assignment_fence_resolver(
                     projection: StoreProjection::MetadataOnly,
                 })
                 .await
-                .map_err(|_| SourceError::Integrity)?;
+                .map_err(|error| match error.kind() {
+                    StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure => {
+                        SourceError::Backpressure
+                    }
+                    StoreErrorKind::Timeout => SourceError::Timeout,
+                    StoreErrorKind::ResourceNotFound => SourceError::Unavailable,
+                    _ => SourceError::Integrity,
+                })?;
             let controller_generation = store
                 .runtime_metadata()
                 .await
@@ -19802,7 +19858,14 @@ fn system_core_assignment_fence_resolver(
                     projection: StoreProjection::MetadataOnly,
                 })
                 .await
-                .map_err(|_| SourceError::Integrity)?;
+                .map_err(|error| match error.kind() {
+                    StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure => {
+                        SourceError::Backpressure
+                    }
+                    StoreErrorKind::Timeout => SourceError::Timeout,
+                    StoreErrorKind::ResourceNotFound => SourceError::Unavailable,
+                    _ => SourceError::Integrity,
+                })?;
             let controller_generation = store
                 .runtime_metadata()
                 .await
@@ -24524,6 +24587,90 @@ mod tests {
                 .await
                 .is_ok()
         );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_materialization_supplies_fixed_process_provider_rows() {
+        let (_directory, runtime, _broker_evidence) = open_production_guest_runtime_for_test().await;
+        let provider_refs = [
+            "Provider/system-core",
+            "Provider/system-minijail",
+            "Provider/system-systemd",
+        ]
+        .into_iter()
+        .map(|provider| ResourceRef::parse(provider).unwrap())
+        .collect::<BTreeSet<_>>();
+        let revision = runtime.store.runtime_metadata().await.unwrap().current_revision;
+        assert!(
+            load_committed_controller_provider_identities(
+                &runtime.zone,
+                &runtime.store,
+                revision,
+                provider_refs.clone(),
+            )
+            .await
+            .is_err(),
+            "missing fixed Provider rows must fail closed"
+        );
+
+        materialize_test_bundle(&runtime, Vec::new()).await;
+
+        let identities = load_committed_controller_provider_identities(
+            &runtime.zone,
+            &runtime.store,
+            runtime.store.runtime_metadata().await.unwrap().current_revision,
+            provider_refs,
+        )
+        .await
+        .expect("materialized fixed Provider identities");
+        assert_eq!(identities.len(), 3);
+
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Process",
+                "bootstrap-process",
+                &runtime.zone,
+                r#"{"providerRef":"Provider/system-minijail","executionRef":"Host/host-system","processClass":"worker","template":"reaction"}"#,
+            )],
+        )
+        .await;
+        let process = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "process-assignment-read-after-bootstrap".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "process-assignment-read-after-bootstrap".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: runtime.zone.clone(),
+                target: ResourceRef::parse("Process/bootstrap-process").unwrap(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let assignment_epoch = Arc::new(AtomicU64::new(1));
+        let resolver = process_assignment_fence_resolver(
+            Arc::clone(&runtime.store),
+            DaemonMode::Host,
+            ResourceRef::parse("Process/d2b-core-controller").unwrap(),
+            ReconnectGeneration::new(1).unwrap(),
+            assignment_epoch,
+        );
+        let fence = resolver(
+            process.resource_ref.clone(),
+            process.uid.clone(),
+            process.revision,
+        )
+        .await
+        .expect("fixed Provider appearance must requeue assignment admission");
+        assert_eq!(fence.resource_uid, process.uid);
+        assert!(fence.provider_generation.get() > 0);
+        drop(resolver);
         runtime.shutdown().await.unwrap();
     }
 
