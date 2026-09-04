@@ -88,6 +88,9 @@ let
         environment.etc."d2b/component-session/parent.pub".source =
           "${fixtureKeys}/host.pub";
         systemd.services.d2bd-guest = {
+          environment = {
+            RUST_LOG = "d2bd::composition=debug";
+          };
           serviceConfig = {
             ReadOnlyPaths = [
               "/etc/d2b/component-session/guest.key"
@@ -645,9 +648,43 @@ pkgs.testers.runNixOSTest {
         "grep -F -- '--api-socket' | grep -F -- 'acceptance-guest'"
     )
 
+    machine.succeed(
+        "guest_uid=$(runuser -u alice -- env "
+        "D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
+        "d2b --zone work --json list Guest | "
+        "jq -er '.resources[] | select(.type == \"Guest\" and "
+        ".metadata.name == \"acceptance-guest\" and "
+        ".spec.providerRef == \"Provider/runtime-cloud-hypervisor\" and "
+        ".spec.executionRef == \"Host/host-system\") | .metadata.uid') && "
+        "jq -c "
+        "'{guestRef, guestUid, zone, reconnectGeneration, "
+        "providerGeneration, controllerGeneration, assignmentEpoch}' "
+        "/var/lib/d2b/zones/work/guests/acceptance-guest/component-session/guest.json "
+        ">/run/d2b-guest-session-before.json && "
+        "jq -e --arg guest_uid \"$guest_uid\" "
+        "'.guestRef == \"Guest/acceptance-guest\" and .guestUid == $guest_uid "
+        "and .zone == \"work\" and .reconnectGeneration > 0 and "
+        ".providerGeneration > 0 and .controllerGeneration > 0 and "
+        ".assignmentEpoch > 0' "
+        "/run/d2b-guest-session-before.json >/dev/null && "
+        "session_generation=$(journalctl --no-pager -b 2>/dev/null | "
+        "grep -F 'Guest ComponentSession Resource API server starting' | "
+        "grep -oE 'generation[[:space:]]*=[[:space:]]*[0-9]+' | "
+        "grep -oE '[0-9]+' | tail -1) && "
+        "test -n \"$session_generation\" && "
+        "test \"$session_generation\" -ge 1 && "
+        "printf '%s\\n' \"$session_generation\" "
+        ">/run/d2b-guest-session-generation-before"
+    )
+
     machine.succeed("systemctl restart d2bd.service")
     machine.wait_for_unit("d2bd.service", timeout=180)
     machine.wait_for_file("/run/d2b/public.sock", timeout=30)
+    machine.wait_until_succeeds(
+        "test -S "
+        "/var/lib/d2b/zones/work/guests/acceptance-guest/acceptance-guest.sock",
+        timeout=30,
+    )
     machine.succeed(f"test -d /proc/{runner_pid}")
     machine.succeed(
         f"test \"$(awk '{{print $22}}' /proc/{runner_pid}/stat)\" = {runner_start}"
@@ -660,6 +697,20 @@ pkgs.testers.runNixOSTest {
         "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
         "d2b --zone work --json list Process "
         ">/run/d2b-process-adopted.json && "
+        "session_generation_before=$(cat "
+        "/run/d2b-guest-session-generation-before) && "
+        "session_generation_after=$(journalctl --no-pager -b 2>/dev/null | "
+        "grep -F 'Guest ComponentSession Resource API server starting' | "
+        "grep -oE 'generation[[:space:]]*=[[:space:]]*[0-9]+' | "
+        "grep -oE '[0-9]+' | tail -1) && "
+        "test -n \"$session_generation_after\" && "
+        "test \"$session_generation_after\" -gt \"$session_generation_before\" && "
+        "jq -c '{guestRef, guestUid, zone, reconnectGeneration, "
+        "providerGeneration, controllerGeneration, assignmentEpoch}' "
+        "/var/lib/d2b/zones/work/guests/acceptance-guest/component-session/guest.json "
+        ">/run/d2b-guest-session-after.json && "
+        "jq -e --slurpfile expected /run/d2b-guest-session-before.json "
+        "'. == $expected[0]' /run/d2b-guest-session-after.json >/dev/null && "
         "jq -e '"
         "([.resources[] | select(.type == \"Process\" and "
         ".metadata.name == \"acceptance-guest-vmm\" and "
@@ -677,9 +728,14 @@ pkgs.testers.runNixOSTest {
         ".spec.template == \"controller-runtime-cloud-hypervisor-cloud-hypervisor-controller\" and "
         ".status.phase == \"Ready\")] | length == 1)' "
         "/run/d2b-process-adopted.json && "
-        "jq -e 'any(.resources[]; "
+        "jq -e --slurpfile session /run/d2b-guest-session-after.json "
+        "'any(.resources[]; "
         ".type == \"Guest\" and "
         ".metadata.name == \"acceptance-guest\" and "
+        ".metadata.zone == \"work\" and "
+        ".metadata.uid == $session[0].guestUid and "
+        ".spec.providerRef == \"Provider/runtime-cloud-hypervisor\" and "
+        ".spec.executionRef == \"Host/host-system\" and "
         ".status.phase == \"Ready\" and "
         ".status.observedGeneration == .metadata.generation and "
         ".status.resource.runtimeReady == true and "
@@ -687,6 +743,15 @@ pkgs.testers.runNixOSTest {
         ".status.resource.activeProcessCount == 1)' "
         "/run/d2b-guest-adopted.json && exit 0; "
         "sleep 1; done; "
+        "echo 'Guest ComponentSession generation did not advance after restart:' >&2; "
+        "printf 'before=%s after=%s\\n' "
+        "\"$(cat /run/d2b-guest-session-generation-before 2>/dev/null || true)\" "
+        "\"$(journalctl --no-pager -b 2>/dev/null | "
+        "grep -F 'Guest ComponentSession Resource API server starting' | "
+        "grep -oE 'generation[[:space:]]*=[[:space:]]*[0-9]+' | "
+        "grep -oE '[0-9]+' | tail -1)\" >&2; "
+        "jq -c '.' /run/d2b-guest-session-before.json >&2 || true; "
+        "jq -c '.' /run/d2b-guest-session-after.json >&2 || true; "
         "echo 'Post-restart Guest readiness failed:' >&2; "
         "jq -c '.resources[] | select(.type == \"Guest\" and "
         ".metadata.name == \"acceptance-guest\") | "
