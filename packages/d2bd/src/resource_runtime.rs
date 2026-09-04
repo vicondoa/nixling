@@ -24764,12 +24764,19 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            4
+            6
         );
         runtime
             .start_core_controller_runners()
             .await
             .expect("sparse bundles must skip absent optional shared Providers");
+        {
+            let _runner_guard = runtime.core_runner_lock.lock().await;
+            runtime
+                .stop_core_controller_runners_locked()
+                .await
+                .expect("sparse runner fixture must stop cleanly");
+        }
         runtime.shutdown().await.unwrap();
     }
 
