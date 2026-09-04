@@ -18,6 +18,11 @@ let
   vmEvaluatorSource =
     builtins.readFile (flakeRoot + "/nixos-modules/vm-evaluator.nix");
   flakeSource = builtins.readFile (flakeRoot + "/flake.nix");
+  makeSource = builtins.readFile (flakeRoot + "/Makefile");
+  bazelHostToolsSource =
+    builtins.readFile (flakeRoot + "/nix/test-support/bazel-host-tools.nix");
+  hostIntegrationLibSource =
+    builtins.readFile (flakeRoot + "/tests/host-integration/lib.nix");
   hostSourceLines = lib.splitString "\n" hostToolsSource;
   hostSourceBuilderLines =
     lib.filter (line: lib.hasInfix "src = hostSource;" line) hostSourceLines;
@@ -52,6 +57,26 @@ in
         "d2bHostToolOverrides ? null"
         "inherit d2bHostToolOverrides"
         "evalGuest = args: self.lib.evalGuest (args //"
+      ];
+    expected = true;
+  };
+
+  "host-tools-source/acceptance-controller-uses-bazel-bundle" = {
+    expr =
+      lib.all (needle: lib.hasInfix needle bazelHostToolsSource) [
+        ''"d2b-provider-test-controller"''
+        "inventoryShell"
+      ]
+      && lib.all (needle: lib.hasInfix needle makeSource) [
+        "//packages/d2b-provider-test-controller:d2b-provider-test-controller"
+        "stage_tool packages/d2b-provider-test-controller/d2b-provider-test-controller d2b-provider-test-controller"
+        ''D2B_HOST_TOOL_BUNDLE="$$stage"''
+      ]
+      && lib.all (needle: lib.hasInfix needle hostIntegrationLibSource) [
+        "if hostToolBundle == null"
+        "self.packages."
+        "hostToolBundle"
+        "hostToolBundle}/bin/d2b-provider-test-controller"
       ];
     expected = true;
   };

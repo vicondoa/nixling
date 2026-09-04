@@ -622,6 +622,7 @@
                   lib = self.lib // {
                     d2bHostToolOverrides =
                       bazelHostTools.d2bHostToolOverrides;
+                    d2bHostToolBundle = bazelHostTools.package;
                     evalGuest = args: self.lib.evalGuest (args // {
                       d2bHostToolOverrides =
                         bazelHostTools.d2bHostToolOverrides;

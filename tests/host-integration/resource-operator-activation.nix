@@ -12,6 +12,8 @@ let
   d2bLib = import ./lib.nix {
     inherit self;
     inherit lib;
+    hostToolBundle =
+      if self.lib ? d2bHostToolBundle then self.lib.d2bHostToolBundle else null;
   };
   providerArtifact = d2bLib.mkAcceptanceProviderArtifact pkgs;
   acceptancePublisherKey = providerArtifact.trustedPublisher.signingKey;

@@ -23,6 +23,8 @@
 - Replaced the inert host acceptance controller with an authenticated fd10
   ComponentSession fixture, made controller-session shutdown ownership explicit,
   and retried bounded watch revision conflicts during relist/open-watch recovery.
+- Routed the acceptance controller through the Bazel-built host-tool bundle so
+  the host VM lane does not rebuild its fixture controller through Nix.
 
 ### Removed
 

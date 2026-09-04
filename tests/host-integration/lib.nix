@@ -9,7 +9,7 @@
 # This file is NOT a flake check: the VM tests live under the `vmChecks` flake
 # output (selected explicitly by `make test-host-integration`), so the Layer-1
 # `nix flake check --no-build --all-systems` never realizes a VM.
-{ self, lib }:
+{ self, lib, hostToolBundle ? null }:
 
 let
   # The minimal, hermetic d2b site declaration every daemon-host node shares.
@@ -205,8 +205,10 @@ let
 
   mkAcceptanceProviderArtifact = pkgs:
     let
-      controller =
-        self.packages.${pkgs.stdenv.hostPlatform.system}.d2b-provider-test-controller;
+      controller = if hostToolBundle == null then
+        "${self.packages.${pkgs.stdenv.hostPlatform.system}.d2b-provider-test-controller}/bin/d2b-provider-test-controller"
+      else
+        "${hostToolBundle}/bin/d2b-provider-test-controller";
       signer = pkgs.python3.withPackages
         (pythonPackages: [ pythonPackages.cryptography ]);
       manifest = ../../tests/fixtures/provider-acceptance/provider-manifest.json;
@@ -215,8 +217,7 @@ let
         nativeBuildInputs = [ signer ];
       } ''
         mkdir -p "$out/bin"
-        cp "${controller}/bin/d2b-provider-test-controller" \
-          "$out/bin/acceptance-controller"
+        cp "${controller}" "$out/bin/acceptance-controller"
         chmod 0755 "$out/bin/acceptance-controller"
         ${signer}/bin/python3 - "${manifest}" "$out" <<'PY'
         import hashlib
