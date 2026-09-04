@@ -89,7 +89,7 @@ let
           "${fixtureKeys}/host.pub";
         systemd.services.d2bd-guest = {
           environment = {
-            RUST_LOG = "d2bd::composition=debug";
+            RUST_LOG = "d2bd=debug";
           };
           serviceConfig = {
             ReadOnlyPaths = [
@@ -690,13 +690,8 @@ pkgs.testers.runNixOSTest {
         f"test \"$(awk '{{print $22}}' /proc/{runner_pid}/stat)\" = {runner_start}"
     )
     machine.succeed(
+        "rm -f /run/d2b-guest-adopted.json /run/d2b-process-adopted.json; "
         "for attempt in $(seq 1 60); do "
-        "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
-        "d2b --zone work --json list Guest "
-        ">/run/d2b-guest-adopted.json && "
-        "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
-        "d2b --zone work --json list Process "
-        ">/run/d2b-process-adopted.json && "
         "session_generation_before=$(cat "
         "/run/d2b-guest-session-generation-before) && "
         "session_generation_after=$(journalctl --no-pager -b 2>/dev/null | "
@@ -711,6 +706,12 @@ pkgs.testers.runNixOSTest {
         ">/run/d2b-guest-session-after.json && "
         "jq -e --slurpfile expected /run/d2b-guest-session-before.json "
         "'. == $expected[0]' /run/d2b-guest-session-after.json >/dev/null && "
+        "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
+        "d2b --zone work --json list Guest "
+        ">/run/d2b-guest-adopted.json && "
+        "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
+        "d2b --zone work --json list Process "
+        ">/run/d2b-process-adopted.json && "
         "jq -e '"
         "([.resources[] | select(.type == \"Process\" and "
         ".metadata.name == \"acceptance-guest-vmm\" and "
