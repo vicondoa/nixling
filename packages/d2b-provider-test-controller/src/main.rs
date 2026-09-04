@@ -117,7 +117,9 @@ async fn run_session(
                     )
                     .map_err(|_| ())?;
             }
-            Ok(Ok(SessionEvent::NamedStream(_))) => return Err(()),
+            Ok(Ok(SessionEvent::NamedStream(_))) => {
+                return Ok(SessionDisposition::Reconnect);
+            }
             Ok(Ok(_)) | Err(_) => {}
             Ok(Err(_)) => return Ok(SessionDisposition::Reconnect),
         }
