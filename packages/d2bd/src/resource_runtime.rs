@@ -13665,11 +13665,19 @@ impl ZoneResourceRuntime {
                                 error.error(),
                             );
                             push_runner_failure(&failure_slot, diagnostic.clone());
+                            let report = error.report();
                             tracing::warn!(
-                                controller = %diagnostic.controller(),
-                                resource_type,
+                                controller = %diagnostic.controller().to_canonical_string(),
+                                resource_types = ?diagnostic
+                                    .resource_types()
+                                    .iter()
+                                    .map(ResourceTypeName::as_str)
+                                    .collect::<Vec<_>>(),
                                 error_kind = ?diagnostic.error(),
                                 error = %diagnostic.error(),
+                                dispatched = report.dispatched,
+                                relists = report.relists,
+                                checkpointed = report.checkpointed,
                                 "U9 interaction shared Runner failed",
                             );
                         }
@@ -17283,11 +17291,19 @@ impl ZoneResourceRuntime {
                             error.error(),
                         );
                         store_runner_failure(&failure_slot, diagnostic.clone());
+                        let report = error.report();
                         tracing::warn!(
-                            controller = %diagnostic.controller(),
-                            resource_types = ?diagnostic.resource_types(),
+                            controller = %diagnostic.controller().to_canonical_string(),
+                            resource_types = ?diagnostic
+                                .resource_types()
+                                .iter()
+                                .map(ResourceTypeName::as_str)
+                                .collect::<Vec<_>>(),
                             error_kind = ?diagnostic.error(),
                             error = %diagnostic.error(),
+                            dispatched = report.dispatched,
+                            relists = report.relists,
+                            checkpointed = report.checkpointed,
                             "Process Provider shared runner failed",
                         );
                     }
