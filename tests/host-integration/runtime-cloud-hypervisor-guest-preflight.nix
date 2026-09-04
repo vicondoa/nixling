@@ -371,16 +371,52 @@ pkgs.testers.runNixOSTest {
         "cat /run/d2b-preflight-summary.log >&2"
     )
 
-    # The VMM API socket is the first nested-VM proof. Its 30-second bound is
-    # deliberately shorter than Guest boot/readiness, which has its own
-    # bounded checks below, so a missing socket cannot consume 900 seconds.
+    # Both storage Providers use the authenticated host acceptance controller.
+    # Their separate owner identities must establish live ResourceV3 sessions;
+    # a stale pause fixture would leave these controller Processes pending.
+    machine.wait_until_succeeds(
+        "test \"$(journalctl -u d2bd.service --no-pager -o cat -b "
+        "| grep -Fc 'external Provider controller ResourceV3 session live')\" -ge 2",
+        timeout=60,
+    )
+    machine.wait_until_succeeds(
+        "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
+        "d2b --zone work --json list Process "
+        ">/run/d2b-volume-controller-processes.json && "
+        "jq -e '"
+        "([.resources[] | select(.type == \"Process\" and "
+        ".metadata.ownerRef == \"Provider/volume-local\" and "
+        ".spec.providerRef == \"Provider/system-minijail\" and "
+        ".spec.processClass == \"controller\" and "
+        ".spec.template == \"controller-volume-acceptance-provider-acceptance-controller\" and "
+        ".status.phase == \"Ready\" and "
+        ".status.observedGeneration == .metadata.generation)] | length == 1) and "
+        "([.resources[] | select(.type == \"Process\" and "
+        ".metadata.ownerRef == \"Provider/volume-virtiofs\" and "
+        ".spec.providerRef == \"Provider/system-minijail\" and "
+        ".spec.processClass == \"controller\" and "
+        ".spec.template == \"controller-volume-acceptance-provider-acceptance-controller\" and "
+        ".status.phase == \"Ready\" and "
+        ".status.observedGeneration == .metadata.generation)] | length == 1)' "
+        "/run/d2b-volume-controller-processes.json",
+        timeout=60,
+    )
     machine.succeed(
-        "for attempt in $(seq 1 30); do "
+        "test \"$(ps -eo pid=,args= | awk '$NF ~ /acceptance-controller$/ {print $1}' "
+        "| wc -l)\" -ge 2 && "
+        "! ps -eo args= | grep -E '(^|/)pause([[:space:]]|$)' | grep -v grep"
+    )
+
+    # The VMM API socket is the first nested-VM proof. Volume convergence can
+    # legitimately precede the nested boot, so keep this bound aligned with
+    # Guest readiness rather than failing before the U7 Runner re-enters.
+    machine.succeed(
+        "for attempt in $(seq 1 180); do "
         "test -S /var/lib/d2b/zones/work/guests/acceptance-guest/acceptance-guest.sock "
         "&& exit 0; "
         "sleep 1; "
         "done; "
-        "echo 'Cloud Hypervisor API socket did not become ready within 30s' >&2; "
+        "echo 'Cloud Hypervisor API socket did not become ready within 180s' >&2; "
         "cat /run/d2b-preflight-summary.log >&2; "
         "exit 1"
     )
@@ -638,41 +674,6 @@ pkgs.testers.runNixOSTest {
         "| .metadata.uid]) as $uids | "
         "$uids | length == 2 and (unique | length == 2)' "
         "/run/d2b-volume-ready.json"
-    )
-    # Both storage Providers use the authenticated host acceptance controller.
-    # Their separate owner identities must establish live ResourceV3 sessions;
-    # a stale pause fixture would leave these controller Processes pending.
-    machine.wait_until_succeeds(
-        "test \"$(journalctl -u d2bd.service --no-pager -o cat -b "
-        "| grep -Fc 'external Provider controller ResourceV3 session live')\" -ge 2",
-        timeout=60,
-    )
-    machine.wait_until_succeeds(
-        "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
-        "d2b --zone work --json list Process "
-        ">/run/d2b-volume-controller-processes.json && "
-        "jq -e '"
-        "([.resources[] | select(.type == \"Process\" and "
-        ".metadata.ownerRef == \"Provider/volume-local\" and "
-        ".spec.providerRef == \"Provider/system-minijail\" and "
-        ".spec.processClass == \"controller\" and "
-        ".spec.template == \"controller-volume-acceptance-provider-acceptance-controller\" and "
-        ".status.phase == \"Ready\" and "
-        ".status.observedGeneration == .metadata.generation)] | length == 1) and "
-        "([.resources[] | select(.type == \"Process\" and "
-        ".metadata.ownerRef == \"Provider/volume-virtiofs\" and "
-        ".spec.providerRef == \"Provider/system-minijail\" and "
-        ".spec.processClass == \"controller\" and "
-        ".spec.template == \"controller-volume-acceptance-provider-acceptance-controller\" and "
-        ".status.phase == \"Ready\" and "
-        ".status.observedGeneration == .metadata.generation)] | length == 1)' "
-        "/run/d2b-volume-controller-processes.json",
-        timeout=60,
-    )
-    machine.succeed(
-        "test \"$(ps -eo pid=,args= | awk '$NF ~ /acceptance-controller$/ {print $1}' "
-        "| wc -l)\" -ge 2 && "
-        "! ps -eo args= | grep -E '(^|/)pause([[:space:]]|$)' | grep -v grep"
     )
     machine.wait_until_succeeds(
         "test -S "
