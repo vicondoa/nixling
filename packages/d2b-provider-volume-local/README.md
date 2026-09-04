@@ -14,7 +14,7 @@
 | ResourceTypes | `Volume` (layout, views, attachment admission) |
 | Attachment transport | none; virtiofs attachments are admitted here and served by `volume-virtiofs` |
 | Source kinds | `local-path`, `block-image`, `tmpfs` |
-| Finalizers | `volume-local/layout` |
+| Finalizers | `volume-local.d2bus.org/layout` |
 | Shared write | not declared |
 
 ## Config schema

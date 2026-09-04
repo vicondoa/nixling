@@ -23,7 +23,7 @@ pub const EXPORT_RESOURCE_TYPE: &str = "virtiofs.d2bus.org.Export";
 
 /// The finalizer volume-virtiofs adds to each Export, and to nothing
 /// else.
-pub const EXPORT_FINALIZER: &str = "volume-virtiofs/export";
+pub const EXPORT_FINALIZER: &str = "volume-virtiofs.d2bus.org/export";
 
 /// The opaque identity of one Export's private listening socket.
 ///

@@ -19,7 +19,7 @@ uniform crate layout, schema links, configuration, and test lanes.
 | ResourceTypes | `virtiofs.d2bus.org.Export`; read-only watch of `Volume` |
 | Attachment transport | `virtiofs` |
 | Worker template | `virtiofsd-worker` |
-| Finalizer | `volume-virtiofs/export`, on an Export and nothing else |
+| Finalizer | `volume-virtiofs.d2bus.org/export`, on an Export and nothing else |
 
 The production controller is attached to the shared Core Runner with an
 event-driven Export watch and a bounded 30-second repair interval. Its only

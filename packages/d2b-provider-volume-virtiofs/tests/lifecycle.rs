@@ -263,7 +263,7 @@ fn public_export_status_carries_no_socket_path_shared_dir_or_argv() {
 #[test]
 fn the_provider_owns_only_the_export_resource_type_and_finalizer() {
     assert_eq!(EXPORT_RESOURCE_TYPE, "virtiofs.d2bus.org.Export");
-    assert_eq!(EXPORT_FINALIZER, "volume-virtiofs/export");
+    assert_eq!(EXPORT_FINALIZER, "volume-virtiofs.d2bus.org/export");
     let port = ScriptedPort::serving();
     let controller = VirtiofsExportController::new(&port);
     assert_eq!(controller.finalizer(), EXPORT_FINALIZER);

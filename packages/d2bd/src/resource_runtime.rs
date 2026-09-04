@@ -22105,6 +22105,27 @@ mod tests {
             } else {
                 assert_eq!(descriptor.finalizers(), &[registration.finalizer.to_owned()]);
             }
+            for finalizer in descriptor
+                .finalizers()
+                .iter()
+                .filter(|finalizer| !finalizer.is_empty())
+            {
+                let parsed = d2b_contracts_resource::v3::FinalizerId::parse(finalizer.clone())
+                    .expect("production finalizer must satisfy the Resource API contract");
+                assert_eq!(parsed.as_str(), finalizer);
+            }
+            match registration.provider_ref {
+                "Provider/volume-local" => {
+                    assert_eq!(registration.finalizer, "volume-local.d2bus.org/layout");
+                }
+                "Provider/volume-virtiofs" => {
+                    assert_eq!(
+                        registration.finalizer,
+                        "volume-virtiofs.d2bus.org/export"
+                    );
+                }
+                _ => {}
+            }
         };
 
         for registration in U6_SHARED_PROVIDER_RUNNERS {
@@ -25703,6 +25724,68 @@ mod tests {
             .require_ready()
             .expect("sparse bundle must reach Host readiness");
         assert_eq!(runtime.interaction_state, InteractionState::Absent);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sparse_host_bundle_registers_both_u7_volume_runners() {
+        let (_directory, mut runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "Provider",
+                    "volume-local",
+                    &zone,
+                    r#"{"artifactId":"acceptance-provider","config":{}}"#,
+                ),
+                bundle_resource(
+                    "Provider",
+                    "volume-virtiofs",
+                    &zone,
+                    r#"{"artifactId":"acceptance-provider","config":{}}"#,
+                ),
+            ],
+        )
+        .await;
+        let state = Arc::new(crate::detached_exec_routing_tests::test_state(
+            Default::default(),
+        ));
+        runtime
+            .start_u7_controller_runners(state)
+            .await
+            .expect("sparse host bundle must start both U7 runners");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let registered_and_live = {
+                    let tasks = runtime
+                        .u7_runner_tasks
+                        .lock()
+                        .expect("U7 runner task lock");
+                    tasks.len() == U7_SHARED_PROVIDER_RUNNERS.len()
+                        && tasks.iter().all(|task| !task.is_finished())
+                };
+                if registered_and_live {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both U7 descriptors must register through the Resource API");
+        assert!(runtime.u7_required.load(Ordering::Acquire));
+        runtime.set_provider_path_ready(true);
+        runtime
+            .require_ready()
+            .expect("sparse host composition must reach readiness after U7 registration");
+
+        runtime
+            .stop_u7_controller_runners_locked()
+            .await
+            .expect("U7 runner fixture must stop cleanly");
         runtime.shutdown().await.unwrap();
     }
 

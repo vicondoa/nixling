@@ -41,7 +41,7 @@ pub struct VolumeRunnerContract {
 }
 
 /// The fixed finalizer owned by volume-local.
-pub const VOLUME_FINALIZER: &str = "volume-local/layout";
+pub const VOLUME_FINALIZER: &str = "volume-local.d2bus.org/layout";
 
 /// Return the production volume-local Runner contract.
 pub const fn volume_runner_contract() -> VolumeRunnerContract {
