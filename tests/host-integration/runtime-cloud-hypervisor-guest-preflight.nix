@@ -10,6 +10,8 @@ let
   d2bLib = import ./lib.nix {
     inherit self;
     inherit lib;
+    hostToolBundle =
+      if self.lib ? d2bHostToolBundle then self.lib.d2bHostToolBundle else null;
   };
   cloudHypervisorArtifact =
     d2bLib.mkRuntimeCloudHypervisorArtifact pkgs;
@@ -636,6 +638,41 @@ pkgs.testers.runNixOSTest {
         "| .metadata.uid]) as $uids | "
         "$uids | length == 2 and (unique | length == 2)' "
         "/run/d2b-volume-ready.json"
+    )
+    # Both storage Providers use the authenticated host acceptance controller.
+    # Their separate owner identities must establish live ResourceV3 sessions;
+    # a stale pause fixture would leave these controller Processes pending.
+    machine.wait_until_succeeds(
+        "test \"$(journalctl -u d2bd.service --no-pager -o cat -b "
+        "| grep -Fc 'external Provider controller ResourceV3 session live')\" -ge 2",
+        timeout=60,
+    )
+    machine.wait_until_succeeds(
+        "runuser -u alice -- env D2B_PUBLIC_SOCKET=/run/d2b/public.sock "
+        "d2b --zone work --json list Process "
+        ">/run/d2b-volume-controller-processes.json && "
+        "jq -e '"
+        "([.resources[] | select(.type == \"Process\" and "
+        ".metadata.ownerRef == \"Provider/volume-local\" and "
+        ".spec.providerRef == \"Provider/system-minijail\" and "
+        ".spec.processClass == \"controller\" and "
+        ".spec.template == \"controller-volume-acceptance-provider-acceptance-controller\" and "
+        ".status.phase == \"Ready\" and "
+        ".status.observedGeneration == .metadata.generation)] | length == 1) and "
+        "([.resources[] | select(.type == \"Process\" and "
+        ".metadata.ownerRef == \"Provider/volume-virtiofs\" and "
+        ".spec.providerRef == \"Provider/system-minijail\" and "
+        ".spec.processClass == \"controller\" and "
+        ".spec.template == \"controller-volume-acceptance-provider-acceptance-controller\" and "
+        ".status.phase == \"Ready\" and "
+        ".status.observedGeneration == .metadata.generation)] | length == 1)' "
+        "/run/d2b-volume-controller-processes.json",
+        timeout=60,
+    )
+    machine.succeed(
+        "test \"$(ps -eo pid=,args= | awk '$NF ~ /acceptance-controller$/ {print $1}' "
+        "| wc -l)\" -ge 2 && "
+        "! ps -eo args= | grep -E '(^|/)pause([[:space:]]|$)' | grep -v grep"
     )
     machine.wait_until_succeeds(
         "test -S "

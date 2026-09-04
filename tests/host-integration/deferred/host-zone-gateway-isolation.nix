@@ -6,6 +6,8 @@ let
   d2bLib = import ./lib.nix {
     inherit self;
     inherit (pkgs) lib;
+    hostToolBundle =
+      if self.lib ? d2bHostToolBundle then self.lib.d2bHostToolBundle else null;
   };
   cloudHypervisorArtifact =
     d2bLib.mkRuntimeCloudHypervisorArtifact pkgs;

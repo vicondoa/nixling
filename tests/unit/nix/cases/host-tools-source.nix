@@ -34,6 +34,17 @@ let
     in
     lib.replaceStrings [ "\n" "\r" ] [ " " "" ]
       (builtins.head (lib.splitString "      signer =" functionBlock));
+  volumeControllerBlock =
+    let
+      functionBlock =
+        builtins.elemAt
+          (lib.splitString
+            "  mkVolumeProviderArtifact = pkgs:"
+            hostIntegrationLibSource)
+          1;
+    in
+    lib.replaceStrings [ "\n" "\r" ] [ " " "" ]
+      (builtins.head (lib.splitString "      package =" functionBlock));
   orderedUnique = source: needles:
     let
       result = lib.foldl'
@@ -116,6 +127,20 @@ in
         "else"
         "self.packages."
       ]);
+    expected = true;
+  };
+
+  "host-tools-source/volume-controller-uses-bazel-bundle" = {
+    expr =
+      orderedUnique volumeControllerBlock [
+        "controller = if hostToolBundle == null then"
+        "self.packages."
+        "d2b-provider-test-controller}/bin/d2b-provider-test-controller"
+        "else"
+        "hostToolBundle}/bin/d2b-provider-test-controller"
+      ]
+      && !(lib.hasInfix "pause()" volumeControllerBlock)
+      && !(lib.hasInfix "stdenv.cc" volumeControllerBlock);
     expected = true;
   };
 }
