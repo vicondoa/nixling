@@ -20073,6 +20073,15 @@ fn process_assignment_fence_resolver(
     session_generation: ReconnectGeneration,
     epoch: Arc<AtomicU64>,
 ) -> AssignmentFenceResolver {
+    fn integrity(target: &ResourceRef, reason: &'static str) -> SourceError {
+        tracing::warn!(
+            resource = %target.to_canonical_string(),
+            reason,
+            "Process assignment source rejected resource identity",
+        );
+        SourceError::Integrity
+    }
+
     Arc::new(move |target, uid, revision| {
         let store = Arc::clone(&store);
         let controller_role = controller_role.clone();
@@ -20107,17 +20116,17 @@ fn process_assignment_fence_resolver(
                 return Err(SourceError::Conflict(resource.revision));
             }
             let envelope = ResourceEnvelope::from_json(&resource.canonical_json)
-                .map_err(|_| SourceError::Integrity)?;
+                .map_err(|_| integrity(&target, "resource-envelope-invalid"))?;
             let provider_ref = envelope
                 .spec()
                 .provider_ref()
                 .cloned()
-                .ok_or(SourceError::Integrity)?;
+                .ok_or_else(|| integrity(&target, "process-provider-ref-missing"))?;
             if !matches!(
                 provider_ref.name().as_str(),
                 "system-minijail" | "system-systemd"
             ) {
-                return Err(SourceError::Integrity);
+                return Err(integrity(&target, "process-provider-ref-unsupported"));
             }
             let execution_ref = envelope
                 .spec()
@@ -20127,13 +20136,13 @@ fn process_assignment_fence_resolver(
                     CanonicalJsonValue::String(value) => ResourceRef::parse(value).ok(),
                     _ => None,
                 })
-                .ok_or(SourceError::Integrity)?;
+                .ok_or_else(|| integrity(&target, "process-execution-ref-missing"))?;
             let expected_target = match mode {
                 DaemonMode::Host => "Host",
                 DaemonMode::Guest => "Guest",
             };
             if execution_ref.resource_type().as_str() != expected_target {
-                return Err(SourceError::Integrity);
+                return Err(integrity(&target, "process-execution-ref-wrong-domain"));
             }
             let provider = store
                 .get(StoreGetRequest {
@@ -20164,10 +20173,10 @@ fn process_assignment_fence_resolver(
                 .map_err(|_| SourceError::Unavailable)?
                 .policy_snapshot
                 .controller_generation
-                .ok_or(SourceError::Integrity)?;
+                .ok_or_else(|| integrity(&target, "controller-generation-missing"))?;
             let assignment_epoch = epoch.load(Ordering::Acquire);
             if assignment_epoch == 0 {
-                return Err(SourceError::Integrity);
+                return Err(integrity(&target, "assignment-epoch-zero"));
             }
             Ok(ResourceAssignmentFence {
                 resource_uid: uid,
