@@ -12,6 +12,8 @@
   interaction, Guest, and observability runner startup paths.
 - Kept authenticated system-core status and finalizer projections local to
   resource audit while retaining broker evidence for desired-state mutations.
+- Preserved that broker-evidence classification when pending audit outboxes
+  are normalized during crash recovery.
 
 ### Removed
 

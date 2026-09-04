@@ -741,6 +741,184 @@ async fn system_core_status_and_finalizer_projections_do_not_need_broker_evidenc
 }
 
 #[tokio::test]
+async fn internal_projection_outboxes_survive_reopen_without_broker_evidence() {
+    let (directory, file, marker) = provisioned_store();
+    let store_identity = identity();
+    let (issuer, store_acceptor) = mutation_seal_pair(store_identity.seal_identity());
+    let audit = Arc::new(RecordingAudit::default());
+    let store = RedbResourceStore::provision_owned_with_test_ports(
+        file,
+        marker,
+        store_identity.clone(),
+        store_acceptor,
+        Arc::new(NoopStoreTelemetry),
+        audit.clone(),
+    )
+    .await
+    .unwrap();
+    let created = seed_broker_audited_resource(&store, &issuer, "Provider", "reopen-provider")
+        .await;
+    let status_operation = "system-core-reopen-status";
+    crate::transaction::fail_next_audit_outbox_clear_for_test();
+    let status_error = store
+        .commit_verified(issuer.seal(update_seal_body_for_type_as(
+            status_operation,
+            created.resource_ref.clone(),
+            ResourceMutationKind::UpdateStatus,
+            created.revision,
+            Some(created.uid.clone()),
+            Some(update_status_body(&created.canonical_json, "Ready")),
+            "Provider/system-core",
+            None,
+            Vec::new(),
+            Vec::new(),
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(status_error.kind(), StoreErrorKind::StoreIntegrityFailure);
+    drop(store);
+
+    let (reopen_issuer, reopen_acceptor) = mutation_seal_pair(store_identity.seal_identity());
+    let reopened = RedbResourceStore::open_owned_with_test_ports(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join("store.redb"))
+            .unwrap(),
+        store_identity.clone(),
+        reopen_acceptor,
+        Arc::new(NoopStoreTelemetry),
+        audit.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(!reopened.audit_outbox_pending(status_operation).await.unwrap());
+    let current = reopened
+        .get(StoreGetRequest {
+            operation: operation("reopen-status-read"),
+            zone: ZoneId::parse("work").unwrap(),
+            target: created.resource_ref.clone(),
+            expected_uid: Some(created.uid.clone()),
+            projection: StoreProjection::Full,
+        })
+        .await
+        .unwrap();
+
+    let finalizer_operation = "system-core-reopen-finalizer";
+    crate::transaction::fail_next_audit_outbox_clear_for_test();
+    let finalizer_error = reopened
+        .commit_verified(reopen_issuer.seal(update_seal_body_for_type_as(
+            finalizer_operation,
+            current.resource_ref.clone(),
+            ResourceMutationKind::UpdateFinalizers,
+            current.revision,
+            None,
+            None,
+            "Provider/system-core",
+            None,
+            vec![FinalizerId::parse("core.reopen-test").unwrap()],
+            Vec::new(),
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(finalizer_error.kind(), StoreErrorKind::StoreIntegrityFailure);
+    drop(reopened);
+
+    let (_, recovery_acceptor) = mutation_seal_pair(store_identity.seal_identity());
+    let recovered = RedbResourceStore::open_owned_with_test_ports(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join("store.redb"))
+            .unwrap(),
+        store_identity,
+        recovery_acceptor,
+        Arc::new(NoopStoreTelemetry),
+        audit.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(!recovered
+        .audit_outbox_pending(finalizer_operation)
+        .await
+        .unwrap());
+    assert_eq!(audit.records().len(), 3);
+    recovered.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn broker_required_outboxes_remain_fail_closed_after_reopen() {
+    for (operation_id, kind, subject_ref) in [
+        (
+            "caller-reopen-status",
+            ResourceMutationKind::UpdateStatus,
+            "Provider/caller",
+        ),
+        (
+            "system-core-reopen-spec",
+            ResourceMutationKind::UpdateSpec,
+            "Provider/system-core",
+        ),
+    ] {
+        let (directory, file, marker) = provisioned_store();
+        let store_identity = identity();
+        let (issuer, store_acceptor) = mutation_seal_pair(store_identity.seal_identity());
+        let store = RedbResourceStore::provision_owned_with_test_ports(
+            file,
+            marker,
+            store_identity.clone(),
+            store_acceptor,
+            Arc::new(NoopStoreTelemetry),
+            Arc::new(RecordingAudit::default()),
+        )
+        .await
+        .unwrap();
+        let created =
+            seed_broker_audited_resource(&store, &issuer, "Provider", "required-reopen").await;
+        let canonical_resource = match kind {
+            ResourceMutationKind::UpdateStatus => {
+                Some(update_status_body(&created.canonical_json, "Ready"))
+            }
+            ResourceMutationKind::UpdateSpec => Some(update_spec_body(&created.canonical_json)),
+            _ => unreachable!(),
+        };
+        let error = store
+            .commit_verified(issuer.seal(update_seal_body_for_type_as(
+                operation_id,
+                created.resource_ref.clone(),
+                kind,
+                created.revision,
+                Some(created.uid.clone()),
+                canonical_resource,
+                subject_ref,
+                None,
+                Vec::new(),
+                Vec::new(),
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), StoreErrorKind::StoreIntegrityFailure);
+        drop(store);
+
+        let (_, reopen_acceptor) = mutation_seal_pair(store_identity.seal_identity());
+        let reopen_error = RedbResourceStore::open_owned_with_test_ports(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(directory.path().join("store.redb"))
+                .unwrap(),
+            store_identity,
+            reopen_acceptor,
+            Arc::new(NoopStoreTelemetry),
+            Arc::new(RecordingAudit::default()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reopen_error.kind(), StoreErrorKind::StoreIntegrityFailure);
+    }
+}
+
+#[tokio::test]
 async fn non_system_core_status_and_finalizer_projections_require_broker_evidence() {
     for (resource_type, name) in [
         ("Provider", "non-internal-provider"),

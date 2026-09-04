@@ -831,6 +831,19 @@ fn requires_broker_audit_for_write(verified: &VerifiedWrite) -> bool {
     })
 }
 
+fn requires_broker_audit_for_outbox(outbox: &AuditOutboxRecord) -> bool {
+    let system_core_subject =
+        outbox.subject_digest == crate::audit::opaque_digest(SYSTEM_CORE_SUBJECT_REF);
+    outbox.mutations.iter().any(|mutation| {
+        requires_broker_audit(mutation.resource_type.as_str())
+            && !(system_core_subject
+                && matches!(
+                    mutation.verb.as_str(),
+                    "update-status" | "update-finalizers"
+                ))
+    })
+}
+
 fn failed_operation_record(
     verified: &VerifiedWrite,
     current_revision: u64,
@@ -1178,11 +1191,8 @@ pub(crate) fn normalize_audit_outboxes(database: &Database) -> Result<(), StoreE
                 changed = true;
             }
         }
-        let required_broker = outbox.requires_broker
-            || outbox
-                .mutations
-                .iter()
-                .any(|mutation| requires_broker_audit(mutation.resource_type.as_str()));
+        let required_broker =
+            outbox.requires_broker || requires_broker_audit_for_outbox(&outbox);
         if required_broker != outbox.requires_broker {
             outbox.requires_broker = required_broker;
             changed = true;
