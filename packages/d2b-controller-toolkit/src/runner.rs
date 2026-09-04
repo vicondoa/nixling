@@ -357,6 +357,16 @@ pub trait ControllerSource: Send + Sync + 'static {
         projection: &ReconcileProjection,
     ) -> impl Future<Output = Result<(), SourceError>> + Send;
 
+    /// Persist a failure projection while retaining the accepted effect's
+    /// operation identity across persistence-only retries.
+    fn persist_outcome_with_operation(
+        &self,
+        projection: &ReconcileProjection,
+        _operation: &OperationContext,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        async move { self.persist_outcome(projection).await }
+    }
+
     fn checkpoint(
         &self,
         context: &ReconcileContext,
@@ -538,6 +548,7 @@ pub struct RunnerConfig {
 }
 
 const WATCH_RECOVERY_MAX_CONFLICT_RETRIES: usize = 3;
+const FAILURE_PERSISTENCE_MAX_ATTEMPTS: usize = 3;
 
 /// Successful loop summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -549,6 +560,7 @@ pub struct RunnerReport {
     pub handler_retries: usize,
     pub handler_failures: usize,
     pub committed_status_pending: usize,
+    pub persistence_uncertain: usize,
 }
 
 /// Closed runner counter labels.
@@ -1033,6 +1045,7 @@ where
                                     completion.work.key(),
                                     persisted_reason,
                                     generation,
+                                    completion.work.operation(),
                                 )
                                 .await?;
                                 match persistence {
@@ -1054,15 +1067,15 @@ where
                                             workers.len(),
                                         );
                                     }
-                                    FailurePersistence::Requeue(retry_revision) => {
-                                        let lane = completion.work.lane();
-                                        queue.retry(completion.work, retry_revision)?;
-                                        report.conflicts_retried += 1;
+                                    FailurePersistence::Uncertain => {
+                                        queue.finish(&key)?;
+                                        report.handler_failures += 1;
+                                        report.persistence_uncertain += 1;
                                         observe_counter(
                                             self.observer.as_ref(),
-                                            RunnerCounter::Retry,
-                                            Some(lane),
-                                            RunnerOutcome::Retrying,
+                                            RunnerCounter::Exhaustion,
+                                            Some(completion.work.lane()),
+                                            RunnerOutcome::Exhausted,
                                             RunnerObservationReason::Conflict,
                                             queue.resource_count(),
                                             workers.len(),
@@ -1104,6 +1117,7 @@ where
                                 projection.target(),
                                 FailureProjectionFields::from_projection(&projection),
                                 generation,
+                                completion.work.operation(),
                             )
                             .await?;
                             match persistence {
@@ -1120,15 +1134,15 @@ where
                                         workers.len(),
                                     );
                                 }
-                                FailurePersistence::Requeue(retry_revision) => {
-                                    let lane = completion.work.lane();
-                                    queue.retry(completion.work, retry_revision)?;
-                                    report.conflicts_retried += 1;
+                                FailurePersistence::Uncertain => {
+                                    queue.finish(&key)?;
+                                    report.handler_failures += 1;
+                                    report.persistence_uncertain += 1;
                                     observe_counter(
                                         self.observer.as_ref(),
-                                        RunnerCounter::Retry,
-                                        Some(lane),
-                                        RunnerOutcome::Retrying,
+                                        RunnerCounter::Exhaustion,
+                                        Some(completion.work.lane()),
+                                        RunnerOutcome::Exhausted,
                                         RunnerObservationReason::Conflict,
                                         queue.resource_count(),
                                         workers.len(),
@@ -1647,7 +1661,15 @@ fn failure_projection(
 enum FailurePersistence {
     Persisted,
     Skipped,
-    Requeue(ZoneRevision),
+    Uncertain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailurePersistenceAttempt {
+    Persisted,
+    Skipped,
+    Conflict,
+    Uncertain,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1669,7 +1691,7 @@ impl FailureProjectionFields {
     }
 }
 
-async fn persist_failure_projection<S>(
+async fn persist_failure_projection_once<S>(
     source: &S,
     clock: &dyn MonotonicClock,
     deadline_tick: u64,
@@ -1677,12 +1699,13 @@ async fn persist_failure_projection<S>(
     target: &ResourceKey,
     fields: FailureProjectionFields,
     expected_generation: Option<ResourceGeneration>,
-) -> Result<FailurePersistence, RunnerError>
+    operation: &OperationContext,
+) -> Result<FailurePersistenceAttempt, RunnerError>
 where
     S: ControllerSource,
 {
     if fields.event_only {
-        return Ok(FailurePersistence::Skipped);
+        return Ok(FailurePersistenceAttempt::Skipped);
     }
     let fresh = match bounded_source(
         clock,
@@ -1693,8 +1716,8 @@ where
     .await
     {
         Ok(fresh) => fresh,
-        Err(RunnerError::Source(SourceError::Conflict(revision))) => {
-            return Ok(FailurePersistence::Requeue(revision));
+        Err(RunnerError::Source(SourceError::Conflict(_))) => {
+            return Ok(FailurePersistenceAttempt::Conflict);
         }
         Err(error) => return Err(error),
     };
@@ -1702,12 +1725,12 @@ where
         FreshSnapshot::Present {
             target: current, ..
         } => current,
-        FreshSnapshot::Deleted { .. } => return Ok(FailurePersistence::Skipped),
+        FreshSnapshot::Deleted { .. } => return Ok(FailurePersistenceAttempt::Skipped),
     };
     if current.key() != target
         || expected_generation.is_some_and(|generation| current.generation() != generation)
     {
-        return Ok(FailurePersistence::Requeue(current.revision()));
+        return Ok(FailurePersistenceAttempt::Uncertain);
     }
     let projection = ReconcileProjection::new(
         current.key().clone(),
@@ -1721,16 +1744,59 @@ where
         clock,
         deadline_tick,
         cancellation,
-        source.persist_outcome(&projection),
+        source.persist_outcome_with_operation(&projection, operation),
     )
     .await
     {
-        Ok(()) => Ok(FailurePersistence::Persisted),
-        Err(RunnerError::Source(SourceError::Conflict(revision))) => {
-            Ok(FailurePersistence::Requeue(revision))
+        Ok(()) => Ok(FailurePersistenceAttempt::Persisted),
+        Err(RunnerError::Source(SourceError::Conflict(_))) => {
+            Ok(FailurePersistenceAttempt::Conflict)
         }
         Err(error) => Err(error),
     }
+}
+
+async fn persist_failure_projection<S>(
+    source: &S,
+    clock: &dyn MonotonicClock,
+    deadline_tick: u64,
+    cancellation: &Cancellation,
+    target: &ResourceKey,
+    fields: FailureProjectionFields,
+    expected_generation: Option<ResourceGeneration>,
+    operation: &OperationContext,
+) -> Result<FailurePersistence, RunnerError>
+where
+    S: ControllerSource,
+{
+    for attempt in 0..FAILURE_PERSISTENCE_MAX_ATTEMPTS {
+        match persist_failure_projection_once(
+            source,
+            clock,
+            deadline_tick,
+            cancellation,
+            target,
+            fields,
+            expected_generation,
+            operation,
+        )
+        .await?
+        {
+            FailurePersistenceAttempt::Persisted => {
+                return Ok(FailurePersistence::Persisted);
+            }
+            FailurePersistenceAttempt::Skipped => return Ok(FailurePersistence::Skipped),
+            FailurePersistenceAttempt::Uncertain => {
+                return Ok(FailurePersistence::Uncertain);
+            }
+            FailurePersistenceAttempt::Conflict
+                if attempt + 1 < FAILURE_PERSISTENCE_MAX_ATTEMPTS => {}
+            FailurePersistenceAttempt::Conflict => {
+                return Ok(FailurePersistence::Uncertain);
+            }
+        }
+    }
+    Ok(FailurePersistence::Uncertain)
 }
 
 async fn persist_exhaustion<S>(
@@ -1741,6 +1807,7 @@ async fn persist_exhaustion<S>(
     key: &ResourceKey,
     reason: ReconcileReason,
     expected_generation: Option<ResourceGeneration>,
+    operation: &OperationContext,
 ) -> Result<FailurePersistence, RunnerError>
 where
     S: ControllerSource,
@@ -1758,6 +1825,7 @@ where
             event_only: false,
         },
         expected_generation,
+        operation,
     )
     .await
 }
@@ -2556,7 +2624,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, BTreeSet, VecDeque},
+        collections::{BTreeMap, VecDeque},
         sync::{
             Mutex,
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -2609,8 +2677,8 @@ mod tests {
         abort_expedited: AtomicBool,
         expedited_gate_error: AtomicBool,
         effect_acceptance_conflicts_remaining: AtomicUsize,
-        deduplicate_effect_acceptance: AtomicBool,
-        accepted_operations: Mutex<BTreeSet<String>>,
+        accepted_operation_ids: Mutex<Vec<String>>,
+        persistence_operation_ids: Mutex<Vec<String>>,
         conflicts_remaining: AtomicUsize,
         commit_status_pending: AtomicBool,
         commit_revision: AtomicU64,
@@ -2651,8 +2719,8 @@ mod tests {
                     abort_expedited: AtomicBool::new(false),
                     expedited_gate_error: AtomicBool::new(false),
                     effect_acceptance_conflicts_remaining: AtomicUsize::new(0),
-                    deduplicate_effect_acceptance: AtomicBool::new(false),
-                    accepted_operations: Mutex::new(BTreeSet::new()),
+                    accepted_operation_ids: Mutex::new(Vec::new()),
+                    persistence_operation_ids: Mutex::new(Vec::new()),
                     conflicts_remaining: AtomicUsize::new(0),
                     commit_status_pending: AtomicBool::new(false),
                     commit_revision: AtomicU64::new(10),
@@ -2682,6 +2750,48 @@ mod tests {
         fn inject_watch_open_recovery_conflicts(&self, count: usize) {
             self.watch_open_conflicts_remaining
                 .store(count, Ordering::Release);
+        }
+
+        fn persist_outcome_impl(
+            &self,
+            projection: &ReconcileProjection,
+        ) -> Result<(), SourceError> {
+            if self.enforce_projection_revision.load(Ordering::SeqCst) {
+                let current_revision = self
+                    .fresh
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(projection.target())
+                    .map(|snapshot| match snapshot {
+                        FreshSnapshot::Present { target, .. } => target.revision(),
+                        FreshSnapshot::Deleted { revision, .. } => *revision,
+                    });
+                if current_revision != Some(projection.revision()) {
+                    return Err(SourceError::Conflict(
+                        current_revision.unwrap_or(ZoneRevision::new(11)),
+                    ));
+                }
+                if self
+                    .persist_conflicts_remaining
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        if remaining > 0 {
+                            Some(remaining - 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .is_ok()
+                {
+                    return Err(SourceError::Conflict(
+                        current_revision.unwrap_or(ZoneRevision::new(11)),
+                    ));
+                }
+            }
+            self.persisted_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(projection.clone());
+            Ok(())
         }
     }
 
@@ -2788,15 +2898,10 @@ mod tests {
                     .fetch_sub(1, Ordering::SeqCst);
                 return std::future::ready(Err(SourceError::Conflict(ZoneRevision::new(9))));
             }
-            if self.deduplicate_effect_acceptance.load(Ordering::SeqCst)
-                && !self
-                    .accepted_operations
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(context.operation().operation_id().to_owned())
-            {
-                return std::future::ready(Ok(()));
-            }
+            self.accepted_operation_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(context.operation().operation_id().to_owned());
             self.effect_acceptances.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(()))
         }
@@ -2878,42 +2983,19 @@ mod tests {
             &self,
             projection: &ReconcileProjection,
         ) -> impl Future<Output = Result<(), SourceError>> + Send {
-            if self.enforce_projection_revision.load(Ordering::SeqCst) {
-                let current_revision = self
-                    .fresh
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .get(projection.target())
-                    .map(|snapshot| match snapshot {
-                        FreshSnapshot::Present { target, .. } => target.revision(),
-                        FreshSnapshot::Deleted { revision, .. } => *revision,
-                    });
-                if current_revision != Some(projection.revision()) {
-                    return std::future::ready(Err(SourceError::Conflict(
-                        current_revision.unwrap_or(ZoneRevision::new(11)),
-                    )));
-                }
-                if self
-                    .persist_conflicts_remaining
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                        if remaining > 0 {
-                            Some(remaining - 1)
-                        } else {
-                            None
-                        }
-                    })
-                    .is_ok()
-                {
-                    return std::future::ready(Err(SourceError::Conflict(
-                        current_revision.unwrap_or(ZoneRevision::new(11)),
-                    )));
-                }
-            }
-            self.persisted_outcomes
+            std::future::ready(self.persist_outcome_impl(projection))
+        }
+
+        fn persist_outcome_with_operation(
+            &self,
+            projection: &ReconcileProjection,
+            operation: &OperationContext,
+        ) -> impl Future<Output = Result<(), SourceError>> + Send {
+            self.persistence_operation_ids
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(projection.clone());
-            std::future::ready(Ok(()))
+                .push(operation.operation_id().to_owned());
+            std::future::ready(self.persist_outcome_impl(projection))
         }
 
         fn schedule_requeue(
@@ -2955,6 +3037,8 @@ mod tests {
         block_handlers: AtomicBool,
         no_op_after_first: AtomicBool,
         mutation_only: AtomicBool,
+        reconcile_calls: AtomicUsize,
+        execute_effect_calls: AtomicUsize,
         assessment_state: Mutex<UpdateAssessmentState>,
         requeue_at: Mutex<Option<u64>>,
     }
@@ -3070,6 +3154,7 @@ mod tests {
             _dependencies: &[DependencySnapshot],
             _plan: &ReconcilePlan,
         ) -> Result<ReconcileResult, Self::Error> {
+            self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
             if self.mutation_only.load(Ordering::SeqCst) {
                 self.enter(resource.key(), "reconcile").await;
                 self.reconcile_count.fetch_add(1, Ordering::SeqCst);
@@ -3125,6 +3210,7 @@ mod tests {
             _plan: &ReconcilePlan,
         ) -> Result<ReconcileResult, Self::Error> {
             context.authorize_effect().map_err(|_| FakeError)?;
+            self.execute_effect_calls.fetch_add(1, Ordering::SeqCst);
             self.enter(resource.key(), "reconcile").await;
             self.reconcile_count.fetch_add(1, Ordering::SeqCst);
             ReconcileResult::new(
@@ -3417,6 +3503,8 @@ mod tests {
             block_handlers: AtomicBool::new(true),
             no_op_after_first: AtomicBool::new(false),
             mutation_only: AtomicBool::new(false),
+            reconcile_calls: AtomicUsize::new(0),
+            execute_effect_calls: AtomicUsize::new(0),
             assessment_state: Mutex::new(UpdateAssessmentState::Current),
             requeue_at: Mutex::new(None),
         });
@@ -4273,37 +4361,7 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_failure_rebases_to_exact_target_revision_below_zone_high_water() {
-        let target = key("app", 1);
-        let (reconciler, _entered, source, watch_tx) =
-            harness_with_revisions(vec![target.clone()], 1, 11, 2);
-        reconciler.block_handlers.store(false, Ordering::SeqCst);
-        source.conflicts_remaining.store(3, Ordering::SeqCst);
-        source
-            .enforce_projection_revision
-            .store(true, Ordering::SeqCst);
-        let runner = run_in_thread(reconciler, Arc::clone(&source));
-
-        wait_for_outcomes(&source, 1);
-        let outcomes = source
-            .persisted_outcomes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(outcomes[0].target(), &target);
-        assert_eq!(outcomes[0].revision(), ZoneRevision::new(2));
-        drop(outcomes);
-        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
-
-        let report = runner
-            .join()
-            .expect("runner thread")
-            .expect("exact target revision avoids a terminal source conflict");
-        assert_eq!(report.handler_failures, 1);
-        assert_eq!(source.commits.load(Ordering::SeqCst), 3);
-    }
-
-    #[test]
-    fn exhausted_failure_requeues_status_race_without_killing_runner_or_repeating_effects() {
+    fn exhausted_persistence_conflict_does_not_reenter_effects() {
         let target = key("app", 1);
         let (reconciler, _entered, source, watch_tx) =
             harness_with_revisions(vec![target.clone()], 1, 11, 2);
@@ -4315,25 +4373,139 @@ mod tests {
         source
             .persist_conflicts_remaining
             .store(1, Ordering::SeqCst);
-        source
-            .deduplicate_effect_acceptance
-            .store(true, Ordering::SeqCst);
-        let runner = run_in_thread(reconciler, Arc::clone(&source));
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
 
-        wait_for(&source.effect_acceptances, 1);
+        wait_for(&reconciler.execute_effect_calls, 3);
         watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
 
         let report = runner
             .join()
             .expect("runner thread")
-            .expect("status race must requeue instead of stopping the runner");
-        assert!(report.conflicts_retried >= 1);
-        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 1);
+            .expect("persistence-only retry avoids a terminal source conflict");
+        assert_eq!(report.handler_failures, 1);
+        assert_eq!(source.commits.load(Ordering::SeqCst), 3);
+        assert_eq!(reconciler.reconcile_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(reconciler.execute_effect_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 3);
+        let accepted = source
+            .accepted_operation_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(accepted.len(), 3);
+        assert_eq!(
+            accepted
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1,
+            "pre-bound retries must keep one effect operation identity"
+        );
+        let persistence_operations = source
+            .persistence_operation_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(persistence_operations.len(), 2);
+        assert_eq!(
+            persistence_operations
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1,
+            "persistence-only retries must keep the accepted operation identity"
+        );
+        assert_eq!(persistence_operations[0], accepted[0]);
         let outcomes = source
             .persisted_outcomes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert!(outcomes.is_empty());
+        assert_eq!(outcomes[0].target(), &target);
+        assert_eq!(outcomes[0].revision(), ZoneRevision::new(2));
+    }
+
+    #[test]
+    fn exhausted_handler_persistence_conflict_does_not_start_new_effect() {
+        let target = key("app", 1);
+        let (reconciler, _entered, source, watch_tx) =
+            harness_with_revisions(vec![target.clone()], 1, 11, 2);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        reconciler
+            .handler_failures_remaining
+            .store(8, Ordering::SeqCst);
+        source
+            .enforce_projection_revision
+            .store(true, Ordering::SeqCst);
+        source
+            .persist_conflicts_remaining
+            .store(1, Ordering::SeqCst);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+
+        wait_for_outcomes(&source, 1);
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let report = runner
+            .join()
+            .expect("runner thread")
+            .expect("handler exhaustion persistence must not stop the runner");
+        assert_eq!(report.handler_failures, 1);
+        assert_eq!(reconciler.reconcile_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(reconciler.execute_effect_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 0);
+        let persistence_operations = source
+            .persistence_operation_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(persistence_operations.len(), 2);
+        assert_eq!(
+            persistence_operations
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
+        let outcomes = source
+            .persisted_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(outcomes[0].revision(), ZoneRevision::new(2));
+    }
+
+    #[test]
+    fn exhausted_persistence_uncertainty_keeps_runner_alive_without_effect_retry() {
+        let target = key("app", 1);
+        let (reconciler, _entered, source, watch_tx) =
+            harness_with_revisions(vec![target], 1, 11, 2);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        reconciler
+            .handler_failures_remaining
+            .store(8, Ordering::SeqCst);
+        source
+            .enforce_projection_revision
+            .store(true, Ordering::SeqCst);
+        source
+            .persist_conflicts_remaining
+            .store(10, Ordering::SeqCst);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+
+        wait_for(&source.reads_started, 6);
+        assert!(
+            !runner.is_finished(),
+            "watch must remain open on uncertainty"
+        );
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let report = runner
+            .join()
+            .expect("runner thread")
+            .expect("persistence uncertainty must not kill the runner");
+        assert_eq!(report.persistence_uncertain, 1);
+        assert_eq!(reconciler.execute_effect_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            source
+                .persisted_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4766,6 +4938,8 @@ mod tests {
             block_handlers: AtomicBool::new(false),
             no_op_after_first: AtomicBool::new(false),
             mutation_only: AtomicBool::new(false),
+            reconcile_calls: AtomicUsize::new(0),
+            execute_effect_calls: AtomicUsize::new(0),
             assessment_state: Mutex::new(UpdateAssessmentState::Current),
             requeue_at: Mutex::new(None),
         });

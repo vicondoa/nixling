@@ -28,6 +28,8 @@
 - Reconnected the fd10 acceptance controller across daemon restarts, kept
   Ready Process observation read-only, and rebased exhausted Runner status
   projections to the exact target revision without killing the healthy runner.
+- Kept exhausted status conflicts inside a bounded persistence-only loop so
+  retries retain effect identity without re-running accepted Process effects.
 
 ### Removed
 
