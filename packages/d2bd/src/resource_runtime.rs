@@ -13681,6 +13681,7 @@ impl ZoneResourceRuntime {
                                 failed_resource = ?error
                                     .failed_key()
                                     .map(|key| key.resource_ref().to_canonical_string()),
+                                failed_operation = ?error.failed_operation(),
                                 "U9 interaction shared Runner failed",
                             );
                         }
@@ -17310,6 +17311,7 @@ impl ZoneResourceRuntime {
                             failed_resource = ?error
                                 .failed_key()
                                 .map(|key| key.resource_ref().to_canonical_string()),
+                            failed_operation = ?error.failed_operation(),
                             "Process Provider shared runner failed",
                         );
                     }

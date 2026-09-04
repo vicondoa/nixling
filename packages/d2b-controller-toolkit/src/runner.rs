@@ -692,6 +692,7 @@ pub struct RunnerFailure {
     error: RunnerError,
     report: RunnerReport,
     failed_key: Option<ResourceKey>,
+    failed_operation: Option<&'static str>,
 }
 
 impl RunnerFailure {
@@ -708,6 +709,11 @@ impl RunnerFailure {
     /// Return the resource whose worker surfaced a source failure, if any.
     pub fn failed_key(&self) -> Option<&ResourceKey> {
         self.failed_key.as_ref()
+    }
+
+    /// Return the bounded source operation that surfaced a worker failure.
+    pub const fn failed_operation(&self) -> Option<&'static str> {
+        self.failed_operation
     }
 }
 
@@ -831,8 +837,15 @@ where
     ) -> Result<RunnerReport, RunnerFailure> {
         let mut report = RunnerReport::default();
         let mut failed_key = None;
+        let mut failed_operation = None;
         match self
-            .run_loop(shutdown, &mut report, startup, &mut failed_key)
+            .run_loop(
+                shutdown,
+                &mut report,
+                startup,
+                &mut failed_key,
+                &mut failed_operation,
+            )
             .await
         {
             Ok(()) => Ok(report),
@@ -844,6 +857,7 @@ where
                     error,
                     report,
                     failed_key,
+                    failed_operation,
                 })
             }
         }
@@ -855,6 +869,7 @@ where
         report: &mut RunnerReport,
         startup: &mut Option<RunnerStartupCallback>,
         failed_key: &mut Option<ResourceKey>,
+        failed_operation: &mut Option<&'static str>,
     ) -> Result<(), RunnerError> {
         let startup_deadline = phase_deadline(self.clock.as_ref(), self.config.deadline_tick);
         let descriptor = bounded_phase(
@@ -1070,8 +1085,9 @@ where
                                 workers.len(),
                             );
                         }
-                        WorkerOutcome::SourceFailed(error) => {
+                        WorkerOutcome::SourceFailed { error, operation } => {
                             *failed_key = Some(key.clone());
+                            *failed_operation = Some(operation);
                             queue.finish(&key)?;
                             return Err(RunnerError::Source(error));
                         }
@@ -1338,7 +1354,10 @@ enum WorkerOutcome {
     Terminal {
         projection: ReconcileProjection,
     },
-    SourceFailed(SourceError),
+    SourceFailed {
+        error: SourceError,
+        operation: &'static str,
+    },
 }
 
 #[derive(Default)]
@@ -1639,7 +1658,12 @@ where
                 reason: ReconcileReason::ConflictExhausted,
             };
         }
-        Err(error) => return WorkerOutcome::SourceFailed(error),
+        Err(error) => {
+            return WorkerOutcome::SourceFailed {
+                error,
+                operation: "read_fresh",
+            };
+        }
     };
     let (target, dependencies, event_only) = match fresh {
         FreshSnapshot::Present {
@@ -1647,7 +1671,10 @@ where
             dependencies,
         } => {
             if target.key() != work.key() {
-                return WorkerOutcome::SourceFailed(SourceError::Integrity);
+                return WorkerOutcome::SourceFailed {
+                    error: SourceError::Integrity,
+                    operation: "read_fresh_identity",
+                };
             }
             (target, dependencies, false)
         }
@@ -1657,7 +1684,10 @@ where
             generation,
         } => {
             if &key != work.key() {
-                return WorkerOutcome::SourceFailed(SourceError::Integrity);
+                return WorkerOutcome::SourceFailed {
+                    error: SourceError::Integrity,
+                    operation: "read_fresh_deleted_identity",
+                };
             }
             (
                 ResourceSnapshot::new(key, revision, generation, Vec::new(), true),
@@ -1772,7 +1802,12 @@ where
                     requeue_at: None,
                 };
             }
-            Err(error) => return WorkerOutcome::SourceFailed(error),
+            Err(error) => {
+                return WorkerOutcome::SourceFailed {
+                    error,
+                    operation: "await_expedited_commit",
+                };
+            }
         }
     }
 
@@ -1816,7 +1851,12 @@ where
                         reason: ReconcileReason::ConflictExhausted,
                     };
                 }
-                Err(error) => return WorkerOutcome::SourceFailed(error),
+                Err(error) => {
+                    return WorkerOutcome::SourceFailed {
+                        error,
+                        operation: "accept_effect_finalize",
+                    };
+                }
             }
         }
         let mut result = match reconciler.execute_finalize(&context, &target).await {
@@ -1875,7 +1915,12 @@ where
                     reason: ReconcileReason::ConflictExhausted,
                 };
             }
-            Err(error) => return WorkerOutcome::SourceFailed(error),
+            Err(error) => {
+                return WorkerOutcome::SourceFailed {
+                    error,
+                    operation: "accept_effect_upgrade",
+                };
+            }
         }
         let result = match reconciler
             .execute_upgrade(&context, &target, &dependencies, &plan)
@@ -2006,7 +2051,12 @@ where
                     reason: ReconcileReason::ConflictExhausted,
                 };
             }
-            Err(error) => return WorkerOutcome::SourceFailed(error),
+            Err(error) => {
+                return WorkerOutcome::SourceFailed {
+                    error,
+                    operation: "accept_effect",
+                };
+            }
         }
         match reconciler
             .execute_effect(&context, &target, &dependencies, &plan)
@@ -2117,21 +2167,33 @@ where
         match source.commit_result(context, &result).await {
             Ok(CommitOutcome::Committed(revision)) => {
                 if revision < context.revision() {
-                    return WorkerOutcome::SourceFailed(SourceError::Integrity);
+                    return WorkerOutcome::SourceFailed {
+                        error: SourceError::Integrity,
+                        operation: "commit_revision_regressed",
+                    };
                 }
                 if context.is_expedited()
                     && result.mutation_batch().is_none()
                     && let Err(error) = persist_projection(source, context, &result, None).await
                 {
-                    return WorkerOutcome::SourceFailed(error);
+                    return WorkerOutcome::SourceFailed {
+                        error,
+                        operation: "persist_projection_expedited",
+                    };
                 }
                 if !context.is_expedited() {
                     if let Err(error) = source.complete_effect(context, &result).await {
-                        return WorkerOutcome::SourceFailed(error);
+                        return WorkerOutcome::SourceFailed {
+                            error,
+                            operation: "complete_effect_after_commit",
+                        };
                     }
                 }
                 if let Err(error) = source.checkpoint(context, revision).await {
-                    return WorkerOutcome::SourceFailed(error);
+                    return WorkerOutcome::SourceFailed {
+                        error,
+                        operation: "checkpoint_after_commit",
+                    };
                 }
                 return WorkerOutcome::Done {
                     checkpointed: true,
@@ -2141,7 +2203,10 @@ where
             }
             Ok(CommitOutcome::CommittedStatusPending(revision)) => {
                 if revision < context.revision() {
-                    return WorkerOutcome::SourceFailed(SourceError::Integrity);
+                    return WorkerOutcome::SourceFailed {
+                        error: SourceError::Integrity,
+                        operation: "commit_status_revision_regressed",
+                    };
                 }
                 if context.is_expedited()
                     && result.mutation_batch().is_none()
@@ -2153,15 +2218,24 @@ where
                     )
                     .await
                 {
-                    return WorkerOutcome::SourceFailed(error);
+                    return WorkerOutcome::SourceFailed {
+                        error,
+                        operation: "persist_projection_pending",
+                    };
                 }
                 if !context.is_expedited() {
                     if let Err(error) = source.complete_effect(context, &result).await {
-                        return WorkerOutcome::SourceFailed(error);
+                        return WorkerOutcome::SourceFailed {
+                            error,
+                            operation: "complete_effect_after_pending_commit",
+                        };
                     }
                 }
                 if let Err(error) = source.checkpoint(context, revision).await {
-                    return WorkerOutcome::SourceFailed(error);
+                    return WorkerOutcome::SourceFailed {
+                        error,
+                        operation: "checkpoint_after_pending_commit",
+                    };
                 }
                 return WorkerOutcome::Done {
                     checkpointed: true,
@@ -2175,16 +2249,27 @@ where
                     reason: ReconcileReason::ConflictExhausted,
                 };
             }
-            Err(error) => return WorkerOutcome::SourceFailed(error),
+            Err(error) => {
+                return WorkerOutcome::SourceFailed {
+                    error,
+                    operation: "commit_result",
+                };
+            }
         }
     }
 
     if let Err(error) = persist_projection(source, context, &result, None).await {
-        return WorkerOutcome::SourceFailed(error);
+        return WorkerOutcome::SourceFailed {
+            error,
+            operation: "persist_projection",
+        };
     }
     if !context.is_expedited() {
         if let Err(error) = source.complete_effect(context, &result).await {
-            return WorkerOutcome::SourceFailed(error);
+            return WorkerOutcome::SourceFailed {
+                error,
+                operation: "complete_effect",
+            };
         }
     }
     if result.disposition().is_terminal()
@@ -2195,7 +2280,10 @@ where
             .checkpoint(context, result.processed_revision())
             .await
         {
-            return WorkerOutcome::SourceFailed(error);
+            return WorkerOutcome::SourceFailed {
+                error,
+                operation: "checkpoint",
+            };
         }
         return WorkerOutcome::Done {
             checkpointed: true,
