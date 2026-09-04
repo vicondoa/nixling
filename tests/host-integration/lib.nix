@@ -29,6 +29,10 @@ let
       yubikey.enable = false;
       usePrebuiltHostTools = false;
     };
+    # The daemon's v3 bundle always carries the local-root storage row. Keep
+    # the corresponding root Zone in these minimal host fixtures so the
+    # emitted topology is sealed and the daemon can enter Ready.
+    d2b.zones.local-root = { };
     # The full daemon + broker systemd surface under test.
     d2b.daemonExperimental.enable = true;
   };
