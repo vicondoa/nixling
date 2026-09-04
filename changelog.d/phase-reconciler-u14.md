@@ -39,6 +39,8 @@
   rejecting identity mismatches instead of falling back to projection IDs.
 - Validated capability-miss retries against the durable effect row and exact
   UID/generation/revision before reusing the supplied effect operation.
+- Resumed pending or retryable authority rows on capability-miss retries and
+  refused to report persistence success while the ledger remained nonterminal.
 
 ### Removed
 

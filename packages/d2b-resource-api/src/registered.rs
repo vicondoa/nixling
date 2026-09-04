@@ -975,11 +975,17 @@ impl RedbRegisteredControllerApi {
             .map(|mut accepted| accepted.remove(operation_id))
     }
 
-    async fn validate_status_operation(
+    async fn resolve_status_operation(
         &self,
         operation_id: &str,
         projection: &ReconcileProjection,
-    ) -> Result<(), SourceError> {
+    ) -> Result<
+        (
+            String,
+            Option<d2b_resource_store_redb::AuthorityOperationCapability>,
+        ),
+        SourceError,
+    > {
         let row = self
             .store
             .authority_operations()
@@ -991,6 +997,7 @@ impl RedbRegisteredControllerApi {
         if matches!(
             row.state,
             d2b_resource_store_redb::AuthorityOperationState::Released
+                | d2b_resource_store_redb::AuthorityOperationState::Closing
                 | d2b_resource_store_redb::AuthorityOperationState::Closed
         ) {
             return Err(SourceError::Integrity);
@@ -1025,7 +1032,32 @@ impl RedbRegisteredControllerApi {
         {
             return Err(SourceError::Integrity);
         }
-        Ok(())
+        let resumed = match row.state {
+            d2b_resource_store_redb::AuthorityOperationState::Pending
+            | d2b_resource_store_redb::AuthorityOperationState::EffectRetryable => {
+                let binding_digest = payload
+                    .get("storeBindingDigest")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(SourceError::Integrity)?;
+                Some(
+                    self.store
+                        .resume_authority_operation(
+                            operation_id.to_owned(),
+                            binding_digest,
+                        )
+                        .await
+                        .map_err(|_| SourceError::Integrity)?,
+                )
+            }
+            d2b_resource_store_redb::AuthorityOperationState::EffectConfirmed
+            | d2b_resource_store_redb::AuthorityOperationState::EffectTerminal => None,
+            d2b_resource_store_redb::AuthorityOperationState::Released
+            | d2b_resource_store_redb::AuthorityOperationState::Closing
+            | d2b_resource_store_redb::AuthorityOperationState::Closed => {
+                return Err(SourceError::Integrity);
+            }
+        };
+        Ok((operation_id.to_owned(), resumed))
     }
 
     async fn record_effect_state(
@@ -1041,6 +1073,17 @@ impl RedbRegisteredControllerApi {
                 .map_err(|error| source_error(error, revision))?;
         }
         Ok(())
+    }
+
+    async fn record_capability_state(
+        capability: d2b_resource_store_redb::AuthorityOperationCapability,
+        revision: ZoneRevision,
+        state: d2b_resource_store_redb::AuthorityOperationState,
+    ) -> Result<(), SourceError> {
+        capability
+            .record_effect(state)
+            .await
+            .map_err(|error| source_error(error, revision))
     }
 }
 
@@ -1501,27 +1544,39 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
                 .lock()
                 .map_err(|_| SourceError::Integrity)?
                 .get(operation.operation_id())
-                .map(|capability| capability.operation_id().to_owned());
-            let status_operation_id = if let Some(accepted_operation_id) =
-                accepted_operation_id
-            {
-                accepted_operation_id
-            } else {
-                self.validate_status_operation(operation.operation_id(), projection)
-                    .await?;
-                operation.operation_id().to_owned()
-            };
+                .map(|capability| {
+                    (
+                        capability.operation_id().to_owned(),
+                        None::<d2b_resource_store_redb::AuthorityOperationCapability>,
+                    )
+                });
+            let (status_operation_id, resumed_capability) =
+                if let Some(accepted_operation_id) = accepted_operation_id {
+                    accepted_operation_id
+                } else {
+                    self.resolve_status_operation(operation.operation_id(), projection)
+                        .await?
+                };
             self.persist_projection_status_with_operation(
                 projection,
                 Some(status_operation_id.as_str()),
             )
-                .await?;
-            self.record_effect_state(
-                operation.operation_id(),
-                projection.revision(),
-                projection_state(projection.disposition(), projection.reason()),
-            )
-            .await
+            .await?;
+            let state = projection_state(projection.disposition(), projection.reason());
+            if let Some(capability) = resumed_capability {
+                Self::record_capability_state(capability, projection.revision(), state).await?;
+            } else {
+                self.record_effect_state(operation.operation_id(), projection.revision(), state)
+                    .await?;
+            }
+            if matches!(
+                state,
+                d2b_resource_store_redb::AuthorityOperationState::Pending
+                    | d2b_resource_store_redb::AuthorityOperationState::EffectRetryable
+            ) {
+                return Err(SourceError::Conflict(projection.revision()));
+            }
+            Ok(())
         }
     }
 
@@ -3729,6 +3784,126 @@ mod tests {
         assert!(!rows_after_retry[0]
             .operation_id
             .starts_with("projection-"));
+    }
+
+    #[tokio::test]
+    async fn capability_miss_resumes_retryable_effect_before_persisting_terminal_status() {
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
+        let target = ResourceRef::parse("Host/owner").unwrap();
+        store
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
+                target.clone(),
+                canonical_host("owner", None),
+                None,
+                "create-owner",
+            ))
+            .await
+            .unwrap();
+        let stored = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-retryable".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-retryable".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let assignment = primary_assignment(stored.uid.clone(), stored.revision);
+        let effect_ids = vec!["retryable-effect".to_owned()];
+        let claim_digest = effect_claim_digest(
+            "reconcile",
+            &stored.uid,
+            stored.generation,
+            &effect_ids,
+            Some(&assignment),
+        );
+        let operation_id = format!("effect:{claim_digest}");
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "kind": "controller-effect",
+            "state": "pending",
+            "operationClass": "reconcile",
+            "effectIds": effect_ids,
+            "resourceUid": stored.uid.as_str(),
+            "generation": stored.generation.get(),
+            "operationId": operation_id,
+            "claimDigest": claim_digest,
+            "storeBindingDigest": store.authority_binding_digest(&claim_digest),
+        }))
+        .unwrap();
+        store
+            .prepare_authority_operation(operation_id.clone(), payload, &claim_digest)
+            .await
+            .unwrap()
+            .record_effect(d2b_resource_store_redb::AuthorityOperationState::EffectRetryable)
+            .await
+            .unwrap();
+        let api = service
+            .registered_controller_api(
+                subject,
+                state,
+                vec![(target.clone(), assignment)],
+            )
+            .unwrap();
+        let projection = ReconcileProjection::new(
+            ResourceKey::new(
+                stored.zone.clone(),
+                stored.resource_ref.clone(),
+                stored.uid.clone(),
+            ),
+            stored.revision,
+            ResourcePhase::Failed,
+            d2b_core_controller::ProjectionDisposition::Failed,
+            d2b_core_controller::ReconcileReason::ConflictExhausted,
+            false,
+        );
+        let operation = OperationContext::new(
+            operation_id.clone(),
+            operation_id.clone(),
+            operation_id.clone(),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            api.persist_outcome_with_operation(&projection, &operation)
+                .await,
+            Err(SourceError::Conflict(_))
+        ));
+        let rows = store.authority_operations().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].operation_id, operation_id);
+        assert_eq!(
+            rows[0].state,
+            d2b_resource_store_redb::AuthorityOperationState::EffectRetryable
+        );
+        let updated = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-retryable-after".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-retryable-after".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target,
+                expected_uid: Some(stored.uid),
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let status: serde_json::Value =
+            serde_json::from_slice(&updated.canonical_json).unwrap();
+        assert_eq!(status["status"]["phase"], "Failed");
     }
 
     #[tokio::test]
