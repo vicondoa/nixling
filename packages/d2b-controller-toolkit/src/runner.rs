@@ -302,6 +302,18 @@ pub trait ControllerSource: Send + Sync + 'static {
         std::future::ready(Ok(()))
     }
 
+    /// Return the durable effect operation accepted for one pass.
+    ///
+    /// The returned identity is carried through worker completion so
+    /// persistence-only retries do not fall back to a transient watch
+    /// operation ID.
+    fn accepted_effect_operation(
+        &self,
+        _context: &ReconcileContext,
+    ) -> impl Future<Output = Result<Option<OperationContext>, SourceError>> + Send {
+        std::future::ready(Ok(None))
+    }
+
     /// Persist the terminal lifecycle state of an accepted ordinary effect.
     fn complete_effect(
         &self,
@@ -1045,7 +1057,7 @@ where
                                     completion.work.key(),
                                     persisted_reason,
                                     generation,
-                                    completion.work.operation(),
+                                    &completion.persistence_operation,
                                 )
                                 .await?;
                                 match persistence {
@@ -1117,7 +1129,7 @@ where
                                 projection.target(),
                                 FailureProjectionFields::from_projection(&projection),
                                 generation,
-                                completion.work.operation(),
+                                &completion.persistence_operation,
                             )
                             .await?;
                             match persistence {
@@ -1418,6 +1430,7 @@ fn initial_hints(
 
 struct WorkerCompletion {
     work: QueuedWork,
+    persistence_operation: OperationContext,
     outcome: WorkerOutcome,
     cancellation: Cancellation,
 }
@@ -1478,6 +1491,7 @@ impl OwnedWorkers {
                 deadline_tick,
                 ..runtime.config
             };
+            let mut persistence_operation = work.operation().clone();
             let outcome = match bounded_phase(
                 runtime.clock.as_ref(),
                 deadline_tick,
@@ -1490,6 +1504,7 @@ impl OwnedWorkers {
                     &work,
                     cancellation.clone(),
                     now_tick,
+                    &mut persistence_operation,
                 ),
             )
             .await
@@ -1517,6 +1532,7 @@ impl OwnedWorkers {
             };
             WorkerCompletion {
                 work,
+                persistence_operation,
                 outcome,
                 cancellation,
             }
@@ -1902,6 +1918,7 @@ async fn execute_work_inner<R, S>(
     work: &QueuedWork,
     cancellation: Cancellation,
     now_tick: u64,
+    persistence_operation: &mut OperationContext,
 ) -> WorkerOutcome
 where
     R: ResourceReconciler,
@@ -2106,7 +2123,20 @@ where
             ReconcilePlan::new(vec!["finalize".to_owned()], false).expect("bounded finalize plan");
         if !event_only {
             match source.accept_effect(&context, &finalize_plan).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    if let Err(error) = capture_accepted_effect_operation(
+                        source.as_ref(),
+                        &context,
+                        persistence_operation,
+                    )
+                    .await
+                    {
+                        return WorkerOutcome::SourceFailed {
+                            error,
+                            operation: "accepted_effect_operation_finalize",
+                        };
+                    }
+                }
                 Err(SourceError::Conflict(revision)) => {
                     return WorkerOutcome::Retry {
                         revision,
@@ -2174,7 +2204,20 @@ where
         let acceptance_plan =
             ReconcilePlan::new(vec!["upgrade".to_owned()], false).expect("bounded upgrade plan");
         match source.accept_effect(&context, &acceptance_plan).await {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Err(error) = capture_accepted_effect_operation(
+                    source.as_ref(),
+                    &context,
+                    persistence_operation,
+                )
+                .await
+                {
+                    return WorkerOutcome::SourceFailed {
+                        error,
+                        operation: "accepted_effect_operation_upgrade",
+                    };
+                }
+            }
             Err(SourceError::Conflict(revision)) => {
                 return WorkerOutcome::Retry {
                     revision,
@@ -2322,7 +2365,20 @@ where
 
     let result = if plan.effect_count() > 0 {
         match source.accept_effect(&context, &plan).await {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Err(error) = capture_accepted_effect_operation(
+                    source.as_ref(),
+                    &context,
+                    persistence_operation,
+                )
+                .await
+                {
+                    return WorkerOutcome::SourceFailed {
+                        error,
+                        operation: "accepted_effect_operation",
+                    };
+                }
+            }
             Err(SourceError::Conflict(revision)) => {
                 return WorkerOutcome::Retry {
                     revision,
@@ -2601,6 +2657,20 @@ where
         status_pending: false,
         requeue_at: None,
     }
+}
+
+async fn capture_accepted_effect_operation<S>(
+    source: &S,
+    context: &ReconcileContext,
+    persistence_operation: &mut OperationContext,
+) -> Result<(), SourceError>
+where
+    S: ControllerSource,
+{
+    if let Some(operation) = source.accepted_effect_operation(context).await? {
+        *persistence_operation = operation;
+    }
+    Ok(())
 }
 
 async fn persist_projection<S>(

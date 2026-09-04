@@ -4170,6 +4170,30 @@ impl RegisteredControllerApi for GuestProcessSource {
         }
     }
 
+    fn accepted_effect_operation(
+        &self,
+        context: &ReconcileContext,
+    ) -> impl Future<Output = Result<Option<OperationContext>, SourceError>> + Send {
+        let operation_id = context.operation().operation_id().to_owned();
+        async move {
+            self.accepted
+                .lock()
+                .await
+                .get(&operation_id)
+                .map(|accepted| {
+                    let effect_operation_id = accepted.capability.operation_id().to_owned();
+                    OperationContext::new(
+                        effect_operation_id.clone(),
+                        effect_operation_id.clone(),
+                        effect_operation_id,
+                        None,
+                    )
+                    .map_err(|_| SourceError::Integrity)
+                })
+                .transpose()
+        }
+    }
+
     fn complete_effect(
         &self,
         context: &ReconcileContext,

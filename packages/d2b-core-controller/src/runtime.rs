@@ -133,6 +133,17 @@ pub trait RegisteredControllerApi: Send + Sync + 'static {
         std::future::ready(Ok(()))
     }
 
+    /// Return the durable effect operation accepted for one pass.
+    ///
+    /// Core forwards this identity so Runner persistence retries never use a
+    /// transient watch operation as ledger authority.
+    fn accepted_effect_operation(
+        &self,
+        _context: &ReconcileContext,
+    ) -> impl Future<Output = Result<Option<OperationContext>, SourceError>> + Send {
+        std::future::ready(Ok(None))
+    }
+
     fn complete_effect(
         &self,
         _context: &ReconcileContext,
@@ -520,6 +531,13 @@ where
         plan: &ReconcilePlan,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
         self.api.accept_effect(context, plan)
+    }
+
+    fn accepted_effect_operation(
+        &self,
+        context: &ReconcileContext,
+    ) -> impl Future<Output = Result<Option<OperationContext>, SourceError>> + Send {
+        self.api.accepted_effect_operation(context)
     }
 
     fn complete_effect(

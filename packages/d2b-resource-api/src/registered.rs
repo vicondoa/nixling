@@ -114,6 +114,8 @@ pub struct RedbRegisteredControllerApi {
     watch_change_observer: Option<WatchChangeObserver>,
     #[cfg(test)]
     status_timeouts_remaining: Arc<AtomicUsize>,
+    #[cfg(test)]
+    effect_state_failures_remaining: Arc<AtomicUsize>,
 }
 
 struct NativeCommitPath {
@@ -199,6 +201,8 @@ impl RedbRegisteredControllerApi {
             watch_change_observer: None,
             #[cfg(test)]
             status_timeouts_remaining: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            effect_state_failures_remaining: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -219,6 +223,8 @@ impl RedbRegisteredControllerApi {
             watch_change_observer: None,
             #[cfg(test)]
             status_timeouts_remaining: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            effect_state_failures_remaining: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -260,6 +266,8 @@ impl RedbRegisteredControllerApi {
             watch_change_observer: None,
             #[cfg(test)]
             status_timeouts_remaining: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            effect_state_failures_remaining: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -271,6 +279,12 @@ impl RedbRegisteredControllerApi {
     #[cfg(test)]
     fn inject_status_timeouts(&self, count: usize) {
         self.status_timeouts_remaining
+            .store(count, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn inject_effect_state_failures(&self, count: usize) {
+        self.effect_state_failures_remaining
             .store(count, Ordering::Release);
     }
 
@@ -1071,6 +1085,20 @@ impl RedbRegisteredControllerApi {
                 .record_effect(state)
                 .await
                 .map_err(|error| source_error(error, revision))?;
+            #[cfg(test)]
+            if self
+                .effect_state_failures_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return Err(SourceError::Timeout);
+            }
         }
         Ok(())
     }
@@ -1423,6 +1451,33 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
             }
             result
         }
+    }
+
+    fn accepted_effect_operation(
+        &self,
+        context: &ReconcileContext,
+    ) -> impl Future<Output = Result<Option<OperationContext>, SourceError>> + Send {
+        let operation_id = context.operation().operation_id().to_owned();
+        let result = self
+            .accepted
+            .lock()
+            .map_err(|_| SourceError::Integrity)
+            .and_then(|accepted| {
+                accepted
+                    .get(&operation_id)
+                    .map(|capability| {
+                        let effect_operation_id = capability.operation_id().to_owned();
+                        OperationContext::new(
+                            effect_operation_id.clone(),
+                            effect_operation_id.clone(),
+                            effect_operation_id,
+                            None,
+                        )
+                        .map_err(|_| SourceError::Integrity)
+                    })
+                    .transpose()
+            });
+        std::future::ready(result)
     }
 
     fn verify_expedited_commit(
@@ -3200,6 +3255,7 @@ mod tests {
         descriptor: ControllerDescriptor,
         effect_only: bool,
         fail_effect: Option<Arc<AtomicBool>>,
+        effect_calls: Option<Arc<AtomicUsize>>,
     }
 
     impl ResourceReconciler for MutationHandler {
@@ -3270,6 +3326,9 @@ mod tests {
             _dependencies: &[DependencySnapshot],
             _plan: &ReconcilePlan,
         ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+            if let Some(effect_calls) = &self.effect_calls {
+                effect_calls.fetch_add(1, Ordering::AcqRel);
+            }
             if self
                 .fail_effect
                 .as_ref()
@@ -3388,6 +3447,7 @@ mod tests {
                 descriptor: descriptor.clone(),
                 effect_only: false,
                 fail_effect: None,
+                effect_calls: None,
             }),
             Arc::clone(&source),
             d2b_core_controller::RunnerConfig {
@@ -3487,6 +3547,7 @@ mod tests {
                 descriptor: descriptor.clone(),
                 effect_only: true,
                 fail_effect: None,
+                effect_calls: None,
             }),
             Arc::clone(&source),
             d2b_core_controller::RunnerConfig {
@@ -3692,6 +3753,7 @@ mod tests {
                 descriptor: descriptor.clone(),
                 effect_only: true,
                 fail_effect: Some(first_failure),
+                effect_calls: None,
             }),
             Arc::clone(&source),
             d2b_core_controller::RunnerConfig {
@@ -3784,6 +3846,117 @@ mod tests {
         assert!(!rows_after_retry[0]
             .operation_id
             .starts_with("projection-"));
+    }
+
+    #[tokio::test]
+    async fn core_redb_runner_retries_post_status_failure_with_durable_effect_identity() {
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
+        let target = ResourceRef::parse("Host/owner").unwrap();
+        store
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
+                target.clone(),
+                canonical_host("owner", None),
+                None,
+                "create-owner",
+            ))
+            .await
+            .unwrap();
+        let stored = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-post-status-failure".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-post-status-failure".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let assignment = primary_assignment(stored.uid.clone(), stored.revision);
+        let api = Arc::new(
+            service
+                .registered_controller_api(
+                    subject,
+                    state,
+                    vec![(target.clone(), assignment)],
+                )
+                .unwrap(),
+        );
+        api.inject_effect_state_failures(1);
+        let effect_calls = Arc::new(AtomicUsize::new(0));
+        let descriptor = descriptor();
+        let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
+        let runner = d2b_core_controller::Runner::new(
+            Arc::new(MutationHandler {
+                descriptor: descriptor.clone(),
+                effect_only: true,
+                fail_effect: Some(Arc::new(AtomicBool::new(true))),
+                effect_calls: Some(Arc::clone(&effect_calls)),
+            }),
+            Arc::clone(&source),
+            d2b_core_controller::RunnerConfig {
+                policy_revision: 7,
+                api_revision: 8,
+                configuration_revision: ConfigurationGeneration::new(9).unwrap(),
+                deadline_tick: 5_000,
+                max_attempts: 1,
+            },
+        )
+        .run();
+        let runner_task = tokio::spawn(runner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let rows = store.authority_operations().await.unwrap();
+                if rows.len() == 1
+                    && rows[0].operation_id.starts_with("effect:")
+                    && rows[0].state
+                        == d2b_resource_store_redb::AuthorityOperationState::EffectTerminal
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        source.close_watch().unwrap();
+        let report = runner_task.await.unwrap().unwrap();
+        assert_eq!(report.handler_failures, 1);
+        assert_eq!(report.persistence_uncertain, 0);
+        assert_eq!(effect_calls.load(Ordering::Acquire), 1);
+
+        let rows = store.authority_operations().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].operation_id.starts_with("effect:"));
+        assert_ne!(rows[0].operation_id, "startup:Host/owner");
+        assert!(!rows[0].operation_id.starts_with("projection-"));
+
+        let updated = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-post-status-failure-after".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-post-status-failure-after".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target,
+                expected_uid: Some(stored.uid),
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let status: Value = serde_json::from_slice(&updated.canonical_json).unwrap();
+        assert_eq!(status["status"]["phase"], "Failed");
     }
 
     #[tokio::test]
