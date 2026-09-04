@@ -2476,8 +2476,8 @@ mod tests {
             self.commit_notify.notify_waiters();
         }
 
-        fn inject_watch_recovery_conflicts(&self, count: usize) {
-            self.list_initial_conflicts_remaining
+        fn inject_watch_open_recovery_conflicts(&self, count: usize) {
+            self.watch_open_conflicts_remaining
                 .store(count, Ordering::Release);
         }
     }
@@ -4411,6 +4411,13 @@ mod tests {
                     resources: vec![InitialResource::new(target, ZoneRevision::new(2))],
                     snapshot_revision: ZoneRevision::new(2),
                 },
+                InitialList {
+                    resources: vec![InitialResource::new(
+                        key("app", 1),
+                        ZoneRevision::new(2),
+                    )],
+                    snapshot_revision: ZoneRevision::new(2),
+                },
             ],
             fresh,
         );
@@ -4451,14 +4458,14 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
-        source.inject_watch_recovery_conflicts(1);
+        source.inject_watch_open_recovery_conflicts(1);
         watch_tx.send(Err(WatchFailure::RevisionExpired)).unwrap();
         entered.recv_timeout(Duration::from_secs(2)).unwrap();
         watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
 
         let report = runner.join().unwrap().unwrap();
         assert_eq!(report.relists, 1);
-        assert_eq!(source.watch_opens.load(Ordering::SeqCst), 2);
+        assert_eq!(source.watch_opens.load(Ordering::SeqCst), 3);
     }
 
     #[test]
