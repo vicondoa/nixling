@@ -23,6 +23,37 @@ let
     builtins.readFile (flakeRoot + "/nix/test-support/bazel-host-tools.nix");
   hostIntegrationLibSource =
     builtins.readFile (flakeRoot + "/tests/host-integration/lib.nix");
+  acceptanceControllerBlock =
+    let
+      functionBlock =
+        builtins.elemAt
+          (lib.splitString
+            "  mkAcceptanceProviderArtifact = pkgs:"
+            hostIntegrationLibSource)
+          1;
+    in
+    lib.replaceStrings [ "\n" "\r" ] [ " " "" ]
+      (builtins.head (lib.splitString "      signer =" functionBlock));
+  orderedUnique = source: needles:
+    let
+      result = lib.foldl'
+        (state: needle:
+          let
+            pieces = lib.splitString needle state.rest;
+            foundExactlyOnce = builtins.length pieces == 2;
+          in
+          {
+            ok = state.ok && foundExactlyOnce;
+            rest =
+              if foundExactlyOnce then builtins.elemAt pieces 1 else "";
+          })
+        {
+          ok = true;
+          rest = source;
+        }
+        needles;
+    in
+    result.ok;
   hostSourceLines = lib.splitString "\n" hostToolsSource;
   hostSourceBuilderLines =
     lib.filter (line: lib.hasInfix "src = hostSource;" line) hostSourceLines;
@@ -72,12 +103,19 @@ in
         "stage_tool packages/d2b-provider-test-controller/d2b-provider-test-controller d2b-provider-test-controller"
         ''D2B_HOST_TOOL_BUNDLE="$$stage"''
       ]
-      && lib.all (needle: lib.hasInfix needle hostIntegrationLibSource) [
-        "if hostToolBundle == null"
+      && orderedUnique acceptanceControllerBlock [
+        "controller = if hostToolBundle == null then"
         "self.packages."
-        "hostToolBundle"
+        "d2b-provider-test-controller}/bin/d2b-provider-test-controller"
+        "else"
         "hostToolBundle}/bin/d2b-provider-test-controller"
-      ];
+      ]
+      && !(orderedUnique acceptanceControllerBlock [
+        "controller = if hostToolBundle != null then"
+        "hostToolBundle}"
+        "else"
+        "self.packages."
+      ]);
     expected = true;
   };
 }
