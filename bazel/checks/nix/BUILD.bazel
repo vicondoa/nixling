@@ -62,7 +62,7 @@ _SURFACES = {
         ],
     },
     "zone-control": {
-        "cases": ["zone-control", "zone-link"],
+        "cases": ["bundle-artifacts-compiler", "zone-control", "zone-link"],
         "package": "packages/d2b-provider-volume-local",
         "files": [
             "nixos-modules/generated/provider-catalog-shape.nix",
