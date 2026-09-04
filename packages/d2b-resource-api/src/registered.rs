@@ -112,6 +112,8 @@ pub struct RedbRegisteredControllerApi {
     accepted:
         Arc<Mutex<BTreeMap<String, Arc<d2b_resource_store_redb::AuthorityOperationCapability>>>>,
     watch_change_observer: Option<WatchChangeObserver>,
+    #[cfg(test)]
+    status_timeouts_remaining: Arc<AtomicUsize>,
 }
 
 struct NativeCommitPath {
@@ -195,6 +197,8 @@ impl RedbRegisteredControllerApi {
             watch_stop: tokio::sync::Notify::new(),
             accepted: Arc::new(Mutex::new(BTreeMap::new())),
             watch_change_observer: None,
+            #[cfg(test)]
+            status_timeouts_remaining: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -213,6 +217,8 @@ impl RedbRegisteredControllerApi {
             watch_stop: tokio::sync::Notify::new(),
             accepted: Arc::new(Mutex::new(BTreeMap::new())),
             watch_change_observer: None,
+            #[cfg(test)]
+            status_timeouts_remaining: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -252,12 +258,20 @@ impl RedbRegisteredControllerApi {
             watch_stop: tokio::sync::Notify::new(),
             accepted: Arc::new(Mutex::new(BTreeMap::new())),
             watch_change_observer: None,
+            #[cfg(test)]
+            status_timeouts_remaining: Arc::new(AtomicUsize::new(0)),
         })
     }
 
     /// Borrow the store used by this adapter.
     pub fn store(&self) -> &Arc<RedbResourceStore> {
         &self.store
+    }
+
+    #[cfg(test)]
+    fn inject_status_timeouts(&self, count: usize) {
+        self.status_timeouts_remaining
+            .store(count, Ordering::Release);
     }
 
     /// Refresh assignment evidence for every fresh target and commit.
@@ -845,6 +859,20 @@ impl RedbRegisteredControllerApi {
         if projection.event_only() {
             return Ok(());
         }
+        #[cfg(test)]
+        if self
+            .status_timeouts_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                if remaining > 0 {
+                    Some(remaining - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+        {
+            return Err(SourceError::Timeout);
+        }
         let current = match self.read_target(projection.target()).await? {
             Ok(resource) => resource,
             Err(revision) => return Err(SourceError::Conflict(revision)),
@@ -1399,13 +1427,13 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
         operation: &OperationContext,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
         async move {
+            self.persist_projection_status(projection).await?;
             self.record_effect_state(
                 operation.operation_id(),
                 projection.revision(),
                 projection_state(projection.disposition(), projection.reason()),
             )
-            .await?;
-            self.persist_projection_status(projection).await
+            .await
         }
     }
 
@@ -3512,6 +3540,7 @@ mod tests {
                 )
                 .unwrap(),
         );
+        api.inject_status_timeouts(1);
         let descriptor = descriptor();
         let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
         let first_failure = Arc::new(AtomicBool::new(true));
@@ -3561,6 +3590,25 @@ mod tests {
             payload["operationId"].as_str(),
             Some(rows[0].operation_id.as_str())
         );
+        let updated = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-after-exhaustion".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-after-exhaustion".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target,
+                expected_uid: Some(stored.uid.clone()),
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let status: serde_json::Value =
+            serde_json::from_slice(&updated.canonical_json).unwrap();
+        assert_eq!(status["status"]["phase"], "Failed");
     }
 
     #[tokio::test]
