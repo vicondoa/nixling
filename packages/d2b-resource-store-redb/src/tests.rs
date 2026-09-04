@@ -6,17 +6,20 @@ use d2b_audit::{
     DurabilityOutcome, OperationIdentity, ZoneOperationKey, genesis_hash,
 };
 use d2b_contracts_resource::v3::{
-    CanonicalJsonValue, ConfigurationGeneration, RESOURCE_ENVELOPE_DOMAIN_TAG, ResourceEnvelope,
-    ResourceRef, ResourceTypeName, ResourceUid, Timestamp, ZoneId, canonical_digest,
+    CanonicalJsonValue, ConfigurationGeneration, ControllerGeneration, FinalizerId,
+    RESOURCE_ENVELOPE_DOMAIN_TAG, ResourceEnvelope, ResourceGeneration, ResourceRef,
+    ResourceTypeName, ResourceUid, Timestamp, ZoneId, ZoneRevision, canonical_digest,
 };
+use d2b_contracts_resource::v3::identity::ReconnectGeneration;
 use d2b_resource_store::mutation_seal::{
-    MutationSealAcceptor, MutationSealBody, mutation_seal_pair,
+    MutationSealAcceptor, MutationSealBody, MutationSealIssuer, mutation_seal_pair,
 };
 use d2b_resource_store::{
     AdmittedAuthorization, AdmittedAuthorizationTarget, AdmittedVerb, ExpectedRevision,
-    PolicySnapshot, PreparedStoreMutation, ResourceMutationKind, StoreError, StoreErrorKind,
-    StoreFilter, StoreGetRequest, StoreListRequest, StoreMutation, StoreOperationContext,
-    StoreProjection, StoreSlot, StoreWatchRequest,
+    PolicySnapshot, PreparedStoreMutation, ResourceAssignmentFence, ResourceAssignmentScope,
+    ResourceMutationKind, StoreError, StoreErrorKind, StoreFilter, StoreGetRequest,
+    StoreListRequest, StoreMutation, StoreOperationContext, StoreProjection, StoreSlot,
+    StoreWatchRequest,
 };
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata};
 use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
@@ -518,14 +521,118 @@ fn create_body_for_type(resource_type: &str, name: &str) -> Vec<u8> {
     let mut value: serde_json::Value =
         serde_json::from_slice(&create_body(name)).expect("resource fixture");
     value["type"] = serde_json::Value::String(resource_type.to_owned());
-    if resource_type == "Provider" {
-        value["spec"] = serde_json::json!({
-            "artifactId": "provider-wayland",
-            "config": {},
-        });
+    match resource_type {
+        "Provider" => {
+            value["spec"] = serde_json::json!({
+                "artifactId": "provider-wayland",
+                "config": {},
+            });
+        }
+        "RoleBinding" => {
+            value["spec"] = serde_json::json!({
+                "roleRef": "Role/system",
+                "subjects": ["Provider/system-core"],
+            });
+        }
+        _ => {}
     }
     CanonicalJsonValue::parse(&serde_json::to_vec(&value).expect("resource fixture json"))
         .expect("canonical resource fixture")
+        .to_canonical_bytes()
+}
+
+fn update_seal_body_for_type_as(
+    operation_id: &str,
+    target: ResourceRef,
+    kind: ResourceMutationKind,
+    expected_revision: ZoneRevision,
+    expected_uid: Option<ResourceUid>,
+    canonical_resource: Option<Vec<u8>>,
+    subject_ref: &str,
+    assignment: Option<ResourceAssignmentFence>,
+    add_finalizers: Vec<FinalizerId>,
+    remove_finalizers: Vec<FinalizerId>,
+) -> MutationSealBody {
+    let verb = match kind {
+        ResourceMutationKind::UpdateSpec => AdmittedVerb::UpdateSpec,
+        ResourceMutationKind::UpdateStatus => AdmittedVerb::UpdateStatus,
+        ResourceMutationKind::UpdateMetadata => AdmittedVerb::UpdateMetadata,
+        ResourceMutationKind::UpdateFinalizers => AdmittedVerb::UpdateFinalizers,
+        ResourceMutationKind::Delete => AdmittedVerb::Delete,
+        ResourceMutationKind::Create => panic!("update helper requires an update mutation"),
+    };
+    let payload_digest = canonical_resource
+        .as_deref()
+        .map(|bytes| canonical_digest(RESOURCE_ENVELOPE_DOMAIN_TAG, bytes));
+    let resource_uid = (kind != ResourceMutationKind::UpdateFinalizers)
+        .then(|| expected_uid.clone())
+        .flatten();
+    MutationSealBody {
+        mutations: vec![PreparedStoreMutation::new(
+            StoreMutation {
+                kind,
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected: ExpectedRevision::Exact(expected_revision),
+                expected_uid,
+                owner: None,
+                canonical_resource,
+                add_finalizers,
+                remove_finalizers,
+                wait_for_reconcile: false,
+                reconcile_deadline_ms: None,
+                configuration_generation: None,
+                assignment,
+            },
+            resource_uid,
+            payload_digest,
+        )],
+        authorization: AdmittedAuthorization {
+            zone: ZoneId::parse("work").unwrap(),
+            subject_ref: ResourceRef::parse(subject_ref).unwrap(),
+            subject_uid: ResourceUid::parse("33333333-3333-4333-8333-333333333333").unwrap(),
+            targets: vec![AdmittedAuthorizationTarget {
+                resource_type: target.resource_type().clone(),
+                resource_name: Some(target.name().clone()),
+                verb,
+                subresource: None,
+                execution_ref: None,
+            }],
+        },
+        policy_snapshot: PolicySnapshot {
+            policy_revision: 7,
+            api_catalog_revision: 8,
+            active_configuration_revision: ConfigurationGeneration::new(9).unwrap(),
+            controller_generation: None,
+        },
+        operation: operation(operation_id),
+    }
+}
+
+fn update_status_body(canonical: &[u8], phase: &str) -> Vec<u8> {
+    let mut value: serde_json::Value = serde_json::from_slice(canonical).unwrap();
+    value["status"]["phase"] = serde_json::Value::String(phase.to_owned());
+    CanonicalJsonValue::parse(&serde_json::to_vec(&value).unwrap())
+        .unwrap()
+        .to_canonical_bytes()
+}
+
+fn update_spec_body(canonical: &[u8]) -> Vec<u8> {
+    let mut value: serde_json::Value = serde_json::from_slice(canonical).unwrap();
+    value["spec"] = serde_json::json!({
+        "artifactId": "provider-wayland",
+        "config": {"revision": "changed"},
+    });
+    CanonicalJsonValue::parse(&serde_json::to_vec(&value).unwrap())
+        .unwrap()
+        .to_canonical_bytes()
+}
+
+fn update_metadata_body(canonical: &[u8]) -> Vec<u8> {
+    let mut value: serde_json::Value = serde_json::from_slice(canonical).unwrap();
+    value["metadata"]["labels"] = serde_json::json!({"mutation": "changed"});
+    CanonicalJsonValue::parse(&serde_json::to_vec(&value).unwrap())
+        .unwrap()
         .to_canonical_bytes()
 }
 
@@ -535,6 +642,318 @@ fn broker_evidence(operation_id: &str, outcome: DurabilityOutcome) -> Durability
         outcome,
         effect_durable: outcome == DurabilityOutcome::Success,
     }
+}
+
+async fn seed_broker_audited_resource(
+    store: &RedbResourceStore,
+    issuer: &MutationSealIssuer,
+    resource_type: &str,
+    name: &str,
+) -> d2b_resource_store::StoredResource {
+    let operation_id = format!("seed-{resource_type}-{name}");
+    let canonical = create_body_for_type(resource_type, name);
+    store
+        .broker_evidence_index()
+        .insert(broker_evidence(&operation_id, DurabilityOutcome::Success))
+        .unwrap();
+    store
+        .commit_verified(issuer.seal(create_seal_body_for_type(
+            &operation_id,
+            resource_type,
+            name,
+            canonical.clone(),
+            canonical_digest(RESOURCE_ENVELOPE_DOMAIN_TAG, &canonical),
+        )))
+        .await
+        .unwrap()
+        .resources
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn system_core_status_and_finalizer_projections_do_not_need_broker_evidence() {
+    let (_directory, file, marker) = provisioned_store();
+    let store_identity = identity();
+    let (issuer, store_acceptor) = mutation_seal_pair(store_identity.seal_identity());
+    let store = RedbResourceStore::provision_owned_with_test_ports(
+        file,
+        marker,
+        store_identity,
+        store_acceptor,
+        Arc::new(NoopStoreTelemetry),
+        Arc::new(RecordingAudit::default()),
+    )
+    .await
+    .unwrap();
+
+    for (resource_type, name) in [
+        ("Provider", "internal-provider"),
+        ("RoleBinding", "internal-binding"),
+    ] {
+        let created = seed_broker_audited_resource(&store, &issuer, resource_type, name).await;
+        let target = created.resource_ref.clone();
+        let status_operation = format!("system-core-{resource_type}-status");
+        let status_body = update_status_body(&created.canonical_json, "Ready");
+        let updated = store
+            .commit_verified(issuer.seal(update_seal_body_for_type_as(
+                &status_operation,
+                target.clone(),
+                ResourceMutationKind::UpdateStatus,
+                created.revision,
+                Some(created.uid.clone()),
+                Some(status_body),
+                "Provider/system-core",
+                None,
+                Vec::new(),
+                Vec::new(),
+            )))
+            .await
+            .unwrap();
+        assert!(!store.audit_outbox_pending(&status_operation).await.unwrap());
+
+        let finalizer_operation = format!("system-core-{resource_type}-finalizer");
+        let finalizer = FinalizerId::parse("core.broker-evidence-test").unwrap();
+        store
+            .commit_verified(issuer.seal(update_seal_body_for_type_as(
+                &finalizer_operation,
+                target,
+                ResourceMutationKind::UpdateFinalizers,
+                updated.revision,
+                None,
+                None,
+                "Provider/system-core",
+                None,
+                vec![finalizer],
+                Vec::new(),
+            )))
+            .await
+            .unwrap();
+        assert!(!store
+            .audit_outbox_pending(&finalizer_operation)
+            .await
+            .unwrap());
+    }
+
+    store.runtime_metadata().await.unwrap();
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn non_system_core_status_and_finalizer_projections_require_broker_evidence() {
+    for (resource_type, name) in [
+        ("Provider", "non-internal-provider"),
+        ("RoleBinding", "non-internal-binding"),
+    ] {
+        for kind in [
+            ResourceMutationKind::UpdateStatus,
+            ResourceMutationKind::UpdateFinalizers,
+        ] {
+            let (_directory, file, marker) = provisioned_store();
+            let store_identity = identity();
+            let (issuer, store_acceptor) = mutation_seal_pair(store_identity.seal_identity());
+            let store = RedbResourceStore::provision_owned_with_test_ports(
+                file,
+                marker,
+                store_identity,
+                store_acceptor,
+                Arc::new(NoopStoreTelemetry),
+                Arc::new(RecordingAudit::default()),
+            )
+            .await
+            .unwrap();
+            let created =
+                seed_broker_audited_resource(&store, &issuer, resource_type, name).await;
+            let operation_id = match (resource_type, kind) {
+                ("Provider", ResourceMutationKind::UpdateStatus) => "caller-provider-status",
+                ("Provider", ResourceMutationKind::UpdateFinalizers) => {
+                    "caller-provider-finalizer"
+                }
+                ("RoleBinding", ResourceMutationKind::UpdateStatus) => {
+                    "caller-role-binding-status"
+                }
+                ("RoleBinding", ResourceMutationKind::UpdateFinalizers) => {
+                    "caller-role-binding-finalizer"
+                }
+                _ => unreachable!(),
+            };
+            let (canonical_resource, add_finalizers) = match kind {
+                ResourceMutationKind::UpdateStatus => (
+                    Some(update_status_body(&created.canonical_json, "Ready")),
+                    Vec::new(),
+                ),
+                ResourceMutationKind::UpdateFinalizers => (
+                    None,
+                    vec![FinalizerId::parse("core.broker-evidence-test").unwrap()],
+                ),
+                _ => unreachable!(),
+            };
+            let error = store
+                .commit_verified(issuer.seal(update_seal_body_for_type_as(
+                    operation_id,
+                    created.resource_ref.clone(),
+                    kind,
+                    created.revision,
+                    Some(created.uid.clone()),
+                    canonical_resource,
+                    "Provider/caller",
+                    None,
+                    add_finalizers,
+                    Vec::new(),
+                )))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), StoreErrorKind::StoreIntegrityFailure);
+            assert_eq!(
+                store
+                    .audit_outbox_pending(operation_id)
+                    .await
+                    .unwrap_err()
+                    .reason_code(),
+                "redb-store-quarantined"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn system_core_desired_state_metadata_and_delete_mutations_require_broker_evidence() {
+    for kind in [
+        ResourceMutationKind::UpdateSpec,
+        ResourceMutationKind::UpdateMetadata,
+        ResourceMutationKind::Delete,
+    ] {
+        let (_directory, file, marker) = provisioned_store();
+        let store_identity = identity();
+        let (issuer, store_acceptor) = mutation_seal_pair(store_identity.seal_identity());
+        let store = RedbResourceStore::provision_owned_with_test_ports(
+            file,
+            marker,
+            store_identity,
+            store_acceptor,
+            Arc::new(NoopStoreTelemetry),
+            Arc::new(RecordingAudit::default()),
+        )
+        .await
+        .unwrap();
+        let created =
+            seed_broker_audited_resource(&store, &issuer, "Provider", "desired-provider").await;
+        let operation_id = match kind {
+            ResourceMutationKind::UpdateSpec => "system-core-provider-spec",
+            ResourceMutationKind::UpdateMetadata => "system-core-provider-metadata",
+            ResourceMutationKind::Delete => "system-core-provider-delete",
+            _ => unreachable!(),
+        };
+        let (canonical_resource, expected_uid) = match kind {
+            ResourceMutationKind::UpdateSpec => (
+                Some(update_spec_body(&created.canonical_json)),
+                Some(created.uid.clone()),
+            ),
+            ResourceMutationKind::UpdateMetadata => (
+                Some(update_metadata_body(&created.canonical_json)),
+                Some(created.uid.clone()),
+            ),
+            ResourceMutationKind::Delete => (None, Some(created.uid.clone())),
+            _ => unreachable!(),
+        };
+        let error = store
+            .commit_verified(issuer.seal(update_seal_body_for_type_as(
+                operation_id,
+                created.resource_ref.clone(),
+                kind,
+                created.revision,
+                expected_uid,
+                canonical_resource,
+                "Provider/system-core",
+                None,
+                Vec::new(),
+                Vec::new(),
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), StoreErrorKind::StoreIntegrityFailure);
+        assert_eq!(
+            store
+                .audit_outbox_pending(operation_id)
+                .await
+                .unwrap_err()
+                .reason_code(),
+            "redb-store-quarantined"
+        );
+    }
+}
+
+#[tokio::test]
+async fn system_core_projection_still_enforces_assignment_session_and_role_fences() {
+    let (_directory, file, marker) = provisioned_store();
+    let store_identity = identity();
+    let (issuer, store_acceptor) = mutation_seal_pair(store_identity.seal_identity());
+    let store = RedbResourceStore::provision_owned_with_test_ports(
+        file,
+        marker,
+        store_identity,
+        store_acceptor,
+        Arc::new(NoopStoreTelemetry),
+        Arc::new(RecordingAudit::default()),
+    )
+    .await
+    .unwrap();
+    let created = seed_broker_audited_resource(&store, &issuer, "Provider", "fenced-provider")
+        .await;
+    let fence = ResourceAssignmentFence {
+        resource_uid: created.uid.clone(),
+        resource_revision: created.revision,
+        provider_generation: ResourceGeneration::new(2).unwrap(),
+        controller_generation: ControllerGeneration::new(3).unwrap(),
+        controller_role: ResourceRef::parse("Process/process-controller").unwrap(),
+        target: ResourceRef::parse("Host/host-system").unwrap(),
+        session_generation: ReconnectGeneration::new(4).unwrap(),
+        epoch: 1,
+        scope: ResourceAssignmentScope::Primary,
+    };
+    let first_operation = "system-core-fenced-status";
+    let first = store
+        .commit_verified(issuer.seal(update_seal_body_for_type_as(
+            first_operation,
+            created.resource_ref.clone(),
+            ResourceMutationKind::UpdateStatus,
+            created.revision,
+            Some(created.uid.clone()),
+            Some(update_status_body(&created.canonical_json, "Ready")),
+            "Provider/system-core",
+            Some(fence.clone()),
+            Vec::new(),
+            Vec::new(),
+        )))
+        .await
+        .unwrap();
+
+    let bad_fence = ResourceAssignmentFence {
+        resource_revision: first.revision,
+        controller_role: ResourceRef::parse("Process/other-controller").unwrap(),
+        session_generation: ReconnectGeneration::new(5).unwrap(),
+        ..fence
+    };
+    let second_operation = "system-core-wrong-fence";
+    let error = store
+        .commit_verified(issuer.seal(update_seal_body_for_type_as(
+            second_operation,
+            created.resource_ref,
+            ResourceMutationKind::UpdateStatus,
+            first.revision,
+            Some(created.uid),
+            Some(update_status_body(&first.resources[0].canonical_json, "Ready")),
+            "Provider/system-core",
+            Some(bad_fence),
+            Vec::new(),
+            Vec::new(),
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(error.reason_code(), "stale-assignment");
+    assert!(!store.audit_outbox_pending(second_operation).await.unwrap());
+    store.shutdown().await.unwrap();
 }
 
 fn seed_host(directory: &tempfile::TempDir, name: &str) {

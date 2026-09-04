@@ -10,6 +10,8 @@
   committed resources, while still refusing a missing Provider that owns work.
 - Applied the same fail-closed ownership check to Credential, storage,
   interaction, Guest, and observability runner startup paths.
+- Kept authenticated system-core status and finalizer projections local to
+  resource audit while retaining broker evidence for desired-state mutations.
 
 ### Removed
 

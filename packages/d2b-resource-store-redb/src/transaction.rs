@@ -679,10 +679,7 @@ fn audit_outbox_for(
             }
         })
         .collect::<Vec<_>>();
-    let requires_broker = verified
-        .mutations
-        .iter()
-        .any(|prepared| requires_broker_audit(prepared.mutation().target.resource_type().as_str()));
+    let requires_broker = requires_broker_audit_for_write(verified);
     Ok(AuditOutboxRecord {
         zone: verified.authorization.zone.as_str().to_owned(),
         operation_id: verified.operation.operation_id.clone(),
@@ -759,9 +756,7 @@ fn audit_outbox_for_failure(
         ),
         policy_revision: verified.policy_snapshot.policy_revision,
         resulting_revision,
-        requires_broker: verified.mutations.iter().any(|prepared| {
-            requires_broker_audit(prepared.mutation().target.resource_type().as_str())
-        }),
+        requires_broker: requires_broker_audit_for_write(verified),
         defer_broker_evidence: false,
         mutations,
     })
@@ -814,6 +809,26 @@ fn requires_broker_audit(resource_type: &str) -> bool {
             | "ResourceExport"
             | "ResourceImport"
     )
+}
+
+fn is_system_core_subject(subject_ref: &ResourceRef) -> bool {
+    subject_ref.to_canonical_string() == SYSTEM_CORE_SUBJECT_REF
+}
+
+fn is_internal_projection(subject_ref: &ResourceRef, mutation: &StoreMutation) -> bool {
+    is_system_core_subject(subject_ref)
+        && matches!(
+            mutation.kind,
+            ResourceMutationKind::UpdateStatus | ResourceMutationKind::UpdateFinalizers
+        )
+}
+
+fn requires_broker_audit_for_write(verified: &VerifiedWrite) -> bool {
+    verified.mutations.iter().any(|prepared| {
+        let mutation = prepared.mutation();
+        requires_broker_audit(mutation.target.resource_type().as_str())
+            && !is_internal_projection(&verified.authorization.subject_ref, mutation)
+    })
 }
 
 fn failed_operation_record(
