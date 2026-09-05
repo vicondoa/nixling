@@ -653,6 +653,11 @@ authority-operation states: accepted/running use `pending`, uncertain recovery
 uses `effect-retryable`/quarantine semantics, and terminal success/failure use
 `effect-confirmed`/`effect-terminal` as applicable. Watched configuration uses
 typed dependency/attachment/binding, never fabricated `ownerRef`.
+Reads remain `ResourceRef`-addressed and do not require eager UID/generation
+projection. Every mutation, finalizer, delete, and effect carries the
+expected UID, generation, revision/CAS, and applicable assignment/session
+fences; stale input conflicts and returns for fresh reconcile. Related identity
+and revision reads use one coherent store snapshot.
 
 **Patterns to follow**
 Reuse `TrustedRequest`, `AuthorizationLease`, `ExpectedRevision`,
@@ -746,6 +751,11 @@ executionRef, Guest-local token acquisition, and Guest-held registries and
 audit; relay identity never maps to Role, and gateway-unavailable degradation
 has no Host fallback. Cover all-27 registration/list/watch composition before
 U11 splits transport lanes.
+U3 owns the Zone composition boundary for the policy projection: one owner
+installs `NativeAuthorizer`, `ZoneBus`, and authorization state together;
+public reads consume the installed projection without refreshing it. Controller
+session changes are submitted through that owner, and session wakes remain
+level-triggered without a synchronous transport wait.
 
 **Patterns to follow**
 Reuse `ApiCatalogHandler`, Provider binding errors, current composition,
@@ -763,6 +773,9 @@ bounded owner propagation, and projection ownership.
   the intended controller.
 - Ledger crash recovery rejoins matching sessions, rejects mismatched desired
   generations, and never reaccepts an operation ID.
+- Concurrent public Get/List, Provider-session admission, and policy refresh
+  retain one installed subject projection; a failed projection or rebind keeps
+  the last complete read projection and returns retryable work.
 
 **Verification**
 
@@ -820,6 +833,11 @@ bootstrap methods required to commit the initial batch and establish watches;
 after authentication, the full Guest Resource session exposes the complete
 authorized ResourceService surface. The seed restriction must never leak into
 the authenticated session.
+Live handshake, Noise, socket, stream, registrar, and reconnect state remains
+an asynchronous per-session actor rather than a normal ResourceType or Runner
+wait. Durable admission/fencing evidence stays in existing Process/Provider
+status, assignment fences, and ledger rows. The session owner uses exact
+transactional rollback and non-lossy wakes when bootstrap state changes.
 
 **Patterns to follow**
 Follow `SessionIdentity`, generated service server, dispatch, stream,
@@ -836,6 +854,10 @@ attachment, and redaction limits.
   while the authenticated session permits every method authorized by its
   capability and assignment fences, including list/get/update/finalizer/delete
   operations required during restart recovery and finalization.
+- Inject bootstrap failure after endpoint receipt, subject installation,
+  acceptor creation, service registration, backend binding, and readiness; each
+  path rolls back only the exact subject, ingress, marker, stream, lease, and
+  assignment it created.
 
 **Verification**
 
@@ -892,6 +914,10 @@ owner reconcile, direct probes stay in workers/declared repair, and fixed
 sleeps/snapshot scheduling are removed when this family attaches the shared
 Runner and disables its legacy scheduler/watch; this family has no dual
 scheduler/watch period.
+Resolve the selected Process Provider UID/generation lazily at the mutation,
+launch, adoption, stop, or finalization boundary. Read-only Process discovery
+does not require an eager identity projection, and a missing Provider row
+requeues only the affected Process.
 
 **Patterns to follow**
 Use current host, systemd, minijail, process conformance, redaction, and
@@ -910,6 +936,8 @@ effect-port tests; never put host mutation in common toolkit code.
   waiting; terminal exit fails immediately while siblings retain budgets.
 - EphemeralProcess TTL, finalization, pidfd ambiguity, and cgroup delegation
   retain exact ownership and per-resource retry isolation.
+- A late or replaced Process Provider identity requeues only its Process,
+  invalidates stale effects, and does not block unrelated Process identities.
 
 **Verification**
 
@@ -1625,9 +1653,11 @@ effects and excluded from the 5 ms handler gate. Exercise
 `MAX_OWNER_HINT_DEPTH = 8`,
 `MAX_OWNER_HINT_WORK_ITEMS = 64`, and `MAX_OWNER_CHILD_BATCH = 128` at depth
 8/64-item fan-out without breaking Process gates.
-These targets also prove UID/generation/revision mutation fences, non-lossy
-controller-session wakes, atomic authorization projection, coherent admission
-snapshots, lazy Process Provider identity, and exact bootstrap rollback.
+Owner-local hardening evidence is bound to the owning tests rather than this
+aggregate alone: ResourceService/store targets prove UID/generation/revision
+fences and coherent snapshots; d2bd runtime tests prove policy projection,
+non-lossy session wakes, and public-read behavior; Process Provider tests prove
+lazy identity and rollback; bus/session seam tests prove bootstrap rollback.
 
 ### V3. All 27 Provider targets
 
