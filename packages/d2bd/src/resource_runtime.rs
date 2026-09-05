@@ -8909,6 +8909,25 @@ struct ControllerSessionAdmissionTestSeam {
     admit_without_transport: bool,
 }
 
+#[cfg(test)]
+struct ControllerSessionAdmissionTestUnwindGuard {
+    first_policy_release: Arc<AtomicBool>,
+    second_snapshot_release: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl Drop for ControllerSessionAdmissionTestUnwindGuard {
+    fn drop(&mut self) {
+        self.first_policy_release.store(true, Ordering::Release);
+        self.second_snapshot_release
+            .store(true, Ordering::Release);
+        self.shutdown.store(true, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+}
+
 #[derive(Clone)]
 struct PolicyProjection {
     authorizer: Arc<NativeAuthorizer>,
@@ -24597,6 +24616,12 @@ mod tests {
         let first_policy_seen_for_hook = Arc::clone(&first_policy_seen);
         let first_policy_release = Arc::new(AtomicBool::new(false));
         let first_policy_release_for_hook = Arc::clone(&first_policy_release);
+        let _admission_unwind_guard = ControllerSessionAdmissionTestUnwindGuard {
+            first_policy_release: Arc::clone(&first_policy_release),
+            second_snapshot_release: Arc::clone(&second_snapshot_release),
+            shutdown: Arc::clone(&shutdown),
+            wake: Arc::clone(&wake),
+        };
         coordinator.set_controller_session_admission_test_seam(
             ControllerSessionAdmissionTestSeam {
                 after_snapshot,
