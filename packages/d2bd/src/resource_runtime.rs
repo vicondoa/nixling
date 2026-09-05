@@ -11972,34 +11972,51 @@ impl ZoneResourceRuntime {
         &self,
         state: AuthorizationState,
     ) -> Result<(), ResourceRuntimeError> {
+        let _session_guard = self.controller_session_lock.lock().await;
+        let session_state = (
+            self.registrar
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .is_some(),
+            self.ingress
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .is_some(),
+            self.service_task
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .is_some(),
+        );
+        if session_state == (false, false, false) {
+            return Ok(());
+        }
+        if session_state != (true, true, true) {
+            return Err(ResourceRuntimeError::AuthenticationUnavailable);
+        }
         let mut registrar = self
             .registrar
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-            .take();
+            .take()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
         let mut ingress = self
             .ingress
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-            .take();
+            .take()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
         let task = self
             .service_task
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-            .take();
-        if let (Some(registrar), Some(mut ingress)) = (registrar.as_mut(), ingress.as_mut()) {
-            registrar
-                .revoke_in_place(&mut ingress)
-                .await
-                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
-        }
-        if let Some(task) = task {
-            task.abort();
-            let _ = task.await;
-        }
-        let Some(mut registrar) = registrar else {
-            return Ok(());
-        };
+            .take()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        registrar
+            .revoke_in_place(&mut ingress)
+            .await
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
+        task.abort();
+        let _ = task.await;
         let (new_ingress, new_task, status_client, subject_context) =
             register_system_core_session(
                 &mut registrar,
@@ -15988,24 +16005,25 @@ impl ControllerSessionCoordinator {
             if !providers.controller_bootstrap_ready(&self.zone, &process_ref) {
                 continue;
             }
-            let Some(endpoint) = providers.begin_controller_bootstrap(&self.zone, &process_ref)
-            else {
-                continue;
-            };
-            let context = endpoint.context().clone();
             let mut registrar = match self.registrar.lock() {
                 Ok(mut registrar) => match registrar.take() {
                     Some(registrar) => registrar,
-                    None => {
-                        providers.fail_controller_bootstrap(&context);
-                        continue;
-                    }
+                    None => continue,
                 },
                 Err(_) => {
-                    providers.fail_controller_bootstrap(&context);
                     return Err(ResourceRuntimeError::AuthenticationUnavailable);
                 }
             };
+            let Some(endpoint) = providers.begin_controller_bootstrap(&self.zone, &process_ref)
+            else {
+                *self
+                    .registrar
+                    .lock()
+                    .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
+                    Some(registrar);
+                continue;
+            };
+            let context = endpoint.context().clone();
             let setup = self
                 .establish_controller_session(&providers, endpoint, &mut registrar)
                 .await;
@@ -23255,6 +23273,60 @@ mod tests {
             ]
         );
         let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn system_core_refresh_waits_for_controller_session_guard() {
+        let fixture = PublicationStoreFixture::new().await;
+        let bundle =
+            publication_bundle(&fixture.zone, fixture.identity.zone_uid(), "session-guard");
+        let runtime = fixture.open(&bundle).await;
+        let state = AuthorizationState {
+            snapshot: runtime.store_metadata.policy_snapshot,
+            zone_policy_revision: runtime.store_metadata.current_revision,
+            bootstrap_phase: d2b_resource_api::authz::BootstrapPhase::Disabled,
+            now_tick: 0,
+        };
+
+        let guard = runtime.controller_session_lock.lock().await;
+        {
+            let refresh = runtime.refresh_system_core_session(state);
+            tokio::pin!(refresh);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut refresh)
+                    .await
+                    .is_err(),
+                "system-core refresh must not bypass controller-session establishment"
+            );
+            drop(guard);
+            assert_eq!(refresh.await, Ok(()));
+        }
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn system_core_refresh_rejects_partial_session_state() {
+        let fixture = PublicationStoreFixture::new().await;
+        let bundle =
+            publication_bundle(&fixture.zone, fixture.identity.zone_uid(), "session-partial");
+        let runtime = fixture.open(&bundle).await;
+        let state = AuthorizationState {
+            snapshot: runtime.store_metadata.policy_snapshot,
+            zone_policy_revision: runtime.store_metadata.current_revision,
+            bootstrap_phase: d2b_resource_api::authz::BootstrapPhase::Disabled,
+            now_tick: 0,
+        };
+        *runtime.service_task.lock().unwrap() = Some(tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        }));
+
+        assert_eq!(
+            runtime.refresh_system_core_session(state).await,
+            Err(ResourceRuntimeError::AuthenticationUnavailable)
+        );
+        assert!(runtime.service_task.lock().unwrap().is_some());
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
