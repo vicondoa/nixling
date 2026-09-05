@@ -782,7 +782,8 @@ bounded owner propagation, and projection ownership.
   exposes no half-installed projection, fails new mutations and admission
   closed, and may retain a prior complete read projection; a post-install
   system-core rebind failure keeps the complete read projection, marks
-  recovery pending, and returns retryable work.
+  recovery pending, blocks new effects, and returns retryable work until a
+  fresh retry succeeds.
 
 **Verification**
 
@@ -823,10 +824,12 @@ contracts.
 - `packages/d2b-provider/BUILD.bazel`,
   `packages/d2b-provider-toolkit/BUILD.bazel`,
   `packages/d2b-session/BUILD.bazel`,
+  `packages/d2b-bus/BUILD.bazel`,
   `//packages/d2b-provider:all-tests`,
   `//packages/d2b-provider-toolkit:all-tests`, and
-`//packages/d2b-session:all-tests`,
-`packages/d2b-bus/src/session_seam_tests.rs`
+  `//packages/d2b-session:all-tests`,
+  `//packages/d2b-bus:all-tests`,
+  `packages/d2b-bus/src/session_seam_tests.rs`
 
 **Approach**
 
@@ -869,7 +872,7 @@ attachment, and redaction limits.
 
 **Verification**
 
-Run the three aggregate targets and verify AE11, AE13, and AE14; reject
+Run the four aggregate targets and verify AE11, AE13, and AE14; reject
 universal method enums, catalogue switches, and zero-resource registrations.
 
 ### U5. Cutting over system and Process Providers
@@ -1810,9 +1813,11 @@ schedulers, universal RPC, zero-resource reconciler, new gates, and inventories.
   contention; pending work survives notification coalescing and shutdown does
   not resurrect a worker.
 - [ ] One policy projection owner linearly installs NativeAuthorizer, ZoneBus,
-  and authorization state; public reads never mutate global policy, partial
-  installation fails closed, and a post-install system-core rebind failure
-  preserves complete read projection while marking recovery pending.
+  and authorization state; public reads never mutate global policy. A
+  pre-install failure exposes no half-installed projection, fails new
+  mutations/admission closed, and may retain a prior complete read projection;
+  a post-install system-core rebind failure preserves complete read
+  projection, marks recovery pending, and blocks new effects until retry.
 - [ ] Startup admission uses coherent Provider/Process snapshots; dynamic
   Process Provider identities resolve lazily per resource and replacement
   UID/generation invalidates stale effects.
