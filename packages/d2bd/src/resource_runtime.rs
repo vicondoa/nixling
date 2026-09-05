@@ -150,7 +150,7 @@ use d2b_provider_system_core::{
 };
 use d2b_resource_api::{
     RedbBackend, ResourceApiClient, ResourceBusAdapter, ResourceService, ResourceStoreBackend,
-    authz::{AuthorizationState, NativeAuthorizer},
+    authz::{AuthorizationState, BoundSubject, NativeAuthorizer, PolicySet},
     registered::AssignmentFenceResolver,
     service::UnavailableUpgradeDispatcher,
 };
@@ -8885,6 +8885,7 @@ struct ControllerSessionCoordinator {
     api: Arc<ResourceService<RedbBackend>>,
     authorizer: Arc<NativeAuthorizer>,
     authorization_state: Arc<Mutex<Option<AuthorizationState>>>,
+    policy_projection: Arc<PolicyProjection>,
     registrar: Arc<Mutex<Option<ZoneRegistrar>>>,
     assignments: AssignmentRegistry,
     controller_sessions: Arc<Mutex<BTreeMap<ResourceRef, ControllerSession>>>,
@@ -8895,6 +8896,117 @@ struct ControllerSessionCoordinator {
 }
 
 type CloudHypervisorResourceClient = ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>;
+
+#[derive(Clone)]
+struct PolicyProjection {
+    authorizer: Arc<NativeAuthorizer>,
+    bus: Option<Arc<ZoneBus>>,
+    authorization_state: Arc<Mutex<Option<AuthorizationState>>>,
+    policy_refresh: Arc<Mutex<()>>,
+    policy_loaded: Arc<Mutex<bool>>,
+    installed_controller_subjects: Arc<Mutex<BTreeSet<BoundSubject>>>,
+}
+
+impl PolicyProjection {
+    /// Serialize the installed native policy with its matching trusted
+    /// authorization state. This mutex is the projection's linearization
+    /// point; callers that need to pair the authorizer with state must use
+    /// this snapshot instead of reading the shadow state independently.
+    fn installed_state(&self) -> Result<AuthorizationState, ResourceRuntimeError> {
+        let _install = self
+            .policy_refresh
+            .lock()
+            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
+        let loaded = *self
+            .policy_loaded
+            .lock()
+            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
+        if !loaded {
+            return Err(ResourceRuntimeError::PolicyUnavailable);
+        }
+        self.authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::PolicyUnavailable)
+    }
+
+    fn installed_controller_subjects(
+        &self,
+    ) -> Result<BTreeSet<BoundSubject>, ResourceRuntimeError> {
+        let _install = self
+            .policy_refresh
+            .lock()
+            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
+        self.installed_controller_subjects
+            .lock()
+            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)
+            .map(|subjects| subjects.clone())
+    }
+
+    fn install(
+        &self,
+        policy: PolicySet,
+        state: AuthorizationState,
+        controller_subjects: BTreeSet<BoundSubject>,
+    ) -> Result<(), ResourceRuntimeError> {
+        let _install = self
+            .policy_refresh
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+        // The policy refresh mutex linearizes the complete projection:
+        // authorizer/ZoneBus replacement and the shadow state are published
+        // under one guard. Validation failures happen before mutation and
+        // therefore leave the last-known-good projection installed.
+        let install_result = if let Some(bus) = &self.bus {
+            bus.replace_policy(policy, state.clone())
+                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)
+        } else {
+            self.authorizer
+                .replace_policy(policy, &state)
+                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)
+        };
+        if let Err(error) = install_result {
+            return Err(error);
+        }
+        if let Ok(mut installed) = self.authorization_state.lock() {
+            *installed = Some(state);
+        } else {
+            self.mark_unavailable();
+            return Err(ResourceRuntimeError::AuthorizationUnavailable);
+        }
+        if let Ok(mut installed) = self.installed_controller_subjects.lock() {
+            *installed = controller_subjects;
+        } else {
+            self.mark_unavailable();
+            return Err(ResourceRuntimeError::AuthorizationUnavailable);
+        }
+        if let Ok(mut loaded) = self.policy_loaded.lock() {
+            *loaded = true;
+        } else {
+            self.mark_unavailable();
+            return Err(ResourceRuntimeError::AuthorizationUnavailable);
+        }
+        Ok(())
+    }
+
+    fn mark_unavailable(&self) {
+        if let Some(bus) = &self.bus {
+            bus.mark_policy_unavailable();
+        } else {
+            self.authorizer.mark_policy_unavailable();
+        }
+        if let Ok(mut installed) = self.authorization_state.lock() {
+            *installed = None;
+        }
+        if let Ok(mut subjects) = self.installed_controller_subjects.lock() {
+            subjects.clear();
+        }
+        if let Ok(mut loaded) = self.policy_loaded.lock() {
+            *loaded = false;
+        }
+    }
+}
 
 /// Authenticated daemon-side Resource API adapter for the Cloud Hypervisor
 /// controller. The adapter owns no store or broker capability in the
@@ -10297,12 +10409,11 @@ pub struct ZoneResourceRuntime {
     api: Arc<ResourceService<RedbBackend>>,
     authorizer: Arc<NativeAuthorizer>,
     authorization_state: Arc<Mutex<Option<AuthorizationState>>>,
-    policy_refresh: Mutex<()>,
+    policy_projection: Arc<PolicyProjection>,
     bundle_resource_types: Vec<ResourceTypeName>,
     policy_subject_fingerprints:
         Mutex<BTreeMap<(ResourceRef, ResourceRef), PolicySubjectFingerprint>>,
-    policy_loaded: Mutex<bool>,
-    bus: Option<ZoneBus>,
+    bus: Option<Arc<ZoneBus>>,
     registrar: Arc<Mutex<Option<ZoneRegistrar>>>,
     ingress: Mutex<Option<BusIngress>>,
     service_task: Mutex<Option<tokio::task::JoinHandle<Result<(), SessionServerError>>>>,
@@ -10354,6 +10465,8 @@ pub struct ZoneResourceRuntime {
     guest_setup_descriptor_catalog_keys: BTreeMap<String, String>,
     closed_guest_sessions: Arc<tokio::sync::Mutex<BTreeSet<crate::GuestComponentSessionKey>>>,
     controller_deployment: ProviderDeployment,
+    controller_session_providers:
+        Mutex<Option<Arc<crate::process_provider_runtime::ProductionProcessProviders>>>,
     controller_sessions: Arc<Mutex<BTreeMap<ResourceRef, ControllerSession>>>,
     controller_session_reconcile_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     controller_session_reconcile_wake: Arc<tokio::sync::Notify>,
@@ -11101,6 +11214,20 @@ impl ZoneResourceRuntime {
             )
         };
         let defer_core_start = authority_identity.is_some();
+        let bus = bus.map(Arc::new);
+        let authorization_state = Arc::new(Mutex::new(authorization_state));
+        let policy_loaded = authorization_state
+            .lock()
+            .ok()
+            .is_some_and(|state| state.is_some());
+        let policy_projection = Arc::new(PolicyProjection {
+            authorizer: Arc::clone(&authorizer),
+            bus: bus.clone(),
+            authorization_state: Arc::clone(&authorization_state),
+            policy_refresh: Arc::new(Mutex::new(())),
+            policy_loaded: Arc::new(Mutex::new(policy_loaded)),
+            installed_controller_subjects: Arc::new(Mutex::new(BTreeSet::new())),
+        });
         let runtime = Self {
             zone,
             authority_identity,
@@ -11112,11 +11239,10 @@ impl ZoneResourceRuntime {
             backend,
             api,
             authorizer,
-            authorization_state: Arc::new(Mutex::new(authorization_state)),
-            policy_refresh: Mutex::new(()),
+            authorization_state,
+            policy_projection,
             bundle_resource_types,
             policy_subject_fingerprints: Mutex::new(BTreeMap::new()),
-            policy_loaded: Mutex::new(false),
             bus,
             registrar: Arc::new(Mutex::new(registrar)),
             ingress: Mutex::new(ingress),
@@ -11179,6 +11305,7 @@ impl ZoneResourceRuntime {
                 d2bd_runtime::target_runtime::AdmissionLimits::host_default(),
             )
             .map_err(|_| ResourceRuntimeError::CoreStartupFailed)?,
+            controller_session_providers: Mutex::new(None),
             controller_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             controller_session_reconcile_task: Arc::new(Mutex::new(None)),
             controller_session_reconcile_wake: Arc::new(tokio::sync::Notify::new()),
@@ -11789,36 +11916,47 @@ impl ZoneResourceRuntime {
     }
 
     /// Refresh the native authorization projection from the current committed
-    /// Role, RoleBinding, and local subject rows before admitting public work.
+    /// Role, RoleBinding, and local subject rows before admitting mutations or
+    /// session transitions. Read-only public requests use the installed
+    /// projection directly and never call this method.
     pub(crate) async fn refresh_authorization_policy(&self) -> Result<(), ResourceRuntimeError> {
-        let _refresh = self
-            .policy_refresh
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+        // All policy projections and controller-session transitions use this
+        // lock order: controller session, then policy install.
+        let _session_guard = self.controller_session_lock.lock().await;
+        self.refresh_authorization_policy_locked().await
+    }
+
+    async fn refresh_authorization_policy_locked(&self) -> Result<(), ResourceRuntimeError> {
         let metadata = self
             .store
             .runtime_metadata()
             .await
             .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
         let current = self
-            .authorization_state
-            .lock()
-            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?
-            .clone();
-        let policy_loaded = *self
-            .policy_loaded
-            .lock()
-            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
+            .policy_projection
+            .installed_state()
+            .ok();
+        let policy_loaded = current.is_some();
+        if metadata.policy_snapshot.policy_revision == 0 {
+            return Err(ResourceRuntimeError::PolicyUnavailable);
+        }
+        let controller_subjects = match self.current_controller_policy_subjects().await {
+            Ok(subjects) => subjects,
+            Err(error) => {
+                return Err(error);
+            }
+        };
+        let installed_controller_subjects = self
+            .policy_projection
+            .installed_controller_subjects()?;
         if policy_loaded
             && current.as_ref().is_some_and(|state| {
                 state.snapshot == metadata.policy_snapshot
                     && state.zone_policy_revision == metadata.current_revision
             })
+            && installed_controller_subjects == controller_subjects
         {
             return Ok(());
-        }
-        if metadata.policy_snapshot.policy_revision == 0 {
-            return Err(ResourceRuntimeError::PolicyUnavailable);
         }
         let resources = d2bd_runtime::resource_runtime_support::load_committed_policy_resources(
             &self.store,
@@ -11843,13 +11981,15 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::IdentityUnbound)?
             .clone();
         let fingerprints = refreshed_policy_subject_fingerprints(&resources, &previous)?;
-        let (policy, state) = d2bd_runtime::resource_runtime_support::compile_committed_policy(
-            &self.zone,
-            metadata.policy_snapshot,
-            metadata.current_revision,
-            &self.bundle_resource_types,
-            &resources,
-        )?;
+        let (policy, state) =
+            d2bd_runtime::resource_runtime_support::compile_committed_policy_with_subjects(
+                &self.zone,
+                metadata.policy_snapshot,
+                metadata.current_revision,
+                &self.bundle_resource_types,
+                &resources,
+                controller_subjects.iter().cloned(),
+            )?;
         let rebind_core = self
             .core_controller_subject
             .lock()
@@ -11893,38 +12033,15 @@ impl ZoneResourceRuntime {
             self.stop_u9_controller_runners_locked().await?;
             self.stop_u10_controller_runners_locked().await?;
         }
-        self.authorizer
-            .replace_policy(policy.clone(), &state)
-            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
-        if let Some(bus) = &self.bus {
-            bus.replace_policy(policy, state.clone())
-                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
-        }
-        if let Err(error) = self.refresh_system_core_session(state.clone()).await {
-            self.authorizer.mark_policy_unavailable();
-            if let Some(bus) = &self.bus {
-                bus.mark_policy_unavailable();
-            }
-            if let Ok(mut installed) = self.authorization_state.lock() {
-                *installed = None;
-            }
-            if let Ok(mut loaded) = self.policy_loaded.lock() {
-                *loaded = false;
-            }
+        self.install_policy_projection(policy, state.clone(), controller_subjects)?;
+        if let Err(error) = self.refresh_system_core_session_locked(state.clone()).await {
+            self.mark_policy_projection_unavailable();
             return Err(error);
         }
-        *self
-            .authorization_state
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)? = Some(state);
         *self
             .policy_subject_fingerprints
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)? = fingerprints;
-        *self
-            .policy_loaded
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)? = true;
         if rebind_core {
             if let Err(error) = self.start_core_controller_runners_locked(true).await {
                 #[cfg(not(test))]
@@ -11971,13 +12088,69 @@ impl ZoneResourceRuntime {
         Ok(())
     }
 
+    async fn current_controller_policy_subjects(
+        &self,
+    ) -> Result<BTreeSet<BoundSubject>, ResourceRuntimeError> {
+        let providers = self
+            .controller_session_providers
+            .lock()
+            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?
+            .clone();
+        let subjects = self
+            .current_controller_policy_subjects_from(providers.as_deref())
+            .await?;
+        if subjects.is_empty() && providers.is_none() {
+            // Before Process Providers attach, preserve the last validated
+            // external projection rather than replacing it with no subjects.
+            return self.policy_projection.installed_controller_subjects();
+        }
+        Ok(subjects)
+    }
+
+    async fn current_controller_policy_subjects_from(
+        &self,
+        providers: Option<
+            &crate::process_provider_runtime::ProductionProcessProviders,
+        >,
+    ) -> Result<BTreeSet<BoundSubject>, ResourceRuntimeError> {
+        load_controller_policy_subjects(
+            &self.zone,
+            &self.store,
+            providers,
+            &self.controller_sessions,
+        )
+        .await
+    }
+
+    fn install_policy_projection(
+        &self,
+        policy: PolicySet,
+        state: AuthorizationState,
+        controller_subjects: BTreeSet<BoundSubject>,
+    ) -> Result<(), ResourceRuntimeError> {
+        self.policy_projection
+            .install(policy, state, controller_subjects)
+    }
+
+    fn mark_policy_projection_unavailable(&self) {
+        self.policy_projection.mark_unavailable();
+    }
+
     /// Re-enroll the fixed internal system-core session after a policy
     /// revision change so its old lease cannot continue past the fence.
+    #[allow(dead_code)]
     async fn refresh_system_core_session(
         &self,
         state: AuthorizationState,
     ) -> Result<(), ResourceRuntimeError> {
         let _session_guard = self.controller_session_lock.lock().await;
+        self.refresh_system_core_session_locked(state).await
+    }
+
+    async fn refresh_system_core_session_locked(
+        &self,
+        state: AuthorizationState,
+    ) -> Result<(), ResourceRuntimeError> {
         let session_state = (
             self.registrar
                 .lock()
@@ -12074,12 +12247,7 @@ impl ZoneResourceRuntime {
             &resolved_user,
             operation_id,
         )?;
-        let state = self
-            .authorization_state
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-            .clone()
-            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let state = self.policy_projection.installed_state()?;
         let subject = self
             .authorizer
             .issue_authenticated_subject(context, state)
@@ -15656,6 +15824,7 @@ impl ZoneResourceRuntime {
             api: Arc::clone(&self.api),
             authorizer: Arc::clone(&self.authorizer),
             authorization_state: self.authorization_state.clone(),
+            policy_projection: Arc::clone(&self.policy_projection),
             registrar: Arc::clone(&self.registrar),
             assignments: Arc::clone(&self.assignments),
             controller_sessions: Arc::clone(&self.controller_sessions),
@@ -15709,6 +15878,10 @@ fn schedule_controller_session_reconcile(
                     error = %error,
                     "external Provider controller session reconciliation degraded",
                 );
+                // Keep the failed session projection as pending work. A
+                // failed install must not look like a successful wake that
+                // waits forever for an unrelated external notification.
+                wake_for_task.notify_one();
             }
             wake_for_task.notified().await;
         }
@@ -15938,9 +16111,7 @@ impl ControllerSessionCoordinator {
                         subject_uid: provider_uid.clone(),
                     })
             })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
         let policy_resources =
             d2bd_runtime::resource_runtime_support::load_committed_policy_resources(
                 &self.store,
@@ -15955,7 +16126,7 @@ impl ControllerSessionCoordinator {
                 store_metadata.current_revision,
                 &self.bundle_resource_types,
                 &policy_resources,
-                provider_subjects,
+                provider_subjects.iter().cloned(),
             ) {
                 Ok(policy) => policy,
                 Err(error) => {
@@ -15968,21 +16139,20 @@ impl ControllerSessionCoordinator {
                         error = %error,
                         "external Provider controller policy projection failed",
                     );
-                    return Ok(());
+                    return Err(error);
                 }
             };
-        if self.authorizer.replace_policy(policy, &state).is_err() {
+        if let Err(error) = self
+            .policy_projection
+            .install(policy, state, provider_subjects)
+        {
             for context in surviving_contexts {
                 providers.fail_controller_bootstrap(&context);
                 self.remove_controller_session(context.process_ref(), Some(&context))
                     .await?;
             }
-            return Ok(());
+            return Err(error);
         }
-        *self
-            .authorization_state
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = Some(state);
 
         let bootstrap_refs = providers.controller_bootstrap_refs(&self.zone);
         for process_ref in bootstrap_refs {
@@ -17058,14 +17228,19 @@ impl ControllerSessionCoordinator {
             .runtime_metadata()
             .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let contexts = providers.controller_bootstrap_contexts(&self.zone);
-        let provider_subjects = contexts
-            .iter()
-            .map(|context| d2b_resource_api::authz::BoundSubject {
-                subject_ref: context.provider_owner_ref().clone(),
-                subject_uid: context.provider_uid().clone(),
-            })
-            .collect::<BTreeSet<_>>();
+        let provider_subjects = match load_controller_policy_subjects(
+            &self.zone,
+            &self.store,
+            Some(providers),
+            &self.controller_sessions,
+        )
+        .await
+        {
+            Ok(subjects) => subjects,
+            Err(error) => {
+                return Err(error);
+            }
+        };
         let policy_resources =
             d2bd_runtime::resource_runtime_support::load_committed_policy_resources(
                 &self.store,
@@ -17080,16 +17255,11 @@ impl ControllerSessionCoordinator {
                 store_metadata.current_revision,
                 &self.bundle_resource_types,
                 &policy_resources,
-                provider_subjects,
+                provider_subjects.iter().cloned(),
             )
             .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
-        self.authorizer
-            .replace_policy(policy, &state)
-            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
-        *self
-            .authorization_state
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = Some(state);
+        self.policy_projection
+            .install(policy, state, provider_subjects)?;
         Ok(())
     }
 }
@@ -17110,6 +17280,11 @@ impl ZoneResourceRuntime {
             .provider_runtime
             .process_providers()
             .ok_or(ResourceRuntimeError::ProviderPathUnavailable)?;
+        *self
+            .controller_session_providers
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
+            Some(Arc::clone(&providers));
         let coordinator = self.controller_session_coordinator();
         coordinator
             .reconcile_controller_sessions(Arc::clone(&providers), false)
@@ -17750,18 +17925,16 @@ impl ZoneResourceRuntime {
             &format!("{}:user", operation_id),
         )
         .await?;
-        self.refresh_authorization_policy().await?;
+        let read_only = matches!(method, "Get" | "List");
+        if !read_only {
+            self.refresh_authorization_policy().await?;
+        }
         let context = d2bd_runtime::resource_runtime_support::local_user_subject_context(
             &self.zone,
             &resolved_user,
             &operation_id,
         )?;
-        let state = self
-            .authorization_state
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-            .clone()
-            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let state = self.policy_projection.installed_state()?;
         let subject = self
             .authorizer
             .issue_authenticated_subject(context, state)
@@ -19273,6 +19446,62 @@ async fn load_committed_controller_provider_identities(
         return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
     }
     Ok(identities)
+}
+
+async fn load_controller_policy_subjects(
+    zone: &ZoneId,
+    store: &RedbResourceStore,
+    providers: Option<&crate::process_provider_runtime::ProductionProcessProviders>,
+    controller_sessions: &Mutex<BTreeMap<ResourceRef, ControllerSession>>,
+) -> Result<BTreeSet<BoundSubject>, ResourceRuntimeError> {
+    let mut contexts = BTreeMap::new();
+    if let Some(providers) = providers {
+        for context in providers.controller_bootstrap_contexts(zone) {
+            contexts.insert(context.process_ref().clone(), context);
+        }
+    }
+    for session in controller_sessions
+        .lock()
+        .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?
+        .values()
+    {
+        let context = session.context.clone();
+        if let Some(existing) = contexts.get(context.process_ref())
+            && existing != &context
+        {
+            return Err(ResourceRuntimeError::PolicyUnavailable);
+        }
+        contexts.insert(context.process_ref().clone(), context);
+    }
+    let provider_refs = contexts
+        .values()
+        .map(|context| context.provider_owner_ref().clone())
+        .collect::<BTreeSet<_>>();
+    let identities = load_committed_controller_provider_identities(
+        zone,
+        store,
+        provider_refs,
+    )
+    .await
+    .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
+    let mut subjects = BTreeSet::new();
+    for context in contexts.values() {
+        let Some((provider_uid, provider_generation)) =
+            identities.get(context.provider_owner_ref())
+        else {
+            return Err(ResourceRuntimeError::PolicyUnavailable);
+        };
+        if provider_uid != context.provider_uid()
+            || *provider_generation != context.provider_generation()
+        {
+            return Err(ResourceRuntimeError::PolicyUnavailable);
+        }
+        subjects.insert(BoundSubject {
+            subject_ref: context.provider_owner_ref().clone(),
+            subject_uid: provider_uid.clone(),
+        });
+    }
+    Ok(subjects)
 }
 
 struct CommittedProcessProviderIdentityLoader {
@@ -23439,6 +23668,280 @@ mod tests {
             drop(guard);
             assert_eq!(refresh.await, Ok(()));
         }
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_policy_refresh_preserves_installed_controller_subjects() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let provider_ref = ResourceRef::parse("Provider/system-minijail").unwrap();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Provider",
+                "system-minijail",
+                &zone,
+                r#"{"artifactId":"system-minijail","config":{}}"#,
+            )],
+        )
+        .await;
+        let providers = test_controller_session_providers();
+        *runtime.controller_session_providers.lock().unwrap() = Some(Arc::clone(&providers));
+        let provider = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "controller-policy-provider-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "controller-policy-provider-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: provider_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::MetadataOnly,
+            })
+            .await
+            .unwrap();
+        let metadata = runtime.store.runtime_metadata().await.unwrap();
+        let controller_generation = metadata
+            .policy_snapshot
+            .controller_generation
+            .expect("test policy has a controller generation");
+        providers
+            .attach_controller_provider_context_for_test(
+                zone.clone(),
+                ResourceRef::parse("Process/system-minijail-controller").unwrap(),
+                ResourceUid::parse("323e4567-e89b-42d3-a456-426614174000").unwrap(),
+                ResourceGeneration::new(1).unwrap(),
+                ResourceRef::parse("Provider/system-minijail").unwrap(),
+                provider_ref.clone(),
+                provider.uid.clone(),
+                provider.generation,
+                ResourceRef::parse("Host/host-system").unwrap(),
+                controller_generation,
+            )
+            .unwrap();
+        assert!(
+            runtime
+                .policy_projection
+                .installed_controller_subjects()
+                .unwrap()
+                .is_empty()
+        );
+
+        // The Provider materialization advanced the store revision, so this
+        // refresh must recompile instead of returning from its installed-state
+        // fast path.
+        runtime.refresh_authorization_policy().await.unwrap();
+
+        let controller_subject = BoundSubject {
+            subject_ref: provider_ref,
+            subject_uid: provider.uid,
+        };
+        let state = runtime.policy_projection.installed_state().unwrap();
+        let authorization_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(state.snapshot, authorization_state.snapshot);
+        assert_eq!(
+            state.zone_policy_revision,
+            authorization_state.zone_policy_revision
+        );
+        assert_eq!(
+            runtime
+                .policy_projection
+                .installed_controller_subjects()
+                .unwrap(),
+            BTreeSet::from([controller_subject.clone()])
+        );
+        let context = || {
+            AuthenticatedSubjectContext::new(
+                controller_subject.subject_ref.clone(),
+                controller_subject.subject_uid.clone(),
+                ResourceRef::parse("Zone/work").unwrap(),
+                EvidenceClass::UnixPeer,
+                d2b_contracts_resource::v3::identity::SessionPurpose::parse("resource-api")
+                    .unwrap(),
+                d2b_contracts_resource::v3::identity::ServiceName::parse("d2b.resource.v3")
+                    .unwrap(),
+                d2b_contracts_resource::v3::identity::SessionBinding::new(
+                    d2b_contracts_resource::v3::SchemaFingerprint::parse(format!(
+                        "sha256:{}",
+                        "1".repeat(64)
+                    ))
+                    .unwrap(),
+                    d2b_contracts_resource::v3::identity::TransportBinding::new(
+                        d2b_contracts_resource::v3::identity::Locality::Local,
+                        BindingDigest::parse(format!("sha256:{}", "2".repeat(64))).unwrap(),
+                    ),
+                    ReconnectGeneration::new(1).unwrap(),
+                    d2b_contracts_resource::v3::identity::TranscriptHash::from_bytes([3; 32]),
+                ),
+            )
+        };
+        assert!(
+            runtime
+                .authorizer
+                .issue_authenticated_subject(context(), state.clone())
+                .is_ok(),
+            "policy refresh must retain the installed Provider controller grant"
+        );
+        let bus_authorizer = runtime
+            .bus
+            .as_ref()
+            .expect("production runtime has a ZoneBus")
+            .native_authorizer();
+        assert!(
+            bus_authorizer
+                .issue_authenticated_subject(context(), state)
+                .is_ok(),
+            "ZoneBus must retain the installed Provider controller grant"
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn policy_projection_preflight_failure_preserves_last_good_projection() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let before = runtime.policy_projection.installed_state().unwrap();
+        let resources = d2bd_runtime::resource_runtime_support::load_committed_policy_resources(
+            &runtime.store,
+            &runtime.zone,
+            "policy-preflight-regression",
+        )
+        .await
+        .unwrap();
+        let metadata = runtime.store.runtime_metadata().await.unwrap();
+        let (policy, mut rejected_state) =
+            d2bd_runtime::resource_runtime_support::compile_committed_policy_with_subjects(
+                &runtime.zone,
+                metadata.policy_snapshot,
+                metadata.current_revision,
+                &runtime.bundle_resource_types,
+                &resources,
+                std::iter::empty(),
+            )
+            .unwrap();
+        rejected_state.snapshot.policy_revision =
+            rejected_state.snapshot.policy_revision.saturating_add(1);
+
+        assert_eq!(
+            runtime
+                .policy_projection
+                .install(policy, rejected_state, BTreeSet::new()),
+            Err(ResourceRuntimeError::AuthorizationUnavailable)
+        );
+        assert_eq!(runtime.policy_projection.installed_state().unwrap(), before);
+        assert!(*runtime.policy_projection.policy_loaded.lock().unwrap());
+        assert_eq!(
+            runtime
+                .authorization_state
+                .lock()
+                .unwrap()
+                .as_ref(),
+            Some(&before)
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_get_and_list_use_installed_policy_while_session_lock_is_held() {
+        let (_directory, runtime, broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let uid = Uid::current();
+        let username = User::from_uid(uid)
+            .unwrap()
+            .expect("test peer uid has an NSS user")
+            .name;
+        let user_ref = ResourceRef::parse(&format!("User/{username}")).unwrap();
+        let role_ref = ResourceRef::parse("Role/public-read").unwrap();
+        let role = d2b_contracts_zone_session::v3::role::RoleSpec::new(vec![
+            d2b_contracts_zone_session::v3::role::RoleRule::new(
+                vec![ResourceTypeName::parse("Host").unwrap()],
+                vec![
+                    d2b_contracts_zone_session::v3::role::RoleResourceVerb::Get,
+                    d2b_contracts_zone_session::v3::role::RoleResourceVerb::List,
+                ],
+                Vec::new(),
+                Vec::new(),
+                vec![zone.clone()],
+                Vec::new(),
+                vec![d2b_contracts_zone_session::v3::role::RoleSessionVerb::Connect],
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let binding =
+            d2b_contracts_zone_session::v3::role_binding::RoleBindingSpec::new(
+                role_ref,
+                vec![user_ref.clone()],
+                None,
+                None,
+            )
+            .unwrap();
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "User",
+                    &username,
+                    &zone,
+                    &serde_json::to_string(&json!({
+                        "displayName": username,
+                        "groups": [],
+                        "osUsername": username,
+                    }))
+                    .unwrap(),
+                ),
+                bundle_resource(
+                    "Role",
+                    "public-read",
+                    &zone,
+                    &serde_json::to_string(&role).unwrap(),
+                ),
+                bundle_resource(
+                    "RoleBinding",
+                    "public-read",
+                    &zone,
+                    &serde_json::to_string(&binding).unwrap(),
+                ),
+            ],
+        )
+        .await;
+        mark_test_resource_ready(&runtime, &user_ref, &broker_evidence).await;
+        runtime.refresh_authorization_policy().await.unwrap();
+
+        let guard = runtime.controller_session_lock.lock().await;
+        for request in [
+            json!({
+                "method": "Get",
+                "zoneRef": "Zone/work",
+                "resourceRef": "Host/host-system",
+            }),
+            json!({
+                "method": "List",
+                "zoneRef": "Zone/work",
+                "resourceType": "Host",
+            }),
+        ] {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                runtime.dispatch_public_cli_request(&request, uid.as_raw()),
+            )
+            .await
+            .expect("public read must not wait for controller-session policy refresh")
+            .expect("public read should use the installed authorization projection");
+        }
+        drop(guard);
         runtime.shutdown().await.unwrap();
     }
 

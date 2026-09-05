@@ -23,8 +23,8 @@ use d2b_core_controller::controller_assignment::{
     ScopedResourceScope,
 };
 use d2b_resource_api::authz::{
-    ApiMethod, AuthorizationRequest, AuthorizationState, AuthorizationTarget, PolicySet,
-    ResourceVerb, SessionVerb,
+    ApiMethod, AuthorizationRequest, AuthorizationState, AuthorizationTarget, NativeAuthorizer,
+    PolicySet, ResourceVerb, SessionVerb,
 };
 use d2b_resource_api::watch::{WatchFrame, WatchSink, WatchSinkError};
 use d2b_session::{
@@ -1397,6 +1397,11 @@ impl ZoneBus {
     ) -> Result<(), BusError> {
         self.core.authorizer.replace_policy(policy, state)?;
         Ok(())
+    }
+
+    /// Borrow the native authorizer shared by this Zone bus.
+    pub fn native_authorizer(&self) -> Arc<NativeAuthorizer> {
+        self.core.authorizer.native_authorizer()
     }
 
     /// Fail closed for all new work while durable policy is unavailable.

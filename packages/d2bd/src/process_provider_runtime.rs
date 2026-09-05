@@ -1956,6 +1956,45 @@ impl ProductionProcessProviders {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn attach_controller_provider_context_for_test(
+        &self,
+        zone: ZoneId,
+        process_ref: ResourceRef,
+        process_uid: ResourceUid,
+        process_generation: ResourceGeneration,
+        process_provider_ref: ResourceRef,
+        provider_owner_ref: ResourceRef,
+        provider_uid: ResourceUid,
+        provider_generation: ResourceGeneration,
+        execution_ref: ResourceRef,
+        controller_generation: ControllerGeneration,
+    ) -> Result<(), String> {
+        let context = ControllerBootstrapContext {
+            zone: zone.clone(),
+            zone_uid: None,
+            process_ref: process_ref.clone(),
+            process_uid,
+            generation: process_generation,
+            process_identity: ProcessIdentityDigest::from_bytes([7; 32]),
+            process_provider_ref,
+            provider_owner_ref,
+            provider_uid,
+            provider_generation,
+            execution_ref,
+            user_ref: None,
+            controller_generation,
+        };
+        self.controller_bootstrap
+            .lock()
+            .map_err(|_| "provider-managed-state-poisoned".to_owned())?
+            .insert(
+                (zone, process_ref),
+                ControllerBootstrapMarker::Active(context),
+            );
+        Ok(())
+    }
+
     pub(crate) fn controller_bootstrap_establishing_contexts(
         &self,
         zone: &ZoneId,
