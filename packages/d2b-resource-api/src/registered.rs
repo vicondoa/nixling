@@ -842,7 +842,12 @@ impl RedbRegisteredControllerApi {
         mutations: Vec<StoreMutation>,
     ) -> Result<CommitOutcome, SourceError> {
         let key = ResourceKey::new(zone.clone(), context_target.clone(), context_uid.clone());
-        loop {
+        let retry_deadline = tokio::time::Instant::now() + TRANSIENT_RETRY_BUDGET;
+        let mut last_error = SourceError::Timeout;
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            if tokio::time::Instant::now() >= retry_deadline {
+                break;
+            }
             match self.read_target(&key).await {
                 Ok(Ok(current))
                     if current.uid == *context_uid
@@ -850,7 +855,11 @@ impl RedbRegisteredControllerApi {
                             .map_or(true, |generation| current.generation == generation) => {}
                 Ok(Ok(current)) => return Ok(CommitOutcome::Conflict(current.revision)),
                 Ok(Err(revision)) => return Ok(CommitOutcome::Conflict(revision)),
-                Err(SourceError::Timeout | SourceError::Backpressure) => {
+                Err(error @ (SourceError::Timeout | SourceError::Backpressure)) => {
+                    last_error = error;
+                    if attempt + 1 == TRANSIENT_RETRY_ATTEMPTS {
+                        break;
+                    }
                     tokio::task::yield_now().await;
                     continue;
                 }
@@ -872,12 +881,17 @@ impl RedbRegisteredControllerApi {
             ))
             .await
             {
-                Err(SourceError::Timeout | SourceError::Backpressure) => {
+                Err(error @ (SourceError::Timeout | SourceError::Backpressure)) => {
+                    last_error = error;
+                    if attempt + 1 == TRANSIENT_RETRY_ATTEMPTS {
+                        break;
+                    }
                     tokio::task::yield_now().await;
                 }
                 outcome => return outcome,
             }
         }
+        Err(last_error)
     }
 
     fn resource_operation_id(context: &ReconcileContext) -> String {
@@ -4371,6 +4385,98 @@ mod tests {
             .unwrap();
         assert_eq!(updated.revision, ZoneRevision::new(2));
         assert_eq!(store.authority_operations().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn core_redb_persistent_commit_timeout_finishes_uncertain_without_effect_retry() {
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
+        let target = ResourceRef::parse("Host/owner").unwrap();
+        store
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
+                target.clone(),
+                canonical_host("owner", None),
+                None,
+                "create-owner-persistent-timeout",
+            ))
+            .await
+            .unwrap();
+        let stored = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-persistent-timeout".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-persistent-timeout".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let effect_calls = Arc::new(AtomicUsize::new(0));
+        let api = Arc::new(
+            service
+                .registered_controller_api(
+                    subject,
+                    state,
+                    vec![(
+                        target.clone(),
+                        primary_assignment(stored.uid.clone(), stored.revision),
+                    )],
+                )
+                .unwrap(),
+        );
+        api.inject_commit_response_timeouts(usize::MAX);
+        let descriptor = descriptor();
+        let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
+        let runner = d2b_core_controller::Runner::new(
+            Arc::new(MutationHandler {
+                descriptor: descriptor.clone(),
+                effect_only: true,
+                no_effect: false,
+                fail_effect: None,
+                effect_calls: Some(Arc::clone(&effect_calls)),
+                observe_failure: None,
+                status_candidate: true,
+            }),
+            Arc::clone(&source),
+            d2b_core_controller::RunnerConfig {
+                policy_revision: 7,
+                api_revision: 8,
+                configuration_revision: ConfigurationGeneration::new(9).unwrap(),
+                deadline_tick: 5_000,
+                max_attempts: 3,
+            },
+        )
+        .run();
+        let runner_task = tokio::spawn(runner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while effect_calls.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        source.close_watch().unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(2), runner_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.handler_failures, 1);
+        assert_eq!(report.persistence_uncertain, 1);
+        assert_eq!(effect_calls.load(Ordering::Acquire), 1);
+        let rows = store.authority_operations().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].state,
+            d2b_resource_store_redb::AuthorityOperationState::Pending
+        );
     }
 
     #[tokio::test]

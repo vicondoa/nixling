@@ -1120,6 +1120,20 @@ where
                                 );
                             }
                         }
+                        WorkerOutcome::PersistenceExhausted => {
+                            queue.finish(&key)?;
+                            report.handler_failures += 1;
+                            report.persistence_uncertain += 1;
+                            observe_counter(
+                                self.observer.as_ref(),
+                                RunnerCounter::Exhaustion,
+                                Some(completion.work.lane()),
+                                RunnerOutcome::Exhausted,
+                                RunnerObservationReason::Conflict,
+                                queue.resource_count(),
+                                workers.len(),
+                            );
+                        }
                         WorkerOutcome::Terminal {
                             projection,
                             generation,
@@ -1461,6 +1475,7 @@ enum WorkerOutcome {
         projection: ReconcileProjection,
         generation: Option<ResourceGeneration>,
     },
+    PersistenceExhausted,
     SourceFailed {
         error: SourceError,
         operation: &'static str,
@@ -1487,16 +1502,17 @@ impl OwnedWorkers {
         self.cancellations.push(cancellation.clone());
         self.tasks.spawn(async move {
             let _permit = permit;
-            let now_tick = runtime.clock.now_tick();
+            let clock = Arc::clone(&runtime.clock);
+            let now_tick = clock.now_tick();
             let deadline_tick =
-                phase_deadline(runtime.clock.as_ref(), runtime.config.deadline_tick);
+                phase_deadline(clock.as_ref(), runtime.config.deadline_tick);
             let work_config = RunnerConfig {
                 deadline_tick,
                 ..runtime.config
             };
             let mut persistence_operation = work.persistence_operation().cloned();
             let outcome = match bounded_phase(
-                runtime.clock.as_ref(),
+                clock.as_ref(),
                 deadline_tick,
                 &cancellation,
                 execute_work_inner(
@@ -1506,6 +1522,7 @@ impl OwnedWorkers {
                     work_config,
                     &work,
                     cancellation.clone(),
+                    clock.as_ref(),
                     now_tick,
                     &mut persistence_operation,
                 ),
@@ -1933,6 +1950,7 @@ async fn execute_work_inner<R, S>(
     config: RunnerConfig,
     work: &QueuedWork,
     cancellation: Cancellation,
+    clock: &dyn MonotonicClock,
     now_tick: u64,
     persistence_operation: &mut Option<OperationContext>,
 ) -> WorkerOutcome
@@ -2114,6 +2132,7 @@ where
         return persist_result(
             source.as_ref(),
             &context,
+            clock,
             ReconcileResult::failed_terminal(target.revision(), target.generation(), projection),
             persistence_operation.as_ref(),
         )
@@ -2137,6 +2156,7 @@ where
             return persist_result(
                 source.as_ref(),
                 &context,
+                clock,
                 prepared,
                 persistence_operation.as_ref(),
             )
@@ -2208,6 +2228,7 @@ where
         return persist_result(
             source.as_ref(),
             &context,
+            clock,
             result,
             persistence_operation.as_ref(),
         )
@@ -2289,6 +2310,7 @@ where
         return persist_result(
             source.as_ref(),
             &context,
+            clock,
             result,
             persistence_operation.as_ref(),
         )
@@ -2311,6 +2333,7 @@ where
         return persist_result(
             source.as_ref(),
             &context,
+            clock,
             result,
             persistence_operation.as_ref(),
         )
@@ -2349,6 +2372,7 @@ where
             return persist_result(
                 source.as_ref(),
                 &context,
+                clock,
                 ReconcileResult::upgrade_required(
                     target.revision(),
                     target.generation(),
@@ -2381,6 +2405,7 @@ where
         return persist_result(
             source.as_ref(),
             &context,
+            clock,
             ReconcileResult::converged(target.revision(), target.generation()),
             persistence_operation.as_ref(),
         )
@@ -2406,6 +2431,7 @@ where
         return persist_result(
             source.as_ref(),
             &context,
+            clock,
             prepared,
             persistence_operation.as_ref(),
         )
@@ -2473,15 +2499,24 @@ where
     persist_result(
         source.as_ref(),
         &context,
+        clock,
         result,
         persistence_operation.as_ref(),
     )
     .await
 }
 
+fn persistence_exhausted(
+    _context: &ReconcileContext,
+    _clock: &dyn MonotonicClock,
+) -> WorkerOutcome {
+    WorkerOutcome::PersistenceExhausted
+}
+
 async fn persist_result<S>(
     source: &S,
     context: &ReconcileContext,
+    clock: &dyn MonotonicClock,
     mut result: ReconcileResult,
     persistence_operation: Option<&OperationContext>,
 ) -> WorkerOutcome
@@ -2559,14 +2594,16 @@ where
 
     let requeue_at = result.next_tick();
     if result.requires_commit() {
-        let commit = loop {
-            match source.commit_result(context, &result).await {
-                Err(SourceError::Timeout | SourceError::Backpressure) => {
-                    tokio::task::yield_now().await;
-                }
-                outcome => break outcome,
-            }
-        };
+        if context.cancellation().is_cancelled() || clock.now_tick() >= context.deadline_tick() {
+            return persistence_exhausted(context, clock);
+        }
+        let commit = source.commit_result(context, &result).await;
+        if matches!(
+            commit,
+            Err(SourceError::Timeout | SourceError::Backpressure)
+        ) {
+            return persistence_exhausted(context, clock);
+        }
         match commit {
             Ok(CommitOutcome::Committed(revision)) => {
                 if revision < context.revision() {
@@ -2587,6 +2624,9 @@ where
                             generation: Some(context.generation()),
                             reason: ReconcileReason::ConflictExhausted,
                         };
+                    }
+                    if matches!(error, SourceError::Timeout | SourceError::Backpressure) {
+                        return persistence_exhausted(context, clock);
                     }
                     return WorkerOutcome::SourceFailed {
                         error,
@@ -2679,14 +2719,25 @@ where
         }
     }
 
-    let projection_persistence = loop {
+    let mut projection_persistence = Err(SourceError::Timeout);
+    for attempt in 0..FAILURE_PERSISTENCE_MAX_ATTEMPTS {
+        if context.cancellation().is_cancelled() || clock.now_tick() >= context.deadline_tick() {
+            return persistence_exhausted(context, clock);
+        }
         match persist_projection(source, context, &result, None, persistence_operation).await {
-            Err(SourceError::Timeout | SourceError::Backpressure) => {
+            Err(error @ (SourceError::Timeout | SourceError::Backpressure)) => {
+                projection_persistence = Err(error);
+                if attempt + 1 == FAILURE_PERSISTENCE_MAX_ATTEMPTS {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
-            outcome => break outcome,
+            outcome => {
+                projection_persistence = outcome;
+                break;
+            }
         }
-    };
+    }
     if let Err(error) = projection_persistence {
         if let SourceError::Conflict(revision) = error {
             return WorkerOutcome::Retry {
@@ -2696,11 +2747,7 @@ where
             };
         }
         if matches!(error, SourceError::Timeout | SourceError::Backpressure) {
-            return WorkerOutcome::Retry {
-                revision: context.revision(),
-                generation: Some(context.generation()),
-                reason: ReconcileReason::ConflictExhausted,
-            };
+            return persistence_exhausted(context, clock);
         }
         return WorkerOutcome::SourceFailed {
             error,
@@ -2867,6 +2914,8 @@ mod tests {
         enforce_projection_revision: AtomicBool,
         persist_conflicts_remaining: AtomicUsize,
         persist_timeouts_remaining: AtomicUsize,
+        commit_timeouts_remaining: AtomicUsize,
+        commit_backpressure_remaining: AtomicUsize,
         checkpoints: AtomicUsize,
         starting: AtomicUsize,
         requeues: AtomicUsize,
@@ -2910,6 +2959,8 @@ mod tests {
                     enforce_projection_revision: AtomicBool::new(false),
                     persist_conflicts_remaining: AtomicUsize::new(0),
                     persist_timeouts_remaining: AtomicUsize::new(0),
+                    commit_timeouts_remaining: AtomicUsize::new(0),
+                    commit_backpressure_remaining: AtomicUsize::new(0),
                     checkpoints: AtomicUsize::new(0),
                     starting: AtomicUsize::new(0),
                     requeues: AtomicUsize::new(0),
@@ -3144,6 +3195,32 @@ mod tests {
             result: &ReconcileResult,
         ) -> impl Future<Output = Result<CommitOutcome, SourceError>> + Send {
             self.commits.fetch_add(1, Ordering::SeqCst);
+            if self
+                .commit_timeouts_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return std::future::ready(Err(SourceError::Timeout));
+            }
+            if self
+                .commit_backpressure_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return std::future::ready(Err(SourceError::Backpressure));
+            }
             let remaining = self.conflicts_remaining.load(Ordering::SeqCst);
             let outcome = if remaining > 0 {
                 self.conflicts_remaining.fetch_sub(1, Ordering::SeqCst);
@@ -4464,7 +4541,8 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = block_on(persist_result(source.as_ref(), &context, result, None));
+        let clock = TokioClock::default();
+        let outcome = block_on(persist_result(source.as_ref(), &context, &clock, result, None));
         assert!(matches!(
             outcome,
             WorkerOutcome::Done {
@@ -4720,6 +4798,114 @@ mod tests {
                 .revision(),
             ZoneRevision::new(2)
         );
+    }
+
+    #[test]
+    fn persistent_commit_timeout_finishes_without_effect_retry_or_sibling_starvation() {
+        let (reconciler, _entered, source, watch_tx) =
+            harness(vec![key("first", 1), key("second", 2)], 2);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source
+            .commit_timeouts_remaining
+            .store(usize::MAX, Ordering::SeqCst);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+
+        wait_for(&reconciler.execute_effect_calls, 2);
+        assert!(!runner.is_finished(), "watch must remain live after bounded recovery");
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let report = runner
+            .join()
+            .expect("runner thread")
+            .expect("persistent commit uncertainty must finish per resource");
+        assert_eq!(report.handler_failures, 2);
+        assert_eq!(report.persistence_uncertain, 2);
+        assert_eq!(reconciler.execute_effect_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn persistent_commit_backpressure_finishes_without_effect_retry() {
+        let (reconciler, _entered, source, watch_tx) =
+            harness(vec![key("first", 1), key("second", 2)], 2);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source
+            .commit_backpressure_remaining
+            .store(usize::MAX, Ordering::SeqCst);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+
+        wait_for(&reconciler.execute_effect_calls, 2);
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let report = runner
+            .join()
+            .expect("runner thread")
+            .expect("persistent commit backpressure must finish per resource");
+        assert_eq!(report.handler_failures, 2);
+        assert_eq!(report.persistence_uncertain, 2);
+        assert_eq!(reconciler.execute_effect_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn cancelled_persistence_timeout_finishes_without_store_retry() {
+        let target = key("cancelled", 1);
+        let (_reconciler, _entered, source, _watch_tx) = harness(Vec::new(), 1);
+        source
+            .commit_timeouts_remaining
+            .store(usize::MAX, Ordering::SeqCst);
+        let (target_snapshot, dependencies) = match resource(target, 1) {
+            FreshSnapshot::Present {
+                target,
+                dependencies,
+            } => (target, dependencies),
+            FreshSnapshot::Deleted { .. } => unreachable!(),
+        };
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        let context = ReconcileContext::ordinary(
+            identity(),
+            &target_snapshot,
+            &dependencies,
+            TriggerSet::new([TriggerReason::ManualReconcile]),
+            target_snapshot.revision(),
+            OperationContext::new("cancelled", "cancelled", "cancelled", None).unwrap(),
+            1,
+            0,
+            30_000,
+            cancellation,
+            1,
+            2,
+            ConfigurationGeneration::new(3).unwrap(),
+        )
+        .unwrap();
+        let mutation = MutationIntent::new(
+            target_snapshot.key().resource_ref().clone(),
+            Some(target_snapshot.key().uid().clone()),
+            Some(target_snapshot.revision()),
+            MutationIntentKind::UpdateSpec,
+            Some(b"{}".to_vec()),
+        )
+        .unwrap();
+        let result = ReconcileResult::new(
+            target_snapshot.revision(),
+            target_snapshot.generation(),
+            Some(ResourceMutationBatch::new(vec![mutation]).unwrap()),
+            None,
+            ReconcileDisposition::Converged,
+            None,
+            None,
+            StatusPersistence::NotRequested,
+        )
+        .unwrap();
+        let clock = TokioClock::default();
+        let outcome = block_on(persist_result(
+            source.as_ref(),
+            &context,
+            &clock,
+            result,
+            None,
+        ));
+        assert!(matches!(outcome, WorkerOutcome::PersistenceExhausted));
+        assert_eq!(source.commits.load(Ordering::SeqCst), 0);
     }
 
     #[test]
