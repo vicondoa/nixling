@@ -1942,19 +1942,6 @@ impl ProductionProcessProviders {
         self.wake_controller_session_reconcile(&zone)
     }
 
-    pub(crate) fn controller_bootstrap_refs(&self, zone: &ZoneId) -> Vec<ResourceRef> {
-        self.controller_bootstrap
-            .lock()
-            .map(|markers| {
-                markers
-                    .keys()
-                    .filter(|(marker_zone, _)| marker_zone == zone)
-                    .map(|(_, process_ref)| process_ref.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     pub(crate) fn set_controller_session_waker(
         &self,
         zone: ZoneId,
@@ -2129,19 +2116,28 @@ impl ProductionProcessProviders {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn begin_controller_bootstrap(
+    pub(crate) fn begin_controller_bootstrap_if_matches(
         &self,
         zone: &ZoneId,
-        process_ref: &ResourceRef,
+        expected: &ControllerBootstrapContext,
     ) -> Option<ControllerBootstrapEndpoint> {
+        if expected.zone() != zone {
+            return None;
+        }
         let mut markers = self.controller_bootstrap.lock().ok()?;
-        let key = (zone.clone(), process_ref.clone());
+        let key = (zone.clone(), expected.process_ref().clone());
         let marker = markers.remove(&key)?;
         match marker {
-            ControllerBootstrapMarker::Pending(endpoint) => {
-                let context = endpoint.context.clone();
+            ControllerBootstrapMarker::Pending(endpoint)
+                if endpoint.context() == expected =>
+            {
+                let context = endpoint.context().clone();
                 markers.insert(key, ControllerBootstrapMarker::Establishing(context));
                 Some(endpoint)
+            }
+            ControllerBootstrapMarker::Pending(endpoint) => {
+                markers.insert(key, ControllerBootstrapMarker::Pending(endpoint));
+                None
             }
             ControllerBootstrapMarker::Establishing(context) => {
                 markers.insert(key, ControllerBootstrapMarker::Establishing(context));

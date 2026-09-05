@@ -16148,7 +16148,10 @@ impl ControllerSessionCoordinator {
                 }
             }
         }
-        let surviving_contexts = providers.controller_bootstrap_contexts(&self.zone);
+        let surviving_contexts = bootstrap_contexts
+            .into_iter()
+            .filter(|context| providers.has_controller_bootstrap(context.process_ref(), context))
+            .collect::<Vec<_>>();
         let provider_subjects = surviving_contexts
             .iter()
             .filter_map(|context| {
@@ -16202,8 +16205,8 @@ impl ControllerSessionCoordinator {
             return Err(error);
         }
 
-        let bootstrap_refs = providers.controller_bootstrap_refs(&self.zone);
-        for process_ref in bootstrap_refs {
+        for context in surviving_contexts {
+            let process_ref = context.process_ref().clone();
             let existing = self
                 .controller_sessions
                 .lock()
@@ -16224,6 +16227,9 @@ impl ControllerSessionCoordinator {
                     .await?;
             }
 
+            if !providers.has_controller_bootstrap(&process_ref, &context) {
+                continue;
+            }
             if !providers.controller_bootstrap_ready(&self.zone, &process_ref) {
                 continue;
             }
@@ -16236,7 +16242,8 @@ impl ControllerSessionCoordinator {
                     return Err(ResourceRuntimeError::AuthenticationUnavailable);
                 }
             };
-            let Some(endpoint) = providers.begin_controller_bootstrap(&self.zone, &process_ref)
+            let Some(endpoint) =
+                providers.begin_controller_bootstrap_if_matches(&self.zone, &context)
             else {
                 *self
                     .registrar
@@ -22068,7 +22075,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         fs::OpenOptions,
-        os::fd::AsRawFd,
+        os::fd::{AsRawFd, OwnedFd},
         sync::Arc,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23559,6 +23566,41 @@ mod tests {
         )
     }
 
+    fn attach_ready_controller(
+        providers: &Arc<crate::process_provider_runtime::ProductionProcessProviders>,
+        zone: &ZoneId,
+        process_ref: &str,
+        process_uid: &str,
+        process_generation: u64,
+        provider_ref: &str,
+        provider_uid: &str,
+        provider_generation: u64,
+    ) -> OwnedFd {
+        let (daemon_endpoint, peer_endpoint) = prearmed_seqpacket_pair().unwrap();
+        nix::sys::socket::send(
+            peer_endpoint.as_raw_fd(),
+            b"controller-ready",
+            nix::sys::socket::MsgFlags::empty(),
+        )
+        .unwrap();
+        providers
+            .attach_pending_controller_provider_context_for_test(
+                daemon_endpoint,
+                zone.clone(),
+                ResourceRef::parse(process_ref).unwrap(),
+                ResourceUid::parse(process_uid).unwrap(),
+                ResourceGeneration::new(process_generation).unwrap(),
+                ResourceRef::parse("Provider/system-minijail").unwrap(),
+                ResourceRef::parse(provider_ref).unwrap(),
+                ResourceUid::parse(provider_uid).unwrap(),
+                ResourceGeneration::new(provider_generation).unwrap(),
+                ResourceRef::parse("Host/host-system").unwrap(),
+                ControllerGeneration::new(1).unwrap(),
+            )
+            .unwrap();
+        peer_endpoint
+    }
+
     fn publication_storage_row(
         zone: &ZoneId,
         identity: &d2b_resource_store_redb::StoreIdentity,
@@ -24196,8 +24238,13 @@ mod tests {
                         .expect("providers remain while the wake is delivered");
                     assert!(providers
                         .controller_bootstrap_ready(&callback_zone, &callback_process_ref));
+                    let context = providers
+                        .controller_bootstrap_contexts(&callback_zone)
+                        .into_iter()
+                        .find(|context| context.process_ref() == &callback_process_ref)
+                        .expect("readable Pending endpoint context");
                     let endpoint = providers
-                        .begin_controller_bootstrap(&callback_zone, &callback_process_ref)
+                        .begin_controller_bootstrap_if_matches(&callback_zone, &context)
                         .expect("readable Pending endpoint must be claimed");
                     let context = endpoint.context().clone();
                     assert!(providers.activate_controller_bootstrap(&context));
@@ -24223,8 +24270,154 @@ mod tests {
             .unwrap();
 
         assert_eq!(wake_count.load(Ordering::SeqCst), 1);
-        assert_eq!(providers.controller_bootstrap_refs(&zone), vec![process_ref.clone()]);
+        assert_eq!(
+            providers
+                .controller_bootstrap_contexts(&zone)
+                .into_iter()
+                .map(|context| context.process_ref().clone())
+                .collect::<Vec<_>>(),
+            vec![process_ref.clone()]
+        );
         assert!(!providers.controller_bootstrap_ready(&zone, &process_ref));
+    }
+
+    #[test]
+    fn controller_session_admission_freezes_pending_snapshot_across_passes() {
+        let zone = ZoneId::parse("work").unwrap();
+        let providers = test_controller_session_providers();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let callback_wake_count = Arc::clone(&wake_count);
+        providers
+            .set_controller_session_waker(
+                zone.clone(),
+                Arc::new(move || {
+                    callback_wake_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        let first_process_ref =
+            ResourceRef::parse("Process/provider-controller-first").expect("first process");
+        let first_provider_ref =
+            ResourceRef::parse("Provider/runtime-cloud-hypervisor").expect("first provider");
+        let _first_peer = attach_ready_controller(
+            &providers,
+            &zone,
+            "Process/provider-controller-first",
+            "123e4567-e89b-42d3-a456-426614174000",
+            1,
+            "Provider/runtime-cloud-hypervisor",
+            "223e4567-e89b-42d3-a456-426614174001",
+            1,
+        );
+
+        let pass_one_snapshot = providers.controller_bootstrap_contexts(&zone);
+        assert_eq!(
+            pass_one_snapshot
+                .iter()
+                .map(|context| context.process_ref().clone())
+                .collect::<Vec<_>>(),
+            vec![first_process_ref.clone()]
+        );
+        assert_eq!(
+            pass_one_snapshot
+                .iter()
+                .map(|context| context.provider_owner_ref().clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first_provider_ref])
+        );
+
+        let second_process_ref =
+            ResourceRef::parse("Process/provider-controller-second").expect("second process");
+        let second_provider_ref =
+            ResourceRef::parse("Provider/runtime-qemu-media").expect("second provider");
+        let _second_peer = attach_ready_controller(
+            &providers,
+            &zone,
+            "Process/provider-controller-second",
+            "323e4567-e89b-42d3-a456-426614174002",
+            1,
+            "Provider/runtime-qemu-media",
+            "423e4567-e89b-42d3-a456-426614174003",
+            1,
+        );
+        let stale_second_context = providers
+            .controller_bootstrap_contexts(&zone)
+            .into_iter()
+            .find(|context| context.process_ref() == &second_process_ref)
+            .expect("late Pending controller context");
+        let _replacement_peer = attach_ready_controller(
+            &providers,
+            &zone,
+            "Process/provider-controller-second",
+            "523e4567-e89b-42d3-a456-426614174004",
+            2,
+            "Provider/runtime-qemu-media",
+            "623e4567-e89b-42d3-a456-426614174005",
+            2,
+        );
+        assert_eq!(wake_count.load(Ordering::SeqCst), 3);
+        assert!(
+            providers
+                .begin_controller_bootstrap_if_matches(&zone, &stale_second_context)
+                .is_none(),
+            "a replaced Pending marker must not be claimed by a stale snapshot"
+        );
+
+        let mut pass_one_admissions = 0;
+        for context in &pass_one_snapshot {
+            if providers.controller_bootstrap_ready(&zone, context.process_ref())
+                && providers
+                    .begin_controller_bootstrap_if_matches(&zone, context)
+                    .is_some()
+            {
+                assert!(providers.activate_controller_bootstrap(context));
+                pass_one_admissions += 1;
+            }
+        }
+        assert_eq!(pass_one_admissions, 1);
+        assert!(providers.has_controller_bootstrap(&first_process_ref, &pass_one_snapshot[0]));
+        assert_eq!(
+            providers
+                .controller_bootstrap_contexts(&zone)
+                .iter()
+                .filter(|context| context.process_ref() == &second_process_ref)
+                .count(),
+            1
+        );
+
+        let pass_two_snapshot = providers.controller_bootstrap_contexts(&zone);
+        assert_eq!(
+            pass_two_snapshot
+                .iter()
+                .map(|context| context.provider_owner_ref().clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                ResourceRef::parse("Provider/runtime-cloud-hypervisor").unwrap(),
+                second_provider_ref.clone(),
+            ])
+        );
+        let mut pass_two_admissions = 0;
+        for context in &pass_two_snapshot {
+            if providers.controller_bootstrap_ready(&zone, context.process_ref())
+                && providers
+                    .begin_controller_bootstrap_if_matches(&zone, context)
+                    .is_some()
+            {
+                assert!(providers.activate_controller_bootstrap(context));
+                pass_two_admissions += 1;
+            }
+        }
+        assert_eq!(pass_two_admissions, 1);
+        for context in providers.controller_bootstrap_contexts(&zone) {
+            assert!(!providers.controller_bootstrap_ready(&zone, context.process_ref()));
+            assert!(
+                providers
+                    .begin_controller_bootstrap_if_matches(&zone, &context)
+                    .is_none(),
+                "an active controller must not be admitted twice"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

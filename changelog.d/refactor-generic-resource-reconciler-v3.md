@@ -26,3 +26,6 @@
 - Woke the controller-session coordinator when a launch or adoption records a
   readable bootstrap endpoint, and made initial test-controller handshake
   failure terminal so one-shot bootstrap delivery cannot queue duplicates.
+- Froze each controller-session admission pass to one bootstrap-context
+  snapshot so late or replaced Pending controllers stay queued for the next
+  non-lossy wake instead of entering a policy compiled without their subject.
