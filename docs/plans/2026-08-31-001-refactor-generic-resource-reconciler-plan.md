@@ -2,7 +2,7 @@
 title: Generic Resource Reconciler and Provider Framework Cutover - Plan
 type: refactor
 date: 2026-08-31
-deepened: 2026-08-31
+deepened: 2026-09-04
 topic: generic-resource-reconciler
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
@@ -1442,11 +1442,14 @@ before Provider migrations. U3 owns runtime registration and U14 owns the final
 
 **Goal**
 Remove named active legacy schedulers and prove the shared reconciler and typed
-Provider framework are the only active paths.
+Provider framework are the only active paths. Harden the cutover so every
+durable Resource has one owner, shared durable state has one projection owner,
+live controller-session transport remains asynchronous, and stale or partial
+control-plane work cannot mutate newer state.
 
 **Requirements**
 
-R1-R3, R8-R20, and R21-R30.
+R1-R4, R7-R20, and R21-R30.
 
 **Dependencies**
 U1-U13 individually verified; existing Bazel, Make, and CI ownership. This is
@@ -1463,6 +1466,13 @@ the only global join.
   `packages/d2bd/src/semantic_binding_resource_runtime.rs`,
   `packages/d2bd/src/provider_registry.rs`, and
   `packages/d2bd/src/composition.rs`
+- Existing owner-local hardening proofs read by U14:
+  `packages/d2bd/src/resource_runtime.rs`,
+  `packages/d2bd/src/process_resource_runtime.rs`,
+  `packages/d2bd/src/process_provider_runtime.rs`,
+  `packages/d2b-bus/src/session_seam_tests.rs`,
+  `packages/d2b-session/tests/component_session.rs`, and
+  `tests/host-integration/runtime-cloud-hypervisor-guest-preflight.nix`.
 - Existing owner tests:
   `packages/d2bd/tests/zone_provider_acceptance.rs`,
   `packages/d2bd/tests/resource_operator_activation.rs`,
@@ -1481,8 +1491,28 @@ scheduler/watch in the same change, assert residual absence of
 `run_process_watch`, `run_activation_watch`, `run_audio_watch`,
 `run_semantic_binding_watch`, `configure_from_host`/`HostJson` Guest authority,
 and fixed-sleep or direct-completion scheduling in the listed d2bd files. U14
-does not keep dual schedulers/watchers alive while waiting for closure. Recheck
-existing policy/drift targets and the matrix; add no census or inventory.
+does not keep dual schedulers/watchers alive while waiting for closure.
+
+U14 verifies the following ownership and concurrency boundaries after the
+predecessor owners implement them:
+
+- Core and Provider controllers own only their declared durable Resources and
+  child graphs; shared durable projections have one owner and no peer writes.
+- `Get`/`List` use `ResourceRef`; mutations, finalizers, deletes, and effects
+  carry expected UID, generation, revision/CAS, and applicable assignment or
+  session fences. Stale input conflicts and causes fresh reconcile.
+- Live bootstrap, Noise, socket, stream, registrar, and reconnect state remain
+  asynchronous per-session runtime state, not a normal ResourceType or generic
+  Runner wait; typed ComponentSession contracts remain distinct.
+- One policy projection owner installs `NativeAuthorizer`, `ZoneBus`, and
+  authorization state as one projection; public reads never refresh global
+  policy.
+- Session wakes are level-triggered and non-lossy; admission uses coherent
+  snapshots and exact rollback; dynamic Process Provider identities resolve
+  lazily at mutation or effect boundaries.
+
+Recheck existing policy, drift, fixture, and Provider-matrix targets; add no
+census, inventory, discovery job, shell gate, or global readiness scanner.
 
 **Patterns to follow**
 
@@ -1498,6 +1528,29 @@ boundaries, and structural removal proofs.
   registration, assignment, scheduler owner, handler/effect source, dossier,
   test, target, and status; no new gate/inventory, universal RPC, zero-resource
   scheduler, or `HostJson` Guest authority exists.
+- A Process watch or liveness wake emitted while controller-session admission
+  holds its guard still produces one later reconcile without another external
+  event; task-slot contention cannot discard the pending work.
+- A public `Get` or `List` concurrent with Provider-subject projection
+  refresh does not replace the installed controller-subject policy, and
+  `NativeAuthorizer`, `ZoneBus`, and authorization state retain one revision.
+- A policy-install failure leaves no half-installed projection and keeps new
+  reads, mutations, and session admission fail-closed until a fresh retry.
+- A Provider UID, generation, or store snapshot changes during admission; the
+  stale candidate is rejected or requeued with no leaked subject, ingress,
+  session, assignment, or marker.
+- A late Process Provider identity is missing; only that Process requeues,
+  unrelated Processes continue, and a replacement Provider UID/generation
+  invalidates stale effects.
+- Bootstrap failures injected after endpoint receipt, subject installation,
+  acceptor creation, service registration, backend binding, and readiness
+  close or restore only the exact state created and leave no active session.
+- Stale UpdateSpec, UpdateStatus, UpdateMetadata, UpdateFinalizers, Delete,
+  and effect acceptance requests conflict on UID, generation, revision, or
+  assignment fences and trigger fresh reconcile without a stale side effect.
+- Existing strict readiness, storage-session count, Guest restart/adoption,
+  ComponentSession generation, and mandatory-handler checks remain unchanged;
+  no "task exists" shortcut proves readiness.
 
 **Verification**
 
@@ -1508,6 +1561,10 @@ check AE10 only after every successor attaches. The rewritten production profile
 binds p95 durable commit-to-handler start <=5 ms
 and p95 durable commit-to-launch-attempt <=20 ms to `CoreControllerSource`,
 durable ledger acceptance, and worker launch after all Provider waves.
+Also verify V1-V5 hardening evidence for single ownership, ResourceRef-only
+reads, UID/generation/revision-fenced mutations, non-lossy session wakes,
+atomic policy projection, coherent admission snapshots, lazy Process identity,
+transactional registrar rollback, and asynchronous session transport.
 
 ## Verification Contract
 
@@ -1535,6 +1592,9 @@ inventory, census, discovery job, or scheduler.
   executionRef, Guest-local token acquisition, Guest-held registries and audit,
   no relay-identity-to-Role mapping, gateway-unavailable degradation, and no
   Host fallback.
+- Check that exactly one owner writes the installed authorization projection;
+  public Get/List paths do not refresh or replace policy, and live session
+  transport is not represented as a normal ResourceType.
 - Check existing policy/drift targets and no new shell gate, census, inventory,
   or discovery job.
 
@@ -1544,6 +1604,7 @@ inventory, census, discovery job, or scheduler.
 - `//packages/d2b-controller-toolkit:production_watch`
 - `//packages/d2b-controller-toolkit:reaction`
 - `//packages/d2b-controller-toolkit:reaction_test`
+- `//packages/d2b-bus:all-tests`
 - `//packages/d2b-session:all-tests`
 - `//packages/d2b-resource-api:all-tests`
 - `//packages/d2b-resource-store:all-tests`
@@ -1564,6 +1625,9 @@ effects and excluded from the 5 ms handler gate. Exercise
 `MAX_OWNER_HINT_DEPTH = 8`,
 `MAX_OWNER_HINT_WORK_ITEMS = 64`, and `MAX_OWNER_CHILD_BATCH = 128` at depth
 8/64-item fan-out without breaking Process gates.
+These targets also prove UID/generation/revision mutation fences, non-lossy
+controller-session wakes, atomic authorization projection, coherent admission
+snapshots, lazy Process Provider identity, and exact bootstrap rollback.
 
 ### V3. All 27 Provider targets
 
@@ -1637,6 +1701,10 @@ each wave must preserve the 1/10/100 Process hard gates.
   through `D2B_HOST_TOOL_BUNDLE` and the Cloud Hypervisor controller through
   its existing controller bundle handoff. The host lane must not rebuild these
   d2b binaries through Nix.
+- Host acceptance preserves the strict external-session count, Guest/Process/
+  Volume readiness, restart/adoption generation, and no-terminal-session-error
+  assertions while proving public reads do not clobber the installed
+  Provider-subject projection.
 
 ### V6. Traceability receipt
 
@@ -1651,7 +1719,7 @@ schedulers, universal RPC, zero-resource reconciler, new gates, and inventories.
 ## Definition of Done
 
 - [ ] Frontmatter/H1 preserve the title, required fields,
-  `artifact_readiness: implementation-ready`, and `deepened: 2026-08-31`.
+  `artifact_readiness: implementation-ready`, and `deepened: 2026-09-04`.
 - [ ] The Product Contract names user-confirmed #487 and full 27-Provider
   scope; A1-A4, R1-R30, F1-F4, AE1-AE15, KTD1-KTD12, U1-U14, four diagrams,
   Verification Contract, and this Definition of Done are present.
@@ -1690,6 +1758,25 @@ schedulers, universal RPC, zero-resource reconciler, new gates, and inventories.
 - [ ] Each Provider family attaches the shared Runner and disables its legacy
   scheduler/watch in the same change; no dual schedulers/watchers remain, and
   U14 proves residual absence only after successors attach.
+- [ ] Every durable Resource and child graph has exactly one active owner;
+  shared durable projections have one writer, and live controller-session
+  transport is not represented as a normal ResourceType.
+- [ ] Get/List paths address resources by ResourceRef without eager identity
+  projection; mutations, finalizers, deletes, and effects carry required UID,
+  generation, revision/CAS, and applicable assignment/session fences, with
+  stale input returning conflict/retry and fresh reconcile.
+- [ ] Controller-session wakes are non-lossy under controller and task-slot
+  contention; pending work survives notification coalescing and shutdown does
+  not resurrect a worker.
+- [ ] One policy projection owner linearly installs NativeAuthorizer, ZoneBus,
+  and authorization state; public reads never mutate global policy and partial
+  installation fails closed.
+- [ ] Startup admission uses coherent Provider/Process snapshots; dynamic
+  Process Provider identities resolve lazily per resource and replacement
+  UID/generation invalidates stale effects.
+- [ ] Every registrar/bootstrap failure path rolls back the exact subject,
+  ingress, marker, session, backend lease, stream, assignment, and finalizer
+  state it created.
 - [ ] Cloud Hypervisor shared controller/session state is serialized per Zone;
   deletion reuses live authenticated sessions, never reconnects after Closed,
   requests child deletion despite cleanup finalizers, and relies on foreground
