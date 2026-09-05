@@ -2639,6 +2639,8 @@ mod tests {
             resource_ref: ResourceRef::parse("Host/host-system").unwrap(),
             zone: ZoneId::parse("dev").unwrap(),
             uid: ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            owner_uid: None,
+            owner_generation: None,
             generation: ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(9),
             canonical_json: vec![b'x'; bytes],

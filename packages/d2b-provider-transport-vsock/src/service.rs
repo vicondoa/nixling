@@ -84,7 +84,7 @@ impl OpenTransportRequest {
         if !(MIN_OPEN_DEADLINE_MS..=MAX_OPEN_DEADLINE_MS).contains(&self.deadline_ms) {
             return Err(ServiceError::InvalidDeadline);
         }
-        if self.session_generation == Some(0) {
+        if self.session_generation.is_none() || self.session_generation == Some(0) {
             return Err(ServiceError::InvalidSessionGeneration);
         }
         Ok(())
@@ -668,5 +668,23 @@ fn futures_phase_is_degraded(entry: &TransportEntry) -> bool {
 impl From<NamedStreamError> for ServiceError {
     fn from(_: NamedStreamError) -> Self {
         ServiceError::StreamUnavailable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_request_requires_a_session_generation_fence() {
+        let endpoint = OpaqueEndpointId::parse("endpoint-a").unwrap();
+        let binding = OpaqueBindingId::parse("binding-a").unwrap();
+        let request =
+            OpenTransportRequest::new(endpoint, binding, TransportRole::Initiator, 1_000);
+
+        assert_eq!(
+            request.validate(),
+            Err(ServiceError::InvalidSessionGeneration)
+        );
     }
 }

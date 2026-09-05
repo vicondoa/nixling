@@ -836,6 +836,8 @@ impl GuestResourceStore {
                         resource_ref: mutation.target.clone(),
                         zone: self.zone.clone(),
                         uid,
+                        owner_uid: None,
+                        owner_generation: None,
                         generation,
                         revision: ZoneRevision::new(next_revision),
                         canonical_json: canonical,

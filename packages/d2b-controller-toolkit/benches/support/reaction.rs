@@ -866,6 +866,8 @@ fn stored_resources_from_response(
                         .expect("production commit response carries resource UID"),
                 )
                 .expect("production commit response carries valid resource UID"),
+                owner_uid: None,
+                owner_generation: None,
                 generation: ResourceGeneration::new(
                     identity
                         .generation

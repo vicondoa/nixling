@@ -53,6 +53,10 @@ pub struct StoredResource {
     pub resource_ref: ResourceRef,
     pub zone: ZoneId,
     pub uid: ResourceUid,
+    /// Internal store binding for the singular owner, when one exists.
+    pub owner_uid: Option<ResourceUid>,
+    /// Resource generation captured when the singular owner binding was written.
+    pub owner_generation: Option<ResourceGeneration>,
     pub generation: ResourceGeneration,
     pub revision: ZoneRevision,
     pub canonical_json: Vec<u8>,
@@ -539,6 +543,8 @@ mod tests {
             resource_ref: resource_ref.clone(),
             zone: zone.clone(),
             uid: uid.clone(),
+            owner_uid: None,
+            owner_generation: None,
             generation: ResourceGeneration::new(3).unwrap(),
             revision: ZoneRevision::new(5),
             canonical_json: PAYLOAD_SENTINEL.as_bytes().to_vec(),

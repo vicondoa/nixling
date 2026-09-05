@@ -1593,6 +1593,12 @@ boundaries, and structural removal proofs.
 - Existing strict readiness, storage-session count, Guest restart/adoption,
   ComponentSession generation, and mandatory-handler checks remain unchanged;
   no "task exists" shortcut proves readiness.
+- Sweep every Core and Provider controller for the same invariant classes:
+  owner UID/generation checks, ResourceRef-only reads, mutation UID/generation/
+  revision fences, unfiltered dependency selectors, stale-session evidence,
+  direct shared-policy writes, broad cross-identity aborts, and readiness
+  derived from incomplete evidence. Fix each owner-local violation and prove
+  sibling identities remain isolated.
 
 **Verification**
 
@@ -1607,6 +1613,8 @@ Also verify V1-V5 hardening evidence for single ownership, ResourceRef-only
 reads, UID/generation/revision-fenced mutations, non-lossy session wakes,
 atomic policy projection, coherent admission snapshots, lazy Process identity,
 transactional registrar rollback, and asynchronous session transport.
+Include the owner-local controller sweep in these existing checks; do not add a
+new repository-wide census, inventory, discovery job, or shell gate.
 
 ## Verification Contract
 
@@ -1824,6 +1832,11 @@ schedulers, universal RPC, zero-resource reconciler, new gates, and inventories.
 - [ ] Every registrar/bootstrap failure path rolls back the exact subject,
   ingress, marker, session, backend lease, stream, assignment, and finalizer
   state it created.
+- [ ] Every Core and Provider controller has been swept for owner UID/generation
+  fencing, ResourceRef-only reads, mutation CAS, unfiltered dependency scans,
+  stale-session evidence, shared-policy writes, cross-identity error isolation,
+  and incomplete readiness claims; each discovered violation is fixed in its
+  owner-local surface and covered by existing targets.
 - [ ] Cloud Hypervisor shared controller/session state is serialized per Zone;
   deletion reuses live authenticated sessions, never reconnects after Closed,
   requests child deletion despite cleanup finalizers, and relies on foreground

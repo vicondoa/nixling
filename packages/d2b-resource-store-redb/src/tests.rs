@@ -1155,6 +1155,7 @@ fn seed_host(directory: &tempfile::TempDir, name: &str) {
     let record = ResourceRecord {
         canonical_json,
         owner_uid: None,
+        owner_generation: None,
         controller_binding_id: "Provider/system-core".to_owned(),
         payload_digest: envelope.digest().unwrap(),
         assignment: None,
@@ -1245,6 +1246,7 @@ fn seed_two_hosts(directory: &tempfile::TempDir) {
     let record = crate::transaction::ResourceRecord {
         canonical_json,
         owner_uid: None,
+        owner_generation: None,
         controller_binding_id: "Provider/system-core".to_owned(),
         payload_digest: envelope.digest().unwrap(),
         assignment: None,
@@ -3562,6 +3564,31 @@ async fn public_owner_child_list_and_watch_are_bound_to_one_owner_uid() {
         vec![guest_child.clone()]
     );
 
+    let listed_by_owner_ref = store
+        .list(StoreListRequest {
+            operation: operation("owner-list-ref"),
+            zone: ZoneId::parse("work").unwrap(),
+            resource_types: vec![ResourceTypeName::parse("Process").unwrap()],
+            resource_names: Vec::new(),
+            filters: vec![StoreFilter {
+                field: "owner.resourceRef".to_owned(),
+                values: vec!["Guest/guest".to_owned()],
+            }],
+            page_size: 10,
+            cursor: None,
+            projection: StoreProjection::Full,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        listed_by_owner_ref
+            .resources
+            .iter()
+            .map(|resource| resource.resource_ref.clone())
+            .collect::<Vec<_>>(),
+        vec![guest_child.clone()]
+    );
+
     let (_receipt, mut stream) = store
         .watch_stream(StoreWatchRequest {
             operation: operation("owner-watch"),
@@ -3809,6 +3836,7 @@ fn prepare_production_rss_fixture() -> tempfile::TempDir {
             let record = crate::transaction::ResourceRecord {
                 canonical_json: canonical,
                 owner_uid: None,
+                owner_generation: None,
                 controller_binding_id: "Provider/system-core".to_owned(),
                 payload_digest,
                 assignment: None,

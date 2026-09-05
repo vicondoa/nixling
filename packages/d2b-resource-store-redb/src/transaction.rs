@@ -209,6 +209,8 @@ fn default_store_epoch() -> u64 {
 pub(crate) struct ResourceRecord {
     pub canonical_json: Vec<u8>,
     pub owner_uid: Option<String>,
+    #[serde(default)]
+    pub owner_generation: Option<u64>,
     pub controller_binding_id: String,
     pub payload_digest: String,
     #[serde(default)]
@@ -3104,6 +3106,8 @@ fn operation_resource(record: &OperationResourceRecord) -> Result<StoredResource
         resource_ref,
         zone,
         uid: envelope.metadata().uid().clone(),
+        owner_uid: None,
+        owner_generation: None,
         generation: envelope.metadata().generation(),
         revision: envelope.metadata().revision(),
         canonical_json: record.canonical_json.clone(),
@@ -3169,6 +3173,7 @@ fn apply_prepared(
             let record = ResourceRecord {
                 canonical_json: canonical_json.clone(),
                 owner_uid: old_record.owner_uid.clone(),
+                owner_generation: old_record.owner_generation,
                 controller_binding_id: old_record.controller_binding_id.clone(),
                 payload_digest: payload_digest.clone(),
                 assignment: old_record
@@ -3278,9 +3283,22 @@ fn apply_prepared(
     {
         return Err(integrity("mutation-resource-identity-mismatch"));
     }
-    let owner_uid = match &effective_owner {
-        Some(owner_ref) => Some(resolve_uid_in_write(write, owner_ref)?.as_str().to_owned()),
-        None => None,
+    let (owner_uid, owner_generation) = if mutation.kind == ResourceMutationKind::UpdateStatus {
+        previous
+            .as_ref()
+            .map(|record| (record.owner_uid.clone(), record.owner_generation))
+            .unwrap_or((None, None))
+    } else {
+        let owner_uid = match &effective_owner {
+            Some(owner_ref) => Some(resolve_uid_in_write(write, owner_ref)?.as_str().to_owned()),
+            None => None,
+        };
+        let owner_generation = effective_owner
+            .as_ref()
+            .map(|owner_ref| resolve_generation_in_write(write, owner_ref))
+            .transpose()?
+            .map(|generation| generation.get());
+        (owner_uid, owner_generation)
     };
     let previous_owner_ref = previous_envelope
         .as_ref()
@@ -3321,6 +3339,7 @@ fn apply_prepared(
     let record = ResourceRecord {
         canonical_json: canonical_json.clone(),
         owner_uid: owner_uid.clone(),
+        owner_generation,
         controller_binding_id: controller_binding_id(&envelope, assignment.as_ref()),
         payload_digest: payload_digest.clone(),
         assignment,
@@ -3424,6 +3443,7 @@ fn staged_state_after_mutation(
         .unwrap_or_else(|| ResourceRecord {
             canonical_json: Vec::new(),
             owner_uid: None,
+            owner_generation: None,
             controller_binding_id: String::new(),
             payload_digest: String::new(),
             assignment: None,
@@ -4057,6 +4077,21 @@ fn resolve_uid_in_write(
     ResourceUid::parse(uid).map_err(|_| integrity("type-index-uid-invalid"))
 }
 
+fn resolve_generation_in_write(
+    write: &redb::WriteTransaction,
+    resource_ref: &ResourceRef,
+) -> Result<ResourceGeneration, StoreError> {
+    current_record_in_write(write, resource_ref)?
+        .map(|(_, envelope)| envelope.metadata().generation())
+        .ok_or_else(|| {
+            error(
+                StoreErrorKind::ResourceRefInvalid,
+                None,
+                "owner-ref-not-found",
+            )
+        })
+}
+
 fn insert_resource_and_indexes(
     write: &redb::WriteTransaction,
     resource_ref: &ResourceRef,
@@ -4678,10 +4713,27 @@ pub(crate) fn stored_resource(
 ) -> Result<StoredResource, StoreError> {
     let envelope = ResourceEnvelope::from_json(&record.canonical_json)
         .map_err(|_| integrity("stored-resource-envelope-invalid"))?;
+    let owner_uid = record
+        .owner_uid
+        .as_deref()
+        .map(|value| {
+            ResourceUid::parse(value.to_owned())
+                .map_err(|_| integrity("stored-resource-owner-uid-invalid"))
+        })
+        .transpose()?;
+    let owner_generation = record
+        .owner_generation
+        .map(|value| {
+            ResourceGeneration::new(value)
+                .map_err(|_| integrity("stored-resource-owner-generation-invalid"))
+        })
+        .transpose()?;
     Ok(StoredResource {
         resource_ref: resource_ref.clone(),
         zone: zone.clone(),
         uid: envelope.metadata().uid().clone(),
+        owner_uid,
+        owner_generation,
         generation: envelope.metadata().generation(),
         revision: envelope.metadata().revision(),
         canonical_json: record.canonical_json.clone(),
@@ -5507,6 +5559,107 @@ mod tests {
                 owner_generation,
             },
         }
+    }
+
+    #[test]
+    fn stored_resource_retains_the_persisted_owner_generation_fence() {
+        let owner_uid = ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap();
+        let resource = stored_resource(
+            &ZoneId::parse("dev").unwrap(),
+            &ResourceRef::parse("Volume/runtime-state").unwrap(),
+            &ResourceRecord {
+                canonical_json: RESOURCE.to_vec(),
+                owner_uid: Some(owner_uid.as_str().to_owned()),
+                owner_generation: Some(7),
+                controller_binding_id: "Provider/volume-local".to_owned(),
+                payload_digest: ResourceEnvelope::from_json(RESOURCE)
+                    .unwrap()
+                    .digest()
+                    .unwrap(),
+                assignment: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(resource.owner_uid, Some(owner_uid));
+        assert_eq!(
+            resource.owner_generation,
+            Some(ResourceGeneration::new(7).unwrap())
+        );
+    }
+
+    #[test]
+    fn controller_session_evidence_update_preserves_the_persisted_owner_incarnation() {
+        let (_directory, database, _identity) = fixture();
+        let owner = ResourceRef::parse("Guest/owner").unwrap();
+        let child = ResourceRef::parse("Process/child").unwrap();
+        apply_group(
+            &database,
+            vec![verified(
+                "owner-create",
+                create_mutation_with_body(owner.clone(), guest_body("owner")),
+                ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            )],
+        )
+        .unwrap();
+
+        let child_body = process_body(child.name().as_str(), Some(&owner));
+        let mut child_create = create_mutation_with_body(child.clone(), child_body.clone());
+        child_create.owner = Some(owner.clone());
+        let child_uid =
+            ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        apply_group(
+            &database,
+            vec![verified("child-create", child_create, child_uid.clone())],
+        )
+        .unwrap();
+
+        let owner_record = {
+            let read = database.begin_read().unwrap();
+            let table = read.open_table(RESOURCES).unwrap();
+            let value = table
+                .get(resource_key(&owner).unwrap().as_slice())
+                .unwrap()
+                .unwrap();
+            decode::<ResourceRecord>(ValueKind::ResourceRecord, value.value()).unwrap()
+        };
+        let owner_uid = ResourceEnvelope::from_json(&owner_record.canonical_json)
+            .unwrap()
+            .metadata()
+            .uid()
+            .clone();
+
+        let mut status_body = CanonicalJsonValue::parse(&child_body).unwrap();
+        let CanonicalJsonValue::Object(root) = &mut status_body else {
+            unreachable!();
+        };
+        let CanonicalJsonValue::Object(status) = root.get_mut("status").unwrap() else {
+            unreachable!();
+        };
+        status.insert(
+            "phase".to_owned(),
+            CanonicalJsonValue::String("Ready".to_owned()),
+        );
+        let mut status = create_mutation_with_body(child.clone(), status_body.to_canonical_bytes());
+        status.kind = ResourceMutationKind::UpdateStatus;
+        status.expected = ExpectedRevision::Exact(ZoneRevision::new(2));
+        status.expected_uid = Some(child_uid.clone());
+        status.owner = None;
+        apply_group(
+            &database,
+            vec![verified("controller-session-evidence", status, child_uid)],
+        )
+        .unwrap();
+
+        let read = database.begin_read().unwrap();
+        let table = read.open_table(RESOURCES).unwrap();
+        let value = table
+            .get(resource_key(&child).unwrap().as_slice())
+            .unwrap()
+            .unwrap();
+        let child_record: ResourceRecord =
+            decode(ValueKind::ResourceRecord, value.value()).unwrap();
+        assert_eq!(child_record.owner_uid, Some(owner_uid.as_str().to_owned()));
+        assert_eq!(child_record.owner_generation, Some(1));
     }
 
     fn stored_envelope(database: &Database, target: &ResourceRef) -> ResourceEnvelope {
@@ -7179,6 +7332,10 @@ mod tests {
             .clone();
         assert_eq!(child.resource_ref, child_ref);
         assert_eq!(
+            child.owner_generation,
+            Some(owner.generation)
+        );
+        assert_eq!(
             stored_envelope(&database, &child_ref)
                 .metadata()
                 .owner_ref(),
@@ -7211,8 +7368,9 @@ mod tests {
             .unwrap()
             .resources[0]
             .clone();
+            assert_eq!(updated.owner_generation, Some(owner.generation));
 
-        let mut request_delete = create_mutation(child_ref.clone());
+            let mut request_delete = create_mutation(child_ref.clone());
         request_delete.kind = ResourceMutationKind::Delete;
         request_delete.expected = ExpectedRevision::Exact(updated.revision);
         request_delete.expected_uid = Some(child.uid.clone());

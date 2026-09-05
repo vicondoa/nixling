@@ -132,6 +132,7 @@ fn request() -> OpenTransportRequest {
         TransportRole::Initiator,
         1_000,
     )
+    .with_session_generation(1)
 }
 
 #[test]

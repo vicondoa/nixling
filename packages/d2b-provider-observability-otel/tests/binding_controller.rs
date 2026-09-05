@@ -152,3 +152,74 @@ fn service_authority_and_stream_target_mismatches_fail_closed() {
     });
     assert_eq!(result, Err(TelemetryControllerError::Admission));
 }
+
+#[test]
+fn projection_readiness_requires_ingest_evidence() {
+    let (_binding, service, _target) = refs();
+    let provider = ResourceRef::parse("Provider/observability-otel").unwrap();
+    let mut controller = TelemetryServiceController::new();
+
+    let status = controller
+        .reconcile(
+            &service,
+            &provider,
+            TelemetryServiceRole::Projection,
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(status.phase, TelemetryServicePhase::Pending);
+}
+
+#[test]
+fn telemetry_children_reject_unsupported_target_types() {
+    let (binding, service, _target) = refs();
+    let user = ResourceRef::parse("User/alice").unwrap();
+
+    assert_eq!(
+        TelemetryBindingController::child_resources(&binding, &service, &user),
+        Err(TelemetryControllerError::Admission)
+    );
+}
+
+#[test]
+fn telemetry_authority_rejects_non_endpoint_ingest_rows() {
+    let (_binding, service, _target) = refs();
+    let provider = ResourceRef::parse("Provider/observability-otel").unwrap();
+    let process = ResourceRef::parse("Process/not-an-endpoint").unwrap();
+    let mut controller = TelemetryServiceController::new();
+
+    assert_eq!(
+        controller.reconcile(
+            &service,
+            &provider,
+            TelemetryServiceRole::Authority,
+            &[process],
+            true,
+            true,
+        ),
+        Err(d2b_provider_observability_otel::TelemetryServiceError::InvalidAuthority)
+    );
+}
+
+#[test]
+fn telemetry_binding_requires_an_identity_scoped_connection() {
+    let (binding, service, target) = refs();
+    let mut controller = TelemetryBindingController::new();
+
+    assert_eq!(
+        controller.reconcile(
+            &binding,
+            &service,
+            &target,
+            Ingress::OtlpVsock,
+            0,
+            &frame(),
+            &IdentityCanaries::default(),
+            true,
+        ),
+        Err(TelemetryControllerError::Admission)
+    );
+}

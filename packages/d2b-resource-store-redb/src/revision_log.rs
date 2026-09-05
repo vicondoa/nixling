@@ -102,6 +102,14 @@ impl WatchSelector {
                         .owner_uid()
                         .is_some_and(|owner_uid| value == owner_uid.as_str())
                 }),
+                "owner.resourceRef" => filter.values.iter().any(|value| {
+                    entry
+                        .owner_ref()
+                        .is_some_and(|owner| value == owner.to_canonical_string().as_str())
+                        || entry
+                            .previous_owner_ref()
+                            .is_some_and(|owner| value == owner.to_canonical_string().as_str())
+                }),
                 "resource-or-owner.type" => filter.values.iter().any(|value| {
                     value == entry.resource_type().as_str()
                         || entry

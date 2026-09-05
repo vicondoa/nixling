@@ -136,7 +136,11 @@ impl EntraController {
         client_state: EntraClientState,
         metadata: Option<&CredentialMetadata>,
     ) -> Result<EntraStatusProjection, CredentialServiceError> {
-        self.reconcile_with_health(client_state, metadata, EntraResourceHealth::Ready, 0)
+        let resource_health = match client_state {
+            EntraClientState::Ready => EntraResourceHealth::Ready,
+            EntraClientState::InteractionRequired => EntraResourceHealth::Degraded,
+        };
+        self.reconcile_with_health(client_state, metadata, resource_health, 0)
     }
 
     /// Project bounded non-secret state with owning-resource health.
@@ -333,6 +337,7 @@ mod tests {
             required.status.interaction_state(),
             CredentialInteractionState::Required
         );
+        assert_eq!(required.resource_health, EntraResourceHealth::Degraded);
         let ready = controller()
             .reconcile(EntraClientState::Ready, None)
             .unwrap();

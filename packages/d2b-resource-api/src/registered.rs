@@ -13,8 +13,8 @@ use std::{
 
 use d2b_contracts_resource::v3::{
     DEFAULT_REQUEST_DEADLINE_MS, FinalizerId, MAX_LIST_PAGE_SIZE, ObservedGeneration,
-    ResourceEnvelope, ResourceGeneration, ResourcePhase, ResourceRef, ResourceUid, ZoneId,
-    ZoneRevision, canonical_digest,
+    ResourceEnvelope, ResourceGeneration, ResourcePhase, ResourceRef, ResourceTypeName,
+    ResourceUid, ZoneId, ZoneRevision, canonical_digest,
 };
 use d2b_core_controller::{
     ChangeField, ChangeRecord, CommitOutcome, ControllerDescriptor, CoreTriggerReason,
@@ -396,6 +396,18 @@ impl RedbRegisteredControllerApi {
         projection: StoreProjection,
         label: &str,
     ) -> Result<(Vec<StoredResource>, ZoneRevision), SourceError> {
+        self.list_all_with_filters(zone, resource_types, Vec::new(), projection, label)
+            .await
+    }
+
+    async fn list_all_with_filters(
+        &self,
+        zone: &ZoneId,
+        resource_types: Vec<d2b_contracts_resource::v3::ResourceTypeName>,
+        filters: Vec<StoreFilter>,
+        projection: StoreProjection,
+        label: &str,
+    ) -> Result<(Vec<StoredResource>, ZoneRevision), SourceError> {
         let mut restarts = 0;
         'relist: loop {
             let mut cursor = None;
@@ -409,7 +421,7 @@ impl RedbRegisteredControllerApi {
                         zone: zone.clone(),
                         resource_types: resource_types.clone(),
                         resource_names: Vec::new(),
-                        filters: Vec::new(),
+                        filters: filters.clone(),
                         page_size: MAX_LIST_PAGE_SIZE,
                         cursor: cursor.take(),
                         projection,
@@ -513,27 +525,101 @@ impl RedbRegisteredControllerApi {
         &self,
         descriptor: &ControllerDescriptor,
         zone: &ZoneId,
+        owner_ref: &ResourceRef,
     ) -> Result<Vec<DependencySnapshot>, SourceError> {
-        let mut types = descriptor
-            .dependency_selectors()
-            .iter()
-            .map(|selector| selector.resource_type().clone())
-            .collect::<Vec<_>>();
+        let owner_scoped_core_provider = descriptor.dependency_selectors().is_empty()
+            && descriptor
+                .resource_types()
+                .any(|resource_type| resource_type.as_str() == "Provider");
+        let fixed_provider = matches!(
+            owner_ref.to_canonical_string().as_str(),
+            "Provider/system-core" | "Provider/system-minijail"
+        );
+        let fixed_dependency_types: &[&str] = if fixed_provider {
+            &["Process", "Volume", "Host", "Zone"]
+        } else {
+            &["Process", "Volume"]
+        };
+        let mut types = if owner_scoped_core_provider {
+            fixed_dependency_types
+                .iter()
+                .copied()
+                .map(|resource_type| {
+                    ResourceTypeName::parse(resource_type).map_err(|_| SourceError::Integrity)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            descriptor
+                .dependency_selectors()
+                .iter()
+                .map(|selector| selector.resource_type().clone())
+                .collect::<Vec<_>>()
+        };
         types.sort();
         types.dedup();
         if types.is_empty() {
             return Ok(Vec::new());
-        }
-        let (resources, _) = self
-            .list_all(zone, types, StoreProjection::BaseOnly, "dependencies")
-            .await?;
+        };
+        let (resources, _) = if owner_scoped_core_provider {
+            let (owned_types, unowned_types) = owner_scoped_dependency_types(&types);
+            let mut resources = Vec::new();
+            let mut snapshot_revision = None;
+            if !owned_types.is_empty() {
+                let (owned, revision) = self
+                    .list_all_with_filters(
+                        zone,
+                        owned_types,
+                        vec![owner_ref_filter(owner_ref)],
+                        StoreProjection::BaseOnly,
+                        "dependencies-owned",
+                    )
+                    .await?;
+                snapshot_revision = Some(revision);
+                resources.extend(owned);
+            }
+            if !unowned_types.is_empty() {
+                let (unowned, revision) = self
+                    .list_all_with_filters(
+                        zone,
+                        unowned_types,
+                        Vec::new(),
+                        StoreProjection::BaseOnly,
+                        "dependencies-zone",
+                    )
+                    .await?;
+                if snapshot_revision.is_some_and(|expected| expected != revision) {
+                    return Err(SourceError::Conflict(revision));
+                }
+                resources.extend(unowned);
+            }
+            (resources, snapshot_revision.unwrap_or_else(|| ZoneRevision::new(0)))
+        } else {
+            self.list_all_with_filters(
+                zone,
+                types,
+                Vec::new(),
+                StoreProjection::BaseOnly,
+                "dependencies",
+            )
+            .await?
+        };
         Ok(resources
             .into_iter()
             .filter(|resource| {
-                descriptor.dependency_selectors().iter().any(|selector| {
-                    selector.resource_type() == resource.resource_ref.resource_type()
-                        && selector_matches(selector, resource)
-                })
+                if owner_scoped_core_provider {
+                    match resource.resource_ref.resource_type().as_str() {
+                        "Host" | "Zone" => true,
+                        "Process" | "Volume" => {
+                            owner_child_ref_matches(resource, owner_ref)
+                        }
+                        _ => false,
+                    }
+                } else {
+                    descriptor.dependency_selectors().iter().any(|selector| {
+                        selector.resource_type() == resource.resource_ref.resource_type()
+                            && selector_matches(selector, resource)
+                    })
+                }
             })
             .map(|resource| DependencySnapshot::new(snapshot_from_resource(resource)))
             .collect())
@@ -1490,7 +1576,9 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
                 Ok(resource) => {
                     Ok(FreshSnapshot::Present {
                         target: snapshot_from_resource(resource),
-                        dependencies: self.dependencies(&descriptor, key.zone()).await?,
+                        dependencies: self
+                            .dependencies(&descriptor, key.zone(), key.resource_ref())
+                            .await?,
                     })
                 }
                 Err(revision) => Ok(FreshSnapshot::Deleted {
@@ -2002,6 +2090,8 @@ fn snapshot_from_resource(resource: StoredResource) -> d2b_core_controller::Reso
         resource_ref,
         zone,
         uid,
+        owner_uid,
+        owner_generation,
         generation,
         revision,
         canonical_json,
@@ -2015,6 +2105,7 @@ fn snapshot_from_resource(resource: StoredResource) -> d2b_core_controller::Reso
         canonical_json,
         deleting,
     )
+    .with_owner_identity(owner_uid, owner_generation)
 }
 
 fn deleting(bytes: &[u8]) -> bool {
@@ -2055,6 +2146,7 @@ fn selector_matches(
             .as_deref()
             == Some(expected);
     }
+
     match selector.field() {
         ChangeField::Metadata => resource.resource_ref.name().as_str() == expected,
         ChangeField::Spec
@@ -2074,6 +2166,45 @@ fn selector_matches(
                     .pointer(field)
                     .is_some_and(|value| selector_value_matches(value, expected))
             }),
+    }
+}
+
+fn owner_child_ref_matches(resource: &StoredResource, owner_ref: &ResourceRef) -> bool {
+    serde_json::from_slice::<Value>(&resource.canonical_json)
+        .ok()
+        .is_some_and(|value| {
+            value
+                .pointer("/metadata/ownerRef")
+                .and_then(Value::as_str)
+                == Some(owner_ref.to_canonical_string().as_str())
+        })
+}
+
+fn owner_scoped_dependency_types(
+    types: &[ResourceTypeName],
+) -> (Vec<ResourceTypeName>, Vec<ResourceTypeName>) {
+    let owned = types
+        .iter()
+        .filter(|resource_type| {
+            matches!(
+                resource_type.as_str(),
+                "Process" | "EphemeralProcess" | "Volume"
+            )
+        })
+        .cloned()
+        .collect();
+    let unowned = types
+        .iter()
+        .filter(|resource_type| matches!(resource_type.as_str(), "Host" | "Zone"))
+        .cloned()
+        .collect();
+    (owned, unowned)
+}
+
+fn owner_ref_filter(owner_ref: &ResourceRef) -> StoreFilter {
+    StoreFilter {
+        field: "owner.resourceRef".to_owned(),
+        values: vec![owner_ref.to_canonical_string()],
     }
 }
 
@@ -2698,6 +2829,8 @@ mod tests {
             resource_ref: ResourceRef::parse("Credential/work").unwrap(),
             zone: ZoneId::parse("work").unwrap(),
             uid: ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            owner_uid: None,
+            owner_generation: None,
             generation: ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(1),
             canonical_json: br#"{"spec":{"providerRef":"Provider/credential-entra"}}"#.to_vec(),
@@ -2710,6 +2843,86 @@ mod tests {
             ..resource
         };
         assert!(!selector_matches(&selector, &wrong));
+    }
+
+    #[test]
+    fn dependency_snapshot_preserves_internal_owner_identity() {
+        let owner_uid = ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap();
+        let resource = StoredResource {
+            resource_ref: ResourceRef::parse("Volume/work-state").unwrap(),
+            zone: ZoneId::parse("work").unwrap(),
+            uid: ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            owner_uid: Some(owner_uid.clone()),
+            owner_generation: Some(ResourceGeneration::new(7).unwrap()),
+            generation: ResourceGeneration::new(1).unwrap(),
+            revision: ZoneRevision::new(1),
+            canonical_json: br#"{"metadata":{"deletionRequestedAt":null}}"#.to_vec(),
+            payload_digest: "sha256:test".to_owned(),
+        };
+        let snapshot = snapshot_from_resource(resource);
+        assert_eq!(snapshot.owner_uid(), Some(&owner_uid));
+        assert_eq!(
+            snapshot.owner_generation(),
+            Some(ResourceGeneration::new(7).unwrap())
+        );
+    }
+
+    #[test]
+    fn provider_dependency_selection_retains_stale_owner_uid_for_core_to_reject() {
+        let provider_ref = ResourceRef::parse("Provider/runtime").unwrap();
+        let resource = StoredResource {
+            resource_ref: ResourceRef::parse("Volume/runtime-state").unwrap(),
+            zone: ZoneId::parse("work").unwrap(),
+            uid: ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            owner_uid: Some(
+                ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap(),
+            ),
+            owner_generation: Some(ResourceGeneration::new(1).unwrap()),
+            generation: ResourceGeneration::new(1).unwrap(),
+            revision: ZoneRevision::new(1),
+            canonical_json: br#"{"metadata":{"ownerRef":"Provider/runtime"}}"#.to_vec(),
+            payload_digest: "sha256:test".to_owned(),
+        };
+        assert!(
+            owner_child_ref_matches(&resource, &provider_ref),
+            "owner-ref selection must retain the stale row so Core can reject its old UID"
+        );
+        let wrong = ResourceRef::parse("Provider/other").unwrap();
+        assert!(!owner_child_ref_matches(&resource, &wrong));
+    }
+
+    #[test]
+    fn provider_dependency_reads_scope_children_by_exact_owner_ref() {
+        let types = vec![
+            ResourceTypeName::parse("Process").unwrap(),
+            ResourceTypeName::parse("Volume").unwrap(),
+            ResourceTypeName::parse("Host").unwrap(),
+            ResourceTypeName::parse("Zone").unwrap(),
+        ];
+        let (owned, unowned) = owner_scoped_dependency_types(&types);
+        assert_eq!(
+            owned
+                .iter()
+                .map(ResourceTypeName::as_str)
+                .collect::<Vec<_>>(),
+            vec!["Process", "Volume"]
+        );
+        assert_eq!(
+            unowned
+                .iter()
+                .map(ResourceTypeName::as_str)
+                .collect::<Vec<_>>(),
+            vec!["Host", "Zone"]
+        );
+
+        let owner_ref = ResourceRef::parse("Provider/runtime").unwrap();
+        assert_eq!(
+            owner_ref_filter(&owner_ref),
+            StoreFilter {
+                field: "owner.resourceRef".to_owned(),
+                values: vec![owner_ref.to_canonical_string()],
+            }
+        );
     }
 
     #[test]

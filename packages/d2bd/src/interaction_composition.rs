@@ -2353,6 +2353,8 @@ where
                 resource_ref,
                 zone,
                 uid: envelope.metadata().uid().clone(),
+                owner_uid: None,
+                owner_generation: None,
                 generation: envelope.metadata().generation().clone(),
                 revision: envelope.metadata().revision().clone(),
                 canonical_json: resource.canonical_json,

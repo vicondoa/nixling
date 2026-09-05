@@ -236,6 +236,37 @@ fn deleted_generation_is_not_restarted() {
 }
 
 #[test]
+fn malformed_generation_observation_cannot_start_a_zero_generation_runner() {
+    let controller = ActivationController::new(3);
+    let result = controller.reconcile(
+        &spec(),
+        &caller(),
+        &[],
+        GenerationObservation::new("generation", GenerationPhase::Pending),
+    );
+
+    assert_eq!(
+        result.unwrap_err(),
+        d2b_provider_activation_nixos::ActivationError::InvalidSpec
+    );
+}
+
+#[test]
+fn stale_deleted_source_cannot_project_a_successful_activation() {
+    let controller = ActivationController::new(3);
+    let result = controller.apply_runner_result(
+        &spec(),
+        ActivationOutcomeCode::Succeeded,
+        GenerationObservation::new("gen-6", GenerationPhase::Deleted),
+    );
+
+    assert_eq!(
+        result.unwrap_err(),
+        d2b_provider_activation_nixos::ActivationError::AlreadyDeleted
+    );
+}
+
+#[test]
 fn prior_generation_reference_must_be_present_in_observations() {
     let spec = NixosGenerationSpec::new(
         ResourceRef::parse("Provider/activation-nixos").unwrap(),

@@ -124,10 +124,19 @@ impl TelemetryServiceController {
             self.phase = TelemetryServicePhase::Degraded;
             return Err(TelemetryServiceError::InvalidAuthority);
         }
+        if ingest_endpoint_refs
+            .iter()
+            .any(|endpoint| endpoint.resource_type().as_str() != "Endpoint")
+            || (matches!(role, TelemetryServiceRole::Projection)
+                && !ingest_endpoint_refs.is_empty())
+        {
+            self.phase = TelemetryServicePhase::Degraded;
+            return Err(TelemetryServiceError::InvalidAuthority);
+        }
         let endpoint_count = u8::try_from(ingest_endpoint_refs.len()).unwrap_or(u8::MAX);
         self.phase = if !authority_unique {
             TelemetryServicePhase::Degraded
-        } else if ingest_ready || matches!(role, TelemetryServiceRole::Projection) {
+        } else if ingest_ready {
             TelemetryServicePhase::Ready
         } else {
             TelemetryServicePhase::Pending
@@ -351,6 +360,9 @@ impl TelemetryBindingController {
         service_ref: &ResourceRef,
         target_ref: &ResourceRef,
     ) -> Result<BindingChildSet, TelemetryControllerError> {
+        if !matches!(target_ref.resource_type().as_str(), "Guest" | "Zone") {
+            return Err(TelemetryControllerError::Admission);
+        }
         let declarations = if target_ref.resource_type().as_str() == "Guest" {
             &TELEMETRY_GUEST_BINDING_CHILD_REQUESTS[..]
         } else {
@@ -383,6 +395,9 @@ impl TelemetryBindingController {
     ) -> Result<TelemetryReconcileResult, TelemetryControllerError> {
         if self.phase == TelemetryBindingPhase::Deleted {
             return Err(TelemetryControllerError::Finalized);
+        }
+        if connection_id == 0 {
+            return Err(TelemetryControllerError::Admission);
         }
         let children = Self::child_resources(binding_ref, service_ref, target_ref)?;
         let (outcome, error_class) = self.gate.admit_for_connection(

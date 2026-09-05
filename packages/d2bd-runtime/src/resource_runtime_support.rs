@@ -2623,6 +2623,81 @@ pub async fn persist_resource_status_with_projection(
     if status_semantically_equal(&previous_status, &candidate_status) {
         return Ok(());
     }
+    persist_resource_status_candidate(client, resource, value, "system-core-status").await
+}
+
+/// Persist only the bounded controller-session evidence below `status.resource`.
+///
+/// Controller-session transport must not advance the owning Process status
+/// generation or phase; the Process controller owns those fields.
+pub async fn persist_resource_controller_session_evidence(
+    client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
+    resource: &StoredResource,
+    controller_session: Option<&serde_json::Value>,
+) -> Result<(), ResourceRuntimeError> {
+    let Some(value) = resource_controller_session_candidate(resource, controller_session)? else {
+        return Ok(());
+    };
+    persist_resource_status_candidate(
+        client,
+        resource,
+        value,
+        "controller-session-evidence",
+    )
+    .await
+}
+
+fn resource_controller_session_candidate(
+    resource: &StoredResource,
+    controller_session: Option<&serde_json::Value>,
+) -> Result<Option<CanonicalJsonValue>, ResourceRuntimeError> {
+    let mut value = CanonicalJsonValue::parse(&resource.canonical_json)
+        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+    let root = match &mut value {
+        CanonicalJsonValue::Object(root) => root,
+        _ => return Err(ResourceRuntimeError::HandlerNotReady),
+    };
+    let Some(CanonicalJsonValue::Object(status)) = root.get_mut("status") else {
+        return Err(ResourceRuntimeError::HandlerNotReady);
+    };
+    let previous_status = CanonicalJsonValue::Object(status.clone());
+    let mut projection = match status.get("resource") {
+        Some(CanonicalJsonValue::Object(projection)) => projection.clone(),
+        Some(_) => return Err(ResourceRuntimeError::HandlerNotReady),
+        None => BTreeMap::new(),
+    };
+    match controller_session {
+        Some(controller_session) => {
+            let bytes = serde_json::to_vec(controller_session)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let controller_session = CanonicalJsonValue::parse(&bytes)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            if !matches!(controller_session, CanonicalJsonValue::Object(_)) {
+                return Err(ResourceRuntimeError::HandlerNotReady);
+            }
+            projection.insert("controllerSession".to_owned(), controller_session);
+        }
+        None => {
+            projection.remove("controllerSession");
+        }
+    }
+    status.insert(
+        "resource".to_owned(),
+        CanonicalJsonValue::Object(projection),
+    );
+    let candidate_status = CanonicalJsonValue::Object(status.clone());
+    if status_semantically_equal(&previous_status, &candidate_status) {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+async fn persist_resource_status_candidate(
+    client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
+    resource: &StoredResource,
+    value: CanonicalJsonValue,
+    operation_scope: &str,
+) -> Result<(), ResourceRuntimeError> {
     let canonical = value.to_canonical_bytes();
     let envelope = ResourceEnvelope::from_json(&canonical)
         .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
@@ -2648,11 +2723,7 @@ pub async fn persist_resource_status_with_projection(
     precondition.expected_revision = Some(resource.revision.get());
     precondition.expected_uid = Some(resource.uid.as_str().to_owned());
 
-    let operation = bounded_operation_id(&format!(
-        "system-core-status-{}-{}",
-        resource.resource_ref.to_canonical_string(),
-        resource.revision.get()
-    ));
+    let operation = resource_status_operation_id(resource, operation_scope);
     let mut mutation = wire::Mutation::new();
     mutation.kind = protobuf::EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_STATUS);
     mutation.target = protobuf::MessageField::some(identity);
@@ -2684,6 +2755,16 @@ pub async fn persist_resource_status_with_projection(
         return Err(ResourceRuntimeError::StoreReadFailed);
     }
     Ok(())
+}
+
+fn resource_status_operation_id(resource: &StoredResource, operation_scope: &str) -> String {
+    bounded_operation_id(&format!(
+        "{operation_scope}-{}-{}-{}-{}",
+        resource.resource_ref.to_canonical_string(),
+        resource.uid.as_str(),
+        resource.generation.get(),
+        resource.revision.get()
+    ))
 }
 
 fn status_semantically_equal(current: &CanonicalJsonValue, candidate: &CanonicalJsonValue) -> bool {
@@ -2811,6 +2892,8 @@ mod tests {
             resource_ref: ResourceRef::parse(&format!("User/{name}")).unwrap(),
             zone,
             uid: ResourceUid::parse(uid).unwrap(),
+            owner_uid: None,
+            owner_generation: None,
             generation: ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(1),
             canonical_json,
@@ -2867,6 +2950,8 @@ mod tests {
             resource_ref: ResourceRef::parse(&format!("{resource_type}/{name}")).unwrap(),
             zone,
             uid: ResourceUid::parse(uid).unwrap(),
+            owner_uid: None,
+            owner_generation: None,
             generation: ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(1),
             canonical_json,
@@ -4012,6 +4097,121 @@ mod tests {
     }
 
     #[test]
+    fn controller_session_projection_preserves_stale_process_status() {
+        let mut process = policy_resource(
+            "Process",
+            "controller",
+            "123e4567-e89b-42d3-a456-426614174000",
+            json!({
+                "processClass": "controller",
+                "providerRef": "Provider/system-minijail",
+            }),
+        );
+        set_status(&mut process, "Ready", 0);
+        let evidence = json!({
+            "ready": true,
+            "providerGeneration": 2,
+            "processGeneration": 1,
+        });
+        let candidate = resource_controller_session_candidate(&process, Some(&evidence))
+            .unwrap()
+            .expect("new controller-session evidence changes the projection");
+        let value: Value = serde_json::from_slice(&candidate.to_canonical_bytes()).unwrap();
+        assert_eq!(value["status"]["phase"], "Ready");
+        assert_eq!(value["status"]["observedGeneration"], 0);
+        assert_eq!(value["status"]["update"]["observedGeneration"], 0);
+        assert_eq!(value["status"]["resource"]["controllerSession"], evidence);
+    }
+
+    #[test]
+    fn controller_session_clear_removes_evidence_without_rewriting_process_status() {
+        let mut process = policy_resource(
+            "Process",
+            "controller",
+            "123e4567-e89b-42d3-a456-426614174000",
+            json!({
+                "processClass": "controller",
+                "providerRef": "Provider/system-minijail",
+            }),
+        );
+        set_status(&mut process, "Ready", 0);
+        let evidence = json!({
+            "ready": true,
+            "providerGeneration": 2,
+            "processGeneration": 1,
+        });
+        let with_evidence = resource_controller_session_candidate(&process, Some(&evidence))
+            .unwrap()
+            .expect("session evidence should be written");
+        let mut persisted = process.clone();
+        persisted.canonical_json = with_evidence.to_canonical_bytes();
+
+        let cleared = resource_controller_session_candidate(&persisted, None)
+            .unwrap()
+            .expect("stale session evidence should be removed");
+        let value: Value = serde_json::from_slice(&cleared.to_canonical_bytes()).unwrap();
+        assert!(value["status"]["resource"]["controllerSession"].is_null());
+        assert_eq!(value["status"]["phase"], "Ready");
+        assert_eq!(value["status"]["observedGeneration"], 0);
+        assert_eq!(value["status"]["update"]["observedGeneration"], 0);
+    }
+
+    #[test]
+    fn controller_session_evidence_uses_a_distinct_status_operation_identity() {
+        let process = policy_resource(
+            "Process",
+            "controller",
+            "123e4567-e89b-42d3-a456-426614174000",
+            json!({
+                "processClass": "controller",
+                "providerRef": "Provider/system-minijail",
+            }),
+        );
+        let status_operation = resource_status_operation_id(&process, "system-core-status");
+        let evidence_operation =
+            resource_status_operation_id(&process, "controller-session-evidence");
+        assert_ne!(status_operation, evidence_operation);
+        assert!(status_operation.starts_with("d2b-op-sha256:"));
+        assert!(evidence_operation.starts_with("d2b-op-sha256:"));
+    }
+
+    #[test]
+    fn controller_session_evidence_operation_identity_fences_recreates() {
+        let process = policy_resource(
+            "Process",
+            "controller",
+            "123e4567-e89b-42d3-a456-426614174000",
+            json!({
+                "processClass": "controller",
+                "providerRef": "Provider/system-minijail",
+            }),
+        );
+        let original = resource_status_operation_id(&process, "controller-session-evidence");
+
+        let mut recreated = process.clone();
+        set_identity(
+            &mut recreated,
+            "223e4567-e89b-42d3-a456-426614174001",
+            1,
+        );
+        assert_ne!(
+            original,
+            resource_status_operation_id(&recreated, "controller-session-evidence")
+        );
+
+        let mut regenerated = process;
+        set_identity(
+            &mut regenerated,
+            "123e4567-e89b-42d3-a456-426614174000",
+            2,
+        );
+        assert_ne!(
+            original,
+            resource_status_operation_id(&regenerated, "controller-session-evidence")
+        );
+    }
+
+    #[test]
     fn status_timestamp_only_changes_are_semantically_equal() {
         let current = CanonicalJsonValue::parse(
             br#"{"lastReconciledAt":"2026-08-19T00:00:00.000Z","phase":"Ready","update":{"lastAssessedAt":"2026-08-19T00:00:00.000Z","state":"Current"}}"#,
@@ -4085,6 +4285,8 @@ mod tests {
                 resource_ref: stale_ref.clone(),
                 zone: zone.clone(),
                 uid: ResourceUid::parse("223e4567-e89b-42d3-a456-426614174000").unwrap(),
+                owner_uid: None,
+                owner_generation: None,
                 generation: ResourceGeneration::new(1).unwrap(),
                 revision: ZoneRevision::new(1),
                 canonical_json: Vec::new(),
@@ -4145,6 +4347,8 @@ mod tests {
             resource_ref: ResourceRef::parse("Host/host-system").unwrap(),
             zone: ZoneId::parse("dev").unwrap(),
             uid: ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            owner_uid: None,
+            owner_generation: None,
             generation: ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(1),
             canonical_json: br#"{"metadata":{"managedBy":"configuration","configurationGeneration":3,"deletionRequestedAt":"2026-08-15T00:00:00Z"}}"#.to_vec(),

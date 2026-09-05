@@ -702,6 +702,8 @@ mod tests {
                 "123e4567-e89b-42d3-a456-426614174000",
             )
             .unwrap(),
+            owner_uid: None,
+            owner_generation: None,
             generation: d2b_contracts_resource::v3::ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(1),
             canonical_json: canonical,
@@ -803,6 +805,8 @@ mod tests {
                 "123e4567-e89b-42d3-a456-426614174000",
             )
             .unwrap(),
+            owner_uid: None,
+            owner_generation: None,
             generation: d2b_contracts_resource::v3::ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(1),
             canonical_json: br#"{"metadata":{}}"#.to_vec(),

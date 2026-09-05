@@ -37,6 +37,7 @@ pub enum ClipboardServiceRole {
 pub struct AuthenticatedClipboardSession {
     subject_ref: ResourceRef,
     zone: ZoneId,
+    provider_generation: u64,
     reconnect_generation: u64,
     role: ClipboardServiceRole,
 }
@@ -60,7 +61,15 @@ impl AuthenticatedClipboardSession {
             route.service().as_str(),
             crate::MANAGEMENT_SERVICE | crate::BRIDGE_SERVICE | crate::PICKER_SERVICE
         );
-        if !provider_matches || !service_matches || route.provider_generation().is_none() {
+        let provider_generation = route
+            .provider_generation()
+            .ok_or(ClipboardServiceError::SessionUnauthenticated)?
+            .get();
+        if !provider_matches
+            || !service_matches
+            || provider_generation == 0
+            || route.reconnect_generation().get() == 0
+        {
             return Err(ClipboardServiceError::SessionUnauthenticated);
         }
         let subject_type = route.subject_ref().resource_type().as_str();
@@ -76,6 +85,7 @@ impl AuthenticatedClipboardSession {
         Ok(Self {
             subject_ref: route.subject_ref().clone(),
             zone: route.zone().clone(),
+            provider_generation,
             reconnect_generation: route.reconnect_generation().get(),
             role,
         })
@@ -113,6 +123,9 @@ impl AuthenticatedClipboardSession {
                 != d2b_contracts_resource::v3::identity::EvidenceClass::UnixPeer
             || route.locality() != d2b_contracts_resource::v3::identity::Locality::Local
             || route.subject_ref().resource_type().as_str() != "User"
+            || route
+                .provider_generation()
+                .is_none_or(|generation| generation.get() == 0)
             || route.reconnect_generation().get() == 0
         {
             return Err(ClipboardServiceError::HostSessionInvalid);
@@ -120,6 +133,10 @@ impl AuthenticatedClipboardSession {
         Ok(Self {
             subject_ref: route.subject_ref().clone(),
             zone: route.zone().clone(),
+            provider_generation: route
+                .provider_generation()
+                .expect("validated display provider generation")
+                .get(),
             reconnect_generation: route.reconnect_generation().get(),
             role: ClipboardServiceRole::Bridge,
         })
@@ -139,6 +156,9 @@ impl AuthenticatedClipboardSession {
             || route.locality() != d2b_contracts_resource::v3::identity::Locality::Local
             || route.subject_ref().resource_type().as_str() != "Guest"
             || user_ref.resource_type().as_str() != "User"
+            || route
+                .provider_generation()
+                .is_none_or(|generation| generation.get() == 0)
             || route.reconnect_generation().get() == 0
         {
             return Err(ClipboardServiceError::HostSessionInvalid);
@@ -146,6 +166,10 @@ impl AuthenticatedClipboardSession {
         Ok(Self {
             subject_ref: user_ref,
             zone: route.zone().clone(),
+            provider_generation: route
+                .provider_generation()
+                .expect("validated display provider generation")
+                .get(),
             reconnect_generation: route.reconnect_generation().get(),
             role: ClipboardServiceRole::Bridge,
         })
@@ -1083,11 +1107,15 @@ pub(crate) fn operation_id_for_sessions(
     digest.update([0]);
     digest.update(source.zone.as_str().as_bytes());
     digest.update([0]);
+    digest.update(source.provider_generation.to_be_bytes());
+    digest.update([0]);
     digest.update(source.reconnect_generation.to_be_bytes());
     digest.update([0]);
     digest.update(destination.subject_ref.to_canonical_string().as_bytes());
     digest.update([0]);
     digest.update(destination.zone.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(destination.provider_generation.to_be_bytes());
     digest.update([0]);
     digest.update(destination.reconnect_generation.to_be_bytes());
     format!(
@@ -1185,6 +1213,7 @@ mod tests {
         AuthenticatedClipboardSession {
             subject_ref: ResourceRef::parse(&format!("Guest/{name}")).unwrap(),
             zone: ZoneId::parse(zone).unwrap(),
+            provider_generation: 1,
             reconnect_generation: generation,
             role: ClipboardServiceRole::Bridge,
         }
@@ -1194,6 +1223,7 @@ mod tests {
         AuthenticatedClipboardSession {
             subject_ref: ResourceRef::parse("User/alice").unwrap(),
             zone: ZoneId::parse(zone).unwrap(),
+            provider_generation: 1,
             reconnect_generation: generation,
             role: ClipboardServiceRole::Bridge,
         }
@@ -1290,6 +1320,7 @@ mod tests {
         let other_user = AuthenticatedClipboardSession {
             subject_ref: ResourceRef::parse("User/bob").unwrap(),
             zone: ZoneId::parse("zone-a").unwrap(),
+            provider_generation: 1,
             reconnect_generation: 1,
             role: ClipboardServiceRole::Bridge,
         };
@@ -1361,6 +1392,7 @@ mod tests {
         let provider = AuthenticatedClipboardSession {
             subject_ref: ResourceRef::parse("Provider/display-wayland").unwrap(),
             zone: ZoneId::parse("zone-a").unwrap(),
+            provider_generation: 1,
             reconnect_generation: 1,
             role: ClipboardServiceRole::Bridge,
         };
@@ -1595,6 +1627,19 @@ mod tests {
         assert_eq!(
             host.reconcile_display_dependency(Some(current)),
             Err(ClipboardServiceError::DependencyUnavailable)
+        );
+    }
+
+    #[test]
+    fn paste_operation_identity_includes_provider_generation() {
+        let source = user("zone-a", 1);
+        let destination = guest("work", "zone-a", 1);
+        let mut replacement = guest("work", "zone-a", 1);
+        replacement.provider_generation = 2;
+
+        assert_ne!(
+            operation_id_for_sessions(&source, &destination),
+            operation_id_for_sessions(&source, &replacement)
         );
     }
 }

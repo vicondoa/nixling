@@ -2409,12 +2409,21 @@ fn read_list(
                 owner_uid,
             )
         };
+        let owner_ref = serde_json::from_slice::<serde_json::Value>(&resource.canonical_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/metadata/ownerRef")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
         if !filters_match(
             &request.filters,
             resource_type,
             name,
             &resource.uid,
             owner_uid.as_deref(),
+            owner_ref.as_deref(),
         ) {
             continue;
         }
@@ -2501,6 +2510,23 @@ fn stored_metadata_resource_from_frame(
         .get("owner_uid")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
+    let owner_uid_resource = owner_uid
+        .as_deref()
+        .map(|value| {
+            ResourceUid::parse(value.to_owned())
+                .map_err(|_| crate::transaction::integrity("stored-resource-owner-uid-invalid"))
+        })
+        .transpose()?;
+    let owner_generation = value
+        .get("owner_generation")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| {
+            d2b_contracts_resource::v3::ResourceGeneration::new(value)
+                .map_err(|_| {
+                    crate::transaction::integrity("stored-resource-owner-generation-invalid")
+                })
+        })
+        .transpose()?;
     let resource: serde_json::Value = serde_json::from_slice(&canonical_json)
         .map_err(|_| crate::transaction::integrity("stored-resource-envelope-invalid"))?;
     let metadata = resource
@@ -2537,6 +2563,8 @@ fn stored_metadata_resource_from_frame(
             resource_ref: resource_ref.clone(),
             zone: zone.clone(),
             uid,
+            owner_uid: owner_uid_resource,
+            owner_generation,
             generation,
             revision,
             canonical_json,
@@ -2642,6 +2670,7 @@ fn filters_match(
     name: &str,
     uid: &ResourceUid,
     owner_uid: Option<&str>,
+    owner_ref: Option<&str>,
 ) -> bool {
     filters.iter().all(|filter| match filter.field.as_str() {
         "metadata.name" => filter.values.iter().any(|value| value == name),
@@ -2651,6 +2680,10 @@ fn filters_match(
             .values
             .iter()
             .any(|value| owner_uid == Some(value.as_str())),
+        "owner.resourceRef" => filter
+            .values
+            .iter()
+            .any(|value| owner_ref == Some(value.as_str())),
         _ => false,
     })
 }
@@ -2798,6 +2831,7 @@ mod tests {
             "worker",
             &uid,
             None,
+            None,
         ));
         assert!(!filters_match(
             &[StoreFilter {
@@ -2807,6 +2841,7 @@ mod tests {
             "Process",
             "worker",
             &uid,
+            None,
             None,
         ));
     }
@@ -2825,9 +2860,40 @@ mod tests {
             "worker",
             &child_uid,
             Some(owner_uid.as_str()),
+            None,
         ));
         assert!(!filters_match(
-            &filter, "Process", "worker", &child_uid, None,
+            &filter,
+            "Process",
+            "worker",
+            &child_uid,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn owner_ref_filter_keeps_stale_uid_children_visible() {
+        let child_uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let filter = [StoreFilter {
+            field: "owner.resourceRef".to_owned(),
+            values: vec!["Provider/runtime".to_owned()],
+        }];
+        assert!(filters_match(
+            &filter,
+            "Process",
+            "worker",
+            &child_uid,
+            Some("223e4567-e89b-42d3-a456-426614174001"),
+            Some("Provider/runtime"),
+        ));
+        assert!(!filters_match(
+            &filter,
+            "Process",
+            "worker",
+            &child_uid,
+            Some("323e4567-e89b-42d3-a456-426614174002"),
+            Some("Provider/other"),
         ));
     }
 

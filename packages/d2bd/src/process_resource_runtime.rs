@@ -87,6 +87,8 @@ pub(crate) enum ProcessResourceRuntimeError {
     ControllerBootstrapUnavailable,
     /// A required Process Provider has no committed identity projection.
     ProviderIdentityUnavailable,
+    /// A semantic Process owner has no committed identity projection.
+    OwnerIdentityUnavailable,
     /// The durable store could not be listed or watched.
     Store,
 }
@@ -103,6 +105,7 @@ impl core::fmt::Display for ProcessResourceRuntimeError {
                 "process-resource-controller-bootstrap-unavailable"
             }
             Self::ProviderIdentityUnavailable => "process-resource-provider-identity-unavailable",
+            Self::OwnerIdentityUnavailable => "process-resource-owner-identity-unavailable",
             Self::Store => "process-resource-store-failed",
         })
     }
@@ -116,6 +119,14 @@ pub(crate) trait ProcessProviderIdentityLoader: Send + Sync {
         &self,
         provider_ref: &ResourceRef,
     ) -> Result<(ResourceUid, ResourceGeneration), ProcessResourceRuntimeError>;
+}
+
+#[async_trait::async_trait]
+pub(crate) trait ProcessOwnerIdentityLoader: Send + Sync {
+    async fn load(
+        &self,
+        owner_ref: &ResourceRef,
+    ) -> Result<ResourceUid, ProcessResourceRuntimeError>;
 }
 
 #[derive(Clone, Default)]
@@ -159,6 +170,60 @@ impl ProcessProviderIdentityCache {
             .lock()
             .map_err(|_| ProcessResourceRuntimeError::ProviderIdentityUnavailable)?;
         identities.entry(provider_ref.clone()).or_insert(identity);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ProcessOwnerIdentityCache {
+    identities: Arc<Mutex<BTreeMap<ResourceRef, ResourceUid>>>,
+}
+
+impl ProcessOwnerIdentityCache {
+    fn replace(
+        &self,
+        identities: BTreeMap<ResourceRef, ResourceUid>,
+    ) -> Result<(), ProcessResourceRuntimeError> {
+        *self
+            .identities
+            .lock()
+            .map_err(|_| ProcessResourceRuntimeError::OwnerIdentityUnavailable)? = identities;
+        Ok(())
+    }
+
+    fn get(&self, owner_ref: &ResourceRef) -> Option<ResourceUid> {
+        self.identities
+            .lock()
+            .ok()
+            .and_then(|identities| identities.get(owner_ref).cloned())
+    }
+
+    async fn ensure(
+        &self,
+        owner_ref: &ResourceRef,
+        loader: Option<&dyn ProcessOwnerIdentityLoader>,
+    ) -> Result<(), ProcessResourceRuntimeError> {
+        self.refresh(owner_ref, loader).await
+    }
+
+    async fn refresh(
+        &self,
+        owner_ref: &ResourceRef,
+        loader: Option<&dyn ProcessOwnerIdentityLoader>,
+    ) -> Result<(), ProcessResourceRuntimeError> {
+        let Some(loader) = loader else {
+            return if self.get(owner_ref).is_some() {
+                Ok(())
+            } else {
+                Err(ProcessResourceRuntimeError::OwnerIdentityUnavailable)
+            };
+        };
+        let uid = loader.load(owner_ref).await?;
+        let mut identities = self
+            .identities
+            .lock()
+            .map_err(|_| ProcessResourceRuntimeError::OwnerIdentityUnavailable)?;
+        identities.insert(owner_ref.clone(), uid);
         Ok(())
     }
 }
@@ -238,6 +303,8 @@ impl DesiredRecord {
         self.resource.zone == other.resource.zone
             && self.resource.resource_ref == other.resource.resource_ref
             && self.resource.uid == other.resource.uid
+            && self.resource.owner_uid == other.resource.owner_uid
+            && self.resource.owner_generation == other.resource.owner_generation
             && self.resource.generation == other.resource.generation
             && self.zone_uid == other.zone_uid
             && self.policy_revision == other.policy_revision
@@ -299,6 +366,35 @@ fn provider_identity_ref(record: &DesiredRecord) -> Option<ResourceRef> {
     }
 }
 
+#[cfg(test)]
+fn owner_identity_available(
+    owner_ref: Option<&ResourceRef>,
+    owner_uids: &BTreeMap<ResourceRef, ResourceUid>,
+) -> bool {
+    owner_ref.is_none_or(|owner| owner_uids.contains_key(owner))
+}
+
+fn stored_owner_identity_is_stale(
+    record: &DesiredRecord,
+    current_owner_uid: Option<&ResourceUid>,
+) -> bool {
+    record.owner_ref().is_some()
+        && record
+            .resource
+            .owner_uid
+            .as_ref()
+            .is_some_and(|stored| current_owner_uid != Some(stored))
+}
+
+fn owner_identity_refresh_failed(
+    record: &DesiredRecord,
+    unavailable: &BTreeSet<ResourceRef>,
+) -> bool {
+    record
+        .owner_ref()
+        .is_some_and(|owner_ref| unavailable.contains(&owner_ref))
+}
+
 const fn process_finalizer_names() -> [&'static str; 3] {
     [
         PROCESS_RUNTIME_FINALIZER,
@@ -345,6 +441,7 @@ pub(crate) struct ProcessResourceRuntime {
     controller_generation: ControllerGeneration,
     controller_provider_identities: ProcessProviderIdentityCache,
     provider_identity_loader: Option<Arc<dyn ProcessProviderIdentityLoader>>,
+    owner_identity_loader: Option<Arc<dyn ProcessOwnerIdentityLoader>>,
     guest_execution: Option<GuestExecutionBinding>,
     zone_uid: Option<ResourceUid>,
     policy_revision: Option<u64>,
@@ -353,7 +450,7 @@ pub(crate) struct ProcessResourceRuntime {
     target_owner_ref: Option<ResourceRef>,
     target_ref: Option<ResourceRef>,
     guest_descriptor_digests: BTreeMap<ResourceRef, SchemaFingerprint>,
-    owner_uids: BTreeMap<ResourceRef, ResourceUid>,
+    owner_uids: ProcessOwnerIdentityCache,
     status_client: Option<Arc<dyn ProcessResourceClient>>,
     liveness_waker: Option<Arc<dyn Fn(ResourceKey, ZoneRevision) + Send + Sync>>,
     last_adopted: Option<bool>,
@@ -430,13 +527,14 @@ impl ProcessResourceRuntime {
                 .expect("controller generation one is valid"),
             controller_provider_identities: ProcessProviderIdentityCache::default(),
             provider_identity_loader: None,
+            owner_identity_loader: None,
             guest_execution: None,
             zone_uid: None,
             policy_revision: None,
             target_owner_ref: None,
             target_ref: None,
             guest_descriptor_digests: BTreeMap::new(),
-            owner_uids: BTreeMap::new(),
+            owner_uids: ProcessOwnerIdentityCache::default(),
             status_client: None,
             liveness_waker: None,
             last_adopted: None,
@@ -459,6 +557,13 @@ impl ProcessResourceRuntime {
         loader: Arc<dyn ProcessProviderIdentityLoader>,
     ) {
         self.provider_identity_loader = Some(loader);
+    }
+
+    pub(crate) fn set_owner_identity_loader(
+        &mut self,
+        loader: Arc<dyn ProcessOwnerIdentityLoader>,
+    ) {
+        self.owner_identity_loader = Some(loader);
     }
 
     pub(crate) fn set_guest_execution_binding(&mut self, binding: GuestExecutionBinding) {
@@ -487,7 +592,7 @@ impl ProcessResourceRuntime {
     }
 
     pub(crate) fn set_owner_uids(&mut self, owner_uids: BTreeMap<ResourceRef, ResourceUid>) {
-        self.owner_uids = owner_uids;
+        let _ = self.owner_uids.replace(owner_uids);
     }
 
     pub(crate) fn set_status_client<C>(&mut self, status_client: Arc<C>)
@@ -523,6 +628,7 @@ impl ProcessResourceRuntime {
             controller_generation: self.controller_generation,
             controller_provider_identities: self.controller_provider_identities.clone(),
             provider_identity_loader: self.provider_identity_loader.clone(),
+            owner_identity_loader: self.owner_identity_loader.clone(),
             guest_execution: self.guest_execution.clone(),
             zone_uid: self.zone_uid.clone(),
             policy_revision: self.policy_revision,
@@ -586,10 +692,11 @@ impl ProcessResourceRuntime {
         )
         .with_owner_ref(owner_ref.clone())
         .with_owner_uid(
-            owner_ref
-                .as_ref()
-                .and_then(|owner| self.owner_uids.get(owner))
-                .cloned(),
+            record.resource.owner_uid.clone().or_else(|| {
+                owner_ref
+                    .as_ref()
+                    .and_then(|owner| self.owner_uids.get(owner))
+            }),
         )
         .with_controller_provider_ref(controller_provider_ref)
         .with_guest_descriptor_digest(
@@ -633,6 +740,27 @@ impl ProcessResourceRuntime {
             .await
     }
 
+    async fn refresh_owner_identity(
+        &self,
+        owner_ref: &ResourceRef,
+    ) -> Result<(), ProcessResourceRuntimeError> {
+        self.owner_uids
+            .refresh(owner_ref, self.owner_identity_loader.as_deref())
+            .await
+    }
+
+    async fn ensure_owner_identity(
+        &self,
+        record: &DesiredRecord,
+    ) -> Result<(), ProcessResourceRuntimeError> {
+        let Some(owner_ref) = record.owner_ref() else {
+            return Ok(());
+        };
+        self.owner_uids
+            .ensure(&owner_ref, self.owner_identity_loader.as_deref())
+            .await
+    }
+
     /// Reconcile the fresh Process/EphemeralProcess targets for this pass.
     pub(crate) async fn reconcile(
         &mut self,
@@ -655,6 +783,18 @@ impl ProcessResourceRuntime {
             self.restart_counts
                 .entry(record.resource.resource_ref.clone())
                 .or_insert_with(|| persisted_restart_count(&record.resource, &record.process));
+        }
+        let mut refreshed_owner_refs = BTreeSet::new();
+        let mut owner_identity_unavailable = BTreeSet::new();
+        for record in desired.values() {
+            let Some(owner_ref) = record.owner_ref() else {
+                continue;
+            };
+            if refreshed_owner_refs.insert(owner_ref.clone())
+                && self.refresh_owner_identity(&owner_ref).await.is_err()
+            {
+                owner_identity_unavailable.insert(owner_ref);
+            }
         }
         for record in desired.values() {
             self.ensure_provider_identity(record).await?;
@@ -693,6 +833,32 @@ impl ProcessResourceRuntime {
         });
         for mut record in desired {
             let key = record.resource.resource_ref.clone();
+            if let Some(owner_ref) = record.owner_ref() {
+                if owner_identity_refresh_failed(&record, &owner_identity_unavailable) {
+                    continue;
+                }
+                let current_owner_uid = self.owner_uids.get(&owner_ref);
+                if stored_owner_identity_is_stale(&record, current_owner_uid.as_ref()) {
+                    let stale = self
+                        .records
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| record.clone());
+                    self.stop_record(&stale).await?;
+                    self.providers
+                        .finalize_resource(self.context(&stale))
+                        .await
+                        .map_err(map_provider_error)?;
+                    self.records.remove(&key);
+                    self.terminal.remove(&key);
+                    self.terminal_failed.remove(&key);
+                    self.restart_counts.remove(&key);
+                    self.started_at.remove(&key);
+                    self.completed_at.remove(&key);
+                    self.next_restart_at.remove(&key);
+                    continue;
+                }
+            }
             let provider_identity_ref = provider_identity_ref(&record);
             let provider_identity = provider_identity_ref
                 .as_ref()
@@ -1508,6 +1674,8 @@ impl ProcessResourceReconciler {
             resource_ref: resource.key().resource_ref().clone(),
             zone: resource.key().zone().clone(),
             uid: resource.key().uid().clone(),
+            owner_uid: resource.owner_uid().cloned(),
+            owner_generation: resource.owner_generation(),
             generation: resource.generation(),
             revision: resource.revision(),
             canonical_json: resource.canonical_json().to_vec(),
@@ -1614,6 +1782,7 @@ impl ProcessResourceReconciler {
         let Some(record) = self.desired_record(resource)? else {
             return Ok(None);
         };
+        self.runtime.ensure_owner_identity(&record).await?;
         self.runtime.ensure_provider_identity(&record).await?;
         self.desired_record(resource)
     }
@@ -2698,6 +2867,7 @@ fn start_failure_code(error: ProcessResourceRuntimeError) -> &'static str {
         ProcessResourceRuntimeError::InvalidResource => "resource-invalid",
         ProcessResourceRuntimeError::ProviderEffect => "provider-start-failed",
         ProcessResourceRuntimeError::ProviderIdentityUnavailable => "provider-identity-unavailable",
+        ProcessResourceRuntimeError::OwnerIdentityUnavailable => "owner-identity-unavailable",
         ProcessResourceRuntimeError::Store => "store-failed",
     }
 }
@@ -2720,6 +2890,9 @@ fn start_failure_message(error: ProcessResourceRuntimeError) -> &'static str {
         ProcessResourceRuntimeError::ProviderEffect => "the Provider failed to start the process",
         ProcessResourceRuntimeError::ProviderIdentityUnavailable => {
             "the committed Provider identity is unavailable"
+        }
+        ProcessResourceRuntimeError::OwnerIdentityUnavailable => {
+            "the committed Process owner identity is unavailable"
         }
         ProcessResourceRuntimeError::Store => "the durable resource store failed",
     }
@@ -3787,17 +3960,22 @@ impl GuestProcessSource {
                 })
             })
             .map(|resource| {
-                DependencySnapshot::new(ResourceSnapshot::new(
-                    ResourceKey::new(
-                        resource.zone,
-                        resource.resource_ref,
-                        resource.uid,
-                    ),
-                    resource.revision,
-                    resource.generation,
-                    resource.canonical_json.clone(),
-                    resource_deleting(&resource.canonical_json),
-                ))
+                let owner_uid = resource.owner_uid.clone();
+                let owner_generation = resource.owner_generation;
+                DependencySnapshot::new(
+                    ResourceSnapshot::new(
+                        ResourceKey::new(
+                            resource.zone,
+                            resource.resource_ref,
+                            resource.uid,
+                        ),
+                        resource.revision,
+                        resource.generation,
+                        resource.canonical_json.clone(),
+                        resource_deleting(&resource.canonical_json),
+                    )
+                    .with_owner_identity(owner_uid, owner_generation),
+                )
             })
             .collect())
     }
@@ -4161,16 +4339,21 @@ impl RegisteredControllerApi for GuestProcessSource {
                 })
                 .await
             {
-                Ok(resource) => Ok(FreshSnapshot::Present {
-                    target: ResourceSnapshot::new(
-                        key,
-                        resource.revision,
-                        resource.generation,
-                        resource.canonical_json.clone(),
-                        resource_deleting(&resource.canonical_json),
-                    ),
-                    dependencies: self.list_dependencies(&descriptor).await?,
-                }),
+                Ok(resource) => {
+                    let owner_uid = resource.owner_uid.clone();
+                    let owner_generation = resource.owner_generation;
+                    Ok(FreshSnapshot::Present {
+                        target: ResourceSnapshot::new(
+                            key,
+                            resource.revision,
+                            resource.generation,
+                            resource.canonical_json.clone(),
+                            resource_deleting(&resource.canonical_json),
+                        )
+                        .with_owner_identity(owner_uid, owner_generation),
+                        dependencies: self.list_dependencies(&descriptor).await?,
+                    })
+                }
                 Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
                     Ok(FreshSnapshot::Deleted {
                         key,
@@ -4725,6 +4908,8 @@ pub(crate) async fn run_guest_process_reconciliation(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use d2b_process_conformance::{
         AdoptionCandidate, AdoptionCondition, ObservedIdentity, ProcessIdentityDigest,
         ProcessPhaseClass, ProcessStatusReport, WaitReapOwner, testing::fixtures,
@@ -4882,6 +5067,8 @@ mod tests {
                 "123e4567-e89b-42d3-a456-426614174000",
             )
             .expect("uid"),
+            owner_uid: None,
+            owner_generation: None,
             generation: d2b_contracts_resource::v3::ResourceGeneration::new(1).expect("generation"),
             revision: ZoneRevision::new(1),
             canonical_json: br#"{"apiVersion":"resources.d2bus.org/v3","metadata":{"configurationGeneration":1,"createdAt":"2026-07-22T00:00:00.000Z","deletionRequestedAt":null,"finalizers":[],"generation":1,"managedBy":"configuration","name":"status-projection","ownerRef":null,"revision":1,"uid":"123e4567-e89b-42d3-a456-426614174000","updatedAt":"2026-07-22T00:00:00.000Z","zone":"dev"},"spec":{"executionRef":"Host/host-system","processClass":"worker","template":"reaction"},"status":{"completedAt":null,"conditions":[],"lastReconciledAt":null,"observedGeneration":0,"outcome":null,"phase":"Pending","resource":{},"startedAt":null,"update":{"dependencies":{"count":0,"refs":[]},"disruption":"None","lastAssessedAt":null,"observedGeneration":0,"operationId":null,"owned":{"count":0,"refs":[]},"preserveState":true,"reasons":[],"state":"Unknown","targetGeneration":1}},"type":"Process"}"#.to_vec(),
@@ -4975,6 +5162,8 @@ mod tests {
                     "123e4567-e89b-42d3-a456-426614174000",
                 )
                 .expect("uid"),
+                owner_uid: None,
+                owner_generation: None,
                 generation: d2b_contracts_resource::v3::ResourceGeneration::new(1)
                     .expect("generation"),
                 revision: ZoneRevision::new(1),
@@ -5045,6 +5234,8 @@ mod tests {
                     "123e4567-e89b-42d3-a456-426614174000",
                 )
                 .expect("uid"),
+                owner_uid: None,
+                owner_generation: None,
                 generation: d2b_contracts_resource::v3::ResourceGeneration::new(1)
                     .expect("generation"),
                 revision: ZoneRevision::new(revision),
@@ -5089,6 +5280,69 @@ mod tests {
             start_failure_message(ProcessResourceRuntimeError::ProviderIdentityUnavailable),
             "the committed Provider identity is unavailable"
         );
+    }
+
+    #[test]
+    fn missing_process_owner_identity_isolated_from_unrelated_processes() {
+        let missing = ResourceRef::parse("Guest/missing").expect("missing owner");
+        let healthy = ResourceRef::parse("Guest/healthy").expect("healthy owner");
+        let owner_uids = BTreeMap::from([(
+            healthy.clone(),
+            ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").expect("owner uid"),
+        )]);
+
+        assert!(!owner_identity_available(Some(&missing), &owner_uids));
+        assert!(owner_identity_available(Some(&healthy), &owner_uids));
+        assert!(owner_identity_available(None, &owner_uids));
+    }
+
+    #[test]
+    fn transient_owner_refresh_defers_the_process_without_removing_desired_state() {
+        let owner_ref = ResourceRef::parse("Guest/transient").expect("owner ref");
+        let mut record = identity_record(1);
+        record.resource.canonical_json =
+            br#"{"metadata":{"ownerRef":"Guest/transient"}}"#.to_vec();
+        let unavailable = BTreeSet::from([owner_ref]);
+
+        assert!(owner_identity_refresh_failed(&record, &unavailable));
+        assert!(
+            !owner_identity_refresh_failed(&identity_record(1), &unavailable),
+            "ownerless Processes remain eligible while one owner read is retrying"
+        );
+    }
+
+    #[test]
+    fn stale_process_owner_incarnation_is_fenced_before_effects() {
+        let old_uid =
+            ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").expect("old owner UID");
+        let new_uid =
+            ResourceUid::parse("323e4567-e89b-42d3-a456-426614174002").expect("new owner UID");
+        let owner_ref = ResourceRef::parse("Guest/recreated").expect("owner ref");
+        let mut record = identity_record(1);
+        record.resource.owner_uid = Some(old_uid.clone());
+        record.resource.canonical_json =
+            br#"{"metadata":{"ownerRef":"Guest/recreated"}}"#.to_vec();
+
+        assert!(stored_owner_identity_is_stale(&record, Some(&new_uid)));
+        assert!(!stored_owner_identity_is_stale(&record, Some(&old_uid)));
+        assert!(owner_identity_refresh_failed(
+            &record,
+            &BTreeSet::from([owner_ref])
+        ));
+    }
+
+    #[test]
+    fn desired_state_comparison_preserves_stored_owner_incarnation() {
+        let old_uid =
+            ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").expect("old owner UID");
+        let new_uid =
+            ResourceUid::parse("323e4567-e89b-42d3-a456-426614174002").expect("new owner UID");
+        let mut old = identity_record(1);
+        old.resource.owner_uid = Some(old_uid);
+        let mut recreated = old.clone();
+        recreated.resource.owner_uid = Some(new_uid);
+
+        assert!(!old.same_desired_state(&recreated));
     }
 
     #[test]
@@ -5189,6 +5443,102 @@ mod tests {
                 .cloned()
                 .ok_or(ProcessResourceRuntimeError::ProviderIdentityUnavailable)
         }
+    }
+
+    struct TestOwnerIdentityLoader {
+        attempts: AtomicUsize,
+        failures_remaining: AtomicUsize,
+        uid: ResourceUid,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessOwnerIdentityLoader for TestOwnerIdentityLoader {
+        async fn load(
+            &self,
+            _owner_ref: &ResourceRef,
+        ) -> Result<ResourceUid, ProcessResourceRuntimeError> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return Err(ProcessResourceRuntimeError::OwnerIdentityUnavailable);
+            }
+            Ok(self.uid.clone())
+        }
+    }
+
+    struct RotatingOwnerIdentityLoader {
+        uid: Mutex<ResourceUid>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessOwnerIdentityLoader for RotatingOwnerIdentityLoader {
+        async fn load(
+            &self,
+            _owner_ref: &ResourceRef,
+        ) -> Result<ResourceUid, ProcessResourceRuntimeError> {
+            Ok(self.uid.lock().expect("owner identity lock").clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_process_owner_identity_retries_without_poisoning_the_cache() {
+        let owner_ref = ResourceRef::parse("Guest/missing").expect("owner ref");
+        let owner_uid =
+            ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").expect("owner uid");
+        let cache = ProcessOwnerIdentityCache::default();
+        let loader = TestOwnerIdentityLoader {
+            attempts: AtomicUsize::new(0),
+            failures_remaining: AtomicUsize::new(1),
+            uid: owner_uid.clone(),
+        };
+
+        assert_eq!(
+            cache.ensure(&owner_ref, Some(&loader)).await,
+            Err(ProcessResourceRuntimeError::OwnerIdentityUnavailable)
+        );
+        assert_eq!(cache.get(&owner_ref), None);
+        cache
+            .ensure(&owner_ref, Some(&loader))
+            .await
+            .expect("owner identity retry");
+        assert_eq!(cache.get(&owner_ref), Some(owner_uid));
+        assert_eq!(loader.attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn recreated_process_owner_replaces_cached_uid_at_reconcile_boundary() {
+        let owner_ref = ResourceRef::parse("Guest/recreated").expect("owner ref");
+        let first_uid =
+            ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").expect("first owner uid");
+        let replacement_uid =
+            ResourceUid::parse("323e4567-e89b-42d3-a456-426614174002")
+                .expect("replacement owner uid");
+        let cache = ProcessOwnerIdentityCache::default();
+        let loader = RotatingOwnerIdentityLoader {
+            uid: Mutex::new(first_uid.clone()),
+        };
+
+        cache
+            .ensure(&owner_ref, Some(&loader))
+            .await
+            .expect("initial owner identity");
+        assert_eq!(cache.get(&owner_ref), Some(first_uid));
+
+        *loader.uid.lock().expect("owner identity lock") = replacement_uid.clone();
+        cache
+            .ensure(&owner_ref, Some(&loader))
+            .await
+            .expect("recreated owner identity");
+        assert_eq!(cache.get(&owner_ref), Some(replacement_uid));
     }
 
     #[tokio::test]

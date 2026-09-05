@@ -15,6 +15,8 @@ use crate::{ControllerIdentity, ResourceKey, TriggerSet};
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResourceSnapshot {
     key: ResourceKey,
+    owner_uid: Option<ResourceUid>,
+    owner_generation: Option<ResourceGeneration>,
     revision: ZoneRevision,
     generation: ResourceGeneration,
     canonical_json: Vec<u8>,
@@ -32,6 +34,8 @@ impl ResourceSnapshot {
     ) -> Self {
         Self {
             key,
+            owner_uid: None,
+            owner_generation: None,
             revision,
             generation,
             canonical_json,
@@ -42,6 +46,27 @@ impl ResourceSnapshot {
     /// Borrow the immutable identity.
     pub const fn key(&self) -> &ResourceKey {
         &self.key
+    }
+
+    /// Borrow the immutable singular owner UID when the store supplied it.
+    pub fn owner_uid(&self) -> Option<&ResourceUid> {
+        self.owner_uid.as_ref()
+    }
+
+    /// Return the immutable owner generation when the source supplied it.
+    pub const fn owner_generation(&self) -> Option<ResourceGeneration> {
+        self.owner_generation
+    }
+
+    /// Attach the store's immutable owner identity to this snapshot.
+    pub fn with_owner_identity(
+        mut self,
+        owner_uid: Option<ResourceUid>,
+        owner_generation: Option<ResourceGeneration>,
+    ) -> Self {
+        self.owner_uid = owner_uid;
+        self.owner_generation = owner_generation;
+        self
     }
 
     /// Return the fresh revision.

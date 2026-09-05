@@ -727,6 +727,9 @@ impl ActivationController {
         if observed.phase == GenerationPhase::Deleted {
             return Err(ActivationError::AlreadyDeleted);
         }
+        if observed.ordinal == 0 {
+            return Err(ActivationError::InvalidSpec);
+        }
         let runner_requests = if matches!(
             observed.phase,
             GenerationPhase::Pending | GenerationPhase::Degraded
@@ -765,6 +768,12 @@ impl ActivationController {
         outcome: ActivationOutcomeCode,
         source: GenerationObservation,
     ) -> Result<RunnerResult, ActivationError> {
+        if source.ordinal == 0 {
+            return Err(ActivationError::InvalidSpec);
+        }
+        if source.phase == GenerationPhase::Deleted {
+            return Err(ActivationError::AlreadyDeleted);
+        }
         let outcome_matches_mode = match spec.activation_mode() {
             ActivationMode::Adopt => matches!(outcome, ActivationOutcomeCode::Adopted),
             _ => !matches!(outcome, ActivationOutcomeCode::Adopted),

@@ -261,7 +261,6 @@ impl EntraCredentialProvider {
                     request.credential_ref(),
                     request.idempotency_key(),
                     grant,
-                    request.requested_expiry_unix_ms(),
                     deadline,
                 )
                 .await;
@@ -640,7 +639,6 @@ impl EntraCredentialProvider {
                     request.credential_ref(),
                     request.idempotency_key(),
                     grant,
-                    request.requested_expiry_unix_ms(),
                     deadline,
                 );
                 return Err(error);
@@ -665,7 +663,6 @@ impl EntraCredentialProvider {
                     request.credential_ref(),
                     request.idempotency_key(),
                     grant,
-                    request.requested_expiry_unix_ms(),
                     deadline,
                 );
                 return Err(error);
@@ -690,7 +687,6 @@ impl EntraCredentialProvider {
                 request.credential_ref(),
                 request.idempotency_key(),
                 grant,
-                request.requested_expiry_unix_ms(),
                 deadline,
             );
             return Err(error);
@@ -1041,21 +1037,9 @@ impl EntraCredentialProvider {
         credential_ref: &ResourceRef,
         idempotency_key: &str,
         grant: crate::EntraLeaseGrant,
-        requested_expiry_unix_ms: u64,
         deadline: std::time::Instant,
     ) {
-        let metadata = CredentialMetadata {
-            lease_handle: grant.lease_handle,
-            rotation_generation: grant.rotation_generation.max(1),
-            source_version: grant.source_version,
-            expires_at_unix_ms: if grant.expires_at_unix_ms == 0 {
-                requested_expiry_unix_ms
-            } else {
-                grant.expires_at_unix_ms
-            },
-            state: CredentialLeaseState::Active,
-            outcome: CredentialOutcomeCode::Success,
-        };
+        let metadata = cleanup_metadata_from_grant(&grant);
         let lease = EntraLeaseRef {
             credential_ref: credential_ref.clone(),
             metadata: metadata.clone(),
@@ -1092,21 +1076,9 @@ impl EntraCredentialProvider {
         credential_ref: &ResourceRef,
         idempotency_key: &str,
         grant: crate::EntraLeaseGrant,
-        requested_expiry_unix_ms: u64,
         deadline: std::time::Instant,
     ) {
-        let metadata = CredentialMetadata {
-            lease_handle: grant.lease_handle,
-            rotation_generation: grant.rotation_generation.max(1),
-            source_version: grant.source_version,
-            expires_at_unix_ms: if grant.expires_at_unix_ms == 0 {
-                requested_expiry_unix_ms
-            } else {
-                grant.expires_at_unix_ms
-            },
-            state: CredentialLeaseState::Active,
-            outcome: CredentialOutcomeCode::Success,
-        };
+        let metadata = cleanup_metadata_from_grant(&grant);
         let lease = EntraLeaseRef {
             credential_ref: credential_ref.clone(),
             metadata: metadata.clone(),
@@ -1136,6 +1108,17 @@ impl EntraCredentialProvider {
                     health: crate::EntraResourceHealth::Degraded,
                 });
         }
+    }
+}
+
+fn cleanup_metadata_from_grant(grant: &crate::EntraLeaseGrant) -> CredentialMetadata {
+    CredentialMetadata {
+        lease_handle: grant.lease_handle.clone(),
+        rotation_generation: grant.rotation_generation,
+        source_version: grant.source_version.clone(),
+        expires_at_unix_ms: grant.expires_at_unix_ms,
+        state: CredentialLeaseState::Active,
+        outcome: CredentialOutcomeCode::Success,
     }
 }
 
@@ -1174,5 +1157,25 @@ fn error_for_state(state: CredentialLeaseState) -> CredentialServiceError {
         }
         CredentialLeaseState::Active => invariant(),
         CredentialLeaseState::Unknown => invariant(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use d2b_contracts_provider::v3::credential::{CredentialLeaseHandle, CredentialSourceVersion};
+
+    #[test]
+    fn cleanup_metadata_preserves_invalid_grant_fences() {
+        let grant = crate::EntraLeaseGrant {
+            lease_handle: CredentialLeaseHandle::parse("invalid-grant-handle").unwrap(),
+            source_version: CredentialSourceVersion::parse("invalid-grant-source").unwrap(),
+            rotation_generation: 0,
+            expires_at_unix_ms: 0,
+        };
+
+        let metadata = cleanup_metadata_from_grant(&grant);
+        assert_eq!(metadata.rotation_generation, 0);
+        assert_eq!(metadata.expires_at_unix_ms, 0);
     }
 }
