@@ -116,6 +116,8 @@ pub struct RedbRegisteredControllerApi {
     status_timeouts_remaining: Arc<AtomicUsize>,
     #[cfg(test)]
     effect_state_failures_remaining: Arc<AtomicUsize>,
+    #[cfg(test)]
+    commit_response_timeouts_remaining: Arc<AtomicUsize>,
 }
 
 struct NativeCommitPath {
@@ -203,6 +205,8 @@ impl RedbRegisteredControllerApi {
             status_timeouts_remaining: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             effect_state_failures_remaining: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            commit_response_timeouts_remaining: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -225,6 +229,8 @@ impl RedbRegisteredControllerApi {
             status_timeouts_remaining: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             effect_state_failures_remaining: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            commit_response_timeouts_remaining: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -268,6 +274,8 @@ impl RedbRegisteredControllerApi {
             status_timeouts_remaining: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             effect_state_failures_remaining: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            commit_response_timeouts_remaining: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -285,6 +293,12 @@ impl RedbRegisteredControllerApi {
     #[cfg(test)]
     fn inject_effect_state_failures(&self, count: usize) {
         self.effect_state_failures_remaining
+            .store(count, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn inject_commit_response_timeouts(&self, count: usize) {
+        self.commit_response_timeouts_remaining
             .store(count, Ordering::Release);
     }
 
@@ -605,6 +619,30 @@ impl RedbRegisteredControllerApi {
         operation: StoreOperationContext,
         mutations: Vec<StoreMutation>,
     ) -> Result<CommitOutcome, SourceError> {
+        self.commit_store_mutations_inner(
+            zone,
+            fallback_revision,
+            context_uid,
+            context_target,
+            context_generation,
+            operation,
+            mutations,
+            true,
+        )
+        .await
+    }
+
+    async fn commit_store_mutations_inner(
+        &self,
+        zone: &ZoneId,
+        fallback_revision: ZoneRevision,
+        context_uid: &ResourceUid,
+        context_target: &ResourceRef,
+        context_generation: Option<ResourceGeneration>,
+        operation: StoreOperationContext,
+        mutations: Vec<StoreMutation>,
+        allow_recovery: bool,
+    ) -> Result<CommitOutcome, SourceError> {
         let Some(commit) = self.commit.as_ref() else {
             return Err(SourceError::Integrity);
         };
@@ -747,19 +785,98 @@ impl RedbRegisteredControllerApi {
                 grant.admit(mutations.clone(), operation.clone())
             }
             .map_err(|_| SourceError::Integrity)?;
-            commit.checked.commit(admitted).await.map_err(|error| {
+            let result = commit.checked.commit(admitted).await.map_err(|error| {
                 if is_conflict(&error) {
                     SourceError::Conflict(error.current_revision().unwrap_or(fallback_revision))
                 } else {
                     source_error(error, fallback_revision)
                 }
-            })
+            })?;
+            #[cfg(test)]
+            if self
+                .commit_response_timeouts_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return Err(SourceError::Timeout);
+            }
+            Ok(result)
         })
         .await;
         match result {
             Ok(StoreCommitResult { revision, .. }) => Ok(CommitOutcome::Committed(revision)),
             Err(SourceError::Conflict(revision)) => Ok(CommitOutcome::Conflict(revision)),
+            Err(error)
+                if allow_recovery
+                    && matches!(error, SourceError::Timeout | SourceError::Backpressure) =>
+            {
+                self.recover_ambiguous_commit(
+                    zone,
+                    fallback_revision,
+                    context_uid,
+                    context_target,
+                    context_generation,
+                    operation,
+                    mutations,
+                )
+                .await
+            }
             Err(error) => Err(error),
+        }
+    }
+
+    async fn recover_ambiguous_commit(
+        &self,
+        zone: &ZoneId,
+        fallback_revision: ZoneRevision,
+        context_uid: &ResourceUid,
+        context_target: &ResourceRef,
+        context_generation: Option<ResourceGeneration>,
+        operation: StoreOperationContext,
+        mutations: Vec<StoreMutation>,
+    ) -> Result<CommitOutcome, SourceError> {
+        let key = ResourceKey::new(zone.clone(), context_target.clone(), context_uid.clone());
+        loop {
+            match self.read_target(&key).await {
+                Ok(Ok(current))
+                    if current.uid == *context_uid
+                        && context_generation
+                            .map_or(true, |generation| current.generation == generation) => {}
+                Ok(Ok(current)) => return Ok(CommitOutcome::Conflict(current.revision)),
+                Ok(Err(revision)) => return Ok(CommitOutcome::Conflict(revision)),
+                Err(SourceError::Timeout | SourceError::Backpressure) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+
+            // The exact operation ID is the store's idempotency/ledger lookup.
+            // Replaying it after a fresh target read cannot duplicate a status
+            // mutation and never starts an external effect.
+            match Box::pin(self.commit_store_mutations_inner(
+                zone,
+                fallback_revision,
+                context_uid,
+                context_target,
+                context_generation,
+                operation.clone(),
+                mutations.clone(),
+                false,
+            ))
+            .await
+            {
+                Err(SourceError::Timeout | SourceError::Backpressure) => {
+                    tokio::task::yield_now().await;
+                }
+                outcome => return outcome,
+            }
         }
     }
 
@@ -3254,8 +3371,11 @@ mod tests {
     struct MutationHandler {
         descriptor: ControllerDescriptor,
         effect_only: bool,
+        no_effect: bool,
         fail_effect: Option<Arc<AtomicBool>>,
         effect_calls: Option<Arc<AtomicUsize>>,
+        observe_failure: Option<Arc<AtomicBool>>,
+        status_candidate: bool,
     }
 
     impl ResourceReconciler for MutationHandler {
@@ -3281,6 +3401,11 @@ mod tests {
             _resource: &d2b_core_controller::ResourceSnapshot,
             _dependencies: &[DependencySnapshot],
         ) -> impl Future<Output = Result<ReconcilePlan, Self::Error>> + Send {
+            if self.no_effect {
+                return std::future::ready(
+                    ReconcilePlan::new(Vec::new(), true).map_err(|_| TestHandlerError),
+                );
+            }
             std::future::ready(
                 ReconcilePlan::new(vec!["mutation".to_owned()], false)
                     .map_err(|_| TestHandlerError),
@@ -3336,6 +3461,21 @@ mod tests {
             {
                 return std::future::ready(Err(TestHandlerError));
             }
+            if self.status_candidate {
+                return std::future::ready(
+                    ReconcileResult::new(
+                        resource.revision(),
+                        resource.generation(),
+                        None,
+                        Some(br#"{}"#.to_vec()),
+                        d2b_core_controller::ReconcileDisposition::Pending,
+                        None,
+                        None,
+                        d2b_core_controller::StatusPersistence::Pending,
+                    )
+                    .map_err(|_| TestHandlerError),
+                );
+            }
             std::future::ready(Ok(ReconcileResult::converged(
                 resource.revision(),
                 resource.generation(),
@@ -3348,6 +3488,13 @@ mod tests {
             resource: &d2b_core_controller::ResourceSnapshot,
         ) -> impl Future<Output = Result<d2b_core_controller::ObservationResult, Self::Error>> + Send
         {
+            if self
+                .observe_failure
+                .as_ref()
+                .is_some_and(|failure| failure.swap(false, Ordering::AcqRel))
+            {
+                return std::future::ready(Err(TestHandlerError));
+            }
             std::future::ready(Ok(d2b_core_controller::ObservationResult::new(
                 ReconcileResult::converged(resource.revision(), resource.generation()),
             )))
@@ -3446,8 +3593,11 @@ mod tests {
             Arc::new(MutationHandler {
                 descriptor: descriptor.clone(),
                 effect_only: false,
+                no_effect: false,
                 fail_effect: None,
                 effect_calls: None,
+                observe_failure: None,
+                status_candidate: false,
             }),
             Arc::clone(&source),
             d2b_core_controller::RunnerConfig {
@@ -3546,8 +3696,11 @@ mod tests {
             Arc::new(MutationHandler {
                 descriptor: descriptor.clone(),
                 effect_only: true,
+                no_effect: false,
                 fail_effect: None,
                 effect_calls: None,
+                observe_failure: None,
+                status_candidate: false,
             }),
             Arc::clone(&source),
             d2b_core_controller::RunnerConfig {
@@ -3752,8 +3905,11 @@ mod tests {
             Arc::new(MutationHandler {
                 descriptor: descriptor.clone(),
                 effect_only: true,
+                no_effect: false,
                 fail_effect: Some(first_failure),
                 effect_calls: None,
+                observe_failure: None,
+                status_candidate: false,
             }),
             Arc::clone(&source),
             d2b_core_controller::RunnerConfig {
@@ -3897,8 +4053,11 @@ mod tests {
             Arc::new(MutationHandler {
                 descriptor: descriptor.clone(),
                 effect_only: true,
+                no_effect: false,
                 fail_effect: Some(Arc::new(AtomicBool::new(true))),
                 effect_calls: Some(Arc::clone(&effect_calls)),
+                observe_failure: None,
+                status_candidate: false,
             }),
             Arc::clone(&source),
             d2b_core_controller::RunnerConfig {
@@ -3957,6 +4116,261 @@ mod tests {
             .unwrap();
         let status: Value = serde_json::from_slice(&updated.canonical_json).unwrap();
         assert_eq!(status["status"]["phase"], "Failed");
+    }
+
+    #[tokio::test]
+    async fn core_redb_observation_exhaustion_uses_ordinary_status_persistence() {
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
+        let target = ResourceRef::parse("Host/owner").unwrap();
+        store
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
+                target.clone(),
+                canonical_host("owner", None),
+                None,
+                "create-owner-observation",
+            ))
+            .await
+            .unwrap();
+        let stored = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-observation".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-observation".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let checkpoints = Arc::new(AtomicUsize::new(0));
+        let checkpoint_count = Arc::clone(&checkpoints);
+        let api = Arc::new(
+            service
+                .registered_controller_api(
+                    subject,
+                    state,
+                    vec![(
+                        target.clone(),
+                        primary_assignment(stored.uid.clone(), stored.revision),
+                    )],
+                )
+                .unwrap()
+                .with_checkpoint_observer(Arc::new(move |_| {
+                    checkpoint_count.fetch_add(1, Ordering::AcqRel);
+                })),
+        );
+        api.inject_status_timeouts(1);
+        let descriptor = descriptor();
+        let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
+        let observation_failure = Arc::new(AtomicBool::new(true));
+        let runner = d2b_core_controller::Runner::new(
+            Arc::new(MutationHandler {
+                descriptor: descriptor.clone(),
+                effect_only: true,
+                no_effect: true,
+                fail_effect: None,
+                effect_calls: None,
+                observe_failure: Some(observation_failure),
+                status_candidate: false,
+            }),
+            Arc::clone(&source),
+            d2b_core_controller::RunnerConfig {
+                policy_revision: 7,
+                api_revision: 8,
+                configuration_revision: ConfigurationGeneration::new(9).unwrap(),
+                deadline_tick: 5_000,
+                max_attempts: 1,
+            },
+        )
+        .run();
+        let runner_task = tokio::spawn(runner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while checkpoints.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        source
+            .dispatch_observation(
+                ResourceKey::new(
+                    stored.zone.clone(),
+                    stored.resource_ref.clone(),
+                    stored.uid.clone(),
+                ),
+                stored.revision,
+            )
+            .unwrap();
+
+        let updated = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let resource = store
+                    .get(StoreGetRequest {
+                        operation: StoreOperationContext {
+                            operation_id: "read-owner-observation-after".to_owned(),
+                            idempotency_key: None,
+                            correlation_id: "read-owner-observation-after".to_owned(),
+                            trace_id: None,
+                            deadline_ms: 1_000,
+                        },
+                        zone: ZoneId::parse("work").unwrap(),
+                        target: target.clone(),
+                        expected_uid: Some(stored.uid.clone()),
+                        projection: StoreProjection::Full,
+                    })
+                    .await
+                    .unwrap();
+                let status: Value = serde_json::from_slice(&resource.canonical_json).unwrap();
+                if status["status"]["phase"] == "Failed" {
+                    break resource;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(updated.revision, ZoneRevision::new(2));
+        assert!(!runner_task.is_finished());
+        assert!(store.authority_operations().await.unwrap().is_empty());
+
+        source.close_watch().unwrap();
+        let report = runner_task.await.unwrap().unwrap();
+        assert_eq!(report.handler_failures, 1);
+        assert_eq!(report.persistence_uncertain, 0);
+    }
+
+    #[tokio::test]
+    async fn core_redb_delayed_commit_response_replays_one_status_without_duplicate_effect() {
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
+        let target = ResourceRef::parse("Host/owner").unwrap();
+        store
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
+                target.clone(),
+                canonical_host("owner", None),
+                None,
+                "create-owner-delayed-commit",
+            ))
+            .await
+            .unwrap();
+        let stored = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-delayed-commit".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-delayed-commit".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let effect_calls = Arc::new(AtomicUsize::new(0));
+        let api = Arc::new(
+            service
+                .registered_controller_api(
+                    subject,
+                    state,
+                    vec![(
+                        target.clone(),
+                        primary_assignment(stored.uid.clone(), stored.revision),
+                    )],
+                )
+                .unwrap(),
+        );
+        api.inject_commit_response_timeouts(2);
+        let descriptor = descriptor();
+        let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
+        let runner = d2b_core_controller::Runner::new(
+            Arc::new(MutationHandler {
+                descriptor: descriptor.clone(),
+                effect_only: true,
+                no_effect: false,
+                fail_effect: None,
+                effect_calls: Some(Arc::clone(&effect_calls)),
+                observe_failure: None,
+                status_candidate: true,
+            }),
+            Arc::clone(&source),
+            d2b_core_controller::RunnerConfig {
+                policy_revision: 7,
+                api_revision: 8,
+                configuration_revision: ConfigurationGeneration::new(9).unwrap(),
+                deadline_tick: 5_000,
+                max_attempts: 2,
+            },
+        )
+        .run();
+        let runner_task = tokio::spawn(runner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let resource = store
+                    .get(StoreGetRequest {
+                        operation: StoreOperationContext {
+                            operation_id: "read-owner-delayed-commit-after".to_owned(),
+                            idempotency_key: None,
+                            correlation_id: "read-owner-delayed-commit-after".to_owned(),
+                            trace_id: None,
+                            deadline_ms: 1_000,
+                        },
+                        zone: ZoneId::parse("work").unwrap(),
+                        target: target.clone(),
+                        expected_uid: Some(stored.uid.clone()),
+                        projection: StoreProjection::Full,
+                    })
+                    .await
+                    .unwrap();
+                if resource.revision == ZoneRevision::new(2) {
+                    let rows = store.authority_operations().await.unwrap();
+                    if rows.len() == 1
+                        && rows[0].state
+                            == d2b_resource_store_redb::AuthorityOperationState::Pending
+                    {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!runner_task.is_finished());
+        assert_eq!(effect_calls.load(Ordering::Acquire), 1);
+
+        source.close_watch().unwrap();
+        let report = runner_task.await.unwrap().unwrap();
+        assert_eq!(report.committed_status_pending, 1);
+        assert_eq!(effect_calls.load(Ordering::Acquire), 1);
+        let updated = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-delayed-commit-final".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-delayed-commit-final".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target,
+                expected_uid: Some(stored.uid),
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.revision, ZoneRevision::new(2));
+        assert_eq!(store.authority_operations().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

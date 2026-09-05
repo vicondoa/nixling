@@ -1057,7 +1057,7 @@ where
                                     completion.work.key(),
                                     persisted_reason,
                                     generation,
-                                    &completion.persistence_operation,
+                                    completion.persistence_operation.as_ref(),
                                 )
                                 .await?;
                                 match persistence {
@@ -1096,7 +1096,10 @@ where
                                 }
                             } else {
                                 let lane = completion.work.lane();
-                                queue.retry(completion.work, revision)?;
+                                let work = completion
+                                    .work
+                                    .with_persistence_operation(completion.persistence_operation);
+                                queue.retry(work, revision)?;
                                 if reason == ReconcileReason::ConflictExhausted {
                                     report.conflicts_retried += 1;
                                 } else {
@@ -1129,7 +1132,7 @@ where
                                 projection.target(),
                                 FailureProjectionFields::from_projection(&projection),
                                 generation,
-                                &completion.persistence_operation,
+                                completion.persistence_operation.as_ref(),
                             )
                             .await?;
                             match persistence {
@@ -1430,7 +1433,7 @@ fn initial_hints(
 
 struct WorkerCompletion {
     work: QueuedWork,
-    persistence_operation: OperationContext,
+    persistence_operation: Option<OperationContext>,
     outcome: WorkerOutcome,
     cancellation: Cancellation,
 }
@@ -1491,7 +1494,7 @@ impl OwnedWorkers {
                 deadline_tick,
                 ..runtime.config
             };
-            let mut persistence_operation = work.operation().clone();
+            let mut persistence_operation = work.persistence_operation().cloned();
             let outcome = match bounded_phase(
                 runtime.clock.as_ref(),
                 deadline_tick,
@@ -1725,7 +1728,7 @@ async fn persist_failure_projection_once<S>(
     target: &ResourceKey,
     fields: FailureProjectionFields,
     expected_generation: Option<ResourceGeneration>,
-    operation: &OperationContext,
+    operation: Option<&OperationContext>,
 ) -> Result<FailurePersistenceAttempt, RunnerError>
 where
     S: ControllerSource,
@@ -1766,14 +1769,27 @@ where
         fields.reason,
         false,
     );
-    match bounded_source(
-        clock,
-        deadline_tick,
-        cancellation,
-        source.persist_outcome_with_operation(&projection, operation),
-    )
-    .await
-    {
+    let persistence = match operation {
+        Some(operation) => {
+            bounded_source(
+                clock,
+                deadline_tick,
+                cancellation,
+                source.persist_outcome_with_operation(&projection, operation),
+            )
+            .await
+        }
+        None => {
+            bounded_source(
+                clock,
+                deadline_tick,
+                cancellation,
+                source.persist_outcome(&projection),
+            )
+            .await
+        }
+    };
+    match persistence {
         Ok(()) => Ok(FailurePersistenceAttempt::Persisted),
         Err(RunnerError::Source(error)) if retryable_persistence_source_error(error) => {
             Ok(FailurePersistenceAttempt::Conflict)
@@ -1790,7 +1806,7 @@ async fn persist_failure_projection<S>(
     target: &ResourceKey,
     fields: FailureProjectionFields,
     expected_generation: Option<ResourceGeneration>,
-    operation: &OperationContext,
+    operation: Option<&OperationContext>,
 ) -> Result<FailurePersistence, RunnerError>
 where
     S: ControllerSource,
@@ -1833,7 +1849,7 @@ async fn persist_exhaustion<S>(
     key: &ResourceKey,
     reason: ReconcileReason,
     expected_generation: Option<ResourceGeneration>,
-    operation: &OperationContext,
+    operation: Option<&OperationContext>,
 ) -> Result<FailurePersistence, RunnerError>
 where
     S: ControllerSource,
@@ -1918,7 +1934,7 @@ async fn execute_work_inner<R, S>(
     work: &QueuedWork,
     cancellation: Cancellation,
     now_tick: u64,
-    persistence_operation: &mut OperationContext,
+    persistence_operation: &mut Option<OperationContext>,
 ) -> WorkerOutcome
 where
     R: ResourceReconciler,
@@ -2099,6 +2115,7 @@ where
             source.as_ref(),
             &context,
             ReconcileResult::failed_terminal(target.revision(), target.generation(), projection),
+            persistence_operation.as_ref(),
         )
         .await;
     }
@@ -2117,7 +2134,13 @@ where
             }
         };
         if prepared.requires_commit() {
-            return persist_result(source.as_ref(), &context, prepared).await;
+            return persist_result(
+                source.as_ref(),
+                &context,
+                prepared,
+                persistence_operation.as_ref(),
+            )
+            .await;
         }
         let finalize_plan =
             ReconcilePlan::new(vec!["finalize".to_owned()], false).expect("bounded finalize plan");
@@ -2182,7 +2205,13 @@ where
                 generation: Some(target.generation()),
             };
         }
-        return persist_result(source.as_ref(), &context, result).await;
+        return persist_result(
+            source.as_ref(),
+            &context,
+            result,
+            persistence_operation.as_ref(),
+        )
+        .await;
     }
 
     if work.reasons().contains(TriggerReason::UpgradeRequested) {
@@ -2257,7 +2286,13 @@ where
                 generation: Some(target.generation()),
             };
         }
-        return persist_result(source.as_ref(), &context, result).await;
+        return persist_result(
+            source.as_ref(),
+            &context,
+            result,
+            persistence_operation.as_ref(),
+        )
+        .await;
     }
 
     if work.reasons().contains(TriggerReason::ScheduledObserve) {
@@ -2273,7 +2308,13 @@ where
                 );
             }
         };
-        return persist_result(source.as_ref(), &context, result).await;
+        return persist_result(
+            source.as_ref(),
+            &context,
+            result,
+            persistence_operation.as_ref(),
+        )
+        .await;
     }
 
     if work.reasons().requires_update_assessment() {
@@ -2313,6 +2354,7 @@ where
                     target.generation(),
                     projection,
                 ),
+                persistence_operation.as_ref(),
             )
             .await;
         }
@@ -2340,6 +2382,7 @@ where
             source.as_ref(),
             &context,
             ReconcileResult::converged(target.revision(), target.generation()),
+            persistence_operation.as_ref(),
         )
         .await;
     }
@@ -2360,7 +2403,13 @@ where
         }
     };
     if prepared.requires_commit() {
-        return persist_result(source.as_ref(), &context, prepared).await;
+        return persist_result(
+            source.as_ref(),
+            &context,
+            prepared,
+            persistence_operation.as_ref(),
+        )
+        .await;
     }
 
     let result = if plan.effect_count() > 0 {
@@ -2421,13 +2470,20 @@ where
             generation: Some(target.generation()),
         };
     }
-    persist_result(source.as_ref(), &context, result).await
+    persist_result(
+        source.as_ref(),
+        &context,
+        result,
+        persistence_operation.as_ref(),
+    )
+    .await
 }
 
 async fn persist_result<S>(
     source: &S,
     context: &ReconcileContext,
     mut result: ReconcileResult,
+    persistence_operation: Option<&OperationContext>,
 ) -> WorkerOutcome
 where
     S: ControllerSource,
@@ -2503,7 +2559,15 @@ where
 
     let requeue_at = result.next_tick();
     if result.requires_commit() {
-        match source.commit_result(context, &result).await {
+        let commit = loop {
+            match source.commit_result(context, &result).await {
+                Err(SourceError::Timeout | SourceError::Backpressure) => {
+                    tokio::task::yield_now().await;
+                }
+                outcome => break outcome,
+            }
+        };
+        match commit {
             Ok(CommitOutcome::Committed(revision)) => {
                 if revision < context.revision() {
                     return WorkerOutcome::SourceFailed {
@@ -2513,7 +2577,9 @@ where
                 }
                 if context.is_expedited()
                     && result.mutation_batch().is_none()
-                    && let Err(error) = persist_projection(source, context, &result, None).await
+                    && let Err(error) =
+                        persist_projection(source, context, &result, None, persistence_operation)
+                            .await
                 {
                     if let SourceError::Conflict(revision) = error {
                         return WorkerOutcome::Retry {
@@ -2561,6 +2627,7 @@ where
                         context,
                         &result,
                         Some(StatusPersistence::Pending),
+                        persistence_operation,
                     )
                     .await
                 {
@@ -2596,6 +2663,13 @@ where
                     reason: ReconcileReason::ConflictExhausted,
                 };
             }
+            Err(SourceError::Timeout | SourceError::Backpressure) => {
+                return WorkerOutcome::Retry {
+                    revision: context.revision(),
+                    generation: Some(context.generation()),
+                    reason: ReconcileReason::ConflictExhausted,
+                };
+            }
             Err(error) => {
                 return WorkerOutcome::SourceFailed {
                     error,
@@ -2605,10 +2679,25 @@ where
         }
     }
 
-    if let Err(error) = persist_projection(source, context, &result, None).await {
+    let projection_persistence = loop {
+        match persist_projection(source, context, &result, None, persistence_operation).await {
+            Err(SourceError::Timeout | SourceError::Backpressure) => {
+                tokio::task::yield_now().await;
+            }
+            outcome => break outcome,
+        }
+    };
+    if let Err(error) = projection_persistence {
         if let SourceError::Conflict(revision) = error {
             return WorkerOutcome::Retry {
                 revision,
+                generation: Some(context.generation()),
+                reason: ReconcileReason::ConflictExhausted,
+            };
+        }
+        if matches!(error, SourceError::Timeout | SourceError::Backpressure) {
+            return WorkerOutcome::Retry {
+                revision: context.revision(),
                 generation: Some(context.generation()),
                 reason: ReconcileReason::ConflictExhausted,
             };
@@ -2662,13 +2751,13 @@ where
 async fn capture_accepted_effect_operation<S>(
     source: &S,
     context: &ReconcileContext,
-    persistence_operation: &mut OperationContext,
+    persistence_operation: &mut Option<OperationContext>,
 ) -> Result<(), SourceError>
 where
     S: ControllerSource,
 {
     if let Some(operation) = source.accepted_effect_operation(context).await? {
-        *persistence_operation = operation;
+        *persistence_operation = Some(operation);
     }
     Ok(())
 }
@@ -2678,6 +2767,7 @@ async fn persist_projection<S>(
     context: &ReconcileContext,
     result: &ReconcileResult,
     status_override: Option<StatusPersistence>,
+    persistence_operation: Option<&OperationContext>,
 ) -> Result<(), SourceError>
 where
     S: ControllerSource,
@@ -2692,7 +2782,14 @@ where
                 )
                 .await
         } else {
-            source.persist_outcome(projection).await
+            match persistence_operation {
+                Some(operation) => {
+                    source
+                        .persist_outcome_with_operation(projection, operation)
+                        .await
+                }
+                None => source.persist_outcome(projection).await,
+            }
         }
     } else if context.is_expedited() {
         Err(SourceError::Integrity)
@@ -2999,6 +3096,19 @@ mod tests {
                 .push(context.operation().operation_id().to_owned());
             self.effect_acceptances.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(()))
+        }
+
+        fn accepted_effect_operation(
+            &self,
+            context: &ReconcileContext,
+        ) -> impl Future<Output = Result<Option<OperationContext>, SourceError>> + Send {
+            let accepted = self
+                .accepted_operation_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|operation| operation == context.operation().operation_id());
+            std::future::ready(Ok(accepted.then(|| context.operation().clone())))
         }
 
         async fn await_expedited_commit(
@@ -4354,7 +4464,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = block_on(persist_result(source.as_ref(), &context, result));
+        let outcome = block_on(persist_result(source.as_ref(), &context, result, None));
         assert!(matches!(
             outcome,
             WorkerOutcome::Done {
@@ -4502,7 +4612,11 @@ mod tests {
             .persistence_operation_ids
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(persistence_operations.len(), 2);
+        assert_eq!(
+            persistence_operations.len(),
+            2,
+            "accepted effects must use effect-aware status persistence"
+        );
         assert_eq!(
             persistence_operations
                 .iter()
@@ -4548,17 +4662,13 @@ mod tests {
         assert_eq!(reconciler.reconcile_calls.load(Ordering::SeqCst), 0);
         assert_eq!(reconciler.execute_effect_calls.load(Ordering::SeqCst), 0);
         assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 0);
-        let persistence_operations = source
-            .persistence_operation_ids
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(persistence_operations.len(), 2);
-        assert_eq!(
-            persistence_operations
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            1
+        assert!(
+            source
+                .persistence_operation_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "no-effect persistence must not resolve a transient work operation"
         );
         let outcomes = source
             .persisted_outcomes
@@ -4594,6 +4704,14 @@ mod tests {
         assert_eq!(reconciler.reconcile_calls.load(Ordering::SeqCst), 0);
         assert_eq!(reconciler.execute_effect_calls.load(Ordering::SeqCst), 0);
         assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 0);
+        assert!(
+            source
+                .persistence_operation_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "no-effect persistence must not resolve a transient work operation"
+        );
         assert_eq!(
             source
                 .persisted_outcomes

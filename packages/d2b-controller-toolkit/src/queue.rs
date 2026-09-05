@@ -72,6 +72,7 @@ pub struct QueuedWork {
     reasons: TriggerSet,
     lane: PriorityLane,
     operation: OperationContext,
+    persistence_operation: Option<OperationContext>,
     attempt: u32,
 }
 
@@ -101,6 +102,19 @@ impl QueuedWork {
         &self.operation
     }
 
+    /// Borrow the optional durable effect operation used for persistence.
+    pub const fn persistence_operation(&self) -> Option<&OperationContext> {
+        self.persistence_operation.as_ref()
+    }
+
+    pub(crate) fn with_persistence_operation(
+        mut self,
+        operation: Option<OperationContext>,
+    ) -> Self {
+        self.persistence_operation = operation;
+        self
+    }
+
     /// Return the one-based attempt.
     pub const fn attempt(&self) -> u32 {
         self.attempt
@@ -115,6 +129,10 @@ impl core::fmt::Debug for QueuedWork {
             .field("reasons", &self.reasons)
             .field("lane", &self.lane)
             .field("operation", &self.operation)
+            .field(
+                "has_persistence_operation",
+                &self.persistence_operation.is_some(),
+            )
             .field("attempt", &self.attempt)
             .finish()
     }
@@ -126,6 +144,7 @@ struct PendingWork {
     reasons: TriggerSet,
     lane: PriorityLane,
     operation: OperationContext,
+    persistence_operation: Option<OperationContext>,
     attempt: u32,
 }
 
@@ -136,6 +155,7 @@ impl PendingWork {
             reasons: hint.reasons.clone(),
             lane: hint.lane,
             operation: hint.operation.clone(),
+            persistence_operation: None,
             attempt: 1,
         }
     }
@@ -157,6 +177,7 @@ impl PendingWork {
             reasons: self.reasons,
             lane: self.lane,
             operation: self.operation,
+            persistence_operation: self.persistence_operation,
             attempt: self.attempt,
         }
     }
@@ -364,6 +385,7 @@ impl PendingQueue {
     pub fn retry(&self, work: QueuedWork, revision: ZoneRevision) -> Result<(), QueueError> {
         let key = work.key.clone();
         let operation_id = work.operation.operation_id().to_owned();
+        let persistence_operation = work.persistence_operation.clone();
         let retry_revision = revision.max(work.high_water_revision);
         self.finish(&key)?;
         let mut state = self
@@ -382,6 +404,7 @@ impl PendingQueue {
             }
             pending.reasons.union_with(&work.reasons);
             pending.reasons.insert(TriggerReason::RetryDue);
+            pending.persistence_operation = persistence_operation;
             pending.attempt = work.attempt.saturating_add(1);
             return Ok(());
         }
@@ -406,6 +429,7 @@ impl PendingQueue {
                 .find(|pending| pending.operation.operation_id() == operation_id),
         }
         .expect("retried work is pending");
+        pending.persistence_operation = persistence_operation;
         pending.attempt = work.attempt.saturating_add(1);
         let _ = outcome;
         Ok(())
@@ -832,6 +856,48 @@ mod tests {
         assert_eq!(retry.attempt(), 2);
         assert_eq!(retry.high_water_revision(), ZoneRevision::new(5));
         assert!(retry.reasons().contains(TriggerReason::RetryDue));
+    }
+
+    #[test]
+    fn retry_carries_only_the_accepted_persistence_operation() {
+        let queue = PendingQueue::new(2, 1);
+        let target = key("app", 0);
+        queue
+            .push(hint(
+                target.clone(),
+                2,
+                TriggerReason::ManualReconcile,
+                PriorityLane::Ordinary,
+                "startup:Process/app",
+            ))
+            .unwrap();
+        let running = queue.pop_ready().unwrap().with_persistence_operation(Some(
+            OperationContext::new(
+                "effect:accepted",
+                "effect:accepted",
+                "effect:accepted",
+                None,
+            )
+            .unwrap(),
+        ));
+        queue.retry(running, ZoneRevision::new(5)).unwrap();
+        queue
+            .push(hint(
+                target.clone(),
+                6,
+                TriggerReason::SpecGenerationChanged,
+                PriorityLane::Ordinary,
+                "watch:6:child:0",
+            ))
+            .unwrap();
+        let retry = queue.pop_ready().unwrap();
+        assert_eq!(
+            retry
+                .persistence_operation()
+                .map(OperationContext::operation_id),
+            Some("effect:accepted")
+        );
+        assert_eq!(retry.operation().operation_id(), "watch:6:child:0");
     }
 
     #[test]
