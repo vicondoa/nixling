@@ -192,6 +192,7 @@ use d2bd_runtime::resource_runtime_support::{
     runtime_policy, store_identity, store_identity_for_authority, unix_transport,
     validate_zone_resource_bundle, validate_zone_self_resource, zone_runtime_metadata,
 };
+use d2bd_runtime::guest_component_session::COMPONENT_SESSION_RETRY_BACKOFF;
 pub use d2bd_runtime::resource_runtime_support::{
     ZoneRuntimeReadiness, bounded_operation_id, persist_resource_status_with_projection,
 };
@@ -12035,7 +12036,9 @@ impl ZoneResourceRuntime {
         }
         self.install_policy_projection(policy, state.clone(), controller_subjects)?;
         if let Err(error) = self.refresh_system_core_session_locked(state.clone()).await {
-            self.mark_policy_projection_unavailable();
+            // The policy projection was installed atomically before the
+            // session rebind. Keep that complete projection available while
+            // the retryable session failure is surfaced to the caller.
             return Err(error);
         }
         *self
@@ -12130,10 +12133,6 @@ impl ZoneResourceRuntime {
     ) -> Result<(), ResourceRuntimeError> {
         self.policy_projection
             .install(policy, state, controller_subjects)
-    }
-
-    fn mark_policy_projection_unavailable(&self) {
-        self.policy_projection.mark_unavailable();
     }
 
     /// Re-enroll the fixed internal system-core session after a policy
@@ -15870,6 +15869,9 @@ fn schedule_controller_session_reconcile(
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
+            let notified = wake_for_task.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
             if let Err(error) = coordinator
                 .reconcile_controller_sessions(Arc::clone(&providers), true)
                 .await
@@ -15878,12 +15880,10 @@ fn schedule_controller_session_reconcile(
                     error = %error,
                     "external Provider controller session reconciliation degraded",
                 );
-                // Keep the failed session projection as pending work. A
-                // failed install must not look like a successful wake that
-                // waits forever for an unrelated external notification.
-                wake_for_task.notify_one();
+                tokio::time::sleep(COMPONENT_SESSION_RETRY_BACKOFF).await;
+                continue;
             }
-            wake_for_task.notified().await;
+            notified.await;
         }
     }));
     Ok(())
@@ -15903,16 +15903,20 @@ impl ControllerSessionCoordinator {
         &self,
         providers: &crate::process_provider_runtime::ProductionProcessProviders,
     ) -> Result<(), ResourceRuntimeError> {
-        let bootstrap_refs = providers.controller_bootstrap_refs(&self.zone);
-        let bootstrap_ref_set = bootstrap_refs.iter().cloned().collect::<BTreeSet<_>>();
+        let bootstrap_contexts = providers.controller_bootstrap_contexts(&self.zone);
+        let bootstrap_contexts = bootstrap_contexts
+            .into_iter()
+            .map(|context| (context.process_ref().clone(), context))
+            .collect::<BTreeMap<_, _>>();
         let stale_sessions = self
             .controller_sessions
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .iter()
             .filter(|(process_ref, session)| {
-                controller_session_needs_fence(
-                    bootstrap_ref_set.contains(*process_ref),
+                crate::process_provider_runtime::controller_session_needs_fence(
+                    bootstrap_contexts.get(*process_ref),
+                    &session.context,
                     session.service_task.is_finished(),
                 )
             })
@@ -19526,10 +19530,6 @@ impl ProcessProviderIdentityLoader for CommittedProcessProviderIdentityLoader {
             .remove(provider_ref)
             .ok_or(ProcessResourceRuntimeError::ProviderIdentityUnavailable)
     }
-}
-
-fn controller_session_needs_fence(bootstrap_present: bool, service_task_finished: bool) -> bool {
-    !bootstrap_present || service_task_finished
 }
 
 fn controller_assignment_refresh_action<'a>(
@@ -23853,7 +23853,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_get_and_list_use_installed_policy_while_session_lock_is_held() {
+    async fn public_get_and_list_use_installed_policy_after_rebind_failure() {
         let (_directory, runtime, broker_evidence) =
             open_production_guest_runtime_for_test().await;
         let zone = runtime.zone.clone();
@@ -23919,6 +23919,22 @@ mod tests {
         .await;
         mark_test_resource_ready(&runtime, &user_ref, &broker_evidence).await;
         runtime.refresh_authorization_policy().await.unwrap();
+        runtime.policy_projection.mark_unavailable();
+        let service_task = runtime
+            .service_task
+            .lock()
+            .unwrap()
+            .take()
+            .expect("system-core session task");
+        service_task.abort();
+        assert_eq!(
+            runtime.refresh_authorization_policy().await,
+            Err(ResourceRuntimeError::AuthenticationUnavailable)
+        );
+        assert!(
+            runtime.policy_projection.installed_state().is_ok(),
+            "a failed session rebind must preserve the complete installed policy"
+        );
 
         let guard = runtime.controller_session_lock.lock().await;
         for request in [
@@ -23942,6 +23958,7 @@ mod tests {
             .expect("public read should use the installed authorization projection");
         }
         drop(guard);
+        let _ = service_task.await;
         runtime.shutdown().await.unwrap();
     }
 
@@ -23976,6 +23993,14 @@ mod tests {
         .await
         .expect("controller-session worker should attempt reconciliation");
         assert!(runtime.authorization_state.lock().unwrap().is_none());
+        schedule_controller_session_reconcile(
+            Arc::clone(&runtime.controller_session_reconcile_task),
+            Arc::clone(&runtime.controller_session_reconcile_wake),
+            Arc::clone(&shutdown),
+            Arc::clone(&coordinator),
+            test_controller_session_providers(),
+        )
+        .unwrap();
 
         drop(guard);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -23988,13 +24013,84 @@ mod tests {
         })
         .await
         .expect("guarded controller-session wake should reconcile after release");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if coordinator.reconcile_attempts.load(Ordering::SeqCst) == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("wake arriving during reconciliation should trigger one later pass");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(
             coordinator.reconcile_attempts.load(Ordering::SeqCst),
-            1,
-            "one scheduled wake should establish once without a second external wake"
+            2,
+            "one wake arriving during reconciliation must not create a hot loop"
         );
 
+        shutdown.store(true, Ordering::Release);
+        drop(coordinator);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn controller_session_reconcile_failures_use_bounded_backoff() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let coordinator = runtime.controller_session_coordinator();
+        let providers = test_controller_session_providers();
+        let task_slot = Arc::clone(&runtime.controller_session_reconcile_task);
+        let wake = Arc::clone(&runtime.controller_session_reconcile_wake);
+        let shutdown = Arc::clone(&runtime.controller_session_reconcile_shutdown);
+        let sessions = Arc::clone(&runtime.controller_sessions);
+        std::thread::spawn(move || {
+            let _guard = sessions.lock().unwrap();
+            panic!("poison controller-session test lock");
+        })
+        .join()
+        .expect_err("test thread must poison the controller-session lock");
+
+        schedule_controller_session_reconcile(
+            task_slot,
+            wake,
+            Arc::clone(&shutdown),
+            Arc::clone(&coordinator),
+            providers,
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if coordinator.reconcile_attempts.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed reconciliation should be attempted");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            coordinator.reconcile_attempts.load(Ordering::SeqCst),
+            1,
+            "a failed reconciliation must not self-notify into a hot loop"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            async {
+                loop {
+                    if coordinator.reconcile_attempts.load(Ordering::SeqCst) >= 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .expect("failed reconciliation should retry after bounded backoff");
+
+        runtime.controller_sessions.clear_poison();
         shutdown.store(true, Ordering::Release);
         drop(coordinator);
         runtime.shutdown().await.unwrap();

@@ -615,6 +615,14 @@ impl ControllerBootstrapContext {
     }
 }
 
+pub(crate) fn controller_session_needs_fence(
+    current_bootstrap: Option<&ControllerBootstrapContext>,
+    live_session: &ControllerBootstrapContext,
+    service_task_finished: bool,
+) -> bool {
+    service_task_finished || current_bootstrap != Some(live_session)
+}
+
 /// Lifetime handle returned by the Guest-local Credential backend supervisor.
 pub(crate) trait GuestCredentialBackendLease: Send + Sync {
     /// Bind the responder to the exact authenticated Provider route.
@@ -3786,6 +3794,51 @@ mod tests {
         processes::ProcessesJson,
     };
     use d2bd_runtime::target_runtime::ProviderDeployment;
+
+    fn controller_bootstrap_context_for_fence(
+        generation: u64,
+        process_uid: &str,
+    ) -> ControllerBootstrapContext {
+        ControllerBootstrapContext {
+            zone: ZoneId::parse("work").expect("zone"),
+            zone_uid: Some(
+                ResourceUid::parse("323e4567-e89b-42d3-a456-426614174001")
+                    .expect("zone uid"),
+            ),
+            process_ref: ResourceRef::parse("Process/provider-controller")
+                .expect("process ref"),
+            process_uid: ResourceUid::parse(process_uid).expect("process uid"),
+            generation: ResourceGeneration::new(generation).expect("process generation"),
+            process_identity: ProcessIdentityDigest::from_bytes([generation as u8; 32]),
+            process_provider_ref: ResourceRef::parse("Provider/system-minijail")
+                .expect("process provider"),
+            provider_owner_ref: ResourceRef::parse("Provider/runtime-cloud-hypervisor")
+                .expect("provider owner"),
+            provider_uid: ResourceUid::parse("423e4567-e89b-42d3-a456-426614174001")
+                .expect("provider uid"),
+            provider_generation: ResourceGeneration::new(1).expect("provider generation"),
+            execution_ref: ResourceRef::parse("Host/host-system").expect("execution ref"),
+            user_ref: None,
+            controller_generation: ControllerGeneration::new(1).expect("controller generation"),
+        }
+    }
+
+    #[test]
+    fn newer_bootstrap_context_fences_older_live_session() {
+        let live = controller_bootstrap_context_for_fence(
+            1,
+            "123e4567-e89b-42d3-a456-426614174000",
+        );
+        let newer = controller_bootstrap_context_for_fence(
+            2,
+            "223e4567-e89b-42d3-a456-426614174000",
+        );
+
+        assert!(controller_session_needs_fence(Some(&newer), &live, false));
+        assert!(!controller_session_needs_fence(Some(&live), &live, false));
+        assert!(controller_session_needs_fence(None, &live, false));
+        assert!(controller_session_needs_fence(Some(&live), &live, true));
+    }
 
     fn controller_resource() -> ControllerProcessResource {
         let digest = ArtifactDigest::parse(format!("sha256:{}", "a".repeat(64))).unwrap();

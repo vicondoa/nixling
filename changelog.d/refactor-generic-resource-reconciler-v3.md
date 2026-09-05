@@ -17,3 +17,6 @@
 - Kept public Get/List reads on the installed policy projection, preserved the
   last-known-good projection across refresh and preflight failures, and
   requeued failed controller-session policy installs without losing their wake.
+- Preserved the installed projection across retryable system-core rebind
+  failures, bounded controller-session retries without self-notify hot loops,
+  and fenced live sessions whose bootstrap context was replaced.
