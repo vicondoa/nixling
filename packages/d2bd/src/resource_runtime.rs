@@ -20,6 +20,8 @@ use std::{
 };
 
 #[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::activation_resource_runtime::{
@@ -8888,6 +8890,8 @@ struct ControllerSessionCoordinator {
     controller_sessions: Arc<Mutex<BTreeMap<ResourceRef, ControllerSession>>>,
     credential_sessions: CredentialSessionRegistry,
     controller_session_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    reconcile_attempts: Arc<AtomicUsize>,
 }
 
 type CloudHypervisorResourceClient = ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>;
@@ -15657,6 +15661,8 @@ impl ZoneResourceRuntime {
             controller_sessions: Arc::clone(&self.controller_sessions),
             credential_sessions: self.credential_sessions.clone(),
             controller_session_lock: Arc::clone(&self.controller_session_lock),
+            #[cfg(test)]
+            reconcile_attempts: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -15858,9 +15864,9 @@ impl ControllerSessionCoordinator {
         providers: Arc<crate::process_provider_runtime::ProductionProcessProviders>,
         establish: bool,
     ) -> Result<(), ResourceRuntimeError> {
-        let Ok(_session_guard) = self.controller_session_lock.try_lock() else {
-            return Ok(());
-        };
+        #[cfg(test)]
+        self.reconcile_attempts.fetch_add(1, Ordering::SeqCst);
+        let _session_guard = self.controller_session_lock.lock().await;
         self.fence(&providers).await?;
         if !establish {
             self.refresh_controller_policy(&providers).await?;
@@ -21742,6 +21748,12 @@ mod tests {
     };
     use d2b_contracts_zone_session::v3::component_session::LimitProfile;
     use d2b_contracts_zone_session::v3::resource_bundle::{BundleResource, BundleResourceMetadata};
+    use d2b_core::{
+        bundle::{Bundle, BundleGeneration},
+        bundle_resolver::BundleResolver,
+        manifest_v04::ManifestV04,
+        processes::ProcessesJson,
+    };
     use d2b_provider_volume_local::VolumeLocalError;
     use d2b_resource_store::mutation_seal::mutation_seal_pair;
     use d2b_resource_store_redb::write_provisioning_marker;
@@ -23162,6 +23174,60 @@ mod tests {
         }
     }
 
+    fn test_controller_session_providers(
+    ) -> Arc<crate::process_provider_runtime::ProductionProcessProviders> {
+        let host = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/deny-unknown/host-valid.json"
+        ))
+        .unwrap();
+        let manifest = ManifestV04::from_slice(
+            include_str!("../../../tests/golden/manifest_v04/baseline-vms.json").as_bytes(),
+        )
+        .unwrap();
+        let resolver = BundleResolver::from_artifacts_with_zone_resource_bundles(
+            Bundle {
+                bundle_version: 11,
+                schema_version: "v2".to_owned(),
+                public_manifest_path: "vms.json".to_owned(),
+                host_path: "host.json".to_owned(),
+                processes_path: "processes.json".to_owned(),
+                privileges_path: "privileges.json".to_owned(),
+                storage_path: None,
+                sync_path: None,
+                allocator_path: None,
+                realm_controllers_path: None,
+                realm_identity_path: None,
+                realm_workloads_launcher_v2_path: None,
+                unsafe_local_workloads_path: None,
+                closures: Vec::new(),
+                minijail_profiles: Vec::new(),
+                managed_keys: Default::default(),
+                generation: BundleGeneration {
+                    generator: "test".to_owned(),
+                    source_revision: None,
+                    generated_at: None,
+                },
+                bundle_hash: Some("sha256:bundle".to_owned()),
+                artifact_hashes: None,
+            },
+            host,
+            ProcessesJson {
+                schema_version: "v2".to_owned(),
+                vms: Vec::new(),
+            },
+            manifest,
+            BTreeMap::new(),
+        );
+        Arc::new(
+            crate::process_provider_runtime::ProductionProcessProviders::new_for_mode(
+                resolver,
+                std::path::PathBuf::from("/nonexistent/d2b-broker.sock"),
+                BrokerCallerRole::AdminUid { uid: 0 },
+                DaemonMode::Host,
+            ),
+        )
+    }
+
     fn publication_storage_row(
         zone: &ZoneId,
         identity: &d2b_resource_store_redb::StoreIdentity,
@@ -23341,6 +23407,61 @@ mod tests {
             drop(guard);
             assert_eq!(refresh.await, Ok(()));
         }
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn controller_session_reconcile_wake_survives_guard_contention() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let coordinator = runtime.controller_session_coordinator();
+        let providers = test_controller_session_providers();
+        let task_slot = Arc::clone(&runtime.controller_session_reconcile_task);
+        let wake = Arc::clone(&runtime.controller_session_reconcile_wake);
+        let shutdown = Arc::clone(&runtime.controller_session_reconcile_shutdown);
+        *runtime.authorization_state.lock().unwrap() = None;
+
+        let guard = runtime.controller_session_lock.lock().await;
+        schedule_controller_session_reconcile(
+            task_slot,
+            wake,
+            Arc::clone(&shutdown),
+            Arc::clone(&coordinator),
+            providers,
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if coordinator.reconcile_attempts.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("controller-session worker should attempt reconciliation");
+        assert!(runtime.authorization_state.lock().unwrap().is_none());
+
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if runtime.authorization_state.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guarded controller-session wake should reconcile after release");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            coordinator.reconcile_attempts.load(Ordering::SeqCst),
+            1,
+            "one scheduled wake should establish once without a second external wake"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        drop(coordinator);
         runtime.shutdown().await.unwrap();
     }
 
