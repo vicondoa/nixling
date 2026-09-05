@@ -8894,9 +8894,20 @@ struct ControllerSessionCoordinator {
     controller_session_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     reconcile_attempts: Arc<AtomicUsize>,
+    #[cfg(test)]
+    admission_test_seam: Arc<Mutex<Option<ControllerSessionAdmissionTestSeam>>>,
 }
 
 type CloudHypervisorResourceClient = ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>;
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ControllerSessionAdmissionTestSeam {
+    after_snapshot:
+        Arc<dyn Fn(&crate::process_provider_runtime::ProductionProcessProviders) + Send + Sync>,
+    after_policy_install: Arc<dyn Fn(&BTreeSet<BoundSubject>) + Send + Sync>,
+    admit_without_transport: bool,
+}
 
 #[derive(Clone)]
 struct PolicyProjection {
@@ -15875,6 +15886,8 @@ impl ZoneResourceRuntime {
             controller_session_lock: Arc::clone(&self.controller_session_lock),
             #[cfg(test)]
             reconcile_attempts: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            admission_test_seam: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -15934,6 +15947,17 @@ fn schedule_controller_session_reconcile(
 }
 
 impl ControllerSessionCoordinator {
+    #[cfg(test)]
+    fn set_controller_session_admission_test_seam(
+        &self,
+        seam: ControllerSessionAdmissionTestSeam,
+    ) {
+        *self
+            .admission_test_seam
+            .lock()
+            .expect("controller-session test seam lock") = Some(seam);
+    }
+
     fn revoke_controller_assignments(&self, binding: &ControllerSessionBinding) {
         if d2b_provider_runtime_cloud_hypervisor::is_provider_ref(binding.provider_ref()) {
             self.assignments
@@ -16098,6 +16122,15 @@ impl ControllerSessionCoordinator {
             .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         let bootstrap_contexts = providers.controller_bootstrap_contexts(&self.zone);
+        #[cfg(test)]
+        if let Some(seam) = self
+            .admission_test_seam
+            .lock()
+            .ok()
+            .and_then(|seam| seam.clone())
+        {
+            (seam.after_snapshot)(providers.as_ref());
+        }
         let provider_refs = bootstrap_contexts
             .iter()
             .map(|context| context.provider_owner_ref().clone())
@@ -16193,6 +16226,8 @@ impl ControllerSessionCoordinator {
                     return Err(error);
                 }
             };
+        #[cfg(test)]
+        let installed_subjects = provider_subjects.clone();
         if let Err(error) = self
             .policy_projection
             .install(policy, state, provider_subjects)
@@ -16203,6 +16238,15 @@ impl ControllerSessionCoordinator {
                     .await?;
             }
             return Err(error);
+        }
+        #[cfg(test)]
+        if let Some(seam) = self
+            .admission_test_seam
+            .lock()
+            .ok()
+            .and_then(|seam| seam.clone())
+        {
+            (seam.after_policy_install)(&installed_subjects);
         }
 
         for context in surviving_contexts {
@@ -16253,6 +16297,45 @@ impl ControllerSessionCoordinator {
                 continue;
             };
             let context = endpoint.context().clone();
+            #[cfg(test)]
+            if let Some(_seam) = self
+                .admission_test_seam
+                .lock()
+                .ok()
+                .and_then(|seam| seam.clone())
+                .filter(|seam| seam.admit_without_transport)
+            {
+                let current = self
+                    .controller_context_is_current(&providers, &context)
+                    .await
+                    .unwrap_or(false);
+                let expected_subject = BoundSubject {
+                    subject_ref: context.provider_owner_ref().clone(),
+                    subject_uid: context.provider_uid().clone(),
+                };
+                let policy_has_subject = self
+                    .policy_projection
+                    .installed_controller_subjects()
+                    .is_ok_and(|subjects| subjects.contains(&expected_subject));
+                *self
+                    .registrar
+                    .lock()
+                    .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
+                    Some(registrar);
+                assert!(
+                    policy_has_subject,
+                    "controller admission must use a policy compiled with its Provider subject"
+                );
+                if current {
+                    assert!(
+                        providers.activate_controller_bootstrap(&context),
+                        "matching controller bootstrap must activate exactly once"
+                    );
+                } else {
+                    providers.fail_controller_bootstrap(&context);
+                }
+                continue;
+            }
             let setup = self
                 .establish_controller_session(&providers, endpoint, &mut registrar)
                 .await;
@@ -23575,6 +23658,7 @@ mod tests {
         provider_ref: &str,
         provider_uid: &str,
         provider_generation: u64,
+        controller_generation: ControllerGeneration,
     ) -> OwnedFd {
         let (daemon_endpoint, peer_endpoint) = prearmed_seqpacket_pair().unwrap();
         nix::sys::socket::send(
@@ -23595,10 +23679,34 @@ mod tests {
                 ResourceUid::parse(provider_uid).unwrap(),
                 ResourceGeneration::new(provider_generation).unwrap(),
                 ResourceRef::parse("Host/host-system").unwrap(),
-                ControllerGeneration::new(1).unwrap(),
+                controller_generation,
             )
             .unwrap();
         peer_endpoint
+    }
+
+    async fn read_test_resource(
+        runtime: &ZoneResourceRuntime,
+        target: ResourceRef,
+        operation_id: &str,
+    ) -> StoredResource {
+        runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: operation_id.to_owned(),
+                    idempotency_key: None,
+                    correlation_id: operation_id.to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: runtime.zone.clone(),
+                target,
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap()
     }
 
     fn publication_storage_row(
@@ -24281,10 +24389,122 @@ mod tests {
         assert!(!providers.controller_bootstrap_ready(&zone, &process_ref));
     }
 
-    #[test]
-    fn controller_session_admission_freezes_pending_snapshot_across_passes() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controller_session_admission_freezes_pending_snapshot_across_passes() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
         let zone = ZoneId::parse("work").unwrap();
+        materialize_test_bundle(&runtime, Vec::new()).await;
+        let first_provider_ref =
+            ResourceRef::parse("Provider/runtime-cloud-hypervisor").expect("first provider");
+        let second_provider_ref =
+            ResourceRef::parse("Provider/runtime-qemu-media").expect("second provider");
+        let first_process_ref =
+            ResourceRef::parse("Process/provider-controller-first").expect("first process");
+        let second_process_ref =
+            ResourceRef::parse("Process/provider-controller-second").expect("second process");
+        let controller_process = |name: &str, owner_ref: &ResourceRef, template: &str| {
+            BundleResource::new(
+                ResourceTypeName::parse("Process").unwrap(),
+                BundleResourceMetadata::new(
+                    ResourceName::parse(name).unwrap(),
+                    zone.clone(),
+                    Some(owner_ref.clone()),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                ),
+                CanonicalJsonObject::parse(
+                    format!(
+                        r#"{{"executionRef":"Host/host-system","processClass":"controller","providerRef":"Provider/system-minijail","template":"{template}"}}"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "Provider",
+                    "runtime-cloud-hypervisor",
+                    &zone,
+                    r#"{"artifactId":"runtime-cloud-hypervisor","config":{}}"#,
+                ),
+                bundle_resource(
+                    "Provider",
+                    "runtime-qemu-media",
+                    &zone,
+                    r#"{"artifactId":"runtime-qemu-media","config":{}}"#,
+                ),
+                controller_process(
+                    first_process_ref.name().as_str(),
+                    &first_provider_ref,
+                    "acceptance-controller",
+                ),
+                controller_process(
+                    second_process_ref.name().as_str(),
+                    &second_provider_ref,
+                    "acceptance-controller",
+                ),
+            ],
+        )
+        .await;
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "Provider",
+                    "runtime-qemu-media",
+                    &zone,
+                    r#"{"artifactId":"runtime-qemu-media","config":{"replacement":true}}"#,
+                ),
+                controller_process(
+                    second_process_ref.name().as_str(),
+                    &second_provider_ref,
+                    "acceptance-controller-replacement",
+                ),
+            ],
+        )
+        .await;
+        let first_provider =
+            read_test_resource(&runtime, first_provider_ref.clone(), "admission-first-provider")
+                .await;
+        let second_provider = read_test_resource(
+            &runtime,
+            second_provider_ref.clone(),
+            "admission-second-provider",
+        )
+        .await;
+        let first_process =
+            read_test_resource(&runtime, first_process_ref.clone(), "admission-first-process")
+                .await;
+        let second_process = read_test_resource(
+            &runtime,
+            second_process_ref.clone(),
+            "admission-second-process",
+        )
+        .await;
+        assert_eq!(second_provider.generation.get(), 2);
+        assert_eq!(second_process.generation.get(), 2);
+        let controller_generation = runtime
+            .store
+            .runtime_metadata()
+            .await
+            .unwrap()
+            .policy_snapshot
+            .controller_generation
+            .expect("test policy has a controller generation");
         let providers = test_controller_session_providers();
+        let coordinator = runtime.controller_session_coordinator();
+        let wake = Arc::clone(&runtime.controller_session_reconcile_wake);
+        let wake_for_waker = Arc::clone(&wake);
+        let shutdown = Arc::clone(&runtime.controller_session_reconcile_shutdown);
+        let task_slot_for_waker = Arc::clone(&runtime.controller_session_reconcile_task);
+        let shutdown_for_waker = Arc::clone(&shutdown);
+        let coordinator_for_waker = Arc::downgrade(&coordinator);
+        let providers_for_waker = Arc::downgrade(&providers);
         let wake_count = Arc::new(AtomicUsize::new(0));
         let callback_wake_count = Arc::clone(&wake_count);
         providers
@@ -24292,123 +24512,225 @@ mod tests {
                 zone.clone(),
                 Arc::new(move || {
                     callback_wake_count.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    let coordinator = coordinator_for_waker
+                        .upgrade()
+                        .ok_or_else(|| "controller-session-coordinator-dropped".to_owned())?;
+                    let providers = providers_for_waker
+                        .upgrade()
+                        .ok_or_else(|| "process-providers-dropped".to_owned())?;
+                    schedule_controller_session_reconcile(
+                        Arc::clone(&task_slot_for_waker),
+                        Arc::clone(&wake_for_waker),
+                        Arc::clone(&shutdown_for_waker),
+                        coordinator,
+                        providers,
+                    )
+                    .map_err(|error| format!("{error:?}"))
                 }),
             )
             .unwrap();
-        let first_process_ref =
-            ResourceRef::parse("Process/provider-controller-first").expect("first process");
-        let first_provider_ref =
-            ResourceRef::parse("Provider/runtime-cloud-hypervisor").expect("first provider");
-        let _first_peer = attach_ready_controller(
+        let peers = Arc::new(Mutex::new(Vec::<OwnedFd>::new()));
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let stale_context = Arc::new(Mutex::new(None));
+        let peers_for_hook = Arc::clone(&peers);
+        let hook_ran_for_hook = Arc::clone(&hook_ran);
+        let stale_context_for_hook = Arc::clone(&stale_context);
+        let providers_for_hook = Arc::clone(&providers);
+        let second_snapshot_seen = Arc::new(AtomicBool::new(false));
+        let second_snapshot_seen_for_hook = Arc::clone(&second_snapshot_seen);
+        let second_snapshot_release = Arc::new(AtomicBool::new(false));
+        let second_snapshot_release_for_hook = Arc::clone(&second_snapshot_release);
+        let zone_for_hook = zone.clone();
+        let replacement_process_uid = second_process.uid.clone();
+        let replacement_process_generation = second_process.generation.get();
+        let replacement_provider_uid = second_provider.uid.clone();
+        let replacement_provider_generation = second_provider.generation.get();
+        let controller_generation_for_hook = controller_generation;
+        let second_process_ref_for_hook = second_process_ref.clone();
+        let second_provider_ref_for_hook = second_provider_ref.clone();
+        let after_snapshot = Arc::new(
+            move |_providers: &crate::process_provider_runtime::ProductionProcessProviders| {
+                if hook_ran_for_hook.swap(true, Ordering::AcqRel) {
+                    second_snapshot_seen_for_hook.store(true, Ordering::Release);
+                    while !second_snapshot_release_for_hook.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    return;
+                }
+                let late_peer = attach_ready_controller(
+                    &providers_for_hook,
+                    &zone_for_hook,
+                    second_process_ref_for_hook.to_canonical_string().as_str(),
+                    "323e4567-e89b-42d3-a456-426614174002",
+                    1,
+                    second_provider_ref_for_hook.to_canonical_string().as_str(),
+                    "423e4567-e89b-42d3-a456-426614174003",
+                    1,
+                    controller_generation_for_hook,
+                );
+                let late_context = providers_for_hook
+                    .controller_bootstrap_contexts(&zone_for_hook)
+                    .into_iter()
+                    .find(|context| context.process_ref() == &second_process_ref_for_hook)
+                    .expect("late Pending controller context");
+                *stale_context_for_hook.lock().unwrap() = Some(late_context);
+                let replacement_peer = attach_ready_controller(
+                    &providers_for_hook,
+                    &zone_for_hook,
+                    second_process_ref_for_hook.to_canonical_string().as_str(),
+                    replacement_process_uid.as_str(),
+                    replacement_process_generation,
+                    second_provider_ref_for_hook.to_canonical_string().as_str(),
+                    replacement_provider_uid.as_str(),
+                    replacement_provider_generation,
+                    controller_generation_for_hook,
+                );
+                peers_for_hook
+                    .lock()
+                    .unwrap()
+                    .extend([late_peer, replacement_peer]);
+            },
+        );
+        let policy_snapshots = Arc::new(Mutex::new(Vec::<BTreeSet<BoundSubject>>::new()));
+        let policy_snapshots_for_hook = Arc::clone(&policy_snapshots);
+        let first_policy_seen = Arc::new(AtomicBool::new(false));
+        let first_policy_seen_for_hook = Arc::clone(&first_policy_seen);
+        let first_policy_release = Arc::new(AtomicBool::new(false));
+        let first_policy_release_for_hook = Arc::clone(&first_policy_release);
+        coordinator.set_controller_session_admission_test_seam(
+            ControllerSessionAdmissionTestSeam {
+                after_snapshot,
+                after_policy_install: Arc::new(move |subjects| {
+                    policy_snapshots_for_hook
+                        .lock()
+                        .unwrap()
+                        .push(subjects.clone());
+                    if !first_policy_seen_for_hook.swap(true, Ordering::AcqRel) {
+                        while !first_policy_release_for_hook.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                    }
+                }),
+                admit_without_transport: true,
+            },
+        );
+        peers.lock().unwrap().push(attach_ready_controller(
             &providers,
             &zone,
-            "Process/provider-controller-first",
-            "123e4567-e89b-42d3-a456-426614174000",
-            1,
-            "Provider/runtime-cloud-hypervisor",
-            "223e4567-e89b-42d3-a456-426614174001",
-            1,
-        );
+            first_process_ref.to_canonical_string().as_str(),
+            first_process.uid.as_str(),
+            first_process.generation.get(),
+            first_provider_ref.to_canonical_string().as_str(),
+            first_provider.uid.as_str(),
+            first_provider.generation.get(),
+            controller_generation,
+        ));
 
-        let pass_one_snapshot = providers.controller_bootstrap_contexts(&zone);
-        assert_eq!(
-            pass_one_snapshot
-                .iter()
-                .map(|context| context.process_ref().clone())
-                .collect::<Vec<_>>(),
-            vec![first_process_ref.clone()]
-        );
-        assert_eq!(
-            pass_one_snapshot
-                .iter()
-                .map(|context| context.provider_owner_ref().clone())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([first_provider_ref])
-        );
-
-        let second_process_ref =
-            ResourceRef::parse("Process/provider-controller-second").expect("second process");
-        let second_provider_ref =
-            ResourceRef::parse("Provider/runtime-qemu-media").expect("second provider");
-        let _second_peer = attach_ready_controller(
-            &providers,
-            &zone,
-            "Process/provider-controller-second",
-            "323e4567-e89b-42d3-a456-426614174002",
-            1,
-            "Provider/runtime-qemu-media",
-            "423e4567-e89b-42d3-a456-426614174003",
-            1,
-        );
-        let stale_second_context = providers
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if policy_snapshots.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first scheduled pass must install its frozen policy");
+        let stale_context = stale_context
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("test seam captured the replaced context");
+        let replacement_context = providers
             .controller_bootstrap_contexts(&zone)
             .into_iter()
             .find(|context| context.process_ref() == &second_process_ref)
-            .expect("late Pending controller context");
-        let _replacement_peer = attach_ready_controller(
-            &providers,
-            &zone,
-            "Process/provider-controller-second",
-            "523e4567-e89b-42d3-a456-426614174004",
-            2,
-            "Provider/runtime-qemu-media",
-            "623e4567-e89b-42d3-a456-426614174005",
-            2,
+            .expect("replacement Pending controller context");
+        let first_subject = BoundSubject {
+            subject_ref: first_provider_ref.clone(),
+            subject_uid: first_provider.uid.clone(),
+        };
+        let second_subject = BoundSubject {
+            subject_ref: second_provider_ref.clone(),
+            subject_uid: second_provider.uid.clone(),
+        };
+        assert_eq!(
+            policy_snapshots.lock().unwrap().as_slice(),
+            [BTreeSet::from([first_subject.clone()])]
         );
-        assert_eq!(wake_count.load(Ordering::SeqCst), 3);
+        first_policy_release.store(true, Ordering::Release);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if second_snapshot_seen.load(Ordering::Acquire)
+                    && !providers.controller_bootstrap_ready(&zone, &first_process_ref)
+                    && providers.controller_bootstrap_ready(&zone, replacement_context.process_ref())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the queued wake must reach a second frozen admission pass");
+        assert_ne!(
+            stale_context.process_uid(),
+            replacement_context.process_uid(),
+            "replacement must fence the stale Process UID"
+        );
+        assert_ne!(
+            stale_context.generation(),
+            replacement_context.generation(),
+            "replacement must fence the stale Process generation"
+        );
+        assert_ne!(
+            stale_context.provider_uid(),
+            replacement_context.provider_uid(),
+            "replacement must fence the stale Provider UID"
+        );
+        assert_ne!(
+            stale_context.provider_generation(),
+            replacement_context.provider_generation(),
+            "replacement must fence the stale Provider generation"
+        );
         assert!(
             providers
-                .begin_controller_bootstrap_if_matches(&zone, &stale_second_context)
+                .begin_controller_bootstrap_if_matches(&zone, &stale_context)
                 .is_none(),
             "a replaced Pending marker must not be claimed by a stale snapshot"
         );
-
-        let mut pass_one_admissions = 0;
-        for context in &pass_one_snapshot {
-            if providers.controller_bootstrap_ready(&zone, context.process_ref())
-                && providers
-                    .begin_controller_bootstrap_if_matches(&zone, context)
-                    .is_some()
-            {
-                assert!(providers.activate_controller_bootstrap(context));
-                pass_one_admissions += 1;
-            }
-        }
-        assert_eq!(pass_one_admissions, 1);
-        assert!(providers.has_controller_bootstrap(&first_process_ref, &pass_one_snapshot[0]));
-        assert_eq!(
-            providers
-                .controller_bootstrap_contexts(&zone)
-                .iter()
-                .filter(|context| context.process_ref() == &second_process_ref)
-                .count(),
-            1
+        assert!(
+            providers.controller_bootstrap_ready(&zone, replacement_context.process_ref()),
+            "the replacement must remain Pending after pass one"
         );
-
-        let pass_two_snapshot = providers.controller_bootstrap_contexts(&zone);
-        assert_eq!(
-            pass_two_snapshot
-                .iter()
-                .map(|context| context.provider_owner_ref().clone())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                ResourceRef::parse("Provider/runtime-cloud-hypervisor").unwrap(),
-                second_provider_ref.clone(),
-            ])
+        assert!(
+            !providers.controller_bootstrap_ready(&zone, &first_process_ref),
+            "the original context must be Active after pass one"
         );
-        let mut pass_two_admissions = 0;
-        for context in &pass_two_snapshot {
-            if providers.controller_bootstrap_ready(&zone, context.process_ref())
-                && providers
-                    .begin_controller_bootstrap_if_matches(&zone, context)
-                    .is_some()
-            {
-                assert!(providers.activate_controller_bootstrap(context));
-                pass_two_admissions += 1;
+        second_snapshot_release.store(true, Ordering::Release);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if policy_snapshots.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-        }
-        assert_eq!(pass_two_admissions, 1);
+        })
+        .await
+        .expect("the second pass must install the replacement Provider subject");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            coordinator.reconcile_attempts.load(Ordering::SeqCst),
+            2,
+            "the non-lossy wake must not create a duplicate pass"
+        );
+        assert_eq!(
+            policy_snapshots.lock().unwrap().as_slice(),
+            [
+                BTreeSet::from([first_subject.clone()]),
+                BTreeSet::from([first_subject.clone(), second_subject.clone()]),
+            ]
+        );
         for context in providers.controller_bootstrap_contexts(&zone) {
             assert!(!providers.controller_bootstrap_ready(&zone, context.process_ref()));
             assert!(
@@ -24418,6 +24740,13 @@ mod tests {
                 "an active controller must not be admitted twice"
             );
         }
+        assert_eq!(wake_count.load(Ordering::SeqCst), 3);
+
+        shutdown.store(true, Ordering::Release);
+        wake.notify_one();
+        drop(peers);
+        drop(coordinator);
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
