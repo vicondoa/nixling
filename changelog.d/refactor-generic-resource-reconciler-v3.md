@@ -4,3 +4,5 @@
   controller admission so pending bootstrap endpoints are retained and
   authenticated Cloud Hypervisor sessions remain available during public
   Resource reads.
+- Refreshed missing Process Provider identities from the authoritative Zone
+  store before launching late-created VMM and virtiofsd workers.

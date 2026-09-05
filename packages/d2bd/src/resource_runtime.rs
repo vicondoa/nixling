@@ -40,8 +40,9 @@ use crate::credential_resource_runtime::{
     CredentialSession, credential_controller_descriptor, is_credential_provider_ref,
 };
 use crate::process_resource_runtime::{
-    ProcessResourceReconciler, ProcessResourceRuntime, ProcessResourceRuntimeError,
-    controller_provider_refs, list_process_resources, process_controller_descriptor,
+    ProcessProviderIdentityLoader, ProcessResourceReconciler, ProcessResourceRuntime,
+    ProcessResourceRuntimeError, controller_provider_refs, list_process_resources,
+    process_controller_descriptor,
 };
 use crate::semantic_binding_resource_runtime::{
     telemetry_controller_descriptor, TelemetryResourceReconciler,
@@ -17237,7 +17238,15 @@ impl ZoneResourceRuntime {
             let mut runtime =
                 ProcessResourceRuntime::new(self.zone.clone(), Arc::clone(&providers));
             runtime.set_controller_generation(controller_generation);
-            runtime.set_controller_provider_identities(controller_provider_identities);
+            runtime
+                .set_controller_provider_identities(controller_provider_identities)
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
+            runtime.set_provider_identity_loader(Arc::new(
+                CommittedProcessProviderIdentityLoader {
+                    zone: self.zone.clone(),
+                    store: Arc::clone(&self.store),
+                },
+            ));
             runtime.set_lifecycle_identity(
                 self.store_metadata.zone_uid.clone(),
                 store_metadata.policy_snapshot.policy_revision,
@@ -19219,6 +19228,37 @@ async fn load_committed_controller_provider_identities(
         identities.insert(provider_ref, (uid, generation));
     }
     Ok(identities)
+}
+
+struct CommittedProcessProviderIdentityLoader {
+    zone: ZoneId,
+    store: Arc<RedbResourceStore>,
+}
+
+#[async_trait]
+impl ProcessProviderIdentityLoader for CommittedProcessProviderIdentityLoader {
+    async fn load(
+        &self,
+        provider_ref: &ResourceRef,
+    ) -> Result<(ResourceUid, ResourceGeneration), ProcessResourceRuntimeError> {
+        let current_revision = self
+            .store
+            .runtime_metadata()
+            .await
+            .map_err(|_| ProcessResourceRuntimeError::ProviderIdentityUnavailable)?
+            .current_revision;
+        let mut identities = load_committed_controller_provider_identities(
+            &self.zone,
+            &self.store,
+            current_revision,
+            BTreeSet::from([provider_ref.clone()]),
+        )
+        .await
+        .map_err(|_| ProcessResourceRuntimeError::ProviderIdentityUnavailable)?;
+        identities
+            .remove(provider_ref)
+            .ok_or(ProcessResourceRuntimeError::ProviderIdentityUnavailable)
+    }
 }
 
 fn controller_session_needs_fence(bootstrap_present: bool, service_task_finished: bool) -> bool {

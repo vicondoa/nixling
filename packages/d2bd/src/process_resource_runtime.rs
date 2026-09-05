@@ -111,6 +111,59 @@ impl core::fmt::Display for ProcessResourceRuntimeError {
 impl std::error::Error for ProcessResourceRuntimeError {}
 
 #[async_trait::async_trait]
+pub(crate) trait ProcessProviderIdentityLoader: Send + Sync {
+    async fn load(
+        &self,
+        provider_ref: &ResourceRef,
+    ) -> Result<(ResourceUid, ResourceGeneration), ProcessResourceRuntimeError>;
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ProcessProviderIdentityCache {
+    identities: Arc<Mutex<BTreeMap<ResourceRef, (ResourceUid, ResourceGeneration)>>>,
+}
+
+impl ProcessProviderIdentityCache {
+    fn replace(
+        &self,
+        identities: BTreeMap<ResourceRef, (ResourceUid, ResourceGeneration)>,
+    ) -> Result<(), ProcessResourceRuntimeError> {
+        *self
+            .identities
+            .lock()
+            .map_err(|_| ProcessResourceRuntimeError::ProviderIdentityUnavailable)? = identities;
+        Ok(())
+    }
+
+    fn get(&self, provider_ref: &ResourceRef) -> Option<(ResourceUid, ResourceGeneration)> {
+        self.identities
+            .lock()
+            .ok()
+            .and_then(|identities| identities.get(provider_ref).cloned())
+    }
+
+    async fn ensure(
+        &self,
+        provider_ref: &ResourceRef,
+        loader: Option<&dyn ProcessProviderIdentityLoader>,
+    ) -> Result<(), ProcessResourceRuntimeError> {
+        if self.get(provider_ref).is_some() {
+            return Ok(());
+        }
+        let Some(loader) = loader else {
+            return Ok(());
+        };
+        let identity = loader.load(provider_ref).await?;
+        let mut identities = self
+            .identities
+            .lock()
+            .map_err(|_| ProcessResourceRuntimeError::ProviderIdentityUnavailable)?;
+        identities.entry(provider_ref.clone()).or_insert(identity);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
 pub(crate) trait ProcessResourceClient: Send + Sync {
     async fn update_status(&self, request: wire::UpdateStatusRequest)
     -> wire::UpdateStatusResponse;
@@ -236,6 +289,16 @@ impl DesiredRecord {
     }
 }
 
+fn provider_identity_ref(record: &DesiredRecord) -> Option<ResourceRef> {
+    if is_static_controller(record) {
+        record
+            .owner_ref()
+            .filter(|owner| owner.resource_type().as_str() == "Provider")
+    } else {
+        Some(record.provider_ref.clone())
+    }
+}
+
 const fn process_finalizer_names() -> [&'static str; 3] {
     [
         PROCESS_RUNTIME_FINALIZER,
@@ -280,7 +343,8 @@ pub(crate) struct ProcessResourceRuntime {
     completed_at: BTreeMap<ResourceRef, Instant>,
     next_restart_at: BTreeMap<ResourceRef, Instant>,
     controller_generation: ControllerGeneration,
-    controller_provider_identities: BTreeMap<ResourceRef, (ResourceUid, ResourceGeneration)>,
+    controller_provider_identities: ProcessProviderIdentityCache,
+    provider_identity_loader: Option<Arc<dyn ProcessProviderIdentityLoader>>,
     guest_execution: Option<GuestExecutionBinding>,
     zone_uid: Option<ResourceUid>,
     policy_revision: Option<u64>,
@@ -364,7 +428,8 @@ impl ProcessResourceRuntime {
             next_restart_at: BTreeMap::new(),
             controller_generation: ControllerGeneration::new(1)
                 .expect("controller generation one is valid"),
-            controller_provider_identities: BTreeMap::new(),
+            controller_provider_identities: ProcessProviderIdentityCache::default(),
+            provider_identity_loader: None,
             guest_execution: None,
             zone_uid: None,
             policy_revision: None,
@@ -383,10 +448,17 @@ impl ProcessResourceRuntime {
     }
 
     pub(crate) fn set_controller_provider_identities(
-        &mut self,
+        &self,
         identities: BTreeMap<ResourceRef, (ResourceUid, ResourceGeneration)>,
+    ) -> Result<(), ProcessResourceRuntimeError> {
+        self.controller_provider_identities.replace(identities)
+    }
+
+    pub(crate) fn set_provider_identity_loader(
+        &mut self,
+        loader: Arc<dyn ProcessProviderIdentityLoader>,
     ) {
-        self.controller_provider_identities = identities;
+        self.provider_identity_loader = Some(loader);
     }
 
     pub(crate) fn set_guest_execution_binding(&mut self, binding: GuestExecutionBinding) {
@@ -450,6 +522,7 @@ impl ProcessResourceRuntime {
             next_restart_at: BTreeMap::new(),
             controller_generation: self.controller_generation,
             controller_provider_identities: self.controller_provider_identities.clone(),
+            provider_identity_loader: self.provider_identity_loader.clone(),
             guest_execution: self.guest_execution.clone(),
             zone_uid: self.zone_uid.clone(),
             policy_revision: self.policy_revision,
@@ -488,7 +561,7 @@ impl ProcessResourceRuntime {
         );
         let committed_controller_provider_identity = controller_provider_ref
             .as_ref()
-            .and_then(|provider| self.controller_provider_identities.get(provider));
+            .and_then(|provider| self.controller_provider_identity(provider));
         ProcessResourceContext::new(
             self.zone.clone(),
             &record.resource.resource_ref,
@@ -534,12 +607,30 @@ impl ProcessResourceRuntime {
                 .or(controller_provider_uid.as_ref()),
             record
                 .controller_provider_generation
-                .or(
-                    committed_controller_provider_identity
-                        .map(|(_, generation)| *generation),
-                )
+                .or(committed_controller_provider_identity
+                    .as_ref()
+                    .map(|(_, generation)| generation.clone()))
                 .or(controller_provider_generation),
         )
+    }
+
+    fn controller_provider_identity(
+        &self,
+        provider_ref: &ResourceRef,
+    ) -> Option<(ResourceUid, ResourceGeneration)> {
+        self.controller_provider_identities.get(provider_ref)
+    }
+
+    async fn ensure_provider_identity(
+        &self,
+        record: &DesiredRecord,
+    ) -> Result<(), ProcessResourceRuntimeError> {
+        let Some(provider_ref) = provider_identity_ref(record) else {
+            return Ok(());
+        };
+        self.controller_provider_identities
+            .ensure(&provider_ref, self.provider_identity_loader.as_deref())
+            .await
     }
 
     /// Reconcile the fresh Process/EphemeralProcess targets for this pass.
@@ -564,6 +655,9 @@ impl ProcessResourceRuntime {
             self.restart_counts
                 .entry(record.resource.resource_ref.clone())
                 .or_insert_with(|| persisted_restart_count(&record.resource, &record.process));
+        }
+        for record in desired.values() {
+            self.ensure_provider_identity(record).await?;
         }
         let desired_keys = desired.keys().cloned().collect::<BTreeSet<_>>();
         let removed = self
@@ -599,16 +693,10 @@ impl ProcessResourceRuntime {
         });
         for mut record in desired {
             let key = record.resource.resource_ref.clone();
-            let provider_identity_ref = if is_static_controller(&record) {
-                record
-                    .owner_ref()
-                    .filter(|owner| owner.resource_type().as_str() == "Provider")
-            } else {
-                Some(record.provider_ref.clone())
-            };
+            let provider_identity_ref = provider_identity_ref(&record);
             let provider_identity = provider_identity_ref
                 .as_ref()
-                .and_then(|provider| self.controller_provider_identities.get(provider).cloned());
+                .and_then(|provider| self.controller_provider_identity(provider));
             record.controller_provider_uid = provider_identity.as_ref().map(|(uid, _)| uid.clone());
             record.controller_provider_generation =
                 provider_identity.map(|(_, generation)| generation);
@@ -1502,8 +1590,7 @@ impl ProcessResourceReconciler {
         };
         let provider_identity = provider_identity_ref
             .as_ref()
-            .and_then(|provider| self.runtime.controller_provider_identities.get(provider))
-            .cloned();
+            .and_then(|provider| self.runtime.controller_provider_identity(provider));
         Ok(Some(DesiredRecord {
             resource: stored,
             provider_ref,
@@ -1518,6 +1605,17 @@ impl ProcessResourceReconciler {
             controller_provider_uid: provider_identity.as_ref().map(|(uid, _)| uid.clone()),
             controller_provider_generation: provider_identity.map(|(_, generation)| generation),
         }))
+    }
+
+    async fn desired_record_with_provider_identity(
+        &self,
+        resource: &ResourceSnapshot,
+    ) -> Result<Option<DesiredRecord>, ProcessResourceRuntimeError> {
+        let Some(record) = self.desired_record(resource)? else {
+            return Ok(None);
+        };
+        self.runtime.ensure_provider_identity(&record).await?;
+        self.desired_record(resource)
     }
 
     fn no_op(&self) -> ReconcilePlan {
@@ -1601,7 +1699,10 @@ impl ProcessResourceReconciler {
         context: &ReconcileContext,
         resource: &ResourceSnapshot,
     ) -> Result<ReconcileResult, ProcessResourceRuntimeError> {
-        let Some(record) = self.desired_record(resource)? else {
+        let Some(record) = self
+            .desired_record_with_provider_identity(resource)
+            .await?
+        else {
             return Ok(ReconcileResult::converged(
                 resource.revision(),
                 resource.generation(),
@@ -1751,7 +1852,8 @@ impl ResourceReconciler for ProcessResourceReconciler {
                 .expect("finalizer enrollment plan is bounded"));
         }
         if self
-            .desired_record(resource)?
+            .desired_record_with_provider_identity(resource)
+            .await?
             .is_some_and(|record| !controller_provider_identity_available(&record))
         {
             return Ok(ReconcilePlan::new(Vec::new(), false)
@@ -1826,7 +1928,8 @@ impl ResourceReconciler for ProcessResourceReconciler {
                 .map_err(|_| ProcessResourceRuntimeError::InvalidResource);
             }
             if self
-                .desired_record(resource)?
+                .desired_record_with_provider_identity(resource)
+                .await?
                 .is_some_and(|record| !controller_provider_identity_available(&record))
             {
                 return ReconcileResult::new(
@@ -1889,7 +1992,10 @@ impl ResourceReconciler for ProcessResourceReconciler {
         _plan: &ReconcilePlan,
     ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
         let result = async {
-            let Some(record) = self.desired_record(resource)? else {
+            let Some(record) = self
+                .desired_record_with_provider_identity(resource)
+                .await?
+            else {
                 return Ok(ReconcileResult::converged(
                     resource.revision(),
                     resource.generation(),
@@ -1999,7 +2105,10 @@ impl ResourceReconciler for ProcessResourceReconciler {
                     resource.generation(),
                 ));
             }
-            let Some(record) = self.desired_record(resource)? else {
+            let Some(record) = self
+                .desired_record_with_provider_identity(resource)
+                .await?
+            else {
                 return Ok(ReconcileResult::converged(
                     resource.revision(),
                     resource.generation(),
@@ -5062,6 +5171,93 @@ mod tests {
             vec![EPHEMERAL_PROCESS_TYPE, PROCESS_TYPE]
         );
         assert!(descriptor.finalizers().is_empty(        ));
+    }
+
+    #[derive(Default)]
+    struct TestProviderIdentityLoader {
+        identities: BTreeMap<ResourceRef, (ResourceUid, ResourceGeneration)>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessProviderIdentityLoader for TestProviderIdentityLoader {
+        async fn load(
+            &self,
+            provider_ref: &ResourceRef,
+        ) -> Result<(ResourceUid, ResourceGeneration), ProcessResourceRuntimeError> {
+            self.identities
+                .get(provider_ref)
+                .cloned()
+                .ok_or(ProcessResourceRuntimeError::ProviderIdentityUnavailable)
+        }
+    }
+
+    #[tokio::test]
+    async fn late_process_provider_identity_refreshes_shared_cache() {
+        let cache = ProcessProviderIdentityCache::default();
+        let controller_ref =
+            ResourceRef::parse("Provider/system-core").expect("controller provider ref");
+        let process_ref =
+            ResourceRef::parse("Provider/system-minijail").expect("process provider ref");
+        let controller_identity = (
+            ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").expect("controller uid"),
+            ResourceGeneration::new(2).expect("controller generation"),
+        );
+        let process_identity = (
+            ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").expect("process uid"),
+            ResourceGeneration::new(3).expect("process generation"),
+        );
+        cache
+            .replace(BTreeMap::from([(
+                controller_ref.clone(),
+                controller_identity.clone(),
+            )]))
+            .expect("initial controller identities");
+        assert_eq!(
+            cache.get(&controller_ref),
+            Some(controller_identity.clone())
+        );
+        assert_eq!(cache.get(&process_ref), None);
+
+        let loader = TestProviderIdentityLoader {
+            identities: BTreeMap::from([(process_ref.clone(), process_identity.clone())]),
+        };
+        cache
+            .ensure(&process_ref, Some(&loader))
+            .await
+            .expect("late process identity");
+
+        assert_eq!(cache.get(&process_ref), Some(process_identity));
+        assert_eq!(cache.get(&controller_ref), Some(controller_identity));
+
+        let missing_ref =
+            ResourceRef::parse("Provider/system-systemd").expect("second process provider ref");
+        assert_eq!(
+            cache.ensure(&missing_ref, Some(&loader)).await,
+            Err(ProcessResourceRuntimeError::ProviderIdentityUnavailable)
+        );
+        assert_eq!(cache.get(&missing_ref), None);
+    }
+
+    #[test]
+    fn process_identity_reference_keeps_controller_owner_and_worker_provider_distinct() {
+        let mut worker = identity_record(1);
+        assert_eq!(
+            provider_identity_ref(&worker),
+            Some(ResourceRef::parse("Provider/system-minijail").expect("worker provider ref"))
+        );
+
+        worker.resource.canonical_json =
+            br#"{"metadata":{"ownerRef":"Provider/runtime-cloud-hypervisor"}}"#.to_vec();
+        worker.process = DesiredProcess::Process(
+            serde_json::from_str(
+                r#"{"executionRef":"Host/host-system","processClass":"controller","template":"controller"}"#,
+            )
+            .expect("controller process"),
+        );
+        assert_eq!(
+            provider_identity_ref(&worker),
+            Some(ResourceRef::parse("Provider/runtime-cloud-hypervisor").expect("owner ref"))
+        );
     }
 
     #[test]
