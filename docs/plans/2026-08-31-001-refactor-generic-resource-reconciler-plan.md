@@ -674,6 +674,10 @@ Reuse `TrustedRequest`, `AuthorizationLease`, `ExpectedRevision`,
   accepted record/message, idempotent claim, side effect, terminal evidence,
   eligible status, owner wakeup, or cleanup; recovery has no duplicate effect,
   and event-only Delete/foreground eligibility remain idempotent.
+- ResourceRef reads resolve the logical row without eager identity projection;
+  stale UID, generation, revision, assignment, or session mutation conflicts
+  and fresh re-entry rereads the target. Provider identity and revision
+  validation use one coherent store snapshot.
 
 **Verification**
 
@@ -774,8 +778,11 @@ bounded owner propagation, and projection ownership.
 - Ledger crash recovery rejoins matching sessions, rejects mismatched desired
   generations, and never reaccepts an operation ID.
 - Concurrent public Get/List, Provider-session admission, and policy refresh
-  retain one installed subject projection; a failed projection or rebind keeps
-  the last complete read projection and returns retryable work.
+  retain one installed subject projection. A compile/preflight/install failure
+  exposes no half-installed projection, fails new mutations and admission
+  closed, and may retain a prior complete read projection; a post-install
+  system-core rebind failure keeps the complete read projection, marks
+  recovery pending, and returns retryable work.
 
 **Verification**
 
@@ -818,7 +825,8 @@ contracts.
   `packages/d2b-session/BUILD.bazel`,
   `//packages/d2b-provider:all-tests`,
   `//packages/d2b-provider-toolkit:all-tests`, and
-  `//packages/d2b-session:all-tests`
+`//packages/d2b-session:all-tests`,
+`packages/d2b-bus/src/session_seam_tests.rs`
 
 **Approach**
 
@@ -1562,8 +1570,11 @@ boundaries, and structural removal proofs.
 - A public `Get` or `List` concurrent with Provider-subject projection
   refresh does not replace the installed controller-subject policy, and
   `NativeAuthorizer`, `ZoneBus`, and authorization state retain one revision.
-- A policy-install failure leaves no half-installed projection and keeps new
-  reads, mutations, and session admission fail-closed until a fresh retry.
+- A policy compile/preflight/install failure exposes no half-installed
+  projection and fails new mutations and session admission closed; a prior
+  complete read projection may remain available. A post-install system-core
+  rebind failure keeps the complete read projection, marks recovery pending,
+  and blocks new effects until a fresh retry succeeds.
 - A Provider UID, generation, or store snapshot changes during admission; the
   stale candidate is rejected or requeued with no leaked subject, ingress,
   session, assignment, or marker.
@@ -1657,7 +1668,7 @@ Owner-local hardening evidence is bound to the owning tests rather than this
 aggregate alone: ResourceService/store targets prove UID/generation/revision
 fences and coherent snapshots; d2bd runtime tests prove policy projection,
 non-lossy session wakes, and public-read behavior; Process Provider tests prove
-lazy identity and rollback; bus/session seam tests prove bootstrap rollback.
+lazy identity; bus/session seam tests prove bootstrap rollback.
 
 ### V3. All 27 Provider targets
 
@@ -1799,8 +1810,9 @@ schedulers, universal RPC, zero-resource reconciler, new gates, and inventories.
   contention; pending work survives notification coalescing and shutdown does
   not resurrect a worker.
 - [ ] One policy projection owner linearly installs NativeAuthorizer, ZoneBus,
-  and authorization state; public reads never mutate global policy and partial
-  installation fails closed.
+  and authorization state; public reads never mutate global policy, partial
+  installation fails closed, and a post-install system-core rebind failure
+  preserves complete read projection while marking recovery pending.
 - [ ] Startup admission uses coherent Provider/Process snapshots; dynamic
   Process Provider identities resolve lazily per resource and replacement
   UID/generation invalidates stale effects.
