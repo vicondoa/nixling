@@ -23,3 +23,6 @@
 - Kept rebind-pending state retryable across unchanged policy snapshots,
   rejected empty or partial post-fence session slots, and restored the fenced
   system-core and Provider runners after recovery.
+- Woke the controller-session coordinator when a launch or adoption records a
+  readable bootstrap endpoint, and made initial test-controller handshake
+  failure terminal so one-shot bootstrap delivery cannot queue duplicates.

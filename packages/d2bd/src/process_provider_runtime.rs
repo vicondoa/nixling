@@ -57,6 +57,7 @@ pub(crate) const GUEST_EXECUTION_UNAVAILABLE: &str = "provider-ticket:guest-exec
 type BrokerProcessSupervisor = ProviderSupervisor<BrokerProcessBackend<BundleBackedLaunchResolver>>;
 type BrokerSystemdSupervisor = ProviderSupervisor<SystemdProcessBackend<BrokerSystemdEffectOwner>>;
 const RESOURCE_WAITER_POLL: Duration = Duration::from_millis(250);
+pub(crate) type ControllerSessionReconcileWake = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 async fn wait_for_controller_bootstrap_endpoint(
     endpoint: OwnedFd,
@@ -762,6 +763,7 @@ pub struct ProductionProcessProviders {
     managed_resources: Mutex<BTreeMap<ManagedResourceKey, ManagedResource>>,
     resource_waiters: Arc<Mutex<BTreeSet<ResourceWaiterKey>>>,
     controller_bootstrap: Mutex<BTreeMap<(ZoneId, ResourceRef), ControllerBootstrapMarker>>,
+    controller_session_wakers: Mutex<BTreeMap<ZoneId, ControllerSessionReconcileWake>>,
 }
 
 impl std::fmt::Debug for ProductionProcessProviders {
@@ -833,6 +835,7 @@ impl ProductionProcessProviders {
             managed_resources: Mutex::new(BTreeMap::new()),
             resource_waiters: Arc::new(Mutex::new(BTreeSet::new())),
             controller_bootstrap: Mutex::new(BTreeMap::new()),
+            controller_session_wakers: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1466,6 +1469,44 @@ impl ProductionProcessProviders {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn attach_pending_controller_provider_context_for_test(
+        &self,
+        daemon_endpoint: OwnedFd,
+        zone: ZoneId,
+        process_ref: ResourceRef,
+        process_uid: ResourceUid,
+        process_generation: ResourceGeneration,
+        process_provider_ref: ResourceRef,
+        provider_owner_ref: ResourceRef,
+        provider_uid: ResourceUid,
+        provider_generation: ResourceGeneration,
+        execution_ref: ResourceRef,
+        controller_generation: ControllerGeneration,
+    ) -> Result<(), String> {
+        let context = ControllerBootstrapContext {
+            zone: zone.clone(),
+            zone_uid: None,
+            process_ref: process_ref.clone(),
+            process_uid,
+            generation: process_generation,
+            process_identity: ProcessIdentityDigest::from_bytes([7; 32]),
+            process_provider_ref,
+            provider_owner_ref,
+            provider_uid,
+            provider_generation,
+            execution_ref,
+            user_ref: None,
+            controller_generation,
+        };
+        self.remember_controller_bootstrap(ControllerBootstrapEndpoint {
+            daemon_endpoint,
+            delivery_key_handoff: None,
+            backend_lease: None,
+            context,
+        })
+    }
+
     /// Adopt one durable Process resource with the controller generation
     /// rehydrated from the owning Zone store.
     pub(crate) async fn adopt_resource(
@@ -1874,6 +1915,7 @@ impl ProductionProcessProviders {
         &self,
         endpoint: ControllerBootstrapEndpoint,
     ) -> Result<(), String> {
+        let zone = endpoint.context.zone.clone();
         let process_ref = endpoint.context.process_ref.clone();
         let key = (endpoint.context.zone.clone(), process_ref);
         let mut markers = self
@@ -1896,7 +1938,8 @@ impl ProductionProcessProviders {
             return Err("provider-controller-bootstrap-stale-generation".to_owned());
         }
         markers.insert(key, ControllerBootstrapMarker::Pending(endpoint));
-        Ok(())
+        drop(markers);
+        self.wake_controller_session_reconcile(&zone)
     }
 
     pub(crate) fn controller_bootstrap_refs(&self, zone: &ZoneId) -> Vec<ResourceRef> {
@@ -1910,6 +1953,51 @@ impl ProductionProcessProviders {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn set_controller_session_waker(
+        &self,
+        zone: ZoneId,
+        wake: ControllerSessionReconcileWake,
+    ) -> Result<(), String> {
+        self.controller_session_wakers
+            .lock()
+            .map_err(|_| "provider-managed-state-poisoned".to_owned())?
+            .insert(zone.clone(), Arc::clone(&wake));
+        let pending = self
+            .controller_bootstrap
+            .lock()
+            .map_err(|_| "provider-managed-state-poisoned".to_owned())?
+            .values()
+            .any(|marker| {
+                matches!(marker, ControllerBootstrapMarker::Pending(_))
+                    && marker.context().zone() == &zone
+            });
+        if pending {
+            self.wake_controller_session_reconcile(&zone)?;
+        }
+        Ok(())
+    }
+
+    fn wake_controller_session_reconcile(&self, zone: &ZoneId) -> Result<(), String> {
+        let result = self
+            .controller_session_wakers
+            .lock()
+            .map_err(|_| "provider-managed-state-poisoned".to_owned())?
+            .get(zone)
+            .cloned()
+            .ok_or_else(|| "provider-controller-session-wake-unavailable".to_owned())
+            .and_then(|wake| {
+                wake().map_err(|error| format!("provider-controller-session-wake-failed:{error}"))
+            });
+        if let Err(error) = &result {
+            tracing::warn!(
+                zone = %zone.as_str(),
+                error = %error,
+                "controller-session coordinator wake failed",
+            );
+        }
+        result
     }
 
     pub(crate) fn controller_bootstrap_present(

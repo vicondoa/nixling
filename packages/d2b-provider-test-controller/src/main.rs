@@ -77,7 +77,7 @@ async fn run_session(
     .await
     {
         Ok(session) => session,
-        Err(_) => return Ok(SessionDisposition::Reconnect),
+        Err(_) => return Err(()),
     };
     let assignment_stream = StreamId::new(CONTROLLER_ASSIGNMENT_STREAM_ID).map_err(|_| ())?;
     session
@@ -191,5 +191,62 @@ mod tests {
         assert!(should_reconnect(CloseReason::SessionLost));
         assert!(!should_reconnect(CloseReason::Normal));
         assert!(!should_reconnect(CloseReason::PeerRequested));
+    }
+
+    #[test]
+    fn initial_handshake_failure_sends_one_bootstrap_then_is_terminal() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let (bootstrap_fd, receiver_fd) =
+                prearmed_seqpacket_pair().expect("bootstrap socketpair");
+            let bootstrap =
+                SeqpacketSocket::from_parent_prearmed(bootstrap_fd).expect("bootstrap sender");
+            let receiver =
+                SeqpacketSocket::from_parent_prearmed(receiver_fd).expect("bootstrap receiver");
+            let expected_peer = bootstrap
+                .acceptor_peer_credentials()
+                .expect("bootstrap peer credentials");
+            let policy = controller_bootstrap_attachment_policy();
+            let capacity = AncillaryCapacity::from_policy(policy).expect("bootstrap capacity");
+            let scopes = controller_credit_scopes().expect("bootstrap credit scopes");
+            let mut session = Box::pin(run_session(&bootstrap, expected_peer));
+            let mut receive = Box::pin(receiver.recv_burst(
+                d2b_contracts_zone_session::v3::component_session::LimitProfile::local_default(),
+                capacity,
+                &scopes,
+                2,
+            ));
+            let burst = tokio::select! {
+                result = &mut session => panic!("handshake must wait for bootstrap delivery: {result:?}"),
+                burst = &mut receive => burst.expect("bootstrap packet"),
+            };
+            assert_eq!(burst.packets.len(), 1);
+            drop(burst);
+
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut session)
+                    .await
+                    .expect("initial handshake must fail promptly")
+                    .is_err(),
+                "an initial handshake failure must be terminal"
+            );
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    receiver.recv_burst(
+                        d2b_contracts_zone_session::v3::component_session::LimitProfile::local_default(),
+                        capacity,
+                        &scopes,
+                        2,
+                    ),
+                )
+                .await
+                .is_err(),
+                "a failed initial handshake must not send a second bootstrap"
+            );
+        });
     }
 }

@@ -17328,12 +17328,38 @@ impl ZoneResourceRuntime {
             .provider_runtime
             .process_providers()
             .ok_or(ResourceRuntimeError::ProviderPathUnavailable)?;
+        let coordinator = self.controller_session_coordinator();
+        let wake_task_slot = Arc::clone(&self.controller_session_reconcile_task);
+        let wake = Arc::clone(&self.controller_session_reconcile_wake);
+        let wake_shutdown = Arc::clone(&self.controller_session_reconcile_shutdown);
+        let wake_coordinator = Arc::downgrade(&coordinator);
+        let wake_providers = Arc::downgrade(&providers);
+        providers
+            .set_controller_session_waker(
+                self.zone.clone(),
+                Arc::new(move || {
+                    let coordinator = wake_coordinator
+                        .upgrade()
+                        .ok_or_else(|| "controller-session-coordinator-dropped".to_owned())?;
+                    let providers = wake_providers
+                        .upgrade()
+                        .ok_or_else(|| "process-providers-dropped".to_owned())?;
+                    schedule_controller_session_reconcile(
+                        Arc::clone(&wake_task_slot),
+                        Arc::clone(&wake),
+                        Arc::clone(&wake_shutdown),
+                        coordinator,
+                        providers,
+                    )
+                    .map_err(|error| format!("{error:?}"))
+                }),
+            )
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
         *self
             .controller_session_providers
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
             Some(Arc::clone(&providers));
-        let coordinator = self.controller_session_coordinator();
         coordinator
             .reconcile_controller_sessions(Arc::clone(&providers), false)
             .await?;
@@ -24139,6 +24165,66 @@ mod tests {
         shutdown.store(true, Ordering::Release);
         drop(coordinator);
         runtime.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn readable_pending_controller_bootstrap_wakes_coordinator_to_active() {
+        let zone = ZoneId::parse("work").unwrap();
+        let providers = test_controller_session_providers();
+        let process_ref = ResourceRef::parse("Process/provider-controller").unwrap();
+        let provider_owner_ref =
+            ResourceRef::parse("Provider/runtime-cloud-hypervisor").unwrap();
+        let process_provider_ref = ResourceRef::parse("Provider/system-minijail").unwrap();
+        let (daemon_endpoint, peer_endpoint) = prearmed_seqpacket_pair().unwrap();
+        nix::sys::socket::send(
+            peer_endpoint.as_raw_fd(),
+            b"bootstrap-ready",
+            nix::sys::socket::MsgFlags::empty(),
+        )
+        .unwrap();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let callback_providers = Arc::downgrade(&providers);
+        let callback_zone = zone.clone();
+        let callback_process_ref = process_ref.clone();
+        let callback_wake_count = Arc::clone(&wake_count);
+        providers
+            .set_controller_session_waker(
+                zone.clone(),
+                Arc::new(move || {
+                    let providers = callback_providers
+                        .upgrade()
+                        .expect("providers remain while the wake is delivered");
+                    assert!(providers
+                        .controller_bootstrap_ready(&callback_zone, &callback_process_ref));
+                    let endpoint = providers
+                        .begin_controller_bootstrap(&callback_zone, &callback_process_ref)
+                        .expect("readable Pending endpoint must be claimed");
+                    let context = endpoint.context().clone();
+                    assert!(providers.activate_controller_bootstrap(&context));
+                    callback_wake_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        providers
+            .attach_pending_controller_provider_context_for_test(
+                daemon_endpoint,
+                zone.clone(),
+                process_ref.clone(),
+                ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+                ResourceGeneration::new(1).unwrap(),
+                process_provider_ref,
+                provider_owner_ref,
+                ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap(),
+                ResourceGeneration::new(1).unwrap(),
+                ResourceRef::parse("Host/host-system").unwrap(),
+                ControllerGeneration::new(1).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        assert_eq!(providers.controller_bootstrap_refs(&zone), vec![process_ref.clone()]);
+        assert!(!providers.controller_bootstrap_ready(&zone, &process_ref));
     }
 
     #[tokio::test(flavor = "current_thread")]
