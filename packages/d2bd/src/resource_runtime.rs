@@ -15775,7 +15775,6 @@ impl ControllerSessionCoordinator {
             .runtime_metadata()
             .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let current_revision = store_metadata.current_revision;
         let current_controller_generation = store_metadata.policy_snapshot.controller_generation;
         let provider_refs = contexts
             .iter()
@@ -15785,7 +15784,6 @@ impl ControllerSessionCoordinator {
             match load_committed_controller_provider_identities(
                 &self.zone,
                 &self.store,
-                current_revision,
                 BTreeSet::from([provider_ref.clone()]),
             )
             .await
@@ -15888,7 +15886,6 @@ impl ControllerSessionCoordinator {
             match load_committed_controller_provider_identities(
                 &self.zone,
                 &self.store,
-                store_metadata.current_revision,
                 BTreeSet::from([provider_ref.clone()]),
             )
             .await
@@ -16237,7 +16234,6 @@ impl ControllerSessionCoordinator {
         let identities = load_committed_controller_provider_identities(
             &self.zone,
             &self.store,
-            metadata.current_revision,
             BTreeSet::from([context.provider_owner_ref().clone()]),
         )
         .await?;
@@ -17236,7 +17232,6 @@ impl ZoneResourceRuntime {
             let controller_provider_identities = load_committed_controller_provider_identities(
                 &self.zone,
                 &self.store,
-                store_metadata.current_revision,
                 controller_provider_refs(&resources),
             )
             .await
@@ -19223,15 +19218,59 @@ async fn committed_resource(
 async fn load_committed_controller_provider_identities(
     zone: &ZoneId,
     store: &RedbResourceStore,
-    current_revision: ZoneRevision,
     provider_refs: BTreeSet<ResourceRef>,
 ) -> Result<BTreeMap<ResourceRef, (ResourceUid, ResourceGeneration)>, ResourceRuntimeError> {
+    if provider_refs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let provider_type = ResourceTypeName::parse("Provider")
+        .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
+    let resource_names = provider_refs
+        .iter()
+        .map(|provider_ref| {
+            if provider_ref.resource_type() != &provider_type {
+                return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
+            }
+            Ok(provider_ref.name().clone())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let page_size = u32::try_from(provider_refs.len())
+        .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
+    let snapshot = store
+        .list(StoreListRequest {
+            operation: StoreOperationContext {
+                operation_id: "controller-provider-identity-snapshot".to_owned(),
+                idempotency_key: None,
+                correlation_id: "controller-provider-identity-snapshot".to_owned(),
+                trace_id: None,
+                deadline_ms: 10_000,
+            },
+            zone: zone.clone(),
+            resource_types: vec![provider_type],
+            resource_names,
+            filters: Vec::new(),
+            page_size,
+            cursor: None,
+            projection: StoreProjection::Full,
+        })
+        .await
+        .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
+    if snapshot.truncated || snapshot.next_cursor.is_some() {
+        return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
+    }
+
     let mut identities = BTreeMap::new();
-    for provider_ref in provider_refs {
-        let resource = committed_resource(zone, store, current_revision, &provider_ref).await?;
+    for resource in snapshot.resources {
+        let provider_ref = resource.resource_ref.clone();
+        if !provider_refs.contains(&provider_ref) || identities.contains_key(&provider_ref) {
+            return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
+        }
         let (_, uid, generation, _, _) =
-            committed_provider_spec(zone, current_revision, &resource, &provider_ref)?;
+            committed_provider_spec(zone, snapshot.snapshot_revision, &resource, &provider_ref)?;
         identities.insert(provider_ref, (uid, generation));
+    }
+    if identities.len() != provider_refs.len() {
+        return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
     }
     Ok(identities)
 }
@@ -19247,16 +19286,9 @@ impl ProcessProviderIdentityLoader for CommittedProcessProviderIdentityLoader {
         &self,
         provider_ref: &ResourceRef,
     ) -> Result<(ResourceUid, ResourceGeneration), ProcessResourceRuntimeError> {
-        let current_revision = self
-            .store
-            .runtime_metadata()
-            .await
-            .map_err(|_| ProcessResourceRuntimeError::ProviderIdentityUnavailable)?
-            .current_revision;
         let mut identities = load_committed_controller_provider_identities(
             &self.zone,
             &self.store,
-            current_revision,
             BTreeSet::from([provider_ref.clone()]),
         )
         .await
@@ -25498,12 +25530,10 @@ mod tests {
         .into_iter()
         .map(|provider| ResourceRef::parse(provider).unwrap())
         .collect::<BTreeSet<_>>();
-        let revision = runtime.store.runtime_metadata().await.unwrap().current_revision;
         assert!(
             load_committed_controller_provider_identities(
                 &runtime.zone,
                 &runtime.store,
-                revision,
                 provider_refs.clone(),
             )
             .await
@@ -25512,11 +25542,9 @@ mod tests {
         );
 
         materialize_test_bundle(&runtime, Vec::new()).await;
-
         let identities = load_committed_controller_provider_identities(
             &runtime.zone,
             &runtime.store,
-            runtime.store.runtime_metadata().await.unwrap().current_revision,
             provider_refs,
         )
         .await
@@ -25581,6 +25609,56 @@ mod tests {
         );
         assert_eq!(fence.epoch, authority.epoch);
         drop(resolver);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn controller_provider_identity_projection_uses_one_current_store_snapshot() {
+        let (_directory, runtime, broker_evidence) = open_production_guest_runtime_for_test().await;
+        let provider_ref = ResourceRef::parse("Provider/system-minijail").unwrap();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Provider",
+                "system-minijail",
+                &runtime.zone,
+                r#"{"artifactId":"system-minijail","config":{}}"#,
+            )],
+        )
+        .await;
+        let stale_revision = runtime.store.runtime_metadata().await.unwrap().current_revision;
+
+        mark_test_resource_phase(&runtime, &provider_ref, &broker_evidence, "Ready").await;
+        let current = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "provider-identity-current-row".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "provider-identity-current-row".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: runtime.zone.clone(),
+                target: provider_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        assert!(current.revision > stale_revision);
+
+        let identities = load_committed_controller_provider_identities(
+            &runtime.zone,
+            &runtime.store,
+            BTreeSet::from([provider_ref.clone()]),
+        )
+        .await
+        .expect("current Provider status revision must not invalidate its identity");
+        assert_eq!(
+            identities.get(&provider_ref),
+            Some(&(current.uid.clone(), current.generation))
+        );
         runtime.shutdown().await.unwrap();
     }
 

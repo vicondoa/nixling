@@ -9,3 +9,5 @@
   Resource reads.
 - Refreshed missing Process Provider identities from the authoritative Zone
   store before launching late-created VMM and virtiofsd workers.
+- Read controller Provider identities and their revision from one atomic Zone
+  store snapshot so concurrent status commits do not abort startup admission.
