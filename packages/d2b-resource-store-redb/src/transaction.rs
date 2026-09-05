@@ -2529,6 +2529,7 @@ fn replayed_operation_failure(operation: &OperationRecord) -> StoreError {
             Some("resource-already-exists") => StoreErrorKind::ResourceAlreadyExists,
             Some("resource-conflict")
             | Some("operation-id-reused")
+            | Some("assignment-required")
             | Some("assignment-owner-missing")
             | Some("owner-child-binding-mismatch")
             | Some("same-batch-create-followup-unsupported")
@@ -2573,7 +2574,10 @@ fn replayed_operation_failure(operation: &OperationRecord) -> StoreError {
         StoreErrorKind::ExpeditedQuotaExceeded => "expedited-quota-exceeded",
         _ => "operation-replayed-error",
     };
-    let retry_class = if kind == StoreErrorKind::AuthorizationDenied {
+    let retry_class = if matches!(
+        kind,
+        StoreErrorKind::AuthorizationDenied | StoreErrorKind::ResourceConflict
+    ) {
         RetryClass::Reauthorize
     } else {
         RetryClass::Never
@@ -6079,6 +6083,86 @@ mod tests {
             second.results[0].as_ref().unwrap_err().kind(),
             StoreErrorKind::AuthorizationDenied
         );
+    }
+
+    #[test]
+    fn assignment_required_failure_replay_remains_a_retryable_conflict() {
+        let (_directory, database, _identity) = fixture();
+        let target = ResourceRef::parse("Host/host-system").unwrap();
+        let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let seeded = apply_group(
+            &database,
+            vec![verified(
+                "assignment-required-seed",
+                create_mutation(target.clone()),
+                uid.clone(),
+            )],
+        )
+        .unwrap();
+        let uid = seeded.results[0].as_ref().unwrap().resources[0].uid.clone();
+
+        let mut assigned_finalizers = create_mutation(target.clone());
+        assigned_finalizers.kind = ResourceMutationKind::UpdateFinalizers;
+        assigned_finalizers.expected = ExpectedRevision::Exact(ZoneRevision::new(1));
+        assigned_finalizers.expected_uid = Some(uid.clone());
+        assigned_finalizers.canonical_resource = None;
+        assigned_finalizers.add_finalizers =
+            vec![FinalizerId::parse("core.controller-test").unwrap()];
+        assigned_finalizers.assignment = Some(primary_fence(
+            uid.clone(),
+            ZoneRevision::new(1),
+            target.clone(),
+        ));
+        let assigned = apply_group(
+            &database,
+            vec![verified(
+                "assignment-required-install",
+                assigned_finalizers,
+                uid.clone(),
+            )],
+        )
+        .unwrap();
+        assert!(
+            assigned.results[0].is_ok(),
+            "assignment install failed: {:?}",
+            assigned.results[0]
+        );
+
+        let mut unassigned_status = create_mutation(target.clone());
+        unassigned_status.kind = ResourceMutationKind::UpdateStatus;
+        unassigned_status.expected = ExpectedRevision::Exact(ZoneRevision::new(2));
+        unassigned_status.expected_uid = Some(uid.clone());
+        let first = apply_group(
+            &database,
+            vec![verified(
+                "assignment-required-replay",
+                unassigned_status.clone(),
+                uid.clone(),
+            )],
+        )
+        .unwrap();
+        let first_error = first.results[0].as_ref().unwrap_err();
+        assert_eq!(first_error.kind(), StoreErrorKind::ResourceConflict);
+        assert_eq!(first_error.reason_code(), "assignment-required");
+        assert_eq!(first_error.retry_class(), RetryClass::Reauthorize);
+
+        let second = apply_group(
+            &database,
+            vec![verified(
+                "assignment-required-replay",
+                unassigned_status,
+                uid,
+            )],
+        )
+        .unwrap();
+        let replayed_error = second.results[0].as_ref().unwrap_err();
+        assert_eq!(replayed_error.kind(), StoreErrorKind::ResourceConflict);
+        assert_eq!(replayed_error.reason_code(), "resource-conflict");
+        assert_eq!(
+            replayed_error.current_revision(),
+            Some(ZoneRevision::new(2))
+        );
+        assert_eq!(replayed_error.retry_class(), RetryClass::Reauthorize);
     }
 
     #[test]

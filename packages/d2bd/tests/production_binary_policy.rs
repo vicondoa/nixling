@@ -101,3 +101,31 @@ fn production_binary_contains_no_peer_override_surface() {
         );
     }
 }
+
+#[test]
+fn cloud_hypervisor_guest_does_not_publish_volume_readiness() {
+    let guest_runtime = read_required_d2bd_source("src/resource_runtime.rs");
+    assert!(
+        !guest_runtime.contains("cloud-hypervisor-setup-volume-ready"),
+        "Cloud Hypervisor Guest setup must not publish Volume Ready"
+    );
+    let setup_volume_runtime = guest_runtime
+        .split_once("async fn reconcile_cloud_hypervisor_setup_volume(")
+        .and_then(|(_, remainder)| {
+            remainder.split_once("async fn ensure_cloud_hypervisor_controller_deployment(")
+        })
+        .map(|(body, _)| body)
+        .expect("Cloud Hypervisor setup Volume reconciler must remain present");
+    assert!(
+        !setup_volume_runtime.contains("persist_public_reconcile_status"),
+        "Cloud Hypervisor Guest setup must not mutate Volume status"
+    );
+
+    let volume_runtime = read_required_d2bd_source("src/resource_runtime/volume_provider_runtime.rs");
+    assert_eq!(
+        volume_runtime.matches("resource_type: \"Volume\"").count(),
+        1,
+        "volume-local must remain the sole Volume Runner owner"
+    );
+    assert!(volume_runtime.contains("provider_ref: VOLUME_LOCAL_PROVIDER_REF"));
+}

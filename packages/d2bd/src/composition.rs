@@ -7982,11 +7982,12 @@ fn dispatch_wave6_resource_reconcile(
         "Network" => {
             let resolver = load_bundle_resolver(state)
                 .map_err(|_| resource_runtime::ResourceRuntimeError::ProviderPathUnavailable)?;
-            block_on_future(runtime.persist_public_reconcile_phase(
+            block_on_future(runtime.persist_public_reconcile_status(
                 &resource_ref,
                 &uid,
                 operation_id,
                 "Pending",
+                None,
             ))?;
             ready = reconcile_wave6_network_effect(Wave6NetworkEffectRequest {
                 state,

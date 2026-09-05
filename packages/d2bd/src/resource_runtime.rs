@@ -151,7 +151,7 @@ use d2b_provider_system_core::{
 use d2b_resource_api::{
     RedbBackend, ResourceApiClient, ResourceBusAdapter, ResourceService, ResourceStoreBackend,
     authz::{AuthorizationState, BoundSubject, NativeAuthorizer, PolicySet},
-    registered::AssignmentFenceResolver,
+    registered::{AssignmentFenceResolver, RedbRegisteredControllerApi},
     service::UnavailableUpgradeDispatcher,
 };
 use d2b_resource_store::{
@@ -8941,8 +8941,7 @@ struct ControllerSessionCoordinator {
     zone: ZoneId,
     bundle_resource_types: Vec<ResourceTypeName>,
     store: Arc<RedbResourceStore>,
-    process_status_client:
-        Arc<Mutex<Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>>>>,
+    assigned_process_api: Arc<Mutex<Option<Arc<RedbRegisteredControllerApi>>>>,
     api: Arc<ResourceService<RedbBackend>>,
     authorizer: Arc<NativeAuthorizer>,
     authorization_state: Arc<Mutex<Option<AuthorizationState>>>,
@@ -12642,6 +12641,33 @@ impl ZoneResourceRuntime {
             .ok_or(ResourceRuntimeError::AuthenticationUnavailable)
     }
 
+    fn process_controller_api(
+        &self,
+        mode: DaemonMode,
+        authority: Arc<CoreAssignmentAuthority>,
+        authorization_state: AuthorizationState,
+    ) -> Result<RedbRegisteredControllerApi, ResourceRuntimeError> {
+        let subject_context = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let subject = self
+            .authorizer
+            .issue_authenticated_subject(subject_context, authorization_state.clone())
+            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+        Ok(self
+            .api
+            .registered_controller_api(subject, authorization_state, Vec::new())
+            .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?
+            .with_assignment_fence_resolver(process_assignment_fence_resolver(
+                Arc::clone(&self.store),
+                mode,
+                authority,
+            )))
+    }
+
     async fn core_assignment_fences(
         &self,
         rotate_epoch: bool,
@@ -14484,19 +14510,6 @@ impl ZoneResourceRuntime {
             .unwrap_or_default()
     }
 
-    /// Persist a provider reconcile phase through the authenticated Resource
-    /// API so restart admission can rely on durable observed generation.
-    pub(crate) async fn persist_public_reconcile_phase(
-        &self,
-        resource_ref: &ResourceRef,
-        resource_uid: &ResourceUid,
-        operation_id: &str,
-        phase: &str,
-    ) -> Result<(), ResourceRuntimeError> {
-        self.persist_public_reconcile_status(resource_ref, resource_uid, operation_id, phase, None)
-            .await
-    }
-
     /// Persist a provider phase together with its typed durable projection.
     ///
     /// Provider readiness must be observed from this committed projection on
@@ -15389,19 +15402,7 @@ impl ZoneResourceRuntime {
                 return Err(ResourceRuntimeError::CapabilityUnavailable);
             }
         }
-        let operation_id = format!(
-            "cloud-hypervisor-setup-volume-ready-{}-{}",
-            volume.uid.as_str(),
-            volume.revision.get(),
-        );
-        self.persist_public_reconcile_phase(&volume_ref, &volume.uid, &operation_id, "Ready")
-            .await
-            .inspect_err(|error| {
-                tracing::warn!(
-                    error = ?error,
-                    "Cloud Hypervisor setup Volume status commit failed",
-                );
-            })
+        Ok(())
     }
 
     async fn ensure_cloud_hypervisor_controller_deployment(
@@ -15961,7 +15962,7 @@ impl ZoneResourceRuntime {
             zone: self.zone.clone(),
             bundle_resource_types: self.bundle_resource_types.clone(),
             store: Arc::clone(&self.store),
-            process_status_client: Arc::clone(&self.process_status_client),
+            assigned_process_api: Arc::new(Mutex::new(None)),
             api: Arc::clone(&self.api),
             authorizer: Arc::clone(&self.authorizer),
             authorization_state: self.authorization_state.clone(),
@@ -16037,6 +16038,17 @@ fn schedule_controller_session_reconcile(
 }
 
 impl ControllerSessionCoordinator {
+    fn set_assigned_process_api(
+        &self,
+        api: Arc<RedbRegisteredControllerApi>,
+    ) -> Result<(), ResourceRuntimeError> {
+        *self
+            .assigned_process_api
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = Some(api);
+        Ok(())
+    }
+
     #[cfg(test)]
     fn set_controller_session_admission_test_seam(
         &self,
@@ -16202,14 +16214,14 @@ impl ControllerSessionCoordinator {
                 "registrationReady": true,
             })
         });
-        let status_client = self
-            .process_status_client
+        let api = self
+            .assigned_process_api
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .clone()
             .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
         persist_resource_controller_session_evidence(
-            &status_client,
+            &api,
             &process,
             controller_session.as_ref(),
         )
@@ -18040,6 +18052,24 @@ impl ZoneResourceRuntime {
         let wake_shutdown = Arc::clone(&self.controller_session_reconcile_shutdown);
         let wake_coordinator = Arc::downgrade(&coordinator);
         let wake_providers = Arc::downgrade(&providers);
+        *self
+            .controller_session_providers
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
+            Some(Arc::clone(&providers));
+        let core_authority = self.core_assignment_fences(false).await?.4;
+        let authorization_state = self
+            .authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let process_api = Arc::new(self.process_controller_api(
+            providers.mode(),
+            Arc::clone(&core_authority),
+            authorization_state.clone(),
+        )?);
+        coordinator.set_assigned_process_api(Arc::clone(&process_api))?;
         providers
             .set_controller_session_waker(
                 self.zone.clone(),
@@ -18061,11 +18091,6 @@ impl ZoneResourceRuntime {
                 }),
             )
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
-        *self
-            .controller_session_providers
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
-            Some(Arc::clone(&providers));
         coordinator
             .reconcile_controller_sessions(Arc::clone(&providers), false)
             .await?;
@@ -18081,7 +18106,6 @@ impl ZoneResourceRuntime {
             .runtime_metadata()
             .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let core_authority = self.core_assignment_fences(false).await?.4;
         let controller_generation = core_authority.controller_generation;
         let stale_task = {
             let mut task = self
@@ -18117,18 +18141,6 @@ impl ZoneResourceRuntime {
             .as_ref()
             .is_some_and(|task| !task.is_finished());
         if !runner_exists {
-            let subject_context = self
-                .core_controller_subject
-                .lock()
-                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-                .clone()
-                .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
-            let authorization_state = self
-                .authorization_state
-                .lock()
-                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-                .clone()
-                .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
             let controller_ref = ResourceRef::parse(CORE_CONTROLLER_PROCESS_REF)
                 .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
             let provider_ref = ResourceRef::parse(CORE_CONTROLLER_PROVIDER_REF)
@@ -18148,19 +18160,11 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
             let descriptor = process_controller_descriptor(identity)
                 .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-            let subject = self
-                .authorizer
-                .issue_authenticated_subject(subject_context, authorization_state.clone())
-                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
-            let api = self
-                .api
-                .registered_controller_api(subject, authorization_state.clone(), Vec::new())
-                .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?
-                .with_assignment_fence_resolver(process_assignment_fence_resolver(
-                    Arc::clone(&self.store),
-                    providers.mode(),
-                    core_authority,
-                ));
+            let api = self.process_controller_api(
+                providers.mode(),
+                Arc::clone(&core_authority),
+                authorization_state.clone(),
+            )?;
             let watch_task_slot = Arc::clone(&self.controller_session_reconcile_task);
             let watch_wake = Arc::clone(&self.controller_session_reconcile_wake);
             let watch_shutdown = Arc::clone(&self.controller_session_reconcile_shutdown);
@@ -25378,6 +25382,20 @@ mod tests {
             .expect("test policy has a controller generation");
         let providers = test_controller_session_providers();
         let coordinator = runtime.controller_session_coordinator();
+        let authority = runtime.core_assignment_fences(false).await.unwrap().4;
+        let authorization_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        coordinator
+            .set_assigned_process_api(Arc::new(
+                runtime
+                    .process_controller_api(DaemonMode::Host, authority, authorization_state)
+                    .unwrap(),
+            ))
+            .unwrap();
         let wake = Arc::clone(&runtime.controller_session_reconcile_wake);
         let wake_for_waker = Arc::clone(&wake);
         let shutdown = Arc::clone(&runtime.controller_session_reconcile_shutdown);
@@ -26449,6 +26467,20 @@ mod tests {
             .find(|context| context.process_ref() == &sibling_process_ref)
             .expect("eligible sibling controller context");
         let mut coordinator = runtime.build_controller_session_coordinator().unwrap();
+        let authority = runtime.core_assignment_fences(false).await.unwrap().4;
+        let authorization_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        coordinator
+            .set_assigned_process_api(Arc::new(
+                runtime
+                    .process_controller_api(DaemonMode::Host, authority, authorization_state)
+                    .unwrap(),
+            ))
+            .unwrap();
         insert_test_controller_session(&mut coordinator, &first_context).await;
         providers.fail_controller_bootstrap(&first_context);
         coordinator.set_controller_session_evidence_test_errors(vec![
@@ -26608,14 +26640,23 @@ mod tests {
         );
 
         let mut coordinator = runtime.build_controller_session_coordinator().unwrap();
-        let process_status_client = coordinator
-            .process_status_client
+        let authority = runtime.core_assignment_fences(false).await.unwrap().4;
+        let authorization_state = runtime
+            .authorization_state
             .lock()
-            .expect("test process status client lock")
+            .unwrap()
             .clone()
-            .expect("test process status client");
+            .unwrap();
+        let assigned_process_api = Arc::new(
+            runtime
+                .process_controller_api(DaemonMode::Host, authority, authorization_state)
+                .unwrap(),
+        );
+        coordinator
+            .set_assigned_process_api(Arc::clone(&assigned_process_api))
+            .unwrap();
         persist_resource_controller_session_evidence(
-            &process_status_client,
+            &assigned_process_api,
             &legacy_process,
             Some(&json!({ "ready": true })),
         )
@@ -26642,9 +26683,9 @@ mod tests {
             .await
             .expect("seed durable controller-session evidence");
         *coordinator
-            .process_status_client
+            .assigned_process_api
             .lock()
-            .expect("test process status client lock") = None;
+            .unwrap() = None;
         let policy = controller_resource_endpoint_policy();
         let catalog = d2b_resource_api::authz::ApiCatalog::standard();
         let role_ref = ResourceRef::parse("Role/test-controller").unwrap();
@@ -26825,7 +26866,7 @@ mod tests {
                     .contains_key(&process_ref),
                 "failed durable clear must retain the already-torn-down session for retry"
         );
-        *coordinator.process_status_client.lock().unwrap() = Some(process_status_client);
+        *coordinator.assigned_process_api.lock().unwrap() = Some(assigned_process_api);
         assert_eq!(
                 coordinator
                     .remove_controller_session(&process_ref, Some(&context))

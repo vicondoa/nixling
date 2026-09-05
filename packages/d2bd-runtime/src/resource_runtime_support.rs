@@ -49,6 +49,7 @@ use d2b_core_controller::{
         CoreProcess, RecoverySnapshot, RuntimeReadiness as CoreRuntimeReadiness, StartupError,
         StartupStage,
     },
+    SourceError,
     zone_status::ZoneRuntimeMetadata,
 };
 
@@ -112,6 +113,7 @@ use d2b_resource_api::{
         CompiledRoleBinding, NativeAuthorizer, PolicyRule, PolicySet, RelayGrantAuthority,
         ResourceVerb, SessionVerb,
     },
+    registered::RedbRegisteredControllerApi,
     service::UnavailableUpgradeDispatcher,
 };
 use d2b_resource_store::{
@@ -2631,20 +2633,29 @@ pub async fn persist_resource_status_with_projection(
 /// Controller-session transport must not advance the owning Process status
 /// generation or phase; the Process controller owns those fields.
 pub async fn persist_resource_controller_session_evidence(
-    client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
+    api: &RedbRegisteredControllerApi,
     resource: &StoredResource,
     controller_session: Option<&serde_json::Value>,
 ) -> Result<(), ResourceRuntimeError> {
     let Some(value) = resource_controller_session_candidate(resource, controller_session)? else {
         return Ok(());
     };
-    persist_resource_status_candidate(
-        client,
-        resource,
-        value,
-        "controller-session-evidence",
-    )
-    .await
+    let operation = resource_status_operation_id(resource, "controller-session-evidence");
+    api.persist_assigned_status(resource, value.to_canonical_bytes(), &operation)
+        .await
+        .map_err(assigned_status_source_error)
+}
+
+fn assigned_status_source_error(error: SourceError) -> ResourceRuntimeError {
+    let kind = match error {
+        SourceError::Conflict(_) => ResourceErrorKind::ResourceConflict,
+        SourceError::Backpressure => ResourceErrorKind::Backpressure,
+        SourceError::Timeout => ResourceErrorKind::Timeout,
+        SourceError::Cancelled => ResourceErrorKind::Cancelled,
+        SourceError::Unavailable => ResourceErrorKind::ResourcePlaneUnavailable,
+        SourceError::Integrity => ResourceErrorKind::InternalIntegrityFailure,
+    };
+    ResourceRuntimeError::ResourceStatusUpdateFailed(kind)
 }
 
 fn resource_controller_session_candidate(

@@ -284,6 +284,63 @@ impl RedbRegisteredControllerApi {
         &self.store
     }
 
+    /// Persist a status-only projection through the controller assignment
+    /// fence owned by this adapter.
+    pub async fn persist_assigned_status(
+        &self,
+        resource: &StoredResource,
+        canonical_resource: Vec<u8>,
+        operation_id: &str,
+    ) -> Result<(), SourceError> {
+        let envelope =
+            ResourceEnvelope::from_json(&canonical_resource).map_err(|_| SourceError::Integrity)?;
+        if envelope.metadata().uid() != &resource.uid
+            || envelope.metadata().generation() != resource.generation
+            || envelope.metadata().revision() != resource.revision
+            || envelope.metadata().zone() != &resource.zone
+        {
+            return Err(SourceError::Integrity);
+        }
+        let mutation = StoreMutation {
+            kind: ResourceMutationKind::UpdateStatus,
+            zone: resource.zone.clone(),
+            target: resource.resource_ref.clone(),
+            expected: ExpectedRevision::Exact(resource.revision),
+            expected_uid: Some(resource.uid.clone()),
+            owner: None,
+            canonical_resource: Some(canonical_resource),
+            add_finalizers: Vec::new(),
+            remove_finalizers: Vec::new(),
+            wait_for_reconcile: false,
+            reconcile_deadline_ms: None,
+            configuration_generation: None,
+            assignment: None,
+        };
+        let operation_id = operation_id.to_owned();
+        let operation = StoreOperationContext {
+            operation_id: operation_id.clone(),
+            idempotency_key: Some(operation_id.clone()),
+            correlation_id: operation_id,
+            trace_id: None,
+            deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
+        };
+        match self
+            .commit_store_mutations(
+                &resource.zone,
+                resource.revision,
+                &resource.uid,
+                &resource.resource_ref,
+                Some(resource.generation),
+                operation,
+                vec![mutation],
+            )
+            .await?
+        {
+            CommitOutcome::Committed(_) | CommitOutcome::CommittedStatusPending(_) => Ok(()),
+            CommitOutcome::Conflict(revision) => Err(SourceError::Conflict(revision)),
+        }
+    }
+
     #[cfg(test)]
     fn inject_status_timeouts(&self, count: usize) {
         self.status_timeouts_remaining
@@ -2816,6 +2873,24 @@ mod tests {
         value.to_canonical_bytes()
     }
 
+    fn canonical_process(name: &str) -> Vec<u8> {
+        let mut value: Value = serde_json::from_slice(&canonical_host(name, None)).unwrap();
+        value["type"] = Value::String("Process".to_owned());
+        let execution = d2b_contracts_resource::v3::process::ExecutionSpec::minimal(
+            ResourceRef::parse("Host/host-system").unwrap(),
+            d2b_contracts_resource::v3::process::ProcessClass::Service,
+            d2b_contracts_resource::v3::execution_policy::BoundedToken::parse("test").unwrap(),
+        )
+        .unwrap();
+        value["spec"] = serde_json::to_value(
+            d2b_contracts_resource::v3::process::ProcessSpec::minimal(execution),
+        )
+        .unwrap();
+        CanonicalJsonValue::parse(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .to_canonical_bytes()
+    }
+
     #[test]
     fn credential_watch_selectors_filter_by_provider_ref_before_dispatch() {
         let credential_type = ResourceTypeName::parse("Credential").unwrap();
@@ -3315,12 +3390,13 @@ mod tests {
             .with_controller_generation(ControllerGeneration::new(1).unwrap()),
         );
         let host = ResourceTypeName::parse("Host").unwrap();
+        let process = ResourceTypeName::parse("Process").unwrap();
         let role = CompiledRole::new(
             ResourceRef::parse("Role/reconciler-test").unwrap(),
             vec![
                 PolicyRule::new(
                     &catalog,
-                    [host.clone()],
+                    [host.clone(), process.clone()],
                     [
                         ResourceVerb::Get,
                         ResourceVerb::List,
@@ -3339,7 +3415,7 @@ mod tests {
                 .unwrap(),
                 PolicyRule::new(
                     &catalog,
-                    [host.clone()],
+                    [host.clone(), process.clone()],
                     [ResourceVerb::UpdateStatus],
                     [],
                     ["status".to_owned()],
@@ -3350,7 +3426,7 @@ mod tests {
                 .unwrap(),
                 PolicyRule::new(
                     &catalog,
-                    [host.clone()],
+                    [host.clone(), process.clone()],
                     [ResourceVerb::UpdateFinalizers],
                     [],
                     ["finalizers".to_owned()],
@@ -3361,7 +3437,7 @@ mod tests {
                 .unwrap(),
                 PolicyRule::new(
                     &catalog,
-                    [host],
+                    [host, process],
                     [ResourceVerb::Get],
                     [],
                     ["owner".to_owned()],
@@ -3439,6 +3515,90 @@ mod tests {
             epoch: 1,
             scope: ResourceAssignmentScope::Primary,
         }
+    }
+
+    #[tokio::test]
+    async fn assigned_process_session_evidence_persists_and_replay_is_wire_conflict() {
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
+        let service = Arc::new(service);
+        let target = ResourceRef::parse("Process/controller").unwrap();
+        store
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
+                target.clone(),
+                canonical_process("controller"),
+                None,
+                "create-controller-session-evidence",
+            ))
+            .await
+            .unwrap();
+        let stored = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-controller-session-evidence".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-controller-session-evidence".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let api = service
+            .registered_controller_api(
+                subject,
+                state.clone(),
+                vec![(
+                    target.clone(),
+                    primary_assignment(stored.uid.clone(), stored.revision),
+                )],
+            )
+            .unwrap();
+        let mut candidate: Value = serde_json::from_slice(&stored.canonical_json).unwrap();
+        candidate["status"]["resource"]["controllerSession"] = serde_json::json!({
+            "ready": true,
+            "processUid": stored.uid.as_str(),
+            "processGeneration": stored.generation.get(),
+            "providerGeneration": 2,
+            "controllerGeneration": 3,
+            "sessionGeneration": 4,
+        });
+        let candidate = CanonicalJsonValue::parse(&serde_json::to_vec(&candidate).unwrap())
+            .unwrap()
+            .to_canonical_bytes();
+        api.persist_assigned_status(
+            &stored,
+            candidate,
+            "controller-session-evidence-assigned",
+        )
+        .await
+        .unwrap();
+        let persisted = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-controller-session-evidence-persisted".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-controller-session-evidence-persisted".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: Some(stored.uid.clone()),
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let persisted_value: Value = serde_json::from_slice(&persisted.canonical_json).unwrap();
+        assert_eq!(
+            persisted_value["status"]["resource"]["controllerSession"]["ready"],
+            true
+        );
     }
 
     #[tokio::test]

@@ -100,6 +100,11 @@
 - Preserved stored Process owner UID and generation on status-only session
   evidence writes, and selected Core-owned dependencies by bounded ownerRef
   filters so stale same-name children remain visible for Core fencing.
+- Routed controller-session evidence through the assigned Process controller
+  status path with exact UID, generation, revision, and assignment fences, while
+  retaining a distinct evidence operation identity.
+- Classified replayed `assignment-required` failures as retryable resource
+  conflicts and kept their ResourceError wire representation valid.
 
 ### Removed
 
@@ -113,3 +118,5 @@
   stream/transport services outside the retired daemon reconciler paths.
 - Keep controller-effect ledger rows in their Resource API owner instead of
   treating them as Host-global authority claims during restart recovery.
+- Removed Cloud Hypervisor Guest's direct Volume Ready projection; StoreSync
+  remains an effect while `volume-local` stays the sole Volume owner.
