@@ -10421,6 +10421,7 @@ pub struct ZoneResourceRuntime {
     process_status_client:
         Mutex<Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>>>,
     core_controller_subject: Mutex<Option<AuthenticatedSubjectContext>>,
+    system_core_rebind_pending: AtomicBool,
     core_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     core_runner_lock: Arc<tokio::sync::Mutex<()>>,
     u12_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -11250,6 +11251,7 @@ impl ZoneResourceRuntime {
             service_task: Mutex::new(service_task),
             process_status_client: Mutex::new(process_status_client),
             core_controller_subject: Mutex::new(core_controller_subject),
+            system_core_rebind_pending: AtomicBool::new(false),
             core_runner_tasks: Mutex::new(Vec::new()),
             core_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
             u12_runner_tasks: Mutex::new(Vec::new()),
@@ -11951,6 +11953,7 @@ impl ZoneResourceRuntime {
             .policy_projection
             .installed_controller_subjects()?;
         if policy_loaded
+            && !self.system_core_rebind_pending.load(Ordering::Acquire)
             && current.as_ref().is_some_and(|state| {
                 state.snapshot == metadata.policy_snapshot
                     && state.zone_policy_revision == metadata.current_revision
@@ -11992,10 +11995,16 @@ impl ZoneResourceRuntime {
                 controller_subjects.iter().cloned(),
             )?;
         let rebind_core = self
-            .core_controller_subject
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-            .is_some();
+            .system_core_rebind_pending
+            .load(Ordering::Acquire)
+            || self
+                .core_controller_subject
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .is_some();
+        if rebind_core {
+            self.system_core_rebind_pending.store(true, Ordering::Release);
+        }
         let _runner_guard = if rebind_core {
             Some(self.core_runner_lock.lock().await)
         } else {
@@ -12039,6 +12048,7 @@ impl ZoneResourceRuntime {
             // The policy projection was installed atomically before the
             // session rebind. Keep that complete projection available while
             // the retryable session failure is surfaced to the caller.
+            self.system_core_rebind_pending.store(true, Ordering::Release);
             return Err(error);
         }
         *self
@@ -12087,6 +12097,8 @@ impl ZoneResourceRuntime {
                 self.start_u9_controller_runners_locked(state).await?;
             }
             self.start_u10_controller_runners_locked().await?;
+            self.system_core_rebind_pending
+                .store(false, Ordering::Release);
         }
         Ok(())
     }
@@ -12150,6 +12162,14 @@ impl ZoneResourceRuntime {
         &self,
         state: AuthorizationState,
     ) -> Result<(), ResourceRuntimeError> {
+        let existing_session = self
+            .system_core_rebind_pending
+            .load(Ordering::Acquire)
+            || self
+                .core_controller_subject
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .is_some();
         let session_state = (
             self.registrar
                 .lock()
@@ -12164,44 +12184,65 @@ impl ZoneResourceRuntime {
                 .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
                 .is_some(),
         );
-        if session_state == (false, false, false) {
+        if session_state == (false, false, false) && !existing_session {
             return Ok(());
         }
-        if session_state != (true, true, true) {
+        if !existing_session && session_state != (false, false, false) {
             return Err(ResourceRuntimeError::AuthenticationUnavailable);
         }
+        *self
+            .process_status_client
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = None;
         let mut registrar = self
             .registrar
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .take()
             .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
-        let mut ingress = self
+        let ingress = self
             .ingress
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-            .take()
-            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+            .take();
         let task = self
             .service_task
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-            .take()
-            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
-        registrar
-            .revoke_in_place(&mut ingress)
-            .await
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
-        task.abort();
-        let _ = task.await;
+            .take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(mut ingress) = ingress {
+            if registrar.revoke_in_place(&mut ingress).await.is_err() {
+                *self
+                    .registrar
+                    .lock()
+                    .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
+                    Some(registrar);
+                return Err(ResourceRuntimeError::AuthenticationUnavailable);
+            }
+        }
         let (new_ingress, new_task, status_client, subject_context) =
-            register_system_core_session(
+            match register_system_core_session(
                 &mut registrar,
                 Arc::clone(&self.api),
                 Arc::clone(&self.authorizer),
                 state,
             )
-            .await?;
+            .await
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    *self
+                        .registrar
+                        .lock()
+                        .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
+                        Some(registrar);
+                    return Err(error);
+                }
+            };
         *self
             .registrar
             .lock()
@@ -12461,6 +12502,9 @@ impl ZoneResourceRuntime {
     pub(crate) fn process_resource_client(
         &self,
     ) -> Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>> {
+        if self.system_core_rebind_pending.load(Ordering::Acquire) {
+            return None;
+        }
         self.process_status_client
             .lock()
             .ok()
@@ -23919,7 +23963,25 @@ mod tests {
         .await;
         mark_test_resource_ready(&runtime, &user_ref, &broker_evidence).await;
         runtime.refresh_authorization_policy().await.unwrap();
-        runtime.policy_projection.mark_unavailable();
+        {
+            let _runner_guard = runtime.core_runner_lock.lock().await;
+            runtime
+                .stop_core_controller_runners_locked()
+                .await
+                .unwrap();
+        }
+        let before_rebind_revision = runtime
+            .store
+            .runtime_metadata()
+            .await
+            .unwrap()
+            .current_revision;
+        let registrar = runtime
+            .registrar
+            .lock()
+            .unwrap()
+            .take()
+            .expect("system-core registrar");
         let service_task = runtime
             .service_task
             .lock()
@@ -23927,6 +23989,21 @@ mod tests {
             .take()
             .expect("system-core session task");
         service_task.abort();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Role",
+                "rebind-trigger",
+                &zone,
+                &serde_json::to_string(&role).unwrap(),
+            )],
+        )
+        .await;
+        assert!(
+            runtime.store.runtime_metadata().await.unwrap().current_revision
+                > before_rebind_revision,
+            "rebind trigger must advance the committed revision"
+        );
         assert_eq!(
             runtime.refresh_authorization_policy().await,
             Err(ResourceRuntimeError::AuthenticationUnavailable)
@@ -23934,6 +24011,13 @@ mod tests {
         assert!(
             runtime.policy_projection.installed_state().is_ok(),
             "a failed session rebind must preserve the complete installed policy"
+        );
+        let installed_after_failure = runtime.policy_projection.installed_state().unwrap();
+        let metadata_after_failure = runtime.store.runtime_metadata().await.unwrap();
+        assert_eq!(
+            installed_after_failure.zone_policy_revision,
+            metadata_after_failure.current_revision,
+            "the retryable failure must occur after the complete projection is installed"
         );
 
         let guard = runtime.controller_session_lock.lock().await;
@@ -23959,6 +24043,28 @@ mod tests {
         }
         drop(guard);
         let _ = service_task.await;
+        assert!(
+            runtime.core_runner_tasks.lock().unwrap().is_empty(),
+            "a failed system-core rebind must stop the old runner generation"
+        );
+        *runtime.registrar.lock().unwrap() = Some(registrar);
+        runtime
+            .refresh_authorization_policy()
+            .await
+            .expect("the next refresh must retry system-core rebind recovery");
+        assert!(
+            runtime.service_task.lock().unwrap().is_some(),
+            "recovery must re-enroll the fenced system-core session"
+        );
+        assert!(
+            runtime
+                .core_runner_tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|task| !task.is_finished()),
+            "successful rebind recovery must restore the core runners"
+        );
         runtime.shutdown().await.unwrap();
     }
 
@@ -24118,6 +24224,35 @@ mod tests {
             Err(ResourceRuntimeError::AuthenticationUnavailable)
         );
         assert!(runtime.service_task.lock().unwrap().is_some());
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn system_core_refresh_rejects_empty_existing_session_state() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let state = runtime.policy_projection.installed_state().unwrap();
+        let registrar = runtime
+            .registrar
+            .lock()
+            .unwrap()
+            .take()
+            .expect("system-core registrar");
+        *runtime.ingress.lock().unwrap() = None;
+        let service_task = runtime
+            .service_task
+            .lock()
+            .unwrap()
+            .take()
+            .expect("system-core session task");
+        service_task.abort();
+
+        assert_eq!(
+            runtime.refresh_system_core_session(state).await,
+            Err(ResourceRuntimeError::AuthenticationUnavailable)
+        );
+        *runtime.registrar.lock().unwrap() = Some(registrar);
+        let _ = service_task.await;
         runtime.shutdown().await.unwrap();
     }
 

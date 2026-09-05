@@ -20,3 +20,6 @@
 - Preserved the installed projection across retryable system-core rebind
   failures, bounded controller-session retries without self-notify hot loops,
   and fenced live sessions whose bootstrap context was replaced.
+- Kept rebind-pending state retryable across unchanged policy snapshots,
+  rejected empty or partial post-fence session slots, and restored the fenced
+  system-core and Provider runners after recovery.
