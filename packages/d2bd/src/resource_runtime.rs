@@ -14809,20 +14809,46 @@ impl ZoneResourceRuntime {
         }
         let target = ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
             .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-        let resource_refs = resources
-            .iter()
-            .map(|resource| resource.resource_ref.clone())
-            .collect::<Vec<_>>();
-        let durable_epoch = Self::durable_assignment_epoch(&resource_refs, |resource_ref| {
-            self.store
-                .assignment_fence(self.zone.clone(), resource_ref.clone())
-        })
-        .await?;
-        let epoch = self
-            .core_assignment_epoch
-            .load(Ordering::Acquire)
-            .max(durable_epoch)
-            .max(1);
+        let current_epoch = self.core_assignment_epoch.load(Ordering::Acquire);
+        let mut durable_epoch = 0;
+        let mut authority_mismatch = false;
+        for resource in &resources {
+            let Some(stored) = self
+                .store
+                .assignment_fence(self.zone.clone(), resource.resource_ref.clone())
+                .await
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?
+            else {
+                continue;
+            };
+            durable_epoch = durable_epoch.max(stored.epoch);
+            let comparison_epoch = current_epoch.max(1);
+            if stored.epoch >= comparison_epoch
+                && (stored.provider_generation != provider_generation
+                    || stored.controller_generation != controller_generation
+                    || stored.controller_role != controller_ref
+                    || stored.target != target
+                    || stored.session_generation != session_generation)
+            {
+                authority_mismatch = true;
+            }
+        }
+        let floor = current_epoch.max(durable_epoch).max(1);
+        let epoch = if authority_mismatch || durable_epoch > current_epoch {
+            let epoch = self
+                .assignments
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .reserve_epoch_after(floor)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            self.core_assignment_epoch.store(epoch, Ordering::Release);
+            epoch
+        } else if current_epoch == 0 {
+            1
+        } else {
+            current_epoch
+        };
+        self.core_assignment_epoch.store(epoch, Ordering::Release);
         let authority = Arc::new(CoreAssignmentAuthority {
             provider_generation,
             controller_generation,

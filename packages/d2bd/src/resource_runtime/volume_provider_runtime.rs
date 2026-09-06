@@ -1976,7 +1976,13 @@ pub(crate) async fn start(
         );
         tasks.push(tokio::spawn(async move {
             if let Err(error) = runner.run().await {
-                tracing::warn!(error = %error, "U7 shared Volume Runner stopped");
+                tracing::warn!(
+                    error = %error,
+                    failed_resource = ?error.failed_key()
+                        .map(|key| key.resource_ref().to_canonical_string()),
+                    failed_operation = ?error.failed_operation(),
+                    "U7 shared Volume Runner stopped",
+                );
             }
         }));
     }
