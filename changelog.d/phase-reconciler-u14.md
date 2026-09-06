@@ -148,8 +148,8 @@
   provider selector so sibling Providers cannot rotate one another's fences.
 - Added bounded Provider-effect diagnostics for failed Guest and Volume
   resource passes without weakening their retry or readiness behavior.
-- Provisioned the daemon-owned volume-local marker root through the storage
-  contract and host tmpfiles before Volume source resolution.
+- Provisioned the daemon-owned volume-local marker root through host tmpfiles
+  and resolved it from the daemon's authoritative state root.
 
 ### Removed
 

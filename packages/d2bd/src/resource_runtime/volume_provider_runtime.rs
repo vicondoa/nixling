@@ -1163,9 +1163,10 @@ impl DaemonVolumeRootResolver {
 
     fn marker_root(&self) -> Result<OwnedFd, d2b_provider_volume_local::VolumeLocalError> {
         let marker_root = self
-            .resolver
-            .find_storage_path_spec("path:volume-local-markers")
-            .map(|spec| PathBuf::from(spec.path_template.as_str()))
+            .state
+            .daemon_state_dir
+            .parent()
+            .map(|root| root.join("volume-local-markers"))
             .ok_or(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
         open_anchored_directory(&marker_root)
             .map_err(|_| d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)

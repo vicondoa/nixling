@@ -270,20 +270,6 @@ let
       invariants = [ "no-symlink" "root-owned-parent" "broker-opaque-id-only" "scope-authorization-required" ];
     })
     (mkPath {
-      id = "path:volume-local-markers";
-      scope = "host";
-      path = "${toString cfg.site.stateDir}/volume-local-markers";
-      owner = principal "user" "d2bd";
-      group = principal "group" "d2bd";
-      mode = "0700";
-      creator = actor "nix-module" "tmpfiles";
-      writers = [ (actor "daemon" "d2bd") ];
-      readers = [ (actor "daemon" "d2bd") ];
-      cleanupPolicy = "never";
-      repairPolicy = "nix-activation";
-      invariants = [ "no-symlink" "scope-authorization-required" ];
-    })
-    (mkPath {
       id = "path:validation-evidence-root";
       scope = "host";
       path = cfg.daemonExperimental.defaultFlipEvidenceDir;
