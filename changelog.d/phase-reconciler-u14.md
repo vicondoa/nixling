@@ -3,6 +3,9 @@
 - Replaced only finished Core runner identities during reconciliation, keeping
   healthy Core and Provider siblings live and ensuring every required runner
   identity is present before reporting success.
+- Preserved the last successful required Core runner identity set across failed
+  replacement setup, keeping readiness fail-closed until every required
+  identity has a live replacement.
 - Added bounded relist recovery coverage for transient source backpressure,
   including typed exhaustion and the existing watch-backpressure no-relist
   path.

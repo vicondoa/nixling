@@ -7516,7 +7516,7 @@ fn owned_child_intent(
 type SharedCoreControllerSource =
     CoreControllerSource<d2b_resource_api::registered::RedbRegisteredControllerApi>;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CoreRunnerIdentity {
     controller_ref: ResourceRef,
     resource_type: String,
@@ -7540,6 +7540,19 @@ impl CoreRunnerTask {
     fn is_finished(&self) -> bool {
         self.handle.is_finished()
     }
+}
+
+fn core_runner_tasks_are_ready(
+    tasks: &[CoreRunnerTask],
+    required_identities: &BTreeSet<CoreRunnerIdentity>,
+) -> bool {
+    !required_identities.is_empty()
+        && tasks.iter().all(|task| !task.is_finished())
+        && required_identities.iter().all(|required| {
+            tasks
+                .iter()
+                .any(|task| task.identity == *required && !task.is_finished())
+        })
 }
 
 enum PreparedCoreRunner {
@@ -10621,6 +10634,7 @@ pub struct ZoneResourceRuntime {
     core_controller_subject: Mutex<Option<AuthenticatedSubjectContext>>,
     system_core_rebind_pending: AtomicBool,
     core_runner_tasks: Mutex<Vec<CoreRunnerTask>>,
+    core_runner_required_identities: Mutex<BTreeSet<CoreRunnerIdentity>>,
     core_runner_lock: Arc<tokio::sync::Mutex<()>>,
     u12_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     u12_runner_lock: Arc<tokio::sync::Mutex<()>>,
@@ -11452,6 +11466,7 @@ impl ZoneResourceRuntime {
             core_controller_subject: Mutex::new(core_controller_subject),
             system_core_rebind_pending: AtomicBool::new(false),
             core_runner_tasks: Mutex::new(Vec::new()),
+            core_runner_required_identities: Mutex::new(BTreeSet::new()),
             core_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
             u12_runner_tasks: Mutex::new(Vec::new()),
             u12_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -13098,7 +13113,12 @@ impl ZoneResourceRuntime {
             .core_runner_tasks
             .lock()
             .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
-            .is_empty();
+            .is_empty()
+            || !self
+                .core_runner_required_identities
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
+                .is_empty();
         reap_finished_core_runner_tasks(&self.core_runner_tasks).await?;
         let subject_context = self
             .core_controller_subject
@@ -13428,8 +13448,8 @@ impl ZoneResourceRuntime {
         let mut required_identities = prepared
             .iter()
             .map(|runner| runner.identity().clone())
-            .collect::<Vec<_>>();
-        required_identities.push(system_core_runner_identity.clone());
+            .collect::<BTreeSet<_>>();
+        required_identities.insert(system_core_runner_identity.clone());
 
         reap_finished_core_runner_tasks(&self.core_runner_tasks).await?;
         let mut present_identities = self
@@ -13479,13 +13499,14 @@ impl ZoneResourceRuntime {
             .core_runner_tasks
             .lock()
             .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-        if required_identities.iter().any(|required| {
-            !tasks
-                .iter()
-                .any(|task| !task.is_finished() && &task.identity == required)
-        }) {
+        if !core_runner_tasks_are_ready(&tasks, &required_identities) {
             return Err(ResourceRuntimeError::HandlerNotReady);
         }
+        drop(tasks);
+        *self
+            .core_runner_required_identities
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)? = required_identities;
         Ok(())
     }
 
@@ -18713,12 +18734,16 @@ impl ZoneResourceRuntime {
         if !self.readiness.provider_path_ready {
             return Some(ResourceRuntimeError::ProviderPathUnavailable);
         }
-        if self
-            .core_runner_tasks
-            .try_lock()
-            .map(|tasks| tasks.is_empty() || tasks.iter().any(|task| task.is_finished()))
-            .unwrap_or(true)
-        {
+        let core_runners_ready = match (
+            self.core_runner_required_identities.try_lock(),
+            self.core_runner_tasks.try_lock(),
+        ) {
+            (Ok(required_identities), Ok(tasks)) => {
+                core_runner_tasks_are_ready(&tasks, &required_identities)
+            }
+            _ => false,
+        };
+        if !core_runners_ready {
             return Some(ResourceRuntimeError::HandlerNotReady);
         }
         if self
@@ -29499,6 +29524,11 @@ mod tests {
         assert_eq!(
             runtime.start_core_controller_runners().await,
             Err(ResourceRuntimeError::AuthenticationUnavailable)
+        );
+        assert_eq!(
+            runtime.require_ready(),
+            Err(ResourceRuntimeError::HandlerNotReady),
+            "failed replacement setup must not restore readiness for the missing required identity"
         );
         {
             let tasks = runtime.core_runner_tasks.lock().unwrap();
