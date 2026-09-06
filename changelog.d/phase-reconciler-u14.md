@@ -103,6 +103,9 @@
 - Routed controller-session evidence through the assigned Process controller
   status path with exact UID, generation, revision, and assignment fences, while
   retaining a distinct evidence operation identity.
+- Invalidated and rebuilt the assigned Process API with each system-core
+  session rebind under the controller-session guard, preventing stale
+  controller-session evidence from crossing assignment or session fences.
 - Classified replayed `assignment-required` failures as retryable resource
   conflicts and kept their ResourceError wire representation valid.
 

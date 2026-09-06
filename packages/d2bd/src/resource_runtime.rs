@@ -12158,6 +12158,14 @@ impl ZoneResourceRuntime {
                     return Err(error);
                 }
             }
+            if let Some(providers) = self
+                .controller_session_providers
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .clone()
+            {
+                self.rebuild_assigned_process_api_locked(&providers).await?;
+            }
             let state = self
                 .u12_state
                 .lock()
@@ -12283,6 +12291,14 @@ impl ZoneResourceRuntime {
         }
         if !existing_session && session_state != (false, false, false) {
             return Err(ResourceRuntimeError::AuthenticationUnavailable);
+        }
+        if let Some(coordinator) = self
+            .controller_session_coordinator
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+        {
+            coordinator.clear_assigned_process_api()?;
         }
         *self
             .process_status_client
@@ -12666,6 +12682,29 @@ impl ZoneResourceRuntime {
                 mode,
                 authority,
             )))
+    }
+
+    // Callers hold controller_session_lock so the authority and API publish
+    // cannot race controller-session evidence writes.
+    async fn rebuild_assigned_process_api_locked(
+        &self,
+        providers: &crate::process_provider_runtime::ProductionProcessProviders,
+    ) -> Result<(Arc<CoreAssignmentAuthority>, AuthorizationState), ResourceRuntimeError> {
+        let core_authority = self.core_assignment_fences(false).await?.4;
+        let authorization_state = self
+            .authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let process_api = Arc::new(self.process_controller_api(
+            providers.mode(),
+            Arc::clone(&core_authority),
+            authorization_state.clone(),
+        )?);
+        self.controller_session_coordinator()
+            .set_assigned_process_api(process_api)?;
+        Ok((core_authority, authorization_state))
     }
 
     async fn core_assignment_fences(
@@ -16049,6 +16088,14 @@ impl ControllerSessionCoordinator {
         Ok(())
     }
 
+    fn clear_assigned_process_api(&self) -> Result<(), ResourceRuntimeError> {
+        *self
+            .assigned_process_api
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = None;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn set_controller_session_admission_test_seam(
         &self,
@@ -16507,9 +16554,18 @@ impl ControllerSessionCoordinator {
         providers: Arc<crate::process_provider_runtime::ProductionProcessProviders>,
         establish: bool,
     ) -> Result<(), ResourceRuntimeError> {
+        let _session_guard = self.controller_session_lock.lock().await;
+        self.reconcile_controller_sessions_locked(providers, establish)
+            .await
+    }
+
+    async fn reconcile_controller_sessions_locked(
+        &self,
+        providers: Arc<crate::process_provider_runtime::ProductionProcessProviders>,
+        establish: bool,
+    ) -> Result<(), ResourceRuntimeError> {
         #[cfg(test)]
         self.reconcile_attempts.fetch_add(1, Ordering::SeqCst);
-        let _session_guard = self.controller_session_lock.lock().await;
         self.fence(&providers).await?;
         if !establish {
             self.refresh_controller_policy(&providers).await?;
@@ -18052,48 +18108,45 @@ impl ZoneResourceRuntime {
         let wake_shutdown = Arc::clone(&self.controller_session_reconcile_shutdown);
         let wake_coordinator = Arc::downgrade(&coordinator);
         let wake_providers = Arc::downgrade(&providers);
-        *self
-            .controller_session_providers
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
-            Some(Arc::clone(&providers));
-        let core_authority = self.core_assignment_fences(false).await?.4;
-        let authorization_state = self
-            .authorization_state
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-            .clone()
-            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
-        let process_api = Arc::new(self.process_controller_api(
-            providers.mode(),
-            Arc::clone(&core_authority),
-            authorization_state.clone(),
-        )?);
-        coordinator.set_assigned_process_api(Arc::clone(&process_api))?;
-        providers
-            .set_controller_session_waker(
-                self.zone.clone(),
-                Arc::new(move || {
-                    let coordinator = wake_coordinator
-                        .upgrade()
-                        .ok_or_else(|| "controller-session-coordinator-dropped".to_owned())?;
-                    let providers = wake_providers
-                        .upgrade()
-                        .ok_or_else(|| "process-providers-dropped".to_owned())?;
-                    schedule_controller_session_reconcile(
-                        Arc::clone(&wake_task_slot),
-                        Arc::clone(&wake),
-                        Arc::clone(&wake_shutdown),
-                        coordinator,
-                        providers,
-                    )
-                    .map_err(|error| format!("{error:?}"))
-                }),
-            )
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
-        coordinator
-            .reconcile_controller_sessions(Arc::clone(&providers), false)
-            .await?;
+        let (core_authority, authorization_state) = {
+            let _session_guard = self.controller_session_lock.lock().await;
+            if self.system_core_rebind_pending.load(Ordering::Acquire) {
+                return Err(ResourceRuntimeError::AuthenticationUnavailable);
+            }
+            *self
+                .controller_session_providers
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
+                Some(Arc::clone(&providers));
+            let (core_authority, authorization_state) = self
+                .rebuild_assigned_process_api_locked(&providers)
+                .await?;
+            providers
+                .set_controller_session_waker(
+                    self.zone.clone(),
+                    Arc::new(move || {
+                        let coordinator = wake_coordinator
+                            .upgrade()
+                            .ok_or_else(|| "controller-session-coordinator-dropped".to_owned())?;
+                        let providers = wake_providers
+                            .upgrade()
+                            .ok_or_else(|| "process-providers-dropped".to_owned())?;
+                        schedule_controller_session_reconcile(
+                            Arc::clone(&wake_task_slot),
+                            Arc::clone(&wake),
+                            Arc::clone(&wake_shutdown),
+                            coordinator,
+                            providers,
+                        )
+                        .map_err(|error| format!("{error:?}"))
+                    }),
+                )
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
+            coordinator
+                .reconcile_controller_sessions_locked(Arc::clone(&providers), false)
+                .await?;
+            (core_authority, authorization_state)
+        };
         let _guard = self.controller_reconcile_lock.lock().await;
         let resources = list_process_resources(&self.store, &self.zone)
             .await
@@ -24961,6 +25014,8 @@ mod tests {
         let (_directory, runtime, broker_evidence) =
             open_production_guest_runtime_for_test().await;
         let zone = runtime.zone.clone();
+        let process_provider_ref = ResourceRef::parse("Provider/system-minijail").unwrap();
+        let process_ref = ResourceRef::parse("Process/system-minijail-controller").unwrap();
         let uid = Uid::current();
         let username = User::from_uid(uid)
             .unwrap()
@@ -24996,6 +25051,27 @@ mod tests {
             &runtime,
             vec![
                 bundle_resource(
+                    "Provider",
+                    "system-minijail",
+                    &zone,
+                    r#"{"artifactId":"system-minijail","config":{}}"#,
+                ),
+                BundleResource::new(
+                    ResourceTypeName::parse("Process").unwrap(),
+                    BundleResourceMetadata::new(
+                        process_ref.name().clone(),
+                        zone.clone(),
+                        Some(process_provider_ref.clone()),
+                        BTreeMap::new(),
+                        BTreeMap::new(),
+                    ),
+                    CanonicalJsonObject::parse(
+                        br#"{"executionRef":"Host/host-system","processClass":"controller","providerRef":"Provider/system-minijail","template":"test-controller"}"#,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                bundle_resource(
                     "User",
                     &username,
                     &zone,
@@ -25022,6 +25098,57 @@ mod tests {
         )
         .await;
         mark_test_resource_ready(&runtime, &user_ref, &broker_evidence).await;
+        let process_provider = read_test_resource(
+            &runtime,
+            process_provider_ref.clone(),
+            "rebind-process-provider",
+        )
+        .await;
+        let process = read_test_resource(&runtime, process_ref.clone(), "rebind-process")
+            .await;
+        let providers = test_controller_session_providers();
+        *runtime.controller_session_providers.lock().unwrap() = Some(Arc::clone(&providers));
+        let controller_generation = runtime
+            .store
+            .runtime_metadata()
+            .await
+            .unwrap()
+            .policy_snapshot
+            .controller_generation
+            .expect("test policy has a controller generation");
+        providers
+            .attach_controller_provider_context_for_test(
+                zone.clone(),
+                process_ref.clone(),
+                process.uid.clone(),
+                process.generation,
+                process_provider_ref.clone(),
+                process_provider_ref.clone(),
+                process_provider.uid.clone(),
+                process_provider.generation,
+                ResourceRef::parse("Host/host-system").unwrap(),
+                controller_generation,
+            )
+            .unwrap();
+        let coordinator = runtime.controller_session_coordinator();
+        let authority = runtime.core_assignment_fences(false).await.unwrap().4;
+        let authorization_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        coordinator
+            .set_assigned_process_api(Arc::new(
+                runtime
+                    .process_controller_api(
+                        DaemonMode::Host,
+                        authority,
+                        authorization_state.clone(),
+                    )
+                    .unwrap(),
+            ))
+            .unwrap();
         runtime.refresh_authorization_policy().await.unwrap();
         {
             let _runner_guard = runtime.core_runner_lock.lock().await;
@@ -25030,6 +25157,50 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let before_rebind_authority = runtime.core_assignment_fences(false).await.unwrap().4;
+        let before_rebind_authorization_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let before_rebind_process =
+            read_test_resource(&runtime, process_ref.clone(), "rebind-process-before-fence").await;
+        let before_rebind_api = Arc::new(
+            runtime
+                .process_controller_api(
+                    DaemonMode::Host,
+                    Arc::clone(&before_rebind_authority),
+                    before_rebind_authorization_state,
+                )
+                .unwrap(),
+        );
+        let before_rebind_fence = process_assignment_fence_resolver(
+            Arc::clone(&runtime.store),
+            DaemonMode::Host,
+            Arc::clone(&before_rebind_authority),
+        )(
+            process_ref.clone(),
+            before_rebind_process.uid.clone(),
+            before_rebind_process.revision,
+        )
+        .await
+        .expect("pre-rebind Process assignment fence");
+        assert_eq!(
+            before_rebind_fence,
+            ResourceAssignmentFence {
+                resource_uid: before_rebind_process.uid.clone(),
+                resource_revision: before_rebind_process.revision,
+                provider_generation: before_rebind_authority.provider_generation,
+                controller_generation: before_rebind_authority.controller_generation,
+                controller_role: before_rebind_authority.controller_role.clone(),
+                target: ResourceRef::parse("Host/host-system").unwrap(),
+                session_generation: before_rebind_authority.session_generation,
+                epoch: before_rebind_authority.epoch,
+                scope: ResourceAssignmentScope::Primary,
+            }
+        );
+        assert!(before_rebind_authority.epoch > 0);
         let before_rebind_revision = runtime
             .store
             .runtime_metadata()
@@ -25079,6 +25250,25 @@ mod tests {
             metadata_after_failure.current_revision,
             "the retryable failure must occur after the complete projection is installed"
         );
+        assert!(
+            coordinator.assigned_process_api.lock().unwrap().is_none(),
+            "failed system-core rebind must invalidate the assigned Process API"
+        );
+        let context = providers
+            .controller_bootstrap_contexts(&zone)
+            .into_iter()
+            .find(|context| context.process_ref() == &process_ref)
+            .expect("rebind Process controller context");
+        assert_eq!(
+            coordinator
+                .persist_controller_session_evidence(
+                    &context,
+                    Some(ReconnectGeneration::new(1).unwrap()),
+                )
+                .await,
+            Err(ResourceRuntimeError::AuthenticationUnavailable),
+            "pending evidence must not write through an invalidated Process API"
+        );
 
         let guard = runtime.controller_session_lock.lock().await;
         for request in [
@@ -25125,6 +25315,101 @@ mod tests {
                 .any(|task| !task.is_finished()),
             "successful rebind recovery must restore the core runners"
         );
+        assert!(
+            coordinator.assigned_process_api.lock().unwrap().is_some(),
+            "successful system-core rebind must restore the assigned Process API"
+        );
+        let after_rebind_authority = runtime.core_assignment_fences(false).await.unwrap().4;
+        let after_rebind_process =
+            read_test_resource(&runtime, process_ref.clone(), "rebind-process-after-fence").await;
+        let rebuilt_process_fence = process_assignment_fence_resolver(
+            Arc::clone(&runtime.store),
+            DaemonMode::Host,
+            Arc::clone(&after_rebind_authority),
+        )(
+            process_ref.clone(),
+            after_rebind_process.uid.clone(),
+            after_rebind_process.revision,
+        )
+        .await
+        .expect("rebuilt Process assignment fence");
+        let expected_rebuilt_process_fence = ResourceAssignmentFence {
+            epoch: before_rebind_fence.epoch + 1,
+            ..before_rebind_fence.clone()
+        };
+        assert_eq!(
+            rebuilt_process_fence,
+            expected_rebuilt_process_fence,
+            "rebind must preserve Process identity and advance its assignment epoch exactly once"
+        );
+        assert_eq!(
+            after_rebind_authority.provider_generation,
+            before_rebind_authority.provider_generation
+        );
+        assert_eq!(
+            after_rebind_authority.controller_generation,
+            before_rebind_authority.controller_generation
+        );
+        assert_eq!(
+            after_rebind_authority.controller_role,
+            before_rebind_authority.controller_role
+        );
+        assert_eq!(
+            after_rebind_authority.target,
+            before_rebind_authority.target
+        );
+        assert_eq!(
+            after_rebind_authority.session_generation,
+            before_rebind_authority.session_generation
+        );
+        assert_eq!(
+            after_rebind_authority.epoch,
+            before_rebind_authority.epoch + 1,
+            "the Process API rebuild must reuse the one epoch rotated for rebind"
+        );
+        coordinator
+            .persist_controller_session_evidence(
+                &context,
+                Some(ReconnectGeneration::new(1).unwrap()),
+            )
+            .await
+            .expect("rebind must rebuild the assigned Process API before evidence writes");
+        let current_process =
+            read_test_resource(&runtime, process_ref.clone(), "rebind-process-current-fence")
+                .await;
+        let current_process_fence = process_assignment_fence_resolver(
+            Arc::clone(&runtime.store),
+            DaemonMode::Host,
+            Arc::clone(&after_rebind_authority),
+        )(
+            process_ref.clone(),
+            current_process.uid.clone(),
+            current_process.revision,
+        )
+        .await
+        .expect("current Process assignment fence");
+        let durable_current_fence = runtime
+            .store
+            .assignment_fence(zone.clone(), process_ref.clone())
+            .await
+            .unwrap()
+            .expect("rebuilt Process assignment fence must persist");
+        assert_eq!(durable_current_fence, current_process_fence);
+        assert_eq!(durable_current_fence.epoch, after_rebind_authority.epoch);
+        assert_eq!(
+            persist_resource_controller_session_evidence(
+                &before_rebind_api,
+                &current_process,
+                Some(&json!({"ready": false, "stale": true})),
+            )
+            .await,
+            Err(ResourceRuntimeError::ResourceStatusUpdateFailed(
+                ResourceErrorKind::ResourceConflict
+            )),
+            "the pre-rebind Process fence must be rejected after the epoch advances"
+        );
+        drop(before_rebind_api);
+        drop(coordinator);
         runtime.shutdown().await.unwrap();
     }
 

@@ -397,6 +397,7 @@ rust_test(
         "src/audio_resource_runtime.rs",
         "src/semantic_binding_resource_runtime.rs",
         "src/provider_registry.rs",
+        "src/resource_runtime/volume_provider_runtime.rs",
     ],
     env = {"CARGO_BIN_EXE_d2bd": "$(rootpath :d2bd)"},
     env_inherit = ["D2B_REPO_ROOT", "PATH"],
