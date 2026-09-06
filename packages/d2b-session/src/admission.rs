@@ -17,18 +17,19 @@ use d2b_contracts_resource::v3::{
     ControllerGeneration, ResourceGeneration, ResourceRef, ResourceUid, SchemaFingerprint, ZoneId,
 };
 use d2b_contracts_zone_session::v3::component_session::{
-    AuthorizationLease, BootstrapIdentityBinding, ChannelClass, EndpointPolicy, EndpointPurpose,
-    EndpointRole, HandshakeOffer, HealthState, Locality as ComponentLocality, MetricLabels,
-    MetricReason, MetricResult, NoiseProfile, OperationClass, PurposeClass, RequestId,
-    SessionErrorCode, TransportClass,
+    AuthorizationLease, BootstrapIdentityBinding, ChannelClass, ComponentSessionBoundary,
+    ComponentSessionDescriptor, EndpointPolicy, EndpointPurpose, EndpointRole, HandshakeOffer,
+    HealthState, Locality as ComponentLocality, MetricLabels, MetricReason, MetricResult,
+    NoiseProfile, OperationClass, PurposeClass, RequestId, ServicePackage, SessionErrorCode,
+    TransportClass,
 };
 use d2b_resource_api::authz::SessionVerb;
 
 use crate::{
-    Cancellation, ComponentSessionDriver, MetricEvent, MetricsSink, NoopMetrics, OwnedAttachment,
-    OwnedTransport, Result, SessionDriverHandle, SessionEngine, SessionError, SessionEvent,
-    SessionOperation, StreamEvent, StreamId, handshake::EstablishedAuthentication,
-    metrics::reason_for_error,
+    Cancellation, ComponentSessionDriver, ComponentSessionStream, MetricEvent, MetricsSink,
+    NoopMetrics, OwnedAttachment, OwnedTransport, Result, SessionDriverHandle, SessionEngine,
+    SessionError, SessionEvent, SessionOperation, StreamEvent, StreamId,
+    handshake::EstablishedAuthentication, metrics::reason_for_error,
 };
 
 /// Redacted transport evidence presented to the trusted session authority.
@@ -1251,6 +1252,84 @@ impl AuthenticatedSessionRouteBinding {
         self.controller_generation
     }
 
+    /// Derive an exact typed ComponentSession descriptor for this route.
+    ///
+    /// The caller chooses the already-decided boundary; the route supplies
+    /// the authenticated service, schema, and reconnect generation.
+    pub fn component_descriptor(
+        &self,
+        boundary: ComponentSessionBoundary,
+    ) -> Result<ComponentSessionDescriptor> {
+        let service = ServicePackage::ALL
+            .iter()
+            .copied()
+            .find(|service| service.as_str() == self.service.as_str())
+            .ok_or_else(|| SessionError::new(SessionErrorCode::ServiceMismatch))?;
+        ComponentSessionDescriptor::new(
+            boundary,
+            service,
+            schema_fingerprint_bytes(&self.schema)?,
+            self.reconnect_generation.get(),
+        )
+        .map_err(SessionError::from)
+    }
+
+    /// Construct route metadata received over an already authenticated peer
+    /// session. The caller must have verified the protected bootstrap frame;
+    /// this value carries routing metadata only and never mints authority.
+    pub fn from_authenticated_peer(
+        context: AuthenticatedSubjectContext,
+        endpoint_locality: ComponentLocality,
+        purpose_class: PurposeClass,
+        initiator_role: EndpointRole,
+        responder_role: EndpointRole,
+        transport_class: TransportClass,
+    ) -> Result<Self> {
+        if context.zone_ref().resource_type().as_str() != "Zone"
+            || context.provider_ref().is_none()
+            || context.provider_generation().is_none()
+            || context.controller_generation().is_none()
+            || context.reconnect_generation().get() == 0
+            || context.transport_binding().locality() != Locality::Local
+        {
+            return Err(SessionError::new(SessionErrorCode::SubjectMismatch));
+        }
+        let zone = ZoneId::parse(context.zone_ref().name().as_str())
+            .map_err(|_| SessionError::new(SessionErrorCode::SubjectMismatch))?;
+        let subject_ref = context.subject_ref().clone();
+        let subject_uid = context.subject_uid().clone();
+        let evidence_class = context.evidence_class();
+        let locality = context.transport_binding().locality();
+        let transport_binding = context.transport_binding().clone();
+        let service = context.service().clone();
+        let schema = context.schema_fingerprint().clone();
+        let reconnect_generation = context.reconnect_generation();
+        let provider_ref = context.provider_ref().cloned();
+        let provider_generation = context.provider_generation();
+        let controller_generation = context.controller_generation();
+        Ok(Self {
+            context,
+            zone,
+            subject_ref,
+            subject_uid,
+            evidence_class,
+            locality,
+            endpoint_locality,
+            purpose_class,
+            initiator_role,
+            responder_role,
+            transport_class,
+            transport_binding,
+            liveness: SessionLiveness::new(),
+            service,
+            schema,
+            reconnect_generation,
+            provider_ref,
+            provider_generation,
+            controller_generation,
+        })
+    }
+
     /// Build redacted route metadata for toolkit unit tests.
     #[cfg(feature = "test-support")]
     pub fn for_test(
@@ -1329,6 +1408,26 @@ impl AuthenticatedSessionRouteBinding {
             controller_generation: controller_generation
                 .map(|generation| ControllerGeneration::new(generation).expect("test generation")),
         }
+    }
+
+    /// Build a test-only route whose authenticated owner has already closed.
+    #[cfg(feature = "test-support")]
+    pub fn for_test_dead(
+        provider_ref: Option<ResourceRef>,
+        service: &str,
+        reconnect_generation: u64,
+        provider_generation: Option<u64>,
+        controller_generation: Option<u64>,
+    ) -> Self {
+        let route = Self::for_test(
+            provider_ref,
+            service,
+            reconnect_generation,
+            provider_generation,
+            controller_generation,
+        );
+        route.liveness.invalidate();
+        route
     }
 }
 
@@ -1515,6 +1614,27 @@ impl<C> AuthenticatedComponentSession<C> {
         handle
             .start(permit, request_id, frame, cancellation, now_tick)
             .await
+    }
+
+    /// Open one named stream under a consumed exact stream authorization.
+    ///
+    /// The returned handle exposes only bounded stream operations and remains
+    /// fenced to the reconnect generation that opened it.
+    pub async fn open_authorized_named_stream(
+        &mut self,
+        permit: AuthorizedSessionOperation,
+        stream: StreamId,
+        send_credit: u32,
+        receive_credit: u32,
+        now_tick: u64,
+    ) -> Result<ComponentSessionStream> {
+        if !permit.lease.is_valid_at(now_tick)
+            || permit.request.verb != SessionVerb::OpenStream
+            || !permit.request.operation.member().is_stream()
+        {
+            return Err(SessionError::new(SessionErrorCode::PolicyDenied));
+        }
+        ComponentSessionStream::open(self.driver.clone(), stream, send_credit, receive_credit).await
     }
 
     /// Remove one terminal correlated request.
@@ -1734,6 +1854,22 @@ fn validate_zone(subject: &AuthenticatedSubjectContext, expected_zone: &ZoneId) 
 fn binding_digest(bytes: [u8; 32]) -> Result<BindingDigest> {
     BindingDigest::parse(format!("sha256:{}", hex(&bytes)))
         .map_err(|_| SessionError::new(SessionErrorCode::ChannelBindingMismatch))
+}
+
+fn schema_fingerprint_bytes(value: &SchemaFingerprint) -> Result<[u8; 32]> {
+    let raw = value
+        .as_str()
+        .strip_prefix("sha256:")
+        .ok_or_else(|| SessionError::new(SessionErrorCode::SchemaMismatch))?;
+    if raw.len() != 64 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(SessionError::new(SessionErrorCode::SchemaMismatch));
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&raw[index * 2..index * 2 + 2], 16)
+            .map_err(|_| SessionError::new(SessionErrorCode::SchemaMismatch))?;
+    }
+    Ok(bytes)
 }
 
 fn hex(bytes: &[u8]) -> String {

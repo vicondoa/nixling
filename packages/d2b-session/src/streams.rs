@@ -40,6 +40,16 @@ pub enum StreamEvent {
     Reset { stream: StreamId },
 }
 
+impl StreamEvent {
+    pub const fn stream(&self) -> StreamId {
+        match self {
+            Self::Data { stream, .. } | Self::RemoteClosed { stream } | Self::Reset { stream } => {
+                *stream
+            }
+        }
+    }
+}
+
 impl fmt::Debug for StreamEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

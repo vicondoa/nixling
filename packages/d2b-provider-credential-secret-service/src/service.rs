@@ -7,12 +7,15 @@ use d2b_contracts_provider::v3::credential::{
     CredentialProvider, CredentialRequest, CredentialResponse, CredentialServiceError,
     CredentialServiceErrorCode, DeliveryResponse, MetadataResponse,
 };
+use d2b_contracts_resource::v3::ResourceRef;
 
 use crate::{
     LeaseRecord, OperationKind, SecretServiceCredentialProvider, SecretServiceLeaseRef,
-    SecretServiceLeaseRequest, SecretServicePollError, SecretServicePortError, SessionKey,
+    SecretServiceLeaseRequest, SecretServiceLeaseRevocation, SecretServicePollError,
+    SecretServicePortError, SessionKey,
 };
 
+#[async_trait::async_trait]
 impl CredentialProvider for SecretServiceCredentialProvider {
     fn dispatch(
         &self,
@@ -21,12 +24,43 @@ impl CredentialProvider for SecretServiceCredentialProvider {
         authorization: &CredentialAuthorization,
     ) -> Result<CredentialResponse, CredentialServiceError> {
         let _lifecycle = self.mutation_guard()?;
-        let session_key = self.authorize_session_locked(authorization)?;
+        let user_ref = self.request_user_ref(authorization)?;
+        let session_key = self.authorize_session_for_user_locked(authorization, &user_ref)?;
         match method {
-            CredentialMethod::AcquireToken => self.acquire(request, authorization, session_key),
-            CredentialMethod::RefreshToken => self.refresh(request, authorization, session_key),
-            CredentialMethod::RevokeToken => self.revoke(request, session_key),
-            CredentialMethod::InspectMetadata => self.inspect(request, session_key),
+            CredentialMethod::AcquireToken => self.acquire(request, authorization, session_key, &user_ref),
+            CredentialMethod::RefreshToken => self.refresh(request, authorization, session_key, &user_ref),
+            CredentialMethod::RevokeToken => self.revoke(request, session_key, &user_ref),
+            CredentialMethod::InspectMetadata => self.inspect(request, session_key, &user_ref),
+            CredentialMethod::SignChallenge => Err(CredentialServiceError::new(
+                CredentialServiceErrorCode::Malformed,
+            )),
+        }
+    }
+
+    async fn dispatch_async(
+        &self,
+        method: CredentialMethod,
+        request: &CredentialRequest,
+        authorization: &CredentialAuthorization,
+    ) -> Result<CredentialResponse, CredentialServiceError> {
+        let _lifecycle = self.async_mutation_gate.lock().await;
+        let user_ref = self.request_user_ref(authorization)?;
+        let session_key = self.authorize_session_for_user_locked(authorization, &user_ref)?;
+        match method {
+            CredentialMethod::AcquireToken => {
+                self.acquire_async(request, authorization, session_key, &user_ref)
+                    .await
+            }
+            CredentialMethod::RefreshToken => {
+                self.refresh_async(request, authorization, session_key, &user_ref)
+                    .await
+            }
+            CredentialMethod::RevokeToken => {
+                self.revoke_async(request, session_key, &user_ref).await
+            }
+            CredentialMethod::InspectMetadata => {
+                self.inspect_async(request, session_key, &user_ref).await
+            }
             CredentialMethod::SignChallenge => Err(CredentialServiceError::new(
                 CredentialServiceErrorCode::Malformed,
             )),
@@ -35,19 +69,57 @@ impl CredentialProvider for SecretServiceCredentialProvider {
 }
 
 impl SecretServiceCredentialProvider {
-    fn acquire(
+    fn request_user_ref(
+        &self,
+        authorization: &CredentialAuthorization,
+    ) -> Result<ResourceRef, CredentialServiceError> {
+        let claimed = authorization.user_ref().cloned();
+        match (self.placement.user_ref(), claimed) {
+            (Some(expected), Some(claimed)) if expected != &claimed => Err(
+                CredentialServiceError::new(CredentialServiceErrorCode::OperationDenied),
+            ),
+            (Some(expected), None) => Ok(expected.clone()),
+            (None, Some(claimed)) if claimed.resource_type().as_str() == "User" => Ok(claimed),
+            _ => Err(CredentialServiceError::new(
+                CredentialServiceErrorCode::OperationDenied,
+            )),
+        }
+    }
+
+    fn validate_delivery(
+        &self,
+        method: CredentialMethod,
+        request: &CredentialRequest,
+        delivery: &d2b_contracts_provider::v3::credential::DeliverySessionParams,
+    ) -> Result<(), CredentialServiceError> {
+        if delivery.credential_ref() != request.credential_ref()
+            || delivery.consumer_provider_ref() != &self.consumer_ref
+            || delivery.operation_class() != method.operation_class()
+            || delivery.deadline_unix_ms() > request.deadline_unix_ms()
+            || delivery.expiry_unix_ms() > request.requested_expiry_unix_ms()
+        {
+            return Err(CredentialServiceError::new(
+                CredentialServiceErrorCode::OperationDenied,
+            ));
+        }
+        Ok(())
+    }
+
+    async fn acquire_async(
         &self,
         request: &CredentialRequest,
         authorization: &CredentialAuthorization,
         session_key: SessionKey,
+        user_ref: &ResourceRef,
     ) -> Result<CredentialResponse, CredentialServiceError> {
         let delivery = authorization
             .delivery_session_params()
             .cloned()
             .ok_or_else(invariant)?;
+        self.validate_delivery(CredentialMethod::AcquireToken, request, &delivery)?;
         let deadline = Self::operation_deadline(request.deadline_unix_ms())?;
         let key = request.credential_ref().to_canonical_string();
-        self.ensure_unlocked(deadline)?;
+        self.ensure_unlocked_async(user_ref, deadline).await?;
         if self.has_ambiguous_credential(session_key, &key)? {
             return Err(invariant());
         }
@@ -75,20 +147,21 @@ impl SecretServiceCredentialProvider {
             ));
         }
         let port_request = SecretServiceLeaseRequest {
+            user_ref: user_ref.clone(),
             credential_ref: request.credential_ref().clone(),
             operation_id: request.operation_id().to_owned(),
             idempotency_key: request.idempotency_key().to_owned(),
             requested_expiry_unix_ms: request.requested_expiry_unix_ms(),
         };
         Self::deadline_remaining(deadline)?;
-        let grant = match Self::poll_port_raw(self.port.issue_lease(&port_request), deadline) {
+        let grant = match await_port(self.port.issue_lease(&port_request), deadline).await {
             Ok(grant) => grant,
             Err(SecretServicePollError::Port(SecretServicePortError::CompletionUnknown)) => {
-                self.remember_ambiguous_acquire(session_key, port_request.clone())?;
+                self.remember_ambiguous_acquire(session_key, port_request)?;
                 return Err(invariant());
             }
             Err(SecretServicePollError::Deadline) => {
-                self.remember_ambiguous_acquire(session_key, port_request.clone())?;
+                self.remember_ambiguous_acquire(session_key, port_request)?;
                 return Err(CredentialServiceError::new(
                     CredentialServiceErrorCode::DeadlineExceeded,
                 ));
@@ -128,19 +201,21 @@ impl SecretServiceCredentialProvider {
         }))
     }
 
-    fn refresh(
+    async fn refresh_async(
         &self,
         request: &CredentialRequest,
         authorization: &CredentialAuthorization,
         session_key: SessionKey,
+        user_ref: &ResourceRef,
     ) -> Result<CredentialResponse, CredentialServiceError> {
         let delivery = authorization
             .delivery_session_params()
             .cloned()
             .ok_or_else(invariant)?;
+        self.validate_delivery(CredentialMethod::RefreshToken, request, &delivery)?;
         let deadline = Self::operation_deadline(request.deadline_unix_ms())?;
         let key = request.credential_ref().to_canonical_string();
-        self.ensure_unlocked(deadline)?;
+        self.ensure_unlocked_async(user_ref, deadline).await?;
         if self.has_ambiguous_credential(session_key, &key)? {
             return Err(invariant());
         }
@@ -166,10 +241,11 @@ impl SecretServiceCredentialProvider {
             CredentialLeaseState::Unknown => return Err(invariant()),
         }
         let lease = SecretServiceLeaseRef {
+            user_ref: user_ref.clone(),
             credential_ref: request.credential_ref().clone(),
             metadata: current.metadata.clone(),
         };
-        let inspected = match Self::poll_port_raw(self.port.inspect_lease(&lease), deadline) {
+        let inspected = match await_port(self.port.inspect_lease(&lease), deadline).await {
             Ok(inspected) => inspected,
             Err(SecretServicePollError::Port(SecretServicePortError::CompletionUnknown)) => {
                 self.mark_metadata_unknown(&lease_key)?;
@@ -262,11 +338,479 @@ impl SecretServiceCredentialProvider {
             .ok_or_else(expired)?
             .metadata = inspected_metadata.clone();
         let lease = SecretServiceLeaseRef {
+            user_ref: user_ref.clone(),
             credential_ref: request.credential_ref().clone(),
             metadata: inspected_metadata,
         };
         let recovery_lease = lease.clone();
-        let grant = match Self::poll_port_raw(self.port.refresh_lease(&lease), deadline) {
+        let grant = match await_port(self.port.refresh_lease(&lease), deadline).await {
+            Ok(grant) => grant,
+            Err(SecretServicePollError::Port(SecretServicePortError::CompletionUnknown)) => {
+                self.mark_metadata_unknown(&lease_key)?;
+                self.remember_ambiguous_refresh(session_key, request, recovery_lease)?;
+                return Err(invariant());
+            }
+            Err(SecretServicePollError::Deadline) => {
+                self.mark_metadata_unknown(&lease_key)?;
+                self.remember_ambiguous_refresh(session_key, request, recovery_lease)?;
+                return Err(CredentialServiceError::new(
+                    CredentialServiceErrorCode::DeadlineExceeded,
+                ));
+            }
+            Err(SecretServicePollError::Port(SecretServicePortError::LeaseExpired)) => {
+                self.set_lease_state(&lease_key, CredentialLeaseState::Expired)?;
+                return Err(expired());
+            }
+            Err(SecretServicePollError::Port(SecretServicePortError::LeaseRevoked)) => {
+                self.set_lease_state(&lease_key, CredentialLeaseState::Revoked)?;
+                return Err(revoked());
+            }
+            Err(error) => return Err(map_poll_error(error)),
+        };
+        let metadata = match Self::grant_metadata(grant.clone(), request.requested_expiry_unix_ms())
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let mut leases = self.leases.lock().map_err(|_| invariant())?;
+                let record = leases.get_mut(&lease_key).ok_or_else(expired)?;
+                record.metadata = Self::unknown_metadata(&grant);
+                self.remember_ambiguous_refresh(session_key, request, recovery_lease)?;
+                return Err(error);
+            }
+        };
+        let mut record = current;
+        record.metadata = metadata.clone();
+        record
+            .refresh_results
+            .insert(request.idempotency_key().to_owned(), metadata.clone());
+        self.leases
+            .lock()
+            .map_err(|_| invariant())?
+            .insert(lease_key, record);
+        Ok(CredentialResponse::RefreshToken(DeliveryResponse {
+            metadata,
+            delivery_session_params: delivery,
+        }))
+    }
+
+    async fn revoke_async(
+        &self,
+        request: &CredentialRequest,
+        session_key: SessionKey,
+        user_ref: &ResourceRef,
+    ) -> Result<CredentialResponse, CredentialServiceError> {
+        let deadline = Self::operation_deadline(request.deadline_unix_ms())?;
+        let key = request.credential_ref().to_canonical_string();
+        self.ensure_unlocked_async(user_ref, deadline).await?;
+        if self.has_ambiguous_credential(session_key, &key)? {
+            return Err(invariant());
+        }
+        let lease_key = (session_key, key.clone());
+        let current = self
+            .leases
+            .lock()
+            .map_err(|_| invariant())?
+            .get(&lease_key)
+            .cloned()
+            .ok_or_else(expired)?;
+        match current.metadata.state {
+            CredentialLeaseState::Revoked => {
+                let mut metadata = current.metadata;
+                metadata.outcome = CredentialOutcomeCode::AlreadyRevoked;
+                self.leases
+                    .lock()
+                    .map_err(|_| invariant())?
+                    .get_mut(&lease_key)
+                    .ok_or_else(expired)?
+                    .metadata = metadata.clone();
+                return Ok(CredentialResponse::RevokeToken(MetadataResponse { metadata }));
+            }
+            CredentialLeaseState::Expired => return Err(expired()),
+            CredentialLeaseState::Unknown => return Err(invariant()),
+            CredentialLeaseState::Active => {}
+        }
+        let lease = SecretServiceLeaseRef {
+            user_ref: user_ref.clone(),
+            credential_ref: request.credential_ref().clone(),
+            metadata: current.metadata,
+        };
+        let result = match await_port(self.port.revoke_lease(&lease), deadline).await {
+            Ok(result) => result,
+            Err(SecretServicePollError::Port(SecretServicePortError::CompletionUnknown)) => {
+                self.mark_metadata_unknown(&lease_key)?;
+                self.mark_ambiguous(
+                    session_key,
+                    &key,
+                    request.idempotency_key(),
+                    OperationKind::Revoke,
+                )?;
+                return Err(invariant());
+            }
+            Err(SecretServicePollError::Deadline) => {
+                self.mark_metadata_unknown(&lease_key)?;
+                self.mark_ambiguous(
+                    session_key,
+                    &key,
+                    request.idempotency_key(),
+                    OperationKind::Revoke,
+                )?;
+                return Err(CredentialServiceError::new(
+                    CredentialServiceErrorCode::DeadlineExceeded,
+                ));
+            }
+            Err(SecretServicePollError::Port(SecretServicePortError::LeaseExpired)) => {
+                self.set_lease_state(&lease_key, CredentialLeaseState::Expired)?;
+                return Err(expired());
+            }
+            Err(SecretServicePollError::Port(SecretServicePortError::LeaseRevoked)) => {
+                SecretServiceLeaseRevocation::AlreadyRevoked
+            }
+            Err(error) => return Err(map_poll_error(error)),
+        };
+        let outcome = match result {
+            SecretServiceLeaseRevocation::Revoked => CredentialOutcomeCode::Revoked,
+            SecretServiceLeaseRevocation::AlreadyRevoked => {
+                CredentialOutcomeCode::AlreadyRevoked
+            }
+        };
+        let mut leases = self.leases.lock().map_err(|_| invariant())?;
+        let record = leases.get_mut(&lease_key).ok_or_else(expired)?;
+        record.metadata.state = CredentialLeaseState::Revoked;
+        record.metadata.outcome = outcome;
+        Ok(CredentialResponse::RevokeToken(MetadataResponse {
+            metadata: record.metadata.clone(),
+        }))
+    }
+
+    async fn inspect_async(
+        &self,
+        request: &CredentialRequest,
+        session_key: SessionKey,
+        user_ref: &ResourceRef,
+    ) -> Result<CredentialResponse, CredentialServiceError> {
+        let deadline = Self::operation_deadline(request.deadline_unix_ms())?;
+        let key = request.credential_ref().to_canonical_string();
+        self.ensure_unlocked_async(user_ref, deadline).await?;
+        if self.has_ambiguous_credential(session_key, &key)? {
+            return Err(invariant());
+        }
+        let lease_key = (session_key, key.clone());
+        let record = self
+            .leases
+            .lock()
+            .map_err(|_| invariant())?
+            .get(&lease_key)
+            .cloned()
+            .ok_or_else(expired)?;
+        match record.metadata.state {
+            CredentialLeaseState::Active => {}
+            CredentialLeaseState::Expired => return Err(expired()),
+            CredentialLeaseState::Revoked => return Err(revoked()),
+            CredentialLeaseState::Unknown => return Err(invariant()),
+        }
+        let lease = SecretServiceLeaseRef {
+            user_ref: user_ref.clone(),
+            credential_ref: request.credential_ref().clone(),
+            metadata: record.metadata.clone(),
+        };
+        let inspection = match await_port(self.port.inspect_lease(&lease), deadline).await {
+            Ok(inspection) => inspection,
+            Err(SecretServicePollError::Port(SecretServicePortError::LeaseExpired)) => {
+                self.set_lease_state(&lease_key, CredentialLeaseState::Expired)?;
+                return Err(expired());
+            }
+            Err(SecretServicePollError::Port(SecretServicePortError::LeaseRevoked)) => {
+                self.set_lease_state(&lease_key, CredentialLeaseState::Revoked)?;
+                return Err(revoked());
+            }
+            Err(SecretServicePollError::Port(SecretServicePortError::CompletionUnknown)) => {
+                self.mark_metadata_unknown(&lease_key)?;
+                self.mark_ambiguous(
+                    session_key,
+                    &key,
+                    request.idempotency_key(),
+                    OperationKind::Inspect,
+                )?;
+                return Err(invariant());
+            }
+            Err(SecretServicePollError::Deadline) => {
+                self.mark_metadata_unknown(&lease_key)?;
+                self.mark_ambiguous(
+                    session_key,
+                    &key,
+                    request.idempotency_key(),
+                    OperationKind::Inspect,
+                )?;
+                return Err(CredentialServiceError::new(
+                    CredentialServiceErrorCode::DeadlineExceeded,
+                ));
+            }
+            Err(error) => return Err(map_poll_error(error)),
+        };
+        let mut metadata = lease.metadata;
+        metadata.state = inspection.state;
+        metadata.source_version = inspection.source_version;
+        metadata.rotation_generation = inspection.rotation_generation;
+        metadata.expires_at_unix_ms = inspection.expires_at_unix_ms;
+        self.leases
+            .lock()
+            .map_err(|_| invariant())?
+            .get_mut(&lease_key)
+            .ok_or_else(expired)?
+            .metadata = metadata.clone();
+        if metadata.state == CredentialLeaseState::Unknown {
+            self.mark_ambiguous(
+                session_key,
+                &key,
+                request.idempotency_key(),
+                OperationKind::Inspect,
+            )?;
+            return Err(invariant());
+        }
+        Ok(CredentialResponse::InspectMetadata(MetadataResponse {
+            metadata,
+        }))
+    }
+
+    fn acquire(
+        &self,
+        request: &CredentialRequest,
+        authorization: &CredentialAuthorization,
+        session_key: SessionKey,
+        user_ref: &ResourceRef,
+    ) -> Result<CredentialResponse, CredentialServiceError> {
+        let delivery = authorization
+            .delivery_session_params()
+            .cloned()
+            .ok_or_else(invariant)?;
+        self.validate_delivery(CredentialMethod::AcquireToken, request, &delivery)?;
+        let deadline = Self::operation_deadline(request.deadline_unix_ms())?;
+        let key = request.credential_ref().to_canonical_string();
+        self.ensure_unlocked(user_ref, deadline)?;
+        if self.has_ambiguous_credential(session_key, &key)? {
+            return Err(invariant());
+        }
+        let lease_key = (session_key, key.clone());
+        {
+            let mut leases = self.leases.lock().map_err(|_| invariant())?;
+            if let Some(existing) = leases.get(&lease_key) {
+                match existing.metadata.state {
+                    CredentialLeaseState::Active => {
+                        return Ok(CredentialResponse::AcquireToken(DeliveryResponse {
+                            metadata: existing.metadata.clone(),
+                            delivery_session_params: delivery,
+                        }));
+                    }
+                    CredentialLeaseState::Unknown => return Err(invariant()),
+                    CredentialLeaseState::Expired | CredentialLeaseState::Revoked => {
+                        leases.remove(&lease_key);
+                    }
+                }
+            }
+        }
+        if self.ambiguous_lease_count()? >= self.config.max_leases() as usize {
+            return Err(CredentialServiceError::new(
+                CredentialServiceErrorCode::ProviderUnavailable,
+            ));
+        }
+        let port_request = SecretServiceLeaseRequest {
+            user_ref: user_ref.clone(),
+            credential_ref: request.credential_ref().clone(),
+            operation_id: request.operation_id().to_owned(),
+            idempotency_key: request.idempotency_key().to_owned(),
+            requested_expiry_unix_ms: request.requested_expiry_unix_ms(),
+        };
+        Self::deadline_remaining(deadline)?;
+        let grant = match Self::poll_port_sync(self.port.issue_lease(&port_request), deadline) {
+            Ok(grant) => grant,
+            Err(SecretServicePollError::Port(SecretServicePortError::CompletionUnknown)) => {
+                self.remember_ambiguous_acquire(session_key, port_request.clone())?;
+                return Err(invariant());
+            }
+            Err(SecretServicePollError::Deadline) => {
+                self.remember_ambiguous_acquire(session_key, port_request.clone())?;
+                return Err(CredentialServiceError::new(
+                    CredentialServiceErrorCode::DeadlineExceeded,
+                ));
+            }
+            Err(error) => return Err(map_poll_error(error)),
+        };
+        let metadata = match Self::grant_metadata(grant.clone(), request.requested_expiry_unix_ms())
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.leases.lock().map_err(|_| invariant())?.insert(
+                    lease_key,
+                    LeaseRecord {
+                        refresh_results: BTreeMap::new(),
+                        metadata: Self::unknown_metadata(&grant),
+                    },
+                );
+                self.mark_ambiguous(
+                    session_key,
+                    &key,
+                    request.idempotency_key(),
+                    OperationKind::Acquire,
+                )?;
+                return Err(error);
+            }
+        };
+        self.leases.lock().map_err(|_| invariant())?.insert(
+            lease_key,
+            LeaseRecord {
+                refresh_results: BTreeMap::new(),
+                metadata: metadata.clone(),
+            },
+        );
+        Ok(CredentialResponse::AcquireToken(DeliveryResponse {
+            metadata,
+            delivery_session_params: delivery,
+        }))
+    }
+
+    fn refresh(
+        &self,
+        request: &CredentialRequest,
+        authorization: &CredentialAuthorization,
+        session_key: SessionKey,
+        user_ref: &ResourceRef,
+    ) -> Result<CredentialResponse, CredentialServiceError> {
+        let delivery = authorization
+            .delivery_session_params()
+            .cloned()
+            .ok_or_else(invariant)?;
+        self.validate_delivery(CredentialMethod::RefreshToken, request, &delivery)?;
+        let deadline = Self::operation_deadline(request.deadline_unix_ms())?;
+        let key = request.credential_ref().to_canonical_string();
+        self.ensure_unlocked(user_ref, deadline)?;
+        if self.has_ambiguous_credential(session_key, &key)? {
+            return Err(invariant());
+        }
+        let lease_key = (session_key, key.clone());
+        let current = self
+            .leases
+            .lock()
+            .map_err(|_| invariant())?
+            .get(&lease_key)
+            .cloned()
+            .ok_or_else(expired)?;
+        match current.metadata.state {
+            CredentialLeaseState::Active => {
+                if let Some(metadata) = current.refresh_results.get(request.idempotency_key()) {
+                    return Ok(CredentialResponse::RefreshToken(DeliveryResponse {
+                        metadata: metadata.clone(),
+                        delivery_session_params: delivery,
+                    }));
+                }
+            }
+            CredentialLeaseState::Expired => return Err(expired()),
+            CredentialLeaseState::Revoked => return Err(revoked()),
+            CredentialLeaseState::Unknown => return Err(invariant()),
+        }
+        let lease = SecretServiceLeaseRef {
+            user_ref: user_ref.clone(),
+            credential_ref: request.credential_ref().clone(),
+            metadata: current.metadata.clone(),
+        };
+        let inspected = match Self::poll_port_sync(self.port.inspect_lease(&lease), deadline) {
+            Ok(inspected) => inspected,
+            Err(SecretServicePollError::Port(SecretServicePortError::CompletionUnknown)) => {
+                self.mark_metadata_unknown(&lease_key)?;
+                self.mark_ambiguous(
+                    session_key,
+                    &key,
+                    request.idempotency_key(),
+                    OperationKind::Inspect,
+                )?;
+                return Err(invariant());
+            }
+            Err(SecretServicePollError::Deadline) => {
+                self.mark_metadata_unknown(&lease_key)?;
+                self.mark_ambiguous(
+                    session_key,
+                    &key,
+                    request.idempotency_key(),
+                    OperationKind::Inspect,
+                )?;
+                return Err(CredentialServiceError::new(
+                    CredentialServiceErrorCode::DeadlineExceeded,
+                ));
+            }
+            Err(SecretServicePollError::Port(SecretServicePortError::LeaseExpired)) => {
+                self.set_lease_state(&lease_key, CredentialLeaseState::Expired)?;
+                return Err(expired());
+            }
+            Err(SecretServicePollError::Port(SecretServicePortError::LeaseRevoked)) => {
+                self.set_lease_state(&lease_key, CredentialLeaseState::Revoked)?;
+                return Err(revoked());
+            }
+            Err(error) => return Err(map_poll_error(error)),
+        };
+        let mut inspected_metadata = lease.metadata.clone();
+        inspected_metadata.state = inspected.state;
+        inspected_metadata.source_version = inspected.source_version;
+        inspected_metadata.rotation_generation = inspected.rotation_generation;
+        inspected_metadata.expires_at_unix_ms = inspected.expires_at_unix_ms;
+        match inspected_metadata.state {
+            CredentialLeaseState::Active => {
+                if inspected_metadata.rotation_generation != lease.metadata.rotation_generation {
+                    self.mark_metadata_unknown(&lease_key)?;
+                    self.mark_ambiguous(
+                        session_key,
+                        &key,
+                        request.idempotency_key(),
+                        OperationKind::Inspect,
+                    )?;
+                    return Err(invariant());
+                }
+            }
+            CredentialLeaseState::Expired => {
+                self.leases
+                    .lock()
+                    .map_err(|_| invariant())?
+                    .get_mut(&lease_key)
+                    .ok_or_else(expired)?
+                    .metadata = inspected_metadata;
+                return Err(expired());
+            }
+            CredentialLeaseState::Revoked => {
+                self.leases
+                    .lock()
+                    .map_err(|_| invariant())?
+                    .get_mut(&lease_key)
+                    .ok_or_else(expired)?
+                    .metadata = inspected_metadata;
+                return Err(revoked());
+            }
+            CredentialLeaseState::Unknown => {
+                self.leases
+                    .lock()
+                    .map_err(|_| invariant())?
+                    .get_mut(&lease_key)
+                    .ok_or_else(expired)?
+                    .metadata = inspected_metadata;
+                self.mark_ambiguous(
+                    session_key,
+                    &key,
+                    request.idempotency_key(),
+                    OperationKind::Inspect,
+                )?;
+                return Err(invariant());
+            }
+        }
+        self.leases
+            .lock()
+            .map_err(|_| invariant())?
+            .get_mut(&lease_key)
+            .ok_or_else(expired)?
+            .metadata = inspected_metadata.clone();
+        let lease = SecretServiceLeaseRef {
+            user_ref: user_ref.clone(),
+            credential_ref: request.credential_ref().clone(),
+            metadata: inspected_metadata,
+        };
+        let recovery_lease = lease.clone();
+        let grant = match Self::poll_port_sync(self.port.refresh_lease(&lease), deadline) {
             Ok(grant) => grant,
             Err(SecretServicePollError::Port(SecretServicePortError::CompletionUnknown)) => {
                 self.mark_metadata_unknown(&lease_key)?;
@@ -320,10 +864,11 @@ impl SecretServiceCredentialProvider {
         &self,
         request: &CredentialRequest,
         session_key: SessionKey,
+        user_ref: &ResourceRef,
     ) -> Result<CredentialResponse, CredentialServiceError> {
         let deadline = Self::operation_deadline(request.deadline_unix_ms())?;
         let key = request.credential_ref().to_canonical_string();
-        self.ensure_unlocked(deadline)?;
+        self.ensure_unlocked(user_ref, deadline)?;
         if self.has_ambiguous_credential(session_key, &key)? {
             return Err(invariant());
         }
@@ -355,10 +900,11 @@ impl SecretServiceCredentialProvider {
         }
 
         let lease = SecretServiceLeaseRef {
+            user_ref: user_ref.clone(),
             credential_ref: request.credential_ref().clone(),
             metadata: current.metadata,
         };
-        let result = match Self::poll_port_raw(self.port.revoke_lease(&lease), deadline) {
+        let result = match Self::poll_port_sync(self.port.revoke_lease(&lease), deadline) {
             Ok(result) => result,
             Err(SecretServicePollError::Port(SecretServicePortError::CompletionUnknown)) => {
                 self.mark_metadata_unknown(&lease_key)?;
@@ -410,10 +956,11 @@ impl SecretServiceCredentialProvider {
         &self,
         request: &CredentialRequest,
         session_key: SessionKey,
+        user_ref: &ResourceRef,
     ) -> Result<CredentialResponse, CredentialServiceError> {
         let deadline = Self::operation_deadline(request.deadline_unix_ms())?;
         let key = request.credential_ref().to_canonical_string();
-        self.ensure_unlocked(deadline)?;
+        self.ensure_unlocked(user_ref, deadline)?;
         if self.has_ambiguous_credential(session_key, &key)? {
             return Err(invariant());
         }
@@ -432,10 +979,11 @@ impl SecretServiceCredentialProvider {
             CredentialLeaseState::Unknown => return Err(invariant()),
         }
         let lease = SecretServiceLeaseRef {
+            user_ref: user_ref.clone(),
             credential_ref: request.credential_ref().clone(),
             metadata: record.metadata.clone(),
         };
-        let inspection = match Self::poll_port_raw(self.port.inspect_lease(&lease), deadline) {
+        let inspection = match Self::poll_port_sync(self.port.inspect_lease(&lease), deadline) {
             Ok(inspection) => inspection,
             Err(SecretServicePollError::Port(SecretServicePortError::LeaseExpired)) => {
                 self.leases
@@ -600,10 +1148,11 @@ impl SecretServiceCredentialProvider {
         session_key: SessionKey,
         deadline: std::time::Instant,
     ) -> Result<(), CredentialServiceError> {
+        let user_ref = self.user_ref_for_session(session_key)?;
         let pending_acquires = self.ambiguous_acquires(session_key)?;
         let mut first_error = None;
         for (credential, idempotency_key, request) in pending_acquires {
-            match Self::poll_port_raw(self.port.revoke_ambiguous_lease(&request), deadline) {
+            match Self::poll_port_sync(self.port.revoke_ambiguous_lease(&request), deadline) {
                 Ok(_)
                 | Err(SecretServicePollError::Port(SecretServicePortError::LeaseExpired))
                 | Err(SecretServicePollError::Port(SecretServicePortError::LeaseRevoked)) => {
@@ -626,7 +1175,7 @@ impl SecretServiceCredentialProvider {
             .map(|(credential, _, _)| credential.clone())
             .collect::<BTreeSet<_>>();
         for (credential, idempotency_key, refresh) in pending_refreshes {
-            match Self::poll_port_raw(
+            match Self::poll_port_sync(
                 self.port.revoke_ambiguous_refresh(
                     &refresh.lease,
                     &refresh.operation_id,
@@ -673,11 +1222,12 @@ impl SecretServiceCredentialProvider {
         for (credential, record) in records {
             let lease_key = (session_key, credential.clone());
             let lease = SecretServiceLeaseRef {
+                user_ref: user_ref.clone(),
                 credential_ref: d2b_contracts_resource::v3::ResourceRef::parse(&credential)
                     .map_err(|_| invariant())?,
                 metadata: record.metadata,
             };
-            match Self::poll_port_raw(self.port.revoke_lease(&lease), deadline) {
+            match Self::poll_port_sync(self.port.revoke_lease(&lease), deadline) {
                 Ok(_)
                 | Err(SecretServicePollError::Port(SecretServicePortError::LeaseExpired))
                 | Err(SecretServicePollError::Port(SecretServicePortError::LeaseRevoked)) => {
@@ -733,8 +1283,25 @@ impl SecretServiceCredentialProvider {
             .lock()
             .map_err(|_| invariant())?
             .remove(&session_key);
+        self.user_sessions
+            .lock()
+            .map_err(|_| invariant())?
+            .retain(|_, key| *key != session_key);
         Ok(())
     }
+}
+
+async fn await_port<T: Send>(
+    future: crate::SecretServiceFuture<'_, T>,
+    deadline: std::time::Instant,
+) -> Result<T, SecretServicePollError> {
+    let remaining = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .ok_or(SecretServicePollError::Deadline)?;
+    tokio::time::timeout(remaining, future)
+        .await
+        .map_err(|_| SecretServicePollError::Deadline)?
+        .map_err(SecretServicePollError::Port)
 }
 
 fn invariant() -> CredentialServiceError {

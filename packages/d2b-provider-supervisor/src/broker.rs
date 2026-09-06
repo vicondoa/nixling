@@ -442,6 +442,21 @@ impl BundleBackedLaunchResolver {
             ticket.template().as_str(),
             None,
         );
+        let provider_component_intent = ticket
+            .owner_ref()
+            .filter(|owner| owner.resource_type().as_str() == "Credential")
+            .filter(|_| process_role_id.starts_with("mi-agent-"))
+            .filter(|_| ticket.template().as_str() == "d2b-managed-identity-agent"
+                || ticket.template().as_str().starts_with("mi-agent-"))
+            .and_then(|_| {
+                self.bundle.find_provider_component_intent_for_template(
+                    &expected_execution_ref,
+                    expected_execution_domain,
+                    expected_user_ref.as_deref(),
+                    ticket.template().as_str(),
+                    Some("Provider/credential-managed-identity"),
+                )
+            });
         let generic_intent = if let Some(owner) = ticket
             .owner_ref()
             .filter(|owner| owner.resource_type().as_str() == "Guest")
@@ -474,6 +489,7 @@ impl BundleBackedLaunchResolver {
             ),
             "process-controller" => (
                 static_controller_intent
+                    .or(provider_component_intent)
                     .or(generic_intent)
                     .ok_or(ProcessEffectError::UnsupportedProvider)?,
                 false,
@@ -513,7 +529,9 @@ impl BundleBackedLaunchResolver {
             }
         }
         let inherited_fd_count = ticket.inherited_fd_table().count();
-        if (role == RunnerRole::ProviderController) != (inherited_fd_count == 1) {
+        if (role == RunnerRole::ProviderController && !(1..=2).contains(&inherited_fd_count))
+            || (role != RunnerRole::ProviderController && inherited_fd_count != 0)
+        {
             return Err(ProcessEffectError::IdentityChanged);
         }
         if intent.execution_ref != expected_execution_ref {
@@ -970,6 +988,14 @@ impl<R: BrokerLaunchResolver> ProcessEffectBackend for BrokerProcessBackend<R> {
         })
     }
 
+    fn wait(
+        &self,
+        handle: &Self::Handle,
+        timeout: Duration,
+    ) -> Result<(), ProcessEffectError> {
+        wait_pidfd_observer(&handle.pidfd, timeout)
+    }
+
     fn take_controller_bootstrap(
         &self,
         handle: &Self::Handle,
@@ -1082,7 +1108,10 @@ impl<R: BrokerLaunchResolver> ProcessEffectBackend for BrokerProcessBackend<R> {
     }
 }
 
-fn wait_pidfd_exit(pidfd: &OwnedFd, timeout: Duration) -> Result<(), ProcessEffectError> {
+pub(crate) fn wait_pidfd_exit(
+    pidfd: &OwnedFd,
+    timeout: Duration,
+) -> Result<(), ProcessEffectError> {
     let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
     let mut fds = [PollFd::new(
         pidfd,
@@ -1092,6 +1121,23 @@ fn wait_pidfd_exit(pidfd: &OwnedFd, timeout: Duration) -> Result<(), ProcessEffe
         Ok(0) | Err(_) => Err(ProcessEffectError::StopFailed),
         Ok(_) if fds[0].revents().intersects(PollFlags::IN | PollFlags::HUP) => Ok(()),
         Ok(_) => Err(ProcessEffectError::StopFailed),
+    }
+}
+
+pub(crate) fn wait_pidfd_observer(
+    pidfd: &OwnedFd,
+    timeout: Duration,
+) -> Result<(), ProcessEffectError> {
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let mut fds = [PollFd::new(
+        pidfd,
+        PollFlags::IN | PollFlags::ERR | PollFlags::HUP,
+    )];
+    match poll(&mut fds, timeout_ms) {
+        Ok(0) => Err(ProcessEffectError::DeadlineExceeded),
+        Err(_) => Err(ProcessEffectError::ObserveFailed),
+        Ok(_) if fds[0].revents().intersects(PollFlags::IN | PollFlags::HUP) => Ok(()),
+        Ok(_) => Err(ProcessEffectError::ObserveFailed),
     }
 }
 

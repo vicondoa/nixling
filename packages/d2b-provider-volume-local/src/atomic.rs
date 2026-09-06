@@ -41,6 +41,15 @@ pub struct AtomicWriteReceipt {
     pub encoded_bytes: usize,
 }
 
+/// Receipt for one atomically replaced raw file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawWriteReceipt {
+    /// The terminal durable-write phase.
+    pub phase: AtomicWritePhase,
+    /// Number of bytes committed.
+    pub encoded_bytes: usize,
+}
+
 /// A closed, content-free atomic state failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtomicWriteError {
@@ -149,6 +158,20 @@ pub trait AtomicFilesystem {
         temp: &mut Self::Temp,
         bytes: &[u8],
     ) -> Result<usize, AtomicWriteError>;
+    /// Apply exact single-inode metadata before publication.
+    ///
+    /// Backends that do not carry host ownership metadata may leave the
+    /// default implementation unchanged; production anchored backends must
+    /// apply the declared owner, group, and mode to the temporary inode.
+    fn set_temp_metadata(
+        &mut self,
+        _temp: &mut Self::Temp,
+        _owner: u32,
+        _group: u32,
+        _mode: u32,
+    ) -> Result<(), AtomicWriteError> {
+        Ok(())
+    }
     /// Synchronize the complete temporary object.
     fn sync_temp(&mut self, temp: &mut Self::Temp) -> Result<(), AtomicWriteError>;
     /// Atomically replace the target from the temporary object.
@@ -157,6 +180,49 @@ pub trait AtomicFilesystem {
     fn sync_parent(&mut self) -> Result<(), AtomicWriteError>;
     /// Remove an uncommitted temporary object.
     fn remove_temp(&mut self, temp: &mut Self::Temp);
+}
+
+/// Replace one raw file using the same temp-fsync, rename, and parent-fsync
+/// sequence as [`AtomicWrite`].
+pub fn replace_bytes<F: AtomicFilesystem>(
+    filesystem: &mut F,
+    bytes: &[u8],
+    owner: u32,
+    group: u32,
+    mode: u32,
+) -> Result<RawWriteReceipt, AtomicWriteError> {
+    let mut temp = filesystem.create_temp()?;
+    let mut phase = AtomicWritePhase::TemporaryCreated;
+    let result = (|| {
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let count = filesystem.write_temp(&mut temp, &bytes[written..])?;
+            if count == 0 {
+                return Err(AtomicWriteError::EffectFailed);
+            }
+            written = written
+                .checked_add(count)
+                .ok_or(AtomicWriteError::EffectFailed)?;
+        }
+        phase = AtomicWritePhase::CompleteDocumentWritten;
+        filesystem.set_temp_metadata(&mut temp, owner, group, mode)?;
+        filesystem.sync_temp(&mut temp)?;
+        phase = AtomicWritePhase::TemporarySynced;
+        filesystem.replace_temp(&mut temp)?;
+        phase = AtomicWritePhase::Replaced;
+        filesystem
+            .sync_parent()
+            .map_err(|_| AtomicWriteError::CommitAmbiguous)?;
+        phase = AtomicWritePhase::ParentSynced;
+        Ok(RawWriteReceipt {
+            phase,
+            encoded_bytes: bytes.len(),
+        })
+    })();
+    if result.is_err() && phase < AtomicWritePhase::Replaced {
+        filesystem.remove_temp(&mut temp);
+    }
+    result
 }
 
 /// Generation and quota policy for one state write.

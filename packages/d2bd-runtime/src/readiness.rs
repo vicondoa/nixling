@@ -343,7 +343,14 @@ mod proc_state_tests {
 #[cfg(target_os = "linux")]
 mod unix_socket_readiness_tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
+
+    fn socket_path(name: &str) -> std::path::PathBuf {
+        let directory = std::path::Path::new(".scratch");
+        std::fs::create_dir_all(directory).expect("create scratch directory");
+        directory.join(format!("d2b-{name}-{}.sock", std::process::id()))
+    }
 
     #[test]
     pub fn unix_socket_listening_detects_listening_stream_socket_without_connecting() {
@@ -357,6 +364,37 @@ mod unix_socket_readiness_tests {
         assert!(unix_socket_listening(&path_str));
 
         drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    pub fn api_socket_info_requires_a_live_http_api() {
+        let path = socket_path("api-readiness");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind API socket");
+        let path_str = path.to_string_lossy().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept API request");
+            let mut request = [0_u8; 256];
+            let read = stream.read(&mut request).expect("read API request");
+            assert!(read > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .expect("write API response");
+        });
+        assert!(api_socket_info_ready(&path_str));
+        server.join().expect("API server");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    pub fn api_socket_info_rejects_a_spawned_task_without_a_live_api() {
+        let path = socket_path("api-readiness-empty");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind placeholder socket");
+        let path_str = path.to_string_lossy().to_string();
+        drop(listener);
+        assert!(!api_socket_info_ready(&path_str));
         let _ = std::fs::remove_file(&path);
     }
 }

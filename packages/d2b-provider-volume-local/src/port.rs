@@ -15,9 +15,14 @@ use serde::Serialize;
 use d2b_contracts_resource::v3::execution_policy::BoundedToken;
 use d2b_contracts_resource::v3::volume::SourceKind;
 
+use crate::content::{
+    ContentMaterializationEvidence, ContentProjection, NetworkConfigContentProjection,
+    NetworkConfigMaterializationEvidence,
+};
 use crate::error::VolumeLocalError;
 use crate::identity::{MarkerState, OwnerProof, VolumeRootHandle};
 use crate::layout::EntryRequest;
+use crate::store_view::StoreViewMarkerEvidence;
 
 /// One observed difference between an existing entry and its declared
 /// state.
@@ -101,6 +106,21 @@ pub trait VolumeSourceEffectPort: Send + Sync {
         kind: SourceKind,
     ) -> impl Future<Output = Result<VolumeRootHandle, VolumeLocalError>> + Send;
 
+    /// Resolve a root while binding it to the exact Volume identity.
+    ///
+    /// Existing source adapters may keep using [`Self::resolve_root`]; the
+    /// production adapter overrides this method so marker evidence cannot be
+    /// reused across Volume UIDs.
+    fn resolve_root_for(
+        &self,
+        _volume_uid: &d2b_contracts_resource::v3::ResourceUid,
+        source_policy_id: Option<&BoundedToken>,
+        system_artifact_id: Option<&BoundedToken>,
+        kind: SourceKind,
+    ) -> impl Future<Output = Result<VolumeRootHandle, VolumeLocalError>> + Send {
+        self.resolve_root(source_policy_id, system_artifact_id, kind)
+    }
+
     /// Report whether the resolved root can enforce hard quotas.
     fn quota_capability(
         &self,
@@ -156,4 +176,47 @@ pub trait VolumeLayoutEffectPort: Send + Sync {
         &self,
         root: &VolumeRootHandle,
     ) -> impl Future<Output = Result<MarkerState, VolumeLocalError>> + Send;
+
+    /// Publish the first-provision marker after all declared entries are
+    /// durable and have been read back successfully.
+    fn publish_marker(
+        &self,
+        _root: &VolumeRootHandle,
+    ) -> impl Future<Output = Result<(), VolumeLocalError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Materialize a complete typed content projection through the same
+    /// anchored, locked, and atomic adapter as layout effects.
+    fn materialize_content(
+        &self,
+        _root: &VolumeRootHandle,
+        _projection: &ContentProjection,
+    ) -> impl Future<Output = Result<ContentMaterializationEvidence, VolumeLocalError>> + Send {
+        async { Err(VolumeLocalError::EffectFailed) }
+    }
+
+    /// Materialize the qualified Network content projection.
+    fn materialize_network_config(
+        &self,
+        _root: &VolumeRootHandle,
+        _projection: &NetworkConfigContentProjection,
+    ) -> impl Future<Output = Result<NetworkConfigMaterializationEvidence, VolumeLocalError>> + Send
+    {
+        async { Err(VolumeLocalError::EffectFailed) }
+    }
+
+    /// Read the zero-length store-view marker through the anchored root.
+    fn observe_store_view_marker(
+        &self,
+        _root: &VolumeRootHandle,
+        _marker_path: &str,
+    ) -> impl Future<Output = Result<StoreViewMarkerEvidence, VolumeLocalError>> + Send {
+        async {
+            Ok(StoreViewMarkerEvidence {
+                present: false,
+                zero_length: false,
+            })
+        }
+    }
 }

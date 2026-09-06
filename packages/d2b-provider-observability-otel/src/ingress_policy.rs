@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+use zeroize::Zeroize;
 
 use crate::metric_policy::{
     IdentityCanaries, MetricDescriptor, MetricPolicyError, validate_data_point,
@@ -166,6 +167,19 @@ impl core::fmt::Debug for MetricFrame {
             .field("point_count", &self.points.len())
             .field("resource_attribute_count", &self.resource_attributes.len())
             .finish()
+    }
+}
+
+impl Drop for MetricFrame {
+    fn drop(&mut self) {
+        for point in &mut self.points {
+            for value in point.labels.values_mut() {
+                value.zeroize();
+            }
+        }
+        for value in self.resource_attributes.values_mut() {
+            value.zeroize();
+        }
     }
 }
 

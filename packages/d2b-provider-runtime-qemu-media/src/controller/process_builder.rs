@@ -222,6 +222,18 @@ impl LaunchTicket {
         display_ref: Option<ResourceRef>,
     ) -> Result<Self, ProcessSpecError> {
         validate_process_spec(&process)?;
+        let media_refs = media_refs.into_iter().collect::<Vec<_>>();
+        if media_refs.len() > 4
+            || media_refs
+                .iter()
+                .any(|reference| reference.resource_type().as_str() != "Volume")
+            || {
+                let mut seen = std::collections::BTreeSet::new();
+                media_refs.iter().any(|reference| !seen.insert(reference))
+            }
+        {
+            return Err(ProcessSpecError::InvalidReference);
+        }
         let mut attachments = Vec::new();
         if let Some(device_ref) = process.execution().device_usage().first() {
             attachments.push(AttachmentSlot {
@@ -242,9 +254,6 @@ impl LaunchTicket {
             });
         }
         for (index, reference) in media_refs.into_iter().enumerate() {
-            if reference.resource_type().as_str() != "Volume" {
-                return Err(ProcessSpecError::InvalidReference);
-            }
             attachments.push(AttachmentSlot {
                 slot: format!("media-{index}"),
                 kind: AttachmentKind::Media,
@@ -261,10 +270,12 @@ impl LaunchTicket {
                 source_ref: reference,
             });
         }
-        Ok(Self {
+        let ticket = Self {
             process,
             attachments,
-        })
+        };
+        ticket.validate()?;
+        Ok(ticket)
     }
 
     /// Validate unique slot labels and typed sources.

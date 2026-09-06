@@ -52,6 +52,7 @@ fn report() -> VolumeStatusReport {
             export_ready: false,
             guest_mount_ready: false,
         }],
+        content: None,
     }
 }
 

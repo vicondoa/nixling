@@ -6,6 +6,52 @@ use d2b_contracts_resource::v3::{ResourceRef, ZoneId};
 use d2b_provider_toolkit::AuthenticatedSessionRouteBinding;
 use sha2::{Digest, Sha256};
 
+/// The bounded repair interval for the clipboard ComponentSession runtime.
+pub const CLIPBOARD_REPAIR_INTERVAL_SECS: u64 = 300;
+
+/// The cutover contract for the clipboard service-only runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardRunnerContract {
+    service_package: &'static str,
+    repair_interval_secs: u64,
+    watched_configuration_is_dependency: bool,
+    component_session_only: bool,
+}
+
+impl ClipboardRunnerContract {
+    /// Return the management service package.
+    pub const fn service_package(self) -> &'static str {
+        self.service_package
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Whether legacy clipboard scheduling is disabled.
+
+    /// Whether configuration is dependency-only.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+
+    /// Whether clipboard state remains on typed ComponentSession streams.
+    pub const fn component_session_only(self) -> bool {
+        self.component_session_only
+    }
+}
+
+/// Return the service-only clipboard cutover contract.
+pub const fn clipboard_runner_contract() -> ClipboardRunnerContract {
+    ClipboardRunnerContract {
+        service_package: crate::MANAGEMENT_SERVICE,
+        repair_interval_secs: CLIPBOARD_REPAIR_INTERVAL_SECS,
+        watched_configuration_is_dependency: true,
+        component_session_only: true,
+    }
+}
+
 /// Display dependency state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyStatus {

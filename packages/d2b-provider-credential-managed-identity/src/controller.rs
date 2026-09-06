@@ -9,12 +9,20 @@ use d2b_contracts_provider::v3::credential_controller::{
     CredentialControllerError, CredentialControllerHandlers, CredentialControllerHealth,
     CredentialObservabilityError, CredentialObserveInput, CredentialReconcileInput,
     CredentialRevocationInput, CredentialSingleFlight, CredentialTelemetryFrame,
-    CredentialTelemetryOperation, CredentialTelemetryOutcome, observe_credential,
+    CredentialProviderKind, CredentialTelemetryOperation, CredentialTelemetryOutcome,
+    observe_credential,
     reconcile_credential, revoke_credential,
 };
 use d2b_contracts_resource::v3::ResourceRef;
 
 use crate::{AGENT_BINARY, ManagedIdentityClientState, ManagedIdentityPlacement};
+
+/// Finalizer owned by the managed-identity Credential controller.
+pub const PROVIDER_REVOKE_FINALIZER: &str =
+    d2b_contracts_provider::v3::credential_controller::CREDENTIAL_PROVIDER_REVOKE_FINALIZER;
+/// Provider identity used by the shared controller registration.
+pub const PROVIDER_KIND: CredentialProviderKind =
+    CredentialProviderKind::ManagedIdentity;
 
 /// Service route selected by the secret-free controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

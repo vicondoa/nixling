@@ -61,8 +61,8 @@ The following are NOT part of this Provider:
 
 | ResourceType | Lifecycle phases | Reconciler | Finalizer |
 | --- | --- | --- | --- |
-| `Process` | Pending → Launching → Ready → Degraded → Failed | system-systemd controller | `process.system-systemd/cleanup` |
-| `EphemeralProcess` | Pending → Ready → Succeeded\|Failed → (TTL cleanup) | system-systemd controller | `process.system-systemd/cleanup` |
+| `Process` | Pending → Launching → Ready → Degraded → Failed | system-systemd controller | `process-system-systemd.d2bus.org/cleanup` |
+| `EphemeralProcess` | Pending → Ready → Succeeded\|Failed → (TTL cleanup) | system-systemd controller | `process-system-systemd.d2bus.org/cleanup` |
 
 The ResourceType schemas are defined in
 `ADR-046-resources-host-guest-process-user`. This Provider implements those
@@ -602,7 +602,7 @@ On `desiredLifecycle=stopped` or `deletion-requested` (finalizer):
    unit, waits for the core-held pidfd and unit state to agree on termination,
    and returns a typed outcome.
 4. Release the opaque handle.
-5. Clear finalizer `process.system-systemd/cleanup`.
+5. Clear finalizer `process-system-systemd.d2bus.org/cleanup`.
 
 On ambiguous state (unit gone, cgroup empty, exit not confirmed via effect port):
 emit audit condition `process-exit-unconfirmed`; record `finalized`; do not
@@ -769,7 +769,7 @@ using a bounded priority lane.
 | `watch` | `EphemeralProcess` | Ongoing reconcile watch |
 | `get` | `Host` | Verifying `executionRef` phase before launch |
 | `watch` | `Host` | Detecting Host state transitions |
-| `finalize` | `Process` | Clearing `process.system-systemd/cleanup` finalizer |
+| `finalize` | `Process` | Clearing `process-system-systemd.d2bus.org/cleanup` finalizer |
 | `finalize` | `EphemeralProcess` | Clearing finalizer after terminal state |
 
 These RoleBindings are configuration-declared and evaluated by the native
@@ -1446,7 +1446,7 @@ and `ADR-046-provider-model-and-packaging` Provider dossier requirement):
 | --- | --- |
 | Provider identity | `Provider/system-systemd`; ProviderType axis: Process, EphemeralProcess; crate path `packages/d2b-provider-system-systemd/` |
 | Nix config schema | `d2b.zones.<zone>.resources.<name>` snippet with `spec.artifactId` and the four `spec.config.*` fields (`launchTimeoutSec`, `terminationGraceSec`, `userManagerCheckTimeout`, `maxConcurrentLaunches`); rendered canonical JSON; no unit-name or user-manager-enable fields (unit names are fixed hash-derived; user-manager verification is mandatory); no credential field (no `credentialRef: true` markers in this Provider) |
-| ResourceTypes | Table: `Process` (phases Pending→Launching→Ready→Degraded→Failed, owner field, finalizer `process.system-systemd/cleanup`); `EphemeralProcess` (phases Pending→Ready→Succeeded\|Failed, finalizer) |
+| ResourceTypes | Table: `Process` (phases Pending→Launching→Ready→Degraded→Failed, owner field, finalizer `process-system-systemd.d2bus.org/cleanup`); `EphemeralProcess` (phases Pending→Ready→Succeeded\|Failed, finalizer) |
 | Controllers/services/workers/binaries | Binary `d2b-provider-system-systemd`; `systemd-controller` component (one instance per execution target); core ProviderDeployment creates controller Process via Provider/system-minijail; no user supervisor binary or entry point inside this crate; cgroup placement per §5.1 |
 | Placement | Valid Host and Guest execution targets; `allowedDomains: [system, user]`; required `providerRef` chain (Provider/system-systemd must be Ready before any Process uses it); system and user domain both dispatched through injected `SystemdProcessEffectPort`; effect port implementation is core-owned |
 | Dependencies and RBAC | Required RoleBinding verbs per §12.1 (no User RoleBindings; UID verification is effect port responsibility); no broker operations; ComponentSession on d2b-bus for ProviderSupervisor integration; no internal socketpair service |

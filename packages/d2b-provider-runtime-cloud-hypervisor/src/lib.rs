@@ -27,7 +27,10 @@ pub use bootstrap_graph::{
     BootstrapGraph, DependencyReadiness, GuestChildGraphPlan, VmmLifecycleEligibility,
 };
 pub use config::{CloudHypervisorConfig, CloudHypervisorGuestSettings, ConsoleType};
-pub use controller::GUEST_CONTROLLER_FINALIZER;
+pub use controller::{
+    CLOUD_HYPERVISOR_REPAIR_INTERVAL_SECS, CloudHypervisorRunnerContract,
+    GUEST_CONTROLLER_FINALIZER, cloud_hypervisor_runner_contract,
+};
 pub use controller::{
     AuthenticatedResourceApiAdapter, AuthenticatedResourceSession, ChildSpecUpdate,
     CloudHypervisorController, CloudHypervisorControllerRegistration, CloudHypervisorError,

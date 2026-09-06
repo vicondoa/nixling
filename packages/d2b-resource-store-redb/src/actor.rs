@@ -15,7 +15,7 @@ use d2b_resource_store::{
     StoreInspectSchemaRequest, StoreListRequest, StoreListResult, StoreProjection,
     StoreResolveRequest, StoreResolvedIdentity, StoredResource, StoredSchema,
 };
-use redb::{Database, ReadableDatabase, ReadableTable};
+use redb::{Database, ReadableDatabase};
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
 use crate::BrokerEvidenceIndex;
@@ -35,10 +35,10 @@ use crate::tracing::{STORE_READ_SPAN, STORE_WRITE_SPAN};
 use crate::transaction::{
     API_SCHEMAS, AuditOutboxRecord, ChangeBatch, CommittedGroup, RESOURCES, ResourceRecord,
     StoreMeta, VerifiedWrite, apply_group_with_hook, audit_outbox_for_operation,
-    audit_outbox_pending, authority_operations, authority_prepare, authority_update, backpressure,
+    audit_outbox_pending, authority_operations, authority_update, backpressure,
     current_meta, decode, mark_audit_outbox_complete, pending_audit_outboxes,
     pending_deferred_activation_operation_ids, resource_key, stored_resource, timeout,
-    validate_deferred_broker_evidence_marker,
+    validate_deferred_broker_evidence_marker, assignment_fence, authority_prepare_batch,
 };
 use d2b_resource_store::mutation_seal::OpenedMutation;
 
@@ -52,6 +52,8 @@ pub const READ_POOL_THREADS: usize = 4;
 pub const MAX_CONCURRENT_READS: usize = 16;
 /// Worker-enforced lifetime ceiling for an admitted read transaction.
 pub const READ_LIFETIME: Duration = Duration::from_millis(250);
+/// Worker-enforced lifetime ceiling for one bounded relist page.
+pub const LIST_READ_LIFETIME: Duration = Duration::from_secs(1);
 
 pub(crate) type CommitFence = Arc<dyn Fn() -> Result<(), StoreError> + Send + Sync>;
 
@@ -549,6 +551,7 @@ impl WriterHandle {
         &self,
         operation_id: String,
         payload: Vec<u8>,
+        request_digest: String,
     ) -> Result<(), StoreError> {
         let (response, receiver) = oneshot::channel();
         self.sender
@@ -557,6 +560,7 @@ impl WriterHandle {
             .send(WriterCommand::AuthorityPrepare {
                 operation_id,
                 payload,
+                request_digest,
                 response,
             })
             .await
@@ -845,6 +849,7 @@ enum WriterCommand {
     AuthorityPrepare {
         operation_id: String,
         payload: Vec<u8>,
+        request_digest: String,
         response: oneshot::Sender<Result<(), StoreError>>,
     },
     AuthorityUpdate {
@@ -1159,15 +1164,41 @@ impl WriterActor {
                 WriterCommand::AuthorityPrepare {
                     operation_id,
                     payload,
+                    request_digest,
                     response,
                 } => {
-                    let result = authority_prepare(&self.database, &operation_id, payload);
+                    let mut requests = vec![(operation_id, payload, request_digest)];
+                    let mut responses = vec![response];
+                    for _ in 0..8 {
+                        match self.receiver.try_recv() {
+                            Err(mpsc::error::TryRecvError::Empty) => {
+                                std::thread::yield_now();
+                            }
+                            Err(mpsc::error::TryRecvError::Disconnected) => break,
+                            Ok(WriterCommand::AuthorityPrepare {
+                                operation_id,
+                                payload,
+                                request_digest,
+                                response,
+                            }) => {
+                                requests.push((operation_id, payload, request_digest));
+                                responses.push(response);
+                            }
+                            Ok(control) => {
+                                deferred = Some(control);
+                                break;
+                            }
+                        }
+                    }
+                    let result = authority_prepare_batch(&self.database, &requests);
                     if let Err(error) = &result
                         && error.kind() == d2b_resource_store::StoreErrorKind::StoreIntegrityFailure
                     {
                         self.quarantine(error.clone());
                     }
-                    let _ = response.send(result);
+                    for response in responses {
+                        let _ = response.send(result.clone());
+                    }
                 }
                 WriterCommand::AuthorityUpdate {
                     operation_id,
@@ -1822,6 +1853,7 @@ fn audit_resource_type(resource_type: &str) -> &'static str {
 
 pub(crate) struct ReadPool {
     senders: Vec<std::sync::mpsc::SyncSender<ReadWork>>,
+    queue_permits: Vec<Arc<tokio::sync::Semaphore>>,
     next_worker: AtomicU64,
     zone: ZoneId,
     permits: Arc<tokio::sync::Semaphore>,
@@ -1841,6 +1873,7 @@ impl ReadPool {
             MAX_CONCURRENT_READS
         );
         let mut senders = Vec::with_capacity(READ_POOL_THREADS);
+        let mut queue_permits = Vec::with_capacity(READ_POOL_THREADS);
         let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(READ_POOL_THREADS);
         for index in 0..READ_POOL_THREADS {
             let database = Arc::clone(&database);
@@ -1859,10 +1892,12 @@ impl ReadPool {
                 }
             };
             senders.push(sender);
+            queue_permits.push(Arc::new(tokio::sync::Semaphore::new(per_worker_capacity)));
             threads.push(thread);
         }
         Ok(Self {
             senders,
+            queue_permits,
             next_worker: AtomicU64::new(0),
             zone,
             permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_READS)),
@@ -1876,30 +1911,58 @@ impl ReadPool {
         operation: &'static str,
         make: impl FnOnce(oneshot::Sender<Result<T, StoreError>>) -> ReadCommand,
     ) -> Result<T, StoreError> {
-        self.submit_with_hold(operation, make, None).await
+        self.submit_with_hold_for(operation, make, None, READ_LIFETIME)
+            .await
     }
 
-    async fn submit_with_hold<T>(
+    async fn submit_with_lifetime<T>(
+        &self,
+        operation: &'static str,
+        make: impl FnOnce(oneshot::Sender<Result<T, StoreError>>) -> ReadCommand,
+        lifetime: Duration,
+    ) -> Result<T, StoreError> {
+        self.submit_with_hold_for(operation, make, None, lifetime)
+            .await
+    }
+
+    async fn submit_with_hold_for<T>(
         &self,
         operation: &'static str,
         make: impl FnOnce(oneshot::Sender<Result<T, StoreError>>) -> ReadCommand,
         hold: Option<ReadHold>,
+        lifetime: Duration,
     ) -> Result<T, StoreError> {
         let started = Instant::now();
-        let permit = Arc::clone(&self.permits)
-            .try_acquire_owned()
-            .map_err(|_| backpressure())?;
-        let (response, receiver) = oneshot::channel();
-        let deadline = Instant::now() + READ_LIFETIME;
+        let deadline = started + lifetime;
+        let admission_deadline = tokio::time::Instant::now() + lifetime;
         let worker = usize::try_from(
             self.next_worker.fetch_add(1, Ordering::Relaxed) % READ_POOL_THREADS as u64,
         )
         .expect("read-worker index fits usize");
+        let queue_permit = tokio::time::timeout_at(
+            admission_deadline,
+            Arc::clone(&self.queue_permits[worker]).acquire_owned(),
+        )
+        .await
+        .map_err(|_| timeout())?
+        .map_err(|_| crate::transaction::integrity("read-pool-closed"))?;
+        let permit = tokio::time::timeout_at(
+            admission_deadline,
+            Arc::clone(&self.permits).acquire_owned(),
+        )
+        .await
+        .map_err(|_| timeout())?
+        .map_err(|_| crate::transaction::integrity("read-pool-closed"))?;
+        let (response, receiver) = oneshot::channel();
+        let (worker_started, worker_started_receiver) = oneshot::channel();
+        let wait_for_worker_completion = hold.is_some();
         self.senders[worker]
             .try_send(ReadWork {
                 command: make(response),
                 deadline,
                 permit,
+                queue_permit,
+                started: worker_started,
                 hold,
             })
             .map_err(|error| match error {
@@ -1908,10 +1971,23 @@ impl ReadPool {
                     crate::transaction::integrity("read-pool-closed")
                 }
             })?;
-        let result = tokio::time::timeout(READ_LIFETIME + Duration::from_millis(25), receiver)
+        // Bound the wait while work is still queued and while production work
+        // is executing. The test hold deliberately awaits worker completion so
+        // it can prove the blocking worker retains and then releases its permit.
+        tokio::time::timeout_at(admission_deadline, worker_started_receiver)
             .await
             .map_err(|_| timeout())?
-            .map_err(|_| crate::transaction::integrity("read-response-closed"))?;
+            .map_err(|_| crate::transaction::integrity("read-start-closed"))?;
+        let result = if wait_for_worker_completion {
+            receiver
+                .await
+                .map_err(|_| crate::transaction::integrity("read-response-closed"))?
+        } else {
+            tokio::time::timeout_at(admission_deadline, receiver)
+                .await
+                .map_err(|_| timeout())?
+                .map_err(|_| crate::transaction::integrity("read-response-closed"))?
+        };
         let outcome = if result.is_ok() { "ok" } else { "error" };
         self.telemetry.metric(
             StoreMetric::ReadDuration,
@@ -1940,8 +2016,12 @@ impl ReadPool {
         request: StoreListRequest,
     ) -> Result<StoreListResult, StoreError> {
         self.validate_zone(&request.zone)?;
-        self.submit("list", |response| ReadCommand::List { request, response })
-            .await
+        self.submit_with_lifetime(
+            "list",
+            |response| ReadCommand::List { request, response },
+            LIST_READ_LIFETIME,
+        )
+        .await
     }
 
     pub(crate) async fn resolve(
@@ -1951,6 +2031,19 @@ impl ReadPool {
         self.validate_zone(&request.zone)?;
         self.submit("get", |response| ReadCommand::Resolve { request, response })
             .await
+    }
+
+    pub(crate) async fn assignment_fence(
+        &self,
+        zone: ZoneId,
+        target: ResourceRef,
+    ) -> Result<Option<d2b_resource_store::ResourceAssignmentFence>, StoreError> {
+        self.validate_zone(&zone)?;
+        self.submit("get", |response| ReadCommand::Assignment {
+            target,
+            response,
+        })
+        .await
     }
 
     pub(crate) async fn inspect_schema(
@@ -1973,9 +2066,11 @@ impl ReadPool {
     pub(crate) async fn authority_operations(
         &self,
     ) -> Result<Vec<crate::AuthorityOperation>, StoreError> {
-        self.submit("scan", |response| ReadCommand::AuthorityOperations {
-            response,
-        })
+        self.submit_with_lifetime(
+            "scan",
+            |response| ReadCommand::AuthorityOperations { response },
+            LIST_READ_LIFETIME,
+        )
         .await
     }
 
@@ -1993,7 +2088,7 @@ impl ReadPool {
         release: std::sync::mpsc::Receiver<()>,
         completed: oneshot::Sender<()>,
     ) -> Result<(), StoreError> {
-        self.submit_with_hold(
+        self.submit_with_hold_for(
             "scan",
             |response| ReadCommand::NeverRespond { response },
             Some(ReadHold {
@@ -2001,6 +2096,7 @@ impl ReadPool {
                 release,
                 completed,
             }),
+            READ_LIFETIME,
         )
         .await
     }
@@ -2008,6 +2104,17 @@ impl ReadPool {
     #[cfg(test)]
     pub(crate) fn available_permits(&self) -> usize {
         self.permits.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserve_permits(&self, count: usize) -> Vec<OwnedSemaphorePermit> {
+        (0..count)
+            .map(|_| {
+                Arc::clone(&self.permits)
+                    .try_acquire_owned()
+                    .expect("test reserve fits read capacity")
+            })
+            .collect()
     }
 }
 
@@ -2036,6 +2143,8 @@ struct ReadWork {
     command: ReadCommand,
     deadline: Instant,
     permit: OwnedSemaphorePermit,
+    queue_permit: OwnedSemaphorePermit,
+    started: oneshot::Sender<()>,
     hold: Option<ReadHold>,
 }
 
@@ -2062,6 +2171,11 @@ enum ReadCommand {
         request: StoreResolveRequest,
         response: oneshot::Sender<Result<StoreResolvedIdentity, StoreError>>,
     },
+    Assignment {
+        target: ResourceRef,
+        response:
+            oneshot::Sender<Result<Option<d2b_resource_store::ResourceAssignmentFence>, StoreError>>,
+    },
     InspectSchema {
         request: StoreInspectSchemaRequest,
         response: oneshot::Sender<Result<StoredSchema, StoreError>>,
@@ -2085,11 +2199,15 @@ fn read_worker(database: Arc<Database>, receiver: std::sync::mpsc::Receiver<Read
             command,
             deadline,
             permit,
+            queue_permit,
+            started,
             hold,
         }) = command
         else {
             return;
         };
+        drop(queue_permit);
+        let _ = started.send(());
         if Instant::now() >= deadline {
             send_read_result(command, Err(timeout()));
             drop(permit);
@@ -2129,6 +2247,10 @@ fn read_worker(database: Arc<Database>, receiver: std::sync::mpsc::Receiver<Read
                     generation: resource.generation,
                     revision: resource.revision,
                 });
+                let _ = response.send(result);
+            }
+            ReadCommand::Assignment { target, response } => {
+                let result = read_assignment(&database, target, deadline);
                 let _ = response.send(result);
             }
             ReadCommand::InspectSchema { request, response } => {
@@ -2187,6 +2309,9 @@ fn send_read_result(command: ReadCommand, result: Result<(), StoreError>) {
         ReadCommand::Resolve { response, .. } => {
             let _ = response.send(Err(result.unwrap_err()));
         }
+        ReadCommand::Assignment { response, .. } => {
+            let _ = response.send(Err(result.unwrap_err()));
+        }
         ReadCommand::InspectSchema { response, .. } => {
             let _ = response.send(Err(result.unwrap_err()));
         }
@@ -2234,6 +2359,34 @@ fn read_get(
     Ok(resource)
 }
 
+fn read_assignment(
+    database: &Database,
+    target: ResourceRef,
+    deadline: Instant,
+) -> Result<Option<d2b_resource_store::ResourceAssignmentFence>, StoreError> {
+    check_deadline(deadline)?;
+    let read = database
+        .begin_read()
+        .map_err(crate::transaction::integrity)?;
+    let table = read
+        .open_table(RESOURCES)
+        .map_err(crate::transaction::integrity)?;
+    let key = resource_key(&target)?;
+    let Some(bytes) = table
+        .get(key.as_slice())
+        .map_err(crate::transaction::integrity)?
+    else {
+        return Ok(None);
+    };
+    check_deadline(deadline)?;
+    let record: ResourceRecord = decode(ValueKind::ResourceRecord, bytes.value())?;
+    record
+        .assignment
+        .as_ref()
+        .map(assignment_fence)
+        .transpose()
+}
+
 fn read_list(
     database: &Database,
     request: StoreListRequest,
@@ -2261,20 +2414,20 @@ fn read_list(
             if cursor.snapshot_revision != snapshot_revision {
                 return Err(crate::transaction::revision_expired(snapshot_revision));
             }
-            Some(cursor.after_key)
+            cursor.after_key
         }
-        None => None,
+        None => Vec::new(),
     };
     let page_size = usize::try_from(request.page_size)
         .map_err(crate::transaction::integrity)?
         .max(1);
-    for row in table.iter().map_err(crate::transaction::integrity)? {
+    for row in table
+        .range(after_key.as_slice()..)
+        .map_err(crate::transaction::integrity)?
+    {
         check_deadline(deadline)?;
         let (key, value) = row.map_err(crate::transaction::integrity)?;
-        if after_key
-            .as_ref()
-            .is_some_and(|after_key| key.value() <= after_key.as_slice())
-        {
+        if !after_key.is_empty() && key.value() <= after_key.as_slice() {
             continue;
         }
         let resource_ref = crate::transaction::resource_ref_from_key(key.value())?;
@@ -2296,18 +2449,38 @@ fn read_list(
         {
             continue;
         }
-        let record: ResourceRecord = decode(ValueKind::ResourceRecord, value.value())?;
-        let mut resource = stored_resource(&request.zone, &resource_ref, &record)?;
+        let (mut resource, owner_uid) = if request.projection == StoreProjection::MetadataOnly {
+            stored_metadata_resource_from_frame(&request.zone, &resource_ref, value.value())?
+        } else {
+            let record: ResourceRecord = decode(ValueKind::ResourceRecord, value.value())?;
+            let owner_uid = record.owner_uid.clone();
+            (
+                stored_resource(&request.zone, &resource_ref, &record)?,
+                owner_uid,
+            )
+        };
+        let owner_ref = serde_json::from_slice::<serde_json::Value>(&resource.canonical_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/metadata/ownerRef")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
         if !filters_match(
             &request.filters,
             resource_type,
             name,
             &resource.uid,
-            record.owner_uid.as_deref(),
+            owner_uid.as_deref(),
+            owner_ref.as_deref(),
         ) {
             continue;
         }
-        project_resource(&mut resource, request.projection)?;
+
+        if request.projection != StoreProjection::MetadataOnly {
+            project_resource(&mut resource, request.projection)?;
+        }
         resources.push((key.value().to_vec(), resource));
         if resources.len() > page_size {
             break;
@@ -2339,6 +2512,116 @@ fn read_list(
         next_cursor,
         truncated,
     })
+}
+
+fn stored_metadata_resource_from_frame(
+    zone: &ZoneId,
+    resource_ref: &ResourceRef,
+    frame: &[u8],
+) -> Result<(StoredResource, Option<String>), StoreError> {
+    // Resource rows are validated at admission and when the store opens. The
+    // metadata-only relist path decodes just the bounded fields it returns so
+    // large snapshot rebuilds do not parse each full envelope twice.
+    if frame.len() < 7
+        || frame[0] != crate::values::VALUE_FORMAT_VERSION
+        || u16::from_be_bytes([frame[1], frame[2]]) != ValueKind::ResourceRecord.discriminant()
+    {
+        return Err(crate::transaction::integrity("table-value-kind-mismatch"));
+    }
+    let payload_length =
+        usize::try_from(u32::from_be_bytes([frame[3], frame[4], frame[5], frame[6]]))
+            .map_err(crate::transaction::integrity)?;
+    if payload_length > crate::values::MAX_VALUE_PAYLOAD_BYTES || frame.len() != 7 + payload_length
+    {
+        return Err(crate::transaction::integrity("value-frame-length-mismatch"));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&frame[7..])
+        .map_err(|_| crate::transaction::integrity("stored-resource-envelope-invalid"))?;
+    let canonical_json = value
+        .get("canonical_json")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-canonical-json-missing"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or_else(|| {
+                    crate::transaction::integrity("stored-resource-canonical-json-invalid")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let payload_digest = value
+        .get("payload_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-payload-digest-missing"))?
+        .to_owned();
+    let owner_uid = value
+        .get("owner_uid")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let owner_uid_resource = owner_uid
+        .as_deref()
+        .map(|value| {
+            ResourceUid::parse(value.to_owned())
+                .map_err(|_| crate::transaction::integrity("stored-resource-owner-uid-invalid"))
+        })
+        .transpose()?;
+    let owner_generation = value
+        .get("owner_generation")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| {
+            d2b_contracts_resource::v3::ResourceGeneration::new(value)
+                .map_err(|_| {
+                    crate::transaction::integrity("stored-resource-owner-generation-invalid")
+                })
+        })
+        .transpose()?;
+    let resource: serde_json::Value = serde_json::from_slice(&canonical_json)
+        .map_err(|_| crate::transaction::integrity("stored-resource-envelope-invalid"))?;
+    let metadata = resource
+        .get("metadata")
+        .cloned()
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-metadata-missing"))?;
+    let uid = metadata
+        .get("uid")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-uid-invalid"))?;
+    let generation = metadata
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| d2b_contracts_resource::v3::ResourceGeneration::new(value).ok())
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-generation-invalid"))?;
+    let revision = metadata
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .map(ZoneRevision::new)
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-revision-invalid"))?;
+    let resource_type = resource
+        .get("type")
+        .cloned()
+        .ok_or_else(|| crate::transaction::integrity("stored-resource-type-missing"))?;
+    let canonical_json = serde_json::to_vec(&serde_json::json!({
+        "apiVersion": "resources.d2bus.org/v3",
+        "metadata": metadata,
+        "type": resource_type,
+    }))
+    .map_err(|_| crate::transaction::integrity("stored-resource-metadata-invalid"))?;
+    Ok((
+        StoredResource {
+            resource_ref: resource_ref.clone(),
+            zone: zone.clone(),
+            uid,
+            owner_uid: owner_uid_resource,
+            owner_generation,
+            generation,
+            revision,
+            canonical_json,
+            payload_digest,
+        },
+        owner_uid,
+    ))
 }
 
 struct ListCursor {
@@ -2437,6 +2720,7 @@ fn filters_match(
     name: &str,
     uid: &ResourceUid,
     owner_uid: Option<&str>,
+    owner_ref: Option<&str>,
 ) -> bool {
     filters.iter().all(|filter| match filter.field.as_str() {
         "metadata.name" => filter.values.iter().any(|value| value == name),
@@ -2446,6 +2730,10 @@ fn filters_match(
             .values
             .iter()
             .any(|value| owner_uid == Some(value.as_str())),
+        "owner.resourceRef" => filter
+            .values
+            .iter()
+            .any(|value| owner_ref == Some(value.as_str())),
         _ => false,
     })
 }
@@ -2593,6 +2881,7 @@ mod tests {
             "worker",
             &uid,
             None,
+            None,
         ));
         assert!(!filters_match(
             &[StoreFilter {
@@ -2602,6 +2891,7 @@ mod tests {
             "Process",
             "worker",
             &uid,
+            None,
             None,
         ));
     }
@@ -2620,9 +2910,40 @@ mod tests {
             "worker",
             &child_uid,
             Some(owner_uid.as_str()),
+            None,
         ));
         assert!(!filters_match(
-            &filter, "Process", "worker", &child_uid, None,
+            &filter,
+            "Process",
+            "worker",
+            &child_uid,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn owner_ref_filter_keeps_stale_uid_children_visible() {
+        let child_uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let filter = [StoreFilter {
+            field: "owner.resourceRef".to_owned(),
+            values: vec!["Provider/runtime".to_owned()],
+        }];
+        assert!(filters_match(
+            &filter,
+            "Process",
+            "worker",
+            &child_uid,
+            Some("223e4567-e89b-42d3-a456-426614174001"),
+            Some("Provider/runtime"),
+        ));
+        assert!(!filters_match(
+            &filter,
+            "Process",
+            "worker",
+            &child_uid,
+            Some("323e4567-e89b-42d3-a456-426614174002"),
+            Some("Provider/other"),
         ));
     }
 

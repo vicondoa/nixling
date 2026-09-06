@@ -22,10 +22,11 @@ pub mod wayland_proxy_argv;
 pub use audit::{DisplayAuditKind, DisplayAuditOutcome, DisplayAuditRecord};
 pub use controller::{
     AuthenticatedDisplaySession, CapabilityReadiness, CleanupState, DependencyReadiness,
-    DependencyState, DisplayController, DisplayDependencyProof, FinalizationDecision,
+    DependencyState, DisplayController, DisplayDependencyProof, DisplayRunnerContract,
+    DISPLAY_MAX_REPAIR_INTERVAL_SECS, DISPLAY_REPAIR_INTERVAL_SECS, FinalizationDecision,
     FinalizationInput, GraceState, Phase, PrincipalReleaseReceipt, ReconcileResult,
     SessionCondition, StopRequest, WaylandPolicySnapshot, WaylandSessionResourceStatus,
-    WaylandSessionStatus,
+    WaylandSessionStatus, display_runner_contract,
 };
 pub use descriptor::{DisplayDescriptorError, DisplayProviderDescriptor};
 pub use metrics::{DisplayTelemetryField, DisplayTelemetryFrame, MetricOutcome};

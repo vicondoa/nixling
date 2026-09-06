@@ -347,6 +347,181 @@ closed_enum!(ServicePackage {
     ConfigNixosV3 = 14 => "d2b.config-nixos.v3"
 });
 
+/// The typed authority boundary carried by a ComponentSession descriptor.
+///
+/// Resource API traffic remains a ResourceService boundary. Service-only
+/// streams and Transport Provider carriage remain ComponentSession
+/// boundaries, so neither can be represented as a generic RPC surface.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComponentSessionBoundary {
+    /// The authenticated ResourceService client boundary.
+    ResourceService,
+    /// A service-only named stream boundary.
+    ServiceStream,
+    /// The typed Transport Provider carriage boundary.
+    Transport,
+}
+
+/// Exact typed identity for one ComponentSession service boundary.
+///
+/// This descriptor carries only the immutable service, schema, and reconnect
+/// generation. It does not enumerate methods or carry a transport handle.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ComponentSessionDescriptor {
+    boundary: ComponentSessionBoundary,
+    service: ServicePackage,
+    schema_fingerprint: [u8; 32],
+    reconnect_generation: u64,
+}
+
+impl ComponentSessionDescriptor {
+    /// Construct and validate one exact typed boundary.
+    pub fn new(
+        boundary: ComponentSessionBoundary,
+        service: ServicePackage,
+        schema_fingerprint: [u8; 32],
+        reconnect_generation: u64,
+    ) -> Result<Self, ContractError> {
+        if reconnect_generation == 0 {
+            return Err(ContractError::InvalidGeneration);
+        }
+        if schema_fingerprint == [0; 32] {
+            return Err(ContractError::InvalidBinding);
+        }
+        let service_matches = match boundary {
+            ComponentSessionBoundary::ResourceService => service == ServicePackage::ResourceV3,
+            ComponentSessionBoundary::ServiceStream => service != ServicePackage::ResourceV3,
+            ComponentSessionBoundary::Transport => service == ServicePackage::ProviderV3,
+        };
+        if !service_matches {
+            return Err(ContractError::IdentityEvidenceMismatch);
+        }
+        Ok(Self {
+            boundary,
+            service,
+            schema_fingerprint,
+            reconnect_generation,
+        })
+    }
+
+    /// Construct the authenticated ResourceService boundary.
+    pub fn resource(
+        schema_fingerprint: [u8; 32],
+        reconnect_generation: u64,
+    ) -> Result<Self, ContractError> {
+        Self::new(
+            ComponentSessionBoundary::ResourceService,
+            ServicePackage::ResourceV3,
+            schema_fingerprint,
+            reconnect_generation,
+        )
+    }
+
+    /// Construct a service-only named-stream boundary.
+    pub fn service_stream(
+        service: ServicePackage,
+        schema_fingerprint: [u8; 32],
+        reconnect_generation: u64,
+    ) -> Result<Self, ContractError> {
+        Self::new(
+            ComponentSessionBoundary::ServiceStream,
+            service,
+            schema_fingerprint,
+            reconnect_generation,
+        )
+    }
+
+    /// Construct the typed Transport Provider boundary.
+    pub fn transport(
+        schema_fingerprint: [u8; 32],
+        reconnect_generation: u64,
+    ) -> Result<Self, ContractError> {
+        Self::new(
+            ComponentSessionBoundary::Transport,
+            ServicePackage::ProviderV3,
+            schema_fingerprint,
+            reconnect_generation,
+        )
+    }
+
+    /// Derive a typed descriptor from an already validated endpoint policy.
+    pub fn from_endpoint_policy(
+        policy: &EndpointPolicy,
+        boundary: ComponentSessionBoundary,
+    ) -> Result<Self, ContractError> {
+        HandshakeOffer::from(policy.clone()).validate()?;
+        Self::new(
+            boundary,
+            policy.service,
+            policy.schema_fingerprint,
+            policy.reconnect_generation,
+        )
+    }
+
+    /// Require exact service, schema, and generation agreement with a policy.
+    pub fn matches_endpoint_policy(&self, policy: &EndpointPolicy) -> Result<(), ContractError> {
+        if self.service != policy.service
+            || self.schema_fingerprint != policy.schema_fingerprint
+            || self.reconnect_generation != policy.reconnect_generation
+        {
+            return Err(ContractError::IdentityEvidenceMismatch);
+        }
+        HandshakeOffer::from(policy.clone()).validate()?;
+        Ok(())
+    }
+
+    /// Return the typed boundary.
+    pub const fn boundary(&self) -> ComponentSessionBoundary {
+        self.boundary
+    }
+
+    /// Return the exact service package.
+    pub const fn service(&self) -> ServicePackage {
+        self.service
+    }
+
+    /// Borrow the exact schema fingerprint.
+    pub const fn schema_fingerprint(&self) -> &[u8; 32] {
+        &self.schema_fingerprint
+    }
+
+    /// Return the exact reconnect generation.
+    pub const fn reconnect_generation(&self) -> u64 {
+        self.reconnect_generation
+    }
+
+    /// Whether this is the ResourceService boundary.
+    pub const fn is_resource_service(&self) -> bool {
+        matches!(self.boundary, ComponentSessionBoundary::ResourceService)
+    }
+
+    /// Whether this is a service-only stream boundary.
+    pub const fn is_service_stream(&self) -> bool {
+        matches!(self.boundary, ComponentSessionBoundary::ServiceStream)
+    }
+
+    /// Whether this is the Transport Provider boundary.
+    pub const fn is_transport(&self) -> bool {
+        matches!(self.boundary, ComponentSessionBoundary::Transport)
+    }
+}
+
+impl fmt::Debug for ComponentSessionDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ComponentSessionDescriptor")
+            .field("boundary", &self.boundary)
+            .field("service", &self.service)
+            .field("schema_fingerprint", &"<redacted>")
+            .field("reconnect_generation", &self.reconnect_generation)
+            .finish()
+    }
+}
+
 closed_enum!(NoiseProfile {
     Nn25519ChaChaPolySha256 = 1 => "Noise_NN_25519_ChaChaPoly_SHA256",
     Kk25519ChaChaPolySha256 = 2 => "Noise_KK_25519_ChaChaPoly_SHA256",

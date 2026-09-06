@@ -37,6 +37,50 @@ pub enum QemuMediaPhase {
     Finalized,
 }
 
+/// Default descriptor repair interval.
+pub const QEMU_MEDIA_REPAIR_INTERVAL_SECS: u64 = 30;
+
+/// The shared-Runner contract for the qemu-media Guest owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QemuMediaRunnerContract {
+    resource_type: &'static str,
+    finalizer: &'static str,
+    repair_interval_secs: u64,
+    watched_configuration_is_dependency: bool,
+}
+
+impl QemuMediaRunnerContract {
+    /// Return the owned ResourceType.
+    pub const fn resource_type(self) -> &'static str {
+        self.resource_type
+    }
+
+    /// Return the exact Guest finalizer.
+    pub const fn finalizer(self) -> &'static str {
+        self.finalizer
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Whether watched configuration is treated as a dependency.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+}
+
+/// Return the shared-Runner contract for qemu-media Guests.
+pub const fn qemu_media_runner_contract() -> QemuMediaRunnerContract {
+    QemuMediaRunnerContract {
+        resource_type: "Guest",
+        finalizer: crate::FINALIZER,
+        repair_interval_secs: QEMU_MEDIA_REPAIR_INTERVAL_SECS,
+        watched_configuration_is_dependency: true,
+    }
+}
+
 /// Reconcile result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QemuMediaReconcileOutcome {

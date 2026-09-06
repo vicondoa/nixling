@@ -25,6 +25,7 @@ rust_library(
         "//packages/d2b-contracts-zone-session:d2b_contracts_zone_session",
         "//packages/d2b-contracts:d2b_contracts",
         "//packages/d2b-session:d2b_session",
+        "@crates//:zeroize",
     ] + all_crate_deps(normal = True, cargo_only = True),
 )
 
@@ -35,6 +36,7 @@ rust_library(
     crate_features = [
         "host-socket",
         "native-vsock",
+        "test-support",
     ],
     crate_name = "d2b_session_unix",
     proc_macro_deps = [
@@ -46,6 +48,7 @@ rust_library(
         "//packages/d2b-contracts-zone-session:d2b_contracts_zone_session",
         "//packages/d2b-contracts:d2b_contracts_test_support",
         "//packages/d2b-session:d2b_session_test_support",
+        "@crates//:zeroize",
     ] + all_crate_deps(normal = True, cargo_only = True),
 )
 

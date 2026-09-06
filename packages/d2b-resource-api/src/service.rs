@@ -181,6 +181,20 @@ impl<S, U> core::fmt::Debug for ResourceService<S, U> {
     }
 }
 
+impl<S, U> ResourceService<S, U> {
+    pub(crate) fn checked_store(&self) -> crate::store::CheckedResourceStore<S> {
+        self.store.clone()
+    }
+
+    pub(crate) fn authorizer_arc(&self) -> Arc<NativeAuthorizer> {
+        Arc::clone(&self.authorizer)
+    }
+
+    pub(crate) fn zone_uid(&self) -> Option<ResourceUid> {
+        self.zone_uid.clone()
+    }
+}
+
 impl<S> ResourceService<S, UnavailableUpgradeDispatcher>
 where
     S: ResourceStoreBackend,
@@ -2625,6 +2639,8 @@ mod tests {
             resource_ref: ResourceRef::parse("Host/host-system").unwrap(),
             zone: ZoneId::parse("dev").unwrap(),
             uid: ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            owner_uid: None,
+            owner_generation: None,
             generation: ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(9),
             canonical_json: vec![b'x'; bytes],

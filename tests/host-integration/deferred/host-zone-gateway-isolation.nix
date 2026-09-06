@@ -6,6 +6,8 @@ let
   d2bLib = import ./lib.nix {
     inherit self;
     inherit (pkgs) lib;
+    hostToolBundle =
+      if self.lib ? d2bHostToolBundle then self.lib.d2bHostToolBundle else null;
   };
   cloudHypervisorArtifact =
     d2bLib.mkRuntimeCloudHypervisorArtifact pkgs;
@@ -160,17 +162,8 @@ pkgs.testers.runNixOSTest {
           inherit (volumeProviderArtifact) package type catalog;
         };
       };
-      d2b.providerCatalog = {
-        acceptance-provider = {
-          artifactId = "acceptance-provider";
-        };
-        runtime-cloud-hypervisor = {
-          artifactId = "runtime-cloud-hypervisor";
-        };
-        volume-acceptance-provider = {
-          artifactId = "volume-acceptance-provider";
-        };
-      };
+      # Acceptance-only packages remain artifact-only fixtures; their
+      # identities are not rows in the closed Provider matrix.
       d2b.zones.local-root.trustedPublishers.d2b-u20-acceptance.signingKey =
         acceptancePublisherKey;
       d2b.zones.local-root.trustedPublishers.d2b-cloud-hypervisor.signingKey =

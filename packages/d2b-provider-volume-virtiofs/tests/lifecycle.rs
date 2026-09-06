@@ -4,9 +4,36 @@ use d2b_contracts_resource::v3::ResourceRef;
 use d2b_contracts_resource::v3::execution_policy::BoundedToken;
 use d2b_provider_volume_virtiofs::testing::{PortCall, ScriptedPort, block_on, fixtures};
 use d2b_provider_volume_virtiofs::{
-    EXPORT_FINALIZER, EXPORT_RESOURCE_TYPE, ExportPhase, ExportSpec, VirtiofsExportController,
-    VirtiofsExportError,
+    EXPORT_FINALIZER, EXPORT_RESOURCE_TYPE, ExportPhase, ExportSpec, LaunchedWorker,
+    VirtiofsExportController, VirtiofsExportEffectPort, VirtiofsExportError, VirtiofsdWorkerPlan,
+    virtiofs_runner_contract,
 };
+
+struct DefaultMarkerPort {
+    inner: ScriptedPort,
+}
+
+impl VirtiofsExportEffectPort for &DefaultMarkerPort {
+    async fn launch_worker(
+        &self,
+        export: &ExportSpec,
+        plan: &VirtiofsdWorkerPlan,
+    ) -> Result<LaunchedWorker, VirtiofsExportError> {
+        (&self.inner).launch_worker(export, plan).await
+    }
+
+    async fn observe_socket(&self, worker: &LaunchedWorker) -> Result<bool, VirtiofsExportError> {
+        (&self.inner).observe_socket(worker).await
+    }
+
+    async fn observe_guest_mount(&self, export: &ExportSpec) -> Result<bool, VirtiofsExportError> {
+        (&self.inner).observe_guest_mount(export).await
+    }
+
+    async fn delete_worker(&self, worker: &LaunchedWorker) -> Result<(), VirtiofsExportError> {
+        (&self.inner).delete_worker(worker).await
+    }
+}
 
 fn reconcile(
     port: &ScriptedPort,
@@ -20,6 +47,24 @@ fn reconcile(
         fixtures::principal(),
     ))
     .expect("reconcile reports")
+}
+
+#[test]
+fn the_default_marker_probe_fails_closed_before_a_store_view_launch() {
+    let port = DefaultMarkerPort {
+        inner: ScriptedPort::serving(),
+    };
+    let controller = VirtiofsExportController::new(&port);
+    let report = block_on(controller.reconcile(
+        &fixtures::export("read-only"),
+        &fixtures::store_view_volume(),
+        4,
+        fixtures::principal(),
+    ))
+    .expect("reconcile reports");
+    assert_eq!(report.phase, ExportPhase::Pending);
+    assert!(report.worker_process_ref.is_none());
+    assert!(!port.inner.calls().contains(&PortCall::LaunchWorker));
 }
 
 #[test]
@@ -218,7 +263,7 @@ fn public_export_status_carries_no_socket_path_shared_dir_or_argv() {
 #[test]
 fn the_provider_owns_only_the_export_resource_type_and_finalizer() {
     assert_eq!(EXPORT_RESOURCE_TYPE, "virtiofs.d2bus.org.Export");
-    assert_eq!(EXPORT_FINALIZER, "volume-virtiofs/export");
+    assert_eq!(EXPORT_FINALIZER, "volume-virtiofs.d2bus.org/export");
     let port = ScriptedPort::serving();
     let controller = VirtiofsExportController::new(&port);
     assert_eq!(controller.finalizer(), EXPORT_FINALIZER);
@@ -240,4 +285,34 @@ fn a_virtio_blk_attachment_is_not_translated_into_an_export() {
         ExportSpec::from_attachment(fixtures::volume_ref(), &attachment).unwrap_err(),
         VirtiofsExportError::InvalidExport
     );
+}
+
+#[test]
+fn resource_export_spec_and_children_keep_one_qualified_owner() {
+    let spec = serde_json::json!({
+        "providerRef": "Provider/volume-virtiofs",
+        "volumeRef": "Volume/work-state",
+        "executionRef": "Guest/work-vm",
+        "view": "ro-store",
+        "access": "read-only",
+        "mountPath": "/nix/.ro-store",
+        "provider": {
+            "schemaId": "volume-virtiofs.d2bus.org/Export/spec",
+            "schemaVersion": "1.0",
+            "settings": {}
+        }
+    });
+    let export = ExportSpec::from_resource_spec(&spec).expect("resource Export spec");
+    assert_eq!(
+        export.provider_ref().to_canonical_string(),
+        "Provider/volume-virtiofs"
+    );
+    assert_ne!(
+        export.worker_process_ref().unwrap(),
+        export.endpoint_ref().unwrap()
+    );
+    let contract = virtiofs_runner_contract();
+    assert_eq!(contract.resource_type, EXPORT_RESOURCE_TYPE);
+    assert_eq!(contract.finalizer, EXPORT_FINALIZER);
+    assert!(contract.watched_configuration_is_dependency);
 }

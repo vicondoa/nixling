@@ -3,7 +3,7 @@ use d2b_provider_device_usbip::{
     AttachProcessIdentity, AttachmentObservation, BindingIdentity, BindingLifecycle,
     BindingLifecycleError, BindingPort, BindingProxyLease, BindingSlotLease, ServiceLifecycle,
     ServiceLifecycleError, ServicePhase, ServicePort, UsbipBindingController, UsbipBindingPhase,
-    UsbipSupervisor, binding_child_resources,
+    UsbipBindingAdmission, UsbipSupervisor, binding_child_resources,
 };
 
 fn uid(value: &str) -> ResourceUid {
@@ -481,4 +481,55 @@ fn foreign_zone_binding_is_refused_before_recovery_observation() {
         Err(BindingLifecycleError::AdmissionDenied)
     );
     assert!(port.calls.is_empty());
+}
+
+#[test]
+fn binding_admission_fences_stale_assignment_and_rejects_volume_ownership() {
+    let binding = ResourceRef::parse("usb.d2bus.org.UsbBinding/keyboard").unwrap();
+    let service = ResourceRef::parse("usb.d2bus.org.UsbService/usb-bus").unwrap();
+    let target = ResourceRef::parse("Guest/guest-a").unwrap();
+    let admission = UsbipBindingAdmission::new(
+        uid("123e4567-e89b-42d3-a456-426614174000"),
+        uid("223e4567-e89b-42d3-a456-426614174001"),
+        uid("323e4567-e89b-42d3-a456-426614174002"),
+        uid("423e4567-e89b-42d3-a456-426614174003"),
+        d2b_contracts_resource::v3::ResourceGeneration::new(2).unwrap(),
+        7,
+    )
+    .unwrap();
+    let mut controller =
+        UsbipBindingController::new_admitted(&binding, &service, &target, admission.clone())
+            .unwrap();
+
+    assert!(!controller.owns_child(&ResourceRef::parse("Volume/foreign").unwrap()));
+    controller.observe_children_with_admission(admission.clone(), true).unwrap();
+
+    let stale = UsbipBindingAdmission::new(
+        uid("123e4567-e89b-42d3-a456-426614174000"),
+        uid("223e4567-e89b-42d3-a456-426614174001"),
+        uid("323e4567-e89b-42d3-a456-426614174002"),
+        uid("423e4567-e89b-42d3-a456-426614174003"),
+        d2b_contracts_resource::v3::ResourceGeneration::new(2).unwrap(),
+        8,
+    )
+    .unwrap();
+    assert_eq!(
+        controller.observe_children_with_admission(stale, true),
+        Err(d2b_provider_device_usbip::UsbipBindingControllerError::StaleAssignment)
+    );
+}
+
+#[test]
+fn usbip_runner_contract_keeps_service_and_binding_on_one_runner() {
+    let contract = d2b_provider_device_usbip::usbip_runner_contract();
+    assert_eq!(
+        contract.service_resource_type(),
+        d2b_provider_device_usbip::USB_SERVICE_RESOURCE_TYPE
+    );
+    assert_eq!(
+        contract.binding_resource_type(),
+        d2b_provider_device_usbip::USB_BINDING_RESOURCE_TYPE
+    );
+    assert!(contract.watched_configuration_is_dependency());
+    assert!((30..=60).contains(&contract.repair_interval_secs()));
 }

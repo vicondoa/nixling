@@ -1,7 +1,7 @@
 //! Persisted store DTOs, recovery validation, and crash-safe write transactions.
 
 use d2b_audit::{AuditHash, OperationIdentity};
-use d2b_contracts_resource::v3::identity::STANDARD_RESOURCE_TYPES;
+use d2b_contracts_resource::v3::identity::{ReconnectGeneration, STANDARD_RESOURCE_TYPES};
 use d2b_contracts_resource::v3::process::PROCESS_RESOURCE_TYPE;
 use d2b_contracts_resource::v3::{
     CanonicalJsonValue, ControllerGeneration, FinalizerId, RESOURCE_ENVELOPE_DOMAIN_TAG,
@@ -209,6 +209,8 @@ fn default_store_epoch() -> u64 {
 pub(crate) struct ResourceRecord {
     pub canonical_json: Vec<u8>,
     pub owner_uid: Option<String>,
+    #[serde(default)]
+    pub owner_generation: Option<u64>,
     pub controller_binding_id: String,
     pub payload_digest: String,
     #[serde(default)]
@@ -348,6 +350,7 @@ pub enum ChangeEvent {
     SpecUpdated,
     StatusUpdated,
     MetadataUpdated,
+    FinalizersUpdated,
     DeletionRequested,
     Deleted,
 }
@@ -389,6 +392,12 @@ pub struct ChangeEntry {
     event: ChangeEvent,
     old_generation: Option<ResourceGeneration>,
     new_generation: Option<ResourceGeneration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_owner_ref: Option<ResourceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_owner_uid: Option<ResourceUid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_ref: Option<ResourceRef>,
     owner_uid: Option<ResourceUid>,
     payload_digest: String,
     canonical_resource: Option<Vec<u8>>,
@@ -406,6 +415,12 @@ struct ChangeEntryWire {
     event: ChangeEvent,
     old_generation: Option<ResourceGeneration>,
     new_generation: Option<ResourceGeneration>,
+    #[serde(default)]
+    previous_owner_ref: Option<ResourceRef>,
+    #[serde(default)]
+    previous_owner_uid: Option<ResourceUid>,
+    #[serde(default)]
+    owner_ref: Option<ResourceRef>,
     owner_uid: Option<ResourceUid>,
     payload_digest: String,
     canonical_resource: Option<Vec<u8>>,
@@ -419,7 +434,7 @@ impl<'de> Deserialize<'de> for ChangeEntry {
         D: serde::Deserializer<'de>,
     {
         let wire = ChangeEntryWire::deserialize(deserializer)?;
-        Self::new(
+        let entry = Self::new(
             wire.ordinal,
             wire.resource_type,
             wire.resource_name,
@@ -433,7 +448,12 @@ impl<'de> Deserialize<'de> for ChangeEntry {
             wire.operation_id.0,
             wire.correlation_id.0,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(serde::de::Error::custom)?;
+        Ok(entry.with_owners(
+            wire.previous_owner_ref,
+            wire.previous_owner_uid,
+            wire.owner_ref,
+        ))
     }
 }
 
@@ -468,12 +488,27 @@ impl ChangeEntry {
             event,
             old_generation,
             new_generation,
+            previous_owner_ref: None,
+            previous_owner_uid: None,
+            owner_ref: None,
             owner_uid,
             payload_digest,
             canonical_resource,
             operation_id: ChangeIdentity::parse(operation_id)?,
             correlation_id: ChangeIdentity::parse(correlation_id)?,
         })
+    }
+
+    pub(crate) fn with_owners(
+        mut self,
+        previous_owner_ref: Option<ResourceRef>,
+        previous_owner_uid: Option<ResourceUid>,
+        owner_ref: Option<ResourceRef>,
+    ) -> Self {
+        self.previous_owner_ref = previous_owner_ref;
+        self.previous_owner_uid = previous_owner_uid;
+        self.owner_ref = owner_ref;
+        self
     }
 
     pub const fn ordinal(&self) -> u32 {
@@ -494,6 +529,38 @@ impl ChangeEntry {
 
     pub fn owner_uid(&self) -> Option<&ResourceUid> {
         self.owner_uid.as_ref()
+    }
+
+    pub fn previous_owner_ref(&self) -> Option<&ResourceRef> {
+        self.previous_owner_ref.as_ref()
+    }
+
+    pub fn previous_owner_uid(&self) -> Option<&ResourceUid> {
+        self.previous_owner_uid.as_ref()
+    }
+
+    pub fn owner_ref(&self) -> Option<&ResourceRef> {
+        self.owner_ref.as_ref()
+    }
+
+    pub const fn old_generation(&self) -> Option<ResourceGeneration> {
+        self.old_generation
+    }
+
+    pub const fn new_generation(&self) -> Option<ResourceGeneration> {
+        self.new_generation
+    }
+
+    pub fn canonical_resource(&self) -> Option<&[u8]> {
+        self.canonical_resource.as_deref()
+    }
+
+    pub fn operation_id(&self) -> &str {
+        self.operation_id.as_str()
+    }
+
+    pub fn correlation_id(&self) -> &str {
+        self.correlation_id.as_str()
     }
 
     pub const fn event(&self) -> ChangeEvent {
@@ -614,10 +681,7 @@ fn audit_outbox_for(
             }
         })
         .collect::<Vec<_>>();
-    let requires_broker = verified
-        .mutations
-        .iter()
-        .any(|prepared| requires_broker_audit(prepared.mutation().target.resource_type().as_str()));
+    let requires_broker = requires_broker_audit_for_write(verified);
     Ok(AuditOutboxRecord {
         zone: verified.authorization.zone.as_str().to_owned(),
         operation_id: verified.operation.operation_id.clone(),
@@ -694,9 +758,7 @@ fn audit_outbox_for_failure(
         ),
         policy_revision: verified.policy_snapshot.policy_revision,
         resulting_revision,
-        requires_broker: verified.mutations.iter().any(|prepared| {
-            requires_broker_audit(prepared.mutation().target.resource_type().as_str())
-        }),
+        requires_broker: requires_broker_audit_for_write(verified),
         defer_broker_evidence: false,
         mutations,
     })
@@ -749,6 +811,39 @@ fn requires_broker_audit(resource_type: &str) -> bool {
             | "ResourceExport"
             | "ResourceImport"
     )
+}
+
+fn is_system_core_subject(subject_ref: &ResourceRef) -> bool {
+    subject_ref.to_canonical_string() == SYSTEM_CORE_SUBJECT_REF
+}
+
+fn is_internal_projection(subject_ref: &ResourceRef, mutation: &StoreMutation) -> bool {
+    is_system_core_subject(subject_ref)
+        && matches!(
+            mutation.kind,
+            ResourceMutationKind::UpdateStatus | ResourceMutationKind::UpdateFinalizers
+        )
+}
+
+fn requires_broker_audit_for_write(verified: &VerifiedWrite) -> bool {
+    verified.mutations.iter().any(|prepared| {
+        let mutation = prepared.mutation();
+        requires_broker_audit(mutation.target.resource_type().as_str())
+            && !is_internal_projection(&verified.authorization.subject_ref, mutation)
+    })
+}
+
+fn requires_broker_audit_for_outbox(outbox: &AuditOutboxRecord) -> bool {
+    let system_core_subject =
+        outbox.subject_digest == crate::audit::opaque_digest(SYSTEM_CORE_SUBJECT_REF);
+    outbox.mutations.iter().any(|mutation| {
+        requires_broker_audit(mutation.resource_type.as_str())
+            && !(system_core_subject
+                && matches!(
+                    mutation.verb.as_str(),
+                    "update-status" | "update-finalizers"
+                ))
+    })
 }
 
 fn failed_operation_record(
@@ -1098,11 +1193,8 @@ pub(crate) fn normalize_audit_outboxes(database: &Database) -> Result<(), StoreE
                 changed = true;
             }
         }
-        let required_broker = outbox.requires_broker
-            || outbox
-                .mutations
-                .iter()
-                .any(|mutation| requires_broker_audit(mutation.resource_type.as_str()));
+        let required_broker =
+            outbox.requires_broker || requires_broker_audit_for_outbox(&outbox);
         if required_broker != outbox.requires_broker {
             outbox.requires_broker = required_broker;
             changed = true;
@@ -1737,10 +1829,15 @@ fn validate_change_batch(batch: &ChangeBatch, meta: &StoreMeta) -> Result<(), St
                     || envelope.metadata().uid() != &entry.resource_uid
                     || envelope.metadata().revision() != batch.revision()
                     || envelope.digest().ok().as_deref() != Some(entry.payload_digest.as_str())
+                    || entry
+                        .owner_ref
+                        .as_ref()
+                        .is_some_and(|owner| envelope.metadata().owner_ref() != Some(owner))
             })
         }) || entry.event == ChangeEvent::Deleted && entry.canonical_resource.is_some()
             || entry.new_generation.is_none() && entry.event != ChangeEvent::Deleted
             || entry.old_generation.is_none() && !matches!(entry.event, ChangeEvent::Created)
+            || entry.previous_owner_ref.is_some() != entry.previous_owner_uid.is_some()
             || entry.operation_id.as_str().is_empty()
             || entry.correlation_id.as_str().is_empty()
     }) || batch.revision().get() > meta.current_revision
@@ -2018,59 +2115,105 @@ pub(crate) fn current_meta(database: &Database) -> Result<StoreMeta, StoreError>
     read_meta(&read)
 }
 
-pub(crate) fn authority_prepare(
+pub(crate) fn authority_prepare_batch(
     database: &Database,
-    operation_id: &str,
-    payload: Vec<u8>,
+    requests: &[(String, Vec<u8>, String)],
 ) -> Result<(), StoreError> {
-    if operation_id.is_empty() || operation_id.len() > 512 {
-        return Err(integrity("authority-operation-id-invalid"));
+    if requests.is_empty() {
+        return Err(integrity("authority-operation-batch-empty"));
     }
-    if payload.is_empty() || payload.len() > 64 * 1024 {
-        return Err(integrity("authority-operation-payload-invalid"));
+    if requests.len() > 128 {
+        return Err(integrity("authority-operation-batch-bound"));
     }
-    let request_digest = canonical_digest("d2b:authority-operation/v1", &payload);
-    let key = operation_key(operation_id)?;
     let mut write = database.begin_write().map_err(integrity)?;
     set_full_durability(&mut write)?;
     let current_revision = read_meta_in_write(&write)?.current_revision;
-    let existing = {
-        let table = write.open_table(OPERATIONS).map_err(integrity)?;
-        table
+    let mut table = write.open_table(OPERATIONS).map_err(integrity)?;
+    for (operation_id, payload, request_digest) in requests {
+        if operation_id.is_empty() || operation_id.len() > 512 {
+            return Err(integrity("authority-operation-id-invalid"));
+        }
+        if payload.is_empty() || payload.len() > 64 * 1024 {
+            return Err(integrity("authority-operation-payload-invalid"));
+        }
+        if !valid_digest(request_digest) {
+            return Err(integrity("authority-operation-digest-invalid"));
+        }
+        let key = operation_key(operation_id)?;
+        let existing = table
             .get(key.as_slice())
             .map_err(integrity)?
             .map(|value| decode::<OperationRecord>(ValueKind::OperationRecord, value.value()))
-            .transpose()?
-    };
-    if let Some(existing) = existing {
-        let _ = existing;
-        return Err(conflict(
-            current_revision,
-            0,
-            "authority-operation-id-reused",
-        ));
+            .transpose()?;
+        if let Some(existing) = existing {
+            let Some(authority) = existing.authority else {
+                return Err(conflict(
+                    current_revision,
+                    0,
+                    "authority-operation-id-reused",
+                ));
+            };
+            if authority_payload_digest(&authority.payload)?.as_str() == request_digest {
+                if matches!(
+                    authority.state.as_str(),
+                    "effect-confirmed" | "effect-terminal" | "released" | "closed"
+                ) {
+                    return Err(conflict(
+                        current_revision,
+                        0,
+                        "authority-operation-id-reused",
+                    ));
+                }
+                continue;
+            }
+            return Err(conflict(
+                current_revision,
+                0,
+                "authority-operation-id-reused",
+            ));
+        }
+        let operation = OperationRecord {
+            request_digest: request_digest.clone(),
+            resource_uids: Vec::new(),
+            resources: Vec::new(),
+            outcome: "committed".to_owned(),
+            error_code: None,
+            accepted_revision: current_revision,
+            finished_revision: current_revision,
+            audit_outbox: None,
+            authority: Some(AuthorityOperationStorage {
+                payload: payload.clone(),
+                state: "pending".to_owned(),
+            }),
+        };
+        let value = encode(ValueKind::OperationRecord, &operation)?;
+        table
+            .insert(key.as_slice(), value.as_slice())
+            .map_err(integrity)?;
     }
-    let operation = OperationRecord {
-        request_digest,
-        resource_uids: Vec::new(),
-        resources: Vec::new(),
-        outcome: "committed".to_owned(),
-        error_code: None,
-        accepted_revision: current_revision,
-        finished_revision: current_revision,
-        audit_outbox: None,
-        authority: Some(AuthorityOperationStorage {
-            payload,
-            state: "pending".to_owned(),
-        }),
-    };
-    let value = encode(ValueKind::OperationRecord, &operation)?;
-    write
-        .open_table(OPERATIONS)
-        .map_err(integrity)?
-        .insert(key.as_slice(), value.as_slice())
-        .map_err(integrity)?;
+    drop(table);
     write.commit().map_err(integrity)
+}
+
+pub(crate) fn authority_payload_digest(payload: &[u8]) -> Result<String, StoreError> {
+    let value: serde_json::Value = serde_json::from_slice(payload)
+        .map_err(|_| integrity("authority-operation-payload-invalid"))?;
+    authority_payload_digest_value(&value)
+}
+
+pub(crate) fn authority_payload_digest_value(
+    value: &serde_json::Value,
+) -> Result<String, StoreError> {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "state".to_owned(),
+            serde_json::Value::String("pending".to_owned()),
+        );
+    }
+    let normalized =
+        serde_json::to_vec(&value).map_err(|_| integrity("authority-operation-payload-invalid"))?;
+    Ok(canonical_digest("d2b:authority-operation/v1", &normalized))
 }
 
 pub(crate) fn authority_update(
@@ -2386,6 +2529,7 @@ fn replayed_operation_failure(operation: &OperationRecord) -> StoreError {
             Some("resource-already-exists") => StoreErrorKind::ResourceAlreadyExists,
             Some("resource-conflict")
             | Some("operation-id-reused")
+            | Some("assignment-required")
             | Some("assignment-owner-missing")
             | Some("owner-child-binding-mismatch")
             | Some("same-batch-create-followup-unsupported")
@@ -2430,7 +2574,10 @@ fn replayed_operation_failure(operation: &OperationRecord) -> StoreError {
         StoreErrorKind::ExpeditedQuotaExceeded => "expedited-quota-exceeded",
         _ => "operation-replayed-error",
     };
-    let retry_class = if kind == StoreErrorKind::AuthorizationDenied {
+    let retry_class = if matches!(
+        kind,
+        StoreErrorKind::AuthorizationDenied | StoreErrorKind::ResourceConflict
+    ) {
         RetryClass::Reauthorize
     } else {
         RetryClass::Never
@@ -2446,6 +2593,54 @@ fn replayed_operation_failure(operation: &OperationRecord) -> StoreError {
 
 fn request_digest_matches(persisted: &str, candidates: &[String; 2]) -> bool {
     candidates.iter().any(|candidate| candidate == persisted)
+}
+
+fn authority_status_continuation_allowed(
+    authority: &AuthorityOperationStorage,
+    verified: &VerifiedWrite,
+) -> bool {
+    if !matches!(
+        authority.state.as_str(),
+        "pending" | "effect-retryable" | "effect-confirmed" | "effect-terminal"
+    )
+        || verified.mutations.len() != 1
+    {
+        return false;
+    }
+    let prepared = &verified.mutations[0];
+    if prepared.mutation.kind != ResourceMutationKind::UpdateStatus
+        || prepared.mutation.assignment.is_none()
+    {
+        return false;
+    }
+    let Some(expected_uid) = prepared.resource_uid.as_ref() else {
+        return false;
+    };
+    let Some(canonical_resource) = prepared.mutation.canonical_resource.as_ref() else {
+        return false;
+    };
+    let Ok(resource) = serde_json::from_slice::<serde_json::Value>(canonical_resource) else {
+        return false;
+    };
+    let Some(payload) = serde_json::from_slice::<serde_json::Value>(&authority.payload).ok()
+    else {
+        return false;
+    };
+    payload
+        .get("operationId")
+        .and_then(serde_json::Value::as_str)
+        == Some(verified.operation.operation_id.as_str())
+        && payload
+            .get("resourceUid")
+            .and_then(serde_json::Value::as_str)
+            == Some(expected_uid.as_str())
+        && payload
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
+            == resource
+                .get("metadata")
+                .and_then(|metadata| metadata.get("generation"))
+                .and_then(serde_json::Value::as_u64)
 }
 
 #[cfg(test)]
@@ -2496,6 +2691,7 @@ pub(crate) fn apply_group_with_hook(
         let request_digests = operation_digests(&verified)?;
         let request_digest = request_digests[0].clone();
         let operation_key_bytes = operation_key(&operation_id)?;
+        let mut retained_authority = None;
         if let Some(previous_digest) =
             seen_operations.insert(operation_id.clone(), request_digest.clone())
         {
@@ -2514,25 +2710,31 @@ pub(crate) fn apply_group_with_hook(
                 .map_err(integrity)?
             {
                 let prior: OperationRecord = decode(ValueKind::OperationRecord, bytes.value())?;
-                if !request_digest_matches(&prior.request_digest, &request_digests) {
-                    results.push(Err(conflict(
-                        meta.current_revision,
-                        0,
-                        "operation-id-reused",
-                    )));
-                } else if prior.outcome == "committed" {
-                    results.push(Ok(StoreCommitResult {
-                        resources: prior
-                            .resources
-                            .iter()
-                            .map(operation_resource)
-                            .collect::<Result<Vec<_>, _>>()?,
-                        revision: ZoneRevision::new(prior.finished_revision),
-                    }));
+                if let Some(authority) = prior.authority.as_ref()
+                    && authority_status_continuation_allowed(authority, &verified)
+                {
+                    retained_authority = Some(authority.clone());
                 } else {
-                    results.push(Err(replayed_operation_failure(&prior)));
+                    if !request_digest_matches(&prior.request_digest, &request_digests) {
+                        results.push(Err(conflict(
+                            meta.current_revision,
+                            0,
+                            "operation-id-reused",
+                        )));
+                    } else if prior.outcome == "committed" {
+                        results.push(Ok(StoreCommitResult {
+                            resources: prior
+                                .resources
+                                .iter()
+                                .map(operation_resource)
+                                .collect::<Result<Vec<_>, _>>()?,
+                            revision: ZoneRevision::new(prior.finished_revision),
+                        }));
+                    } else {
+                        results.push(Err(replayed_operation_failure(&prior)));
+                    }
+                    continue;
                 }
-                continue;
             }
         }
 
@@ -2576,25 +2778,30 @@ pub(crate) fn apply_group_with_hook(
                 .map_err(integrity)?
             {
                 let prior: OperationRecord = decode(ValueKind::OperationRecord, bytes.value())?;
-                if request_digest_matches(&prior.request_digest, &request_digests) {
-                    if prior.outcome != "committed" {
-                        results.push(Err(replayed_operation_failure(&prior)));
-                        continue;
-                    }
-                    results.push(Ok(StoreCommitResult {
-                        resources: prior
-                            .resources
-                            .iter()
-                            .map(operation_resource)
-                            .collect::<Result<Vec<_>, _>>()?,
-                        revision: ZoneRevision::new(prior.finished_revision),
-                    }));
+                if let Some(authority) = prior.authority.as_ref()
+                    && authority_status_continuation_allowed(authority, &verified)
+                {
+                    retained_authority = Some(authority.clone());
                 } else {
-                    let error = conflict(meta.current_revision, 0, "operation-id-reused");
-                    results.push(Err(error.clone()));
+                    if request_digest_matches(&prior.request_digest, &request_digests) {
+                        if prior.outcome != "committed" {
+                            results.push(Err(replayed_operation_failure(&prior)));
+                            continue;
+                        }
+                        results.push(Ok(StoreCommitResult {
+                            resources: prior
+                                .resources
+                                .iter()
+                                .map(operation_resource)
+                                .collect::<Result<Vec<_>, _>>()?,
+                            revision: ZoneRevision::new(prior.finished_revision),
+                        }));
+                    } else {
+                        let error = conflict(meta.current_revision, 0, "operation-id-reused");
+                        results.push(Err(error.clone()));
+                    }
+                    continue;
                 }
-
-                continue;
             }
         }
 
@@ -2678,7 +2885,7 @@ pub(crate) fn apply_group_with_hook(
                 revision,
                 audit_now_ms(),
             )?),
-            authority: None,
+            authority: retained_authority,
         };
         let operation_value = encode(ValueKind::OperationRecord, &operation)?;
         write
@@ -2903,6 +3110,8 @@ fn operation_resource(record: &OperationResourceRecord) -> Result<StoredResource
         resource_ref,
         zone,
         uid: envelope.metadata().uid().clone(),
+        owner_uid: None,
+        owner_generation: None,
         generation: envelope.metadata().generation(),
         revision: envelope.metadata().revision(),
         canonical_json: record.canonical_json.clone(),
@@ -2929,6 +3138,13 @@ fn apply_prepared(
             .map(|bytes| decode::<ResourceRecord>(ValueKind::ResourceRecord, bytes.value()))
             .transpose()?
     };
+    let previous_envelope = previous
+        .as_ref()
+        .map(|record| {
+            ResourceEnvelope::from_json(&record.canonical_json)
+                .map_err(|_| integrity("stored-resource-envelope-invalid"))
+        })
+        .transpose()?;
     let previous_resource = previous
         .as_ref()
         .map(|record| stored_resource(&mutation.zone, &mutation.target, record))
@@ -2943,8 +3159,11 @@ fn apply_prepared(
             ));
         };
         let old_record = previous.as_ref().expect("previous resource was checked");
-        let old_envelope = ResourceEnvelope::from_json(&old_record.canonical_json)
-            .map_err(|_| integrity("stored-resource-envelope-invalid"))?;
+        let old_envelope = previous_envelope
+            .as_ref()
+            .ok_or_else(|| integrity("stored-resource-envelope-invalid"))?;
+        let old_owner_ref = old_envelope.metadata().owner_ref().cloned();
+        let old_owner_uid = parse_optional_uid(old_record.owner_uid.as_deref())?;
         if !deletion_requested(&old_record.canonical_json)?
             && (has_finalizers(&old_record.canonical_json)?
                 || owned_children_remain(write, &mutation.target)?
@@ -2958,6 +3177,7 @@ fn apply_prepared(
             let record = ResourceRecord {
                 canonical_json: canonical_json.clone(),
                 owner_uid: old_record.owner_uid.clone(),
+                owner_generation: old_record.owner_generation,
                 controller_binding_id: old_record.controller_binding_id.clone(),
                 payload_digest: payload_digest.clone(),
                 assignment: old_record
@@ -2984,12 +3204,17 @@ fn apply_prepared(
                     ChangeEvent::DeletionRequested,
                     Some(old.generation),
                     Some(resource.generation),
-                    parse_optional_uid(old_record.owner_uid.as_deref())?,
+                    old_owner_uid.clone(),
                     payload_digest,
                     Some(canonical_json),
                     operation_id.to_owned(),
                     correlation_id.to_owned(),
-                )?,
+                )?
+                .with_owners(
+                    old_owner_ref.clone(),
+                    old_owner_uid.clone(),
+                    old_owner_ref,
+                ),
             ));
         }
         if has_finalizers(&old_record.canonical_json)? {
@@ -3029,12 +3254,13 @@ fn apply_prepared(
                 ChangeEvent::Deleted,
                 Some(old.generation),
                 None,
-                parse_optional_uid(old_record.owner_uid.as_deref())?,
+                old_owner_uid.clone(),
                 old.payload_digest.clone(),
                 None,
                 operation_id.to_owned(),
                 correlation_id.to_owned(),
-            )?,
+            )?
+            .with_owners(old_owner_ref, old_owner_uid, None),
         ));
     }
 
@@ -3050,10 +3276,8 @@ fn apply_prepared(
     ) {
         mutation.owner.clone()
     } else {
-        previous_resource
+        previous_envelope
             .as_ref()
-            .and(previous.as_ref())
-            .and_then(|record| ResourceEnvelope::from_json(&record.canonical_json).ok())
             .and_then(|envelope| envelope.metadata().owner_ref().cloned())
     };
     if envelope.resource_type() != mutation.target.resource_type()
@@ -3063,18 +3287,39 @@ fn apply_prepared(
     {
         return Err(integrity("mutation-resource-identity-mismatch"));
     }
-    let owner_uid = match &effective_owner {
-        Some(owner_ref) => Some(resolve_uid_in_write(write, owner_ref)?.as_str().to_owned()),
-        None => None,
+    let (owner_uid, owner_generation) = if mutation.kind == ResourceMutationKind::UpdateStatus {
+        previous
+            .as_ref()
+            .map(|record| (record.owner_uid.clone(), record.owner_generation))
+            .unwrap_or((None, None))
+    } else {
+        let owner_uid = match &effective_owner {
+            Some(owner_ref) => Some(resolve_uid_in_write(write, owner_ref)?.as_str().to_owned()),
+            None => None,
+        };
+        let owner_generation = effective_owner
+            .as_ref()
+            .map(|owner_ref| resolve_generation_in_write(write, owner_ref))
+            .transpose()?
+            .map(|generation| generation.get());
+        (owner_uid, owner_generation)
     };
+    let previous_owner_ref = previous_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.metadata().owner_ref().cloned());
+    let previous_owner_uid = previous
+        .as_ref()
+        .map(|record| parse_optional_uid(record.owner_uid.as_deref()))
+        .transpose()?
+        .flatten();
     if let (Some(previous_resource), Some(previous_record)) = (&previous_resource, &previous) {
-        let previous_envelope = ResourceEnvelope::from_json(&previous_record.canonical_json)
-            .map_err(|_| integrity("stored-resource-envelope-invalid"))?;
         remove_indexes(
             write,
             previous_resource,
             previous_record,
-            &previous_envelope,
+            previous_envelope
+                .as_ref()
+                .ok_or_else(|| integrity("stored-resource-envelope-invalid"))?,
         )?;
     }
     let payload_digest = envelope.digest().map_err(integrity)?;
@@ -3098,6 +3343,7 @@ fn apply_prepared(
     let record = ResourceRecord {
         canonical_json: canonical_json.clone(),
         owner_uid: owner_uid.clone(),
+        owner_generation,
         controller_binding_id: controller_binding_id(&envelope, assignment.as_ref()),
         payload_digest: payload_digest.clone(),
         assignment,
@@ -3131,7 +3377,8 @@ fn apply_prepared(
                 None,
                 operation_id.to_owned(),
                 correlation_id.to_owned(),
-            )?,
+            )?
+            .with_owners(previous_owner_ref, previous_owner_uid, None),
         ));
     }
     let producer = endpoint_producer(&envelope)?;
@@ -3148,9 +3395,8 @@ fn apply_prepared(
         ResourceMutationKind::Create => ChangeEvent::Created,
         ResourceMutationKind::UpdateSpec => ChangeEvent::SpecUpdated,
         ResourceMutationKind::UpdateStatus => ChangeEvent::StatusUpdated,
-        ResourceMutationKind::UpdateMetadata | ResourceMutationKind::UpdateFinalizers => {
-            ChangeEvent::MetadataUpdated
-        }
+        ResourceMutationKind::UpdateMetadata => ChangeEvent::MetadataUpdated,
+        ResourceMutationKind::UpdateFinalizers => ChangeEvent::FinalizersUpdated,
         ResourceMutationKind::Delete => unreachable!("delete returned above"),
     };
     Ok((
@@ -3170,7 +3416,8 @@ fn apply_prepared(
             Some(canonical_json),
             operation_id.to_owned(),
             correlation_id.to_owned(),
-        )?,
+        )?
+        .with_owners(previous_owner_ref, previous_owner_uid, effective_owner),
     ))
 }
 
@@ -3200,6 +3447,7 @@ fn staged_state_after_mutation(
         .unwrap_or_else(|| ResourceRecord {
             canonical_json: Vec::new(),
             owner_uid: None,
+            owner_generation: None,
             controller_binding_id: String::new(),
             payload_digest: String::new(),
             assignment: None,
@@ -3578,7 +3826,10 @@ fn validate_owner_child_assignment_fence(
     current_revision: u64,
     ordinal: u32,
 ) -> Result<(), StoreError> {
-    if mutation.target.resource_type().as_str() != PROCESS_RESOURCE_TYPE
+    if !matches!(
+        mutation.target.resource_type().as_str(),
+        PROCESS_RESOURCE_TYPE | "Endpoint" | "Volume"
+    )
         || fence.resource_uid != *owner_uid
         || fence.resource_revision != owner_revision
     {
@@ -3831,6 +4082,21 @@ fn resolve_uid_in_write(
         })?;
     let uid: String = decode(ValueKind::TypeIndexRecord, bytes.value())?;
     ResourceUid::parse(uid).map_err(|_| integrity("type-index-uid-invalid"))
+}
+
+fn resolve_generation_in_write(
+    write: &redb::WriteTransaction,
+    resource_ref: &ResourceRef,
+) -> Result<ResourceGeneration, StoreError> {
+    current_record_in_write(write, resource_ref)?
+        .map(|(_, envelope)| envelope.metadata().generation())
+        .ok_or_else(|| {
+            error(
+                StoreErrorKind::ResourceRefInvalid,
+                None,
+                "owner-ref-not-found",
+            )
+        })
 }
 
 fn insert_resource_and_indexes(
@@ -4454,10 +4720,27 @@ pub(crate) fn stored_resource(
 ) -> Result<StoredResource, StoreError> {
     let envelope = ResourceEnvelope::from_json(&record.canonical_json)
         .map_err(|_| integrity("stored-resource-envelope-invalid"))?;
+    let owner_uid = record
+        .owner_uid
+        .as_deref()
+        .map(|value| {
+            ResourceUid::parse(value.to_owned())
+                .map_err(|_| integrity("stored-resource-owner-uid-invalid"))
+        })
+        .transpose()?;
+    let owner_generation = record
+        .owner_generation
+        .map(|value| {
+            ResourceGeneration::new(value)
+                .map_err(|_| integrity("stored-resource-owner-generation-invalid"))
+        })
+        .transpose()?;
     Ok(StoredResource {
         resource_ref: resource_ref.clone(),
         zone: zone.clone(),
         uid: envelope.metadata().uid().clone(),
+        owner_uid,
+        owner_generation,
         generation: envelope.metadata().generation(),
         revision: envelope.metadata().revision(),
         canonical_json: record.canonical_json.clone(),
@@ -4511,6 +4794,31 @@ fn assignment_record(
         session_generation: fence.session_generation.get(),
         epoch: fence.epoch,
         phase: "assigned".to_owned(),
+    })
+}
+
+pub(crate) fn assignment_fence(
+    record: &AssignmentRecord,
+) -> Result<ResourceAssignmentFence, StoreError> {
+    if record.phase != "assigned" {
+        return Err(integrity("stored-assignment-not-active"));
+    }
+    Ok(ResourceAssignmentFence {
+        resource_uid: ResourceUid::parse(record.resource_uid.clone())
+            .map_err(|_| integrity("stored-assignment-invalid"))?,
+        resource_revision: ZoneRevision::new(record.resource_revision),
+        provider_generation: ResourceGeneration::new(record.provider_generation)
+            .map_err(|_| integrity("stored-assignment-invalid"))?,
+        controller_generation: ControllerGeneration::new(record.controller_generation)
+            .map_err(|_| integrity("stored-assignment-invalid"))?,
+        controller_role: ResourceRef::parse(&record.controller_role)
+            .map_err(|_| integrity("stored-assignment-invalid"))?,
+        target: ResourceRef::parse(&record.target)
+            .map_err(|_| integrity("stored-assignment-invalid"))?,
+        session_generation: ReconnectGeneration::new(record.session_generation)
+            .map_err(|_| integrity("stored-assignment-invalid"))?,
+        epoch: record.epoch,
+        scope: ResourceAssignmentScope::Primary,
     })
 }
 
@@ -5022,7 +5330,8 @@ mod tests {
     use super::*;
     use d2b_contracts_resource::v3::identity::ReconnectGeneration;
     use d2b_contracts_resource::v3::{
-        ConfigurationGeneration, ResourceGeneration, ResourcePhase, ResourceTypeName, Timestamp,
+        ConfigurationGeneration, ResourceGeneration, ResourceName, ResourcePhase, ResourceTypeName,
+        Timestamp,
     };
     use d2b_resource_store::{
         AdmittedAuthorizationTarget, AdmittedVerb, ResourceAssignmentFence,
@@ -5257,6 +5566,107 @@ mod tests {
                 owner_generation,
             },
         }
+    }
+
+    #[test]
+    fn stored_resource_retains_the_persisted_owner_generation_fence() {
+        let owner_uid = ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap();
+        let resource = stored_resource(
+            &ZoneId::parse("dev").unwrap(),
+            &ResourceRef::parse("Volume/runtime-state").unwrap(),
+            &ResourceRecord {
+                canonical_json: RESOURCE.to_vec(),
+                owner_uid: Some(owner_uid.as_str().to_owned()),
+                owner_generation: Some(7),
+                controller_binding_id: "Provider/volume-local".to_owned(),
+                payload_digest: ResourceEnvelope::from_json(RESOURCE)
+                    .unwrap()
+                    .digest()
+                    .unwrap(),
+                assignment: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(resource.owner_uid, Some(owner_uid));
+        assert_eq!(
+            resource.owner_generation,
+            Some(ResourceGeneration::new(7).unwrap())
+        );
+    }
+
+    #[test]
+    fn controller_session_evidence_update_preserves_the_persisted_owner_incarnation() {
+        let (_directory, database, _identity) = fixture();
+        let owner = ResourceRef::parse("Guest/owner").unwrap();
+        let child = ResourceRef::parse("Process/child").unwrap();
+        apply_group(
+            &database,
+            vec![verified(
+                "owner-create",
+                create_mutation_with_body(owner.clone(), guest_body("owner")),
+                ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            )],
+        )
+        .unwrap();
+
+        let child_body = process_body(child.name().as_str(), Some(&owner));
+        let mut child_create = create_mutation_with_body(child.clone(), child_body.clone());
+        child_create.owner = Some(owner.clone());
+        let child_uid =
+            ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        apply_group(
+            &database,
+            vec![verified("child-create", child_create, child_uid.clone())],
+        )
+        .unwrap();
+
+        let owner_record = {
+            let read = database.begin_read().unwrap();
+            let table = read.open_table(RESOURCES).unwrap();
+            let value = table
+                .get(resource_key(&owner).unwrap().as_slice())
+                .unwrap()
+                .unwrap();
+            decode::<ResourceRecord>(ValueKind::ResourceRecord, value.value()).unwrap()
+        };
+        let owner_uid = ResourceEnvelope::from_json(&owner_record.canonical_json)
+            .unwrap()
+            .metadata()
+            .uid()
+            .clone();
+
+        let mut status_body = CanonicalJsonValue::parse(&child_body).unwrap();
+        let CanonicalJsonValue::Object(root) = &mut status_body else {
+            unreachable!();
+        };
+        let CanonicalJsonValue::Object(status) = root.get_mut("status").unwrap() else {
+            unreachable!();
+        };
+        status.insert(
+            "phase".to_owned(),
+            CanonicalJsonValue::String("Ready".to_owned()),
+        );
+        let mut status = create_mutation_with_body(child.clone(), status_body.to_canonical_bytes());
+        status.kind = ResourceMutationKind::UpdateStatus;
+        status.expected = ExpectedRevision::Exact(ZoneRevision::new(2));
+        status.expected_uid = Some(child_uid.clone());
+        status.owner = None;
+        apply_group(
+            &database,
+            vec![verified("controller-session-evidence", status, child_uid)],
+        )
+        .unwrap();
+
+        let read = database.begin_read().unwrap();
+        let table = read.open_table(RESOURCES).unwrap();
+        let value = table
+            .get(resource_key(&child).unwrap().as_slice())
+            .unwrap()
+            .unwrap();
+        let child_record: ResourceRecord =
+            decode(ValueKind::ResourceRecord, value.value()).unwrap();
+        assert_eq!(child_record.owner_uid, Some(owner_uid.as_str().to_owned()));
+        assert_eq!(child_record.owner_generation, Some(1));
     }
 
     fn stored_envelope(database: &Database, target: &ResourceRef) -> ResourceEnvelope {
@@ -5676,6 +6086,86 @@ mod tests {
             second.results[0].as_ref().unwrap_err().kind(),
             StoreErrorKind::AuthorizationDenied
         );
+    }
+
+    #[test]
+    fn assignment_required_failure_replay_remains_a_retryable_conflict() {
+        let (_directory, database, _identity) = fixture();
+        let target = ResourceRef::parse("Host/host-system").unwrap();
+        let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let seeded = apply_group(
+            &database,
+            vec![verified(
+                "assignment-required-seed",
+                create_mutation(target.clone()),
+                uid.clone(),
+            )],
+        )
+        .unwrap();
+        let uid = seeded.results[0].as_ref().unwrap().resources[0].uid.clone();
+
+        let mut assigned_finalizers = create_mutation(target.clone());
+        assigned_finalizers.kind = ResourceMutationKind::UpdateFinalizers;
+        assigned_finalizers.expected = ExpectedRevision::Exact(ZoneRevision::new(1));
+        assigned_finalizers.expected_uid = Some(uid.clone());
+        assigned_finalizers.canonical_resource = None;
+        assigned_finalizers.add_finalizers =
+            vec![FinalizerId::parse("core.controller-test").unwrap()];
+        assigned_finalizers.assignment = Some(primary_fence(
+            uid.clone(),
+            ZoneRevision::new(1),
+            target.clone(),
+        ));
+        let assigned = apply_group(
+            &database,
+            vec![verified(
+                "assignment-required-install",
+                assigned_finalizers,
+                uid.clone(),
+            )],
+        )
+        .unwrap();
+        assert!(
+            assigned.results[0].is_ok(),
+            "assignment install failed: {:?}",
+            assigned.results[0]
+        );
+
+        let mut unassigned_status = create_mutation(target.clone());
+        unassigned_status.kind = ResourceMutationKind::UpdateStatus;
+        unassigned_status.expected = ExpectedRevision::Exact(ZoneRevision::new(2));
+        unassigned_status.expected_uid = Some(uid.clone());
+        let first = apply_group(
+            &database,
+            vec![verified(
+                "assignment-required-replay",
+                unassigned_status.clone(),
+                uid.clone(),
+            )],
+        )
+        .unwrap();
+        let first_error = first.results[0].as_ref().unwrap_err();
+        assert_eq!(first_error.kind(), StoreErrorKind::ResourceConflict);
+        assert_eq!(first_error.reason_code(), "assignment-required");
+        assert_eq!(first_error.retry_class(), RetryClass::Reauthorize);
+
+        let second = apply_group(
+            &database,
+            vec![verified(
+                "assignment-required-replay",
+                unassigned_status,
+                uid,
+            )],
+        )
+        .unwrap();
+        let replayed_error = second.results[0].as_ref().unwrap_err();
+        assert_eq!(replayed_error.kind(), StoreErrorKind::ResourceConflict);
+        assert_eq!(replayed_error.reason_code(), "resource-conflict");
+        assert_eq!(
+            replayed_error.current_revision(),
+            Some(ZoneRevision::new(2))
+        );
+        assert_eq!(replayed_error.retry_class(), RetryClass::Reauthorize);
     }
 
     #[test]
@@ -6712,6 +7202,44 @@ mod tests {
     }
 
     #[test]
+    fn change_entries_retain_old_and_new_owner_bindings() {
+        let old_owner = ResourceRef::parse("Host/old-owner").unwrap();
+        let new_owner = ResourceRef::parse("Host/new-owner").unwrap();
+        let entry = ChangeEntry::new(
+            0,
+            ResourceTypeName::parse("Process").unwrap(),
+            ResourceName::parse("worker").unwrap(),
+            ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            ChangeEvent::MetadataUpdated,
+            Some(ResourceGeneration::new(1).unwrap()),
+            Some(ResourceGeneration::new(2).unwrap()),
+            Some(ResourceUid::parse("123e4567-e89b-42d3-a456-426614174002").unwrap()),
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            Some(RESOURCE.to_vec()),
+            "reparent".to_owned(),
+            "reparent-correlation".to_owned(),
+        )
+        .unwrap()
+        .with_owners(
+            Some(old_owner.clone()),
+            Some(ResourceUid::parse("123e4567-e89b-42d3-a456-426614174001").unwrap()),
+            Some(new_owner.clone()),
+        );
+        let encoded = serde_json::to_vec(&entry).unwrap();
+        let decoded: ChangeEntry = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.previous_owner_ref(), Some(&old_owner));
+        assert_eq!(decoded.owner_ref(), Some(&new_owner));
+        assert_eq!(
+            decoded.previous_owner_uid().unwrap().as_str(),
+            "123e4567-e89b-42d3-a456-426614174001"
+        );
+        assert_eq!(
+            decoded.owner_uid().unwrap().as_str(),
+            "123e4567-e89b-42d3-a456-426614174002"
+        );
+    }
+
+    #[test]
     fn recovery_rejects_derived_resource_drift_and_invalid_auxiliary_tables() {
         let (_directory, database, _identity) = fixture();
         let target = ResourceRef::parse("Host/host-system").unwrap();
@@ -6891,6 +7419,10 @@ mod tests {
             .clone();
         assert_eq!(child.resource_ref, child_ref);
         assert_eq!(
+            child.owner_generation,
+            Some(owner.generation)
+        );
+        assert_eq!(
             stored_envelope(&database, &child_ref)
                 .metadata()
                 .owner_ref(),
@@ -6923,8 +7455,9 @@ mod tests {
             .unwrap()
             .resources[0]
             .clone();
+            assert_eq!(updated.owner_generation, Some(owner.generation));
 
-        let mut request_delete = create_mutation(child_ref.clone());
+            let mut request_delete = create_mutation(child_ref.clone());
         request_delete.kind = ResourceMutationKind::Delete;
         request_delete.expected = ExpectedRevision::Exact(updated.revision);
         request_delete.expected_uid = Some(child.uid.clone());

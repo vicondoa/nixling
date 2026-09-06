@@ -1,4 +1,4 @@
-//! Focused Provider toolkit conformance over the v3 registry and RPC seam.
+//! Focused Provider toolkit conformance over the v3 registry and service seam.
 
 use std::{
     fmt::Write as FmtWrite,
@@ -25,7 +25,7 @@ use d2b_contracts_resource::v3::{
 };
 use d2b_provider::{
     AdmissionOptions, CancellationToken, ProviderClass, ProviderMethodName,
-    ProviderRegistryBuilder, ProviderRuntimeError, rpc::RpcProviderProxy,
+    ProviderRegistryBuilder, ProviderRuntimeError,
 };
 use d2b_provider_toolkit::{
     FakeProvider, Fixture, GeneratedProviderServiceServer, ProviderValues, ServerError,
@@ -71,20 +71,18 @@ async fn fake_provider_round_trip_uses_the_exact_placement_binding() {
         .expect("second admission");
 
     let provider = FakeProvider::new(first.clone());
-    let proxy = RpcProviderProxy::new_with_descriptor(first.descriptor.clone(), provider.clone())
-        .expect("placement-bound proxy");
-    let response = proxy
-        .dispatch(
-            &first_admitted.context,
-            first.call(method.clone()).expect("call"),
-        )
-        .await
-        .expect("round trip");
-    assert!(response.payload().get("state").is_some());
+    let response = provider.call(method.clone()).expect("round trip");
+    assert!(response.get("state").is_some());
+    first_admitted
+        .context
+        .identity()
+        .matches_descriptor(&first.descriptor)
+        .expect("matching placement");
     assert_eq!(
-        proxy
-            .dispatch(&second_admitted.context, first.call(method).expect("call"),)
-            .await
+        second_admitted
+            .context
+            .identity()
+            .matches_descriptor(&first.descriptor)
             .expect_err("foreign placement must fail"),
         ProviderRuntimeError::SessionIdentityMismatch
     );

@@ -17,7 +17,7 @@ use crate::auth::{MAX_SAS_TTL_SECS, RelayCredential, RelayEndpoint, RelayError, 
 use crate::{
     MAX_ACTIVE_RELAY_LEASES, MAX_RELAY_LEASE_TTL_MS, RelayCredentialBinding, RelayCredentialError,
     RelayCredentialLease, RelayCredentialMaterial, RelayCredentialPort, RelayCredentialRole,
-    RelaySecret,
+    RelaySecret, ScopedCredentialClient,
 };
 use async_trait::async_trait;
 use base64::Engine;
@@ -599,6 +599,24 @@ impl RelayCredentialPort for GatewayGuestCredentialPort {
         };
         drop(active);
         result
+    }
+}
+
+#[async_trait]
+impl ScopedCredentialClient for GatewayGuestCredentialPort {
+    async fn read_credential(
+        &self,
+        request: &crate::ScopedCredentialRequest,
+    ) -> Result<RelayCredentialLease, RelayCredentialError> {
+        self.acquire_bound(request.role(), request.binding(), request.deadline_ms())
+            .await
+    }
+
+    async fn revoke_credential(
+        &self,
+        lease: RelayCredentialLease,
+    ) -> Result<(), RelayCredentialError> {
+        RelayCredentialPort::revoke(self, lease).await
     }
 }
 

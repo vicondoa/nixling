@@ -29,6 +29,7 @@ use d2b_resource_api::{
         ResourceVerb, SessionVerb,
     },
     service::UnavailableUpgradeDispatcher,
+    watch::{ResourceWatch, WatchService},
 };
 use d2b_resource_store::{
     ExpectedRevision, MutationSealBody, ResourceMutationKind, SealedMutation, StoreCommitResult,
@@ -36,7 +37,10 @@ use d2b_resource_store::{
     StoreListResult, StoreResolveRequest, StoreResolvedIdentity, StoreWatchReceipt,
     StoreWatchRequest, StoredResource, StoredSchema, mutation_seal::MutationSealAcceptor,
 };
-use d2b_resource_store_redb::{RedbResourceStore, StoreIdentity, write_provisioning_marker};
+use d2b_resource_store_redb::{
+    AuthorityOperation, AuthorityOperationCapability, RedbResourceStore, StoreIdentity,
+    write_provisioning_marker,
+};
 use protobuf::Message;
 use ttrpc::{
     r#async::{MethodHandler, TtrpcContext},
@@ -231,17 +235,17 @@ impl GuestResourceRuntime {
         descriptor_digest: SchemaFingerprint,
         approved_types: impl IntoIterator<Item = ResourceTypeName>,
     ) -> Result<GuestResourceSeedSession, GuestResourceRuntimeError> {
-        let (store, adapter) = self.bind_session_parts(route)?;
         let approved_types = approved_types.into_iter().collect::<BTreeSet<_>>();
-        if approved_types.is_empty()
+        if is_zero_fingerprint(&descriptor_digest)
+            || approved_types.is_empty()
             || approved_types
                 .iter()
                 .any(|resource_type| !GUEST_SEED_RESOURCE_TYPES.contains(&resource_type.as_str()))
         {
             return Err(GuestResourceRuntimeError::SeedPolicy);
         }
+        let (_store, adapter) = self.bind_session_parts(route)?;
         Ok(GuestResourceSeedSession {
-            store,
             adapter,
             guest_ref: self.identity.guest_ref().clone(),
             guest_uid: self.identity.guest_uid().clone(),
@@ -300,7 +304,6 @@ pub struct GuestResourceSession {
 
 /// Narrow target-local Resource API capability used by Guest-local seeding.
 pub struct GuestResourceSeedSession {
-    store: Arc<SessionBoundStore>,
     adapter: Arc<ResourceBusAdapter<SessionBoundStore, UnavailableUpgradeDispatcher>>,
     guest_ref: ResourceRef,
     guest_uid: ResourceUid,
@@ -390,11 +393,6 @@ impl GuestResourceSeedSession {
         self.validate_watch(&request)?;
         Ok(self.adapter.client().watch(request).await)
     }
-
-    /// Borrow the session-fenced store for target-local controller wiring.
-    pub fn store_backend(&self) -> Arc<SessionBoundStore> {
-        Arc::clone(&self.store)
-    }
 }
 
 impl core::fmt::Debug for GuestResourceSession {
@@ -458,6 +456,13 @@ impl core::fmt::Display for GuestResourceRuntimeError {
 }
 
 impl std::error::Error for GuestResourceRuntimeError {}
+
+fn is_zero_fingerprint(value: &SchemaFingerprint) -> bool {
+    value
+        .as_str()
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|byte| byte == b'0'))
+}
 
 struct GuestStoreState {
     revision: u64,
@@ -617,6 +622,28 @@ impl GuestResourceStore {
             RetryClass::Never,
             "guest-target-resource-not-found",
         )
+    }
+
+    async fn open_resource_watch(
+        &self,
+        request: StoreWatchRequest,
+    ) -> Result<ResourceWatch, StoreError> {
+        if request.zone != self.zone
+            || request
+                .resource_types
+                .iter()
+                .any(|resource_type| !Self::is_target_local_type(resource_type))
+        {
+            return Err(Self::forbidden());
+        }
+        match &self.backend {
+            GuestStoreBackend::Durable(store) => {
+                WatchService::new(Arc::clone(store)).open(request).await
+            }
+            GuestStoreBackend::Memory { .. } => {
+                Err(Self::unavailable("guest-target-watch-unavailable"))
+            }
+        }
     }
 
     fn conflict(revision: u64) -> StoreError {
@@ -809,6 +836,8 @@ impl GuestResourceStore {
                         resource_ref: mutation.target.clone(),
                         zone: self.zone.clone(),
                         uid,
+                        owner_uid: None,
+                        owner_generation: None,
                         generation,
                         revision: ZoneRevision::new(next_revision),
                         canonical_json: canonical,
@@ -1422,6 +1451,82 @@ impl SessionBoundStore {
         }
         Ok(())
     }
+
+    /// Open the current session's revision-resumable resource watch.
+    pub async fn open_resource_watch(
+        &self,
+        request: StoreWatchRequest,
+    ) -> Result<ResourceWatch, StoreError> {
+        self.ensure_current()?;
+        self.store.open_resource_watch(request).await
+    }
+
+    /// Verify that this session generation still owns its store.
+    pub fn ensure_session_current(&self) -> Result<(), StoreError> {
+        self.ensure_current()
+    }
+
+    /// Derive the current target-local store binding for one authority claim.
+    pub fn authority_binding_digest(&self, claim_digest: &str) -> Result<String, StoreError> {
+        self.ensure_current()?;
+        match &self.store.backend {
+            GuestStoreBackend::Durable(store) => Ok(store.authority_binding_digest(claim_digest)),
+            GuestStoreBackend::Memory { .. } => Err(GuestResourceStore::unavailable(
+                "guest-target-authority-unavailable",
+            )),
+        }
+    }
+
+    /// Prepare one durable target-local authority operation.
+    pub async fn prepare_authority_operation(
+        &self,
+        operation_id: String,
+        payload: Vec<u8>,
+        claim_digest: &str,
+    ) -> Result<AuthorityOperationCapability, StoreError> {
+        self.ensure_current()?;
+        match &self.store.backend {
+            GuestStoreBackend::Durable(store) => {
+                store
+                    .prepare_authority_operation(operation_id, payload, claim_digest)
+                    .await
+            }
+            GuestStoreBackend::Memory { .. } => Err(GuestResourceStore::unavailable(
+                "guest-target-authority-unavailable",
+            )),
+        }
+    }
+
+    /// Resume one non-terminal target-local authority operation after rejoin.
+    pub async fn resume_authority_operation(
+        &self,
+        operation_id: String,
+        binding_digest: &str,
+    ) -> Result<AuthorityOperationCapability, StoreError> {
+        self.ensure_current()?;
+        match &self.store.backend {
+            GuestStoreBackend::Durable(store) => {
+                store
+                    .resume_authority_operation(operation_id, binding_digest)
+                    .await
+            }
+            GuestStoreBackend::Memory { .. } => Err(GuestResourceStore::unavailable(
+                "guest-target-authority-unavailable",
+            )),
+        }
+    }
+
+    /// Read target-local authority operations for crash/session rejoin.
+    pub async fn authority_operations(&self) -> Result<Vec<AuthorityOperation>, StoreError> {
+        self.ensure_current()?;
+        match &self.store.backend {
+            GuestStoreBackend::Durable(store) => store.authority_operations().await,
+            GuestStoreBackend::Memory { .. } => Err(GuestResourceStore::unavailable(
+                "guest-target-authority-unavailable",
+            )),
+        }
+    }
+
 }
 
 impl ResourceStoreBackend for SessionBoundStore {
@@ -1485,6 +1590,7 @@ impl ResourceStoreBackend for SessionBoundStore {
 mod tests {
     use super::*;
     use d2b_resource_store::mutation_seal::StoreSealIdentity;
+    use d2b_resource_store_redb::AuthorityOperationState;
     use protobuf::{EnumOrUnknown, MessageField};
 
     fn test_identity() -> GuestIdentity {
@@ -1544,6 +1650,115 @@ mod tests {
             .await
             .expect("reopened store list");
         assert!(listed.resources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn target_local_authority_operation_rejoins_without_duplicate_rows() {
+        let directory = tempfile::tempdir().expect("state directory");
+        let identity = test_identity();
+        let first = GuestResourceRuntime::new(identity.clone(), directory.path())
+            .await
+            .expect("initial target-local runtime");
+        let active_generation = first.active_generation();
+        *active_generation.lock().expect("active generation") = Some(1);
+        let bound = SessionBoundStore {
+            store: Arc::clone(&first.store),
+            active_generation,
+            generation: 1,
+        };
+        let claim_digest = d2b_contracts_resource::v3::canonical_digest(
+            "d2b:test-guest-effect",
+            b"resource:1:generation:1",
+        );
+        let store_binding_digest = bound
+            .authority_binding_digest(&claim_digest)
+            .expect("store binding digest");
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "kind": "controller-effect",
+            "state": "pending",
+            "resourceUid": identity.guest_uid().as_str(),
+            "generation": 1,
+            "operationId": "effect:test",
+            "claimDigest": claim_digest,
+            "storeBindingDigest": store_binding_digest,
+            "assignment": {
+                "sessionGeneration": 1,
+                "epoch": 1,
+            },
+        }))
+        .expect("authority payload");
+        let first_capability = bound
+            .prepare_authority_operation(
+                "effect:test".to_owned(),
+                payload.clone(),
+                &claim_digest,
+            )
+            .await
+            .expect("prepare authority operation");
+        let second_capability = bound
+            .prepare_authority_operation("effect:test".to_owned(), payload, &claim_digest)
+            .await
+            .expect("idempotent authority operation");
+        let rows = bound
+            .authority_operations()
+            .await
+            .expect("read authority rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, AuthorityOperationState::Pending);
+        drop(first_capability);
+        drop(second_capability);
+        drop(bound);
+        drop(first);
+
+        let second = GuestResourceRuntime::new(identity, directory.path())
+            .await
+            .expect("reopened target-local runtime");
+        let active_generation = second.active_generation();
+        *active_generation.lock().expect("active generation") = Some(2);
+        let rebound = SessionBoundStore {
+            store: Arc::clone(&second.store),
+            active_generation,
+            generation: 2,
+        };
+        let resumed = rebound
+            .resume_authority_operation("effect:test".to_owned(), &store_binding_digest)
+            .await
+            .expect("resume pending authority operation");
+        resumed
+            .record_effect(AuthorityOperationState::EffectConfirmed)
+            .await
+            .expect("confirm resumed authority operation");
+        let rows = rebound
+            .authority_operations()
+            .await
+            .expect("read resumed authority row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, AuthorityOperationState::EffectConfirmed);
+    }
+
+    #[test]
+    fn session_bound_store_rejects_an_old_session_generation() {
+        let zone = ZoneId::parse("work").expect("zone");
+        let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").expect("store UID");
+        let store_identity = StoreSealIdentity::new(
+            d2b_resource_store::StoreSlot::new(STORE_SLOT).expect("store slot"),
+            zone.clone(),
+            uid,
+        );
+        let (_, acceptor) = d2b_resource_store::mutation_seal::mutation_seal_pair(store_identity);
+        let store = Arc::new(GuestResourceStore::new_in_memory(zone, acceptor));
+        let active_generation = Arc::new(Mutex::new(Some(2)));
+        let bound = SessionBoundStore {
+            store,
+            active_generation,
+            generation: 1,
+        };
+
+        let error = bound
+            .ensure_current()
+            .expect_err("an older session generation must be fenced");
+        assert_eq!(error.kind(), StoreErrorKind::ResourcePlaneUnavailable);
     }
 
     #[tokio::test]

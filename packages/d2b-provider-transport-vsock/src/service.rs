@@ -38,6 +38,8 @@ pub struct OpenTransportRequest {
     pub role: TransportRole,
     /// Bounded connect/accept deadline.
     pub deadline_ms: u32,
+    /// Optional Core-owned reconnect generation fence.
+    pub session_generation: Option<u64>,
 }
 
 impl OpenTransportRequest {
@@ -53,7 +55,15 @@ impl OpenTransportRequest {
             binding_id,
             role,
             deadline_ms,
+            session_generation: None,
         }
+    }
+
+    /// Bind this request to the Core-owned reconnect generation.
+    #[must_use]
+    pub const fn with_session_generation(mut self, generation: u64) -> Self {
+        self.session_generation = Some(generation);
+        self
     }
 
     /// Parse a wire-shaped request at the service boundary.
@@ -73,6 +83,9 @@ impl OpenTransportRequest {
     fn validate(&self) -> Result<(), ServiceError> {
         if !(MIN_OPEN_DEADLINE_MS..=MAX_OPEN_DEADLINE_MS).contains(&self.deadline_ms) {
             return Err(ServiceError::InvalidDeadline);
+        }
+        if self.session_generation.is_none() || self.session_generation == Some(0) {
+            return Err(ServiceError::InvalidSessionGeneration);
         }
         Ok(())
     }
@@ -263,6 +276,12 @@ where
             return Err(ServiceError::SessionIdentityMismatch);
         }
         request.validate()?;
+        if request
+            .session_generation
+            .is_some_and(|generation| generation != session.generation())
+        {
+            return Err(ServiceError::SessionGenerationMismatch);
+        }
         let permit = Arc::clone(&self.slots)
             .try_acquire_owned()
             .map_err(|_| ServiceError::ProviderOverloaded)?;
@@ -649,5 +668,23 @@ fn futures_phase_is_degraded(entry: &TransportEntry) -> bool {
 impl From<NamedStreamError> for ServiceError {
     fn from(_: NamedStreamError) -> Self {
         ServiceError::StreamUnavailable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_request_requires_a_session_generation_fence() {
+        let endpoint = OpaqueEndpointId::parse("endpoint-a").unwrap();
+        let binding = OpaqueBindingId::parse("binding-a").unwrap();
+        let request =
+            OpenTransportRequest::new(endpoint, binding, TransportRole::Initiator, 1_000);
+
+        assert_eq!(
+            request.validate(),
+            Err(ServiceError::InvalidSessionGeneration)
+        );
     }
 }

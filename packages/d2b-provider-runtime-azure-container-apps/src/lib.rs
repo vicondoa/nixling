@@ -13,7 +13,9 @@ mod metrics;
 pub use audit::{AcaAuditEvent, AcaAuditOutcome, AcaAuditSink};
 pub use controller::{
     AcaClock, AcaController, AcaControllerError, AcaPhase, AcaReconcileOutcome, AcaRecoveryState,
-    AcaStatus, AzureContainerAppsRuntimeProvider, CompletedOperationLedger, SystemAcaClock,
+    AcaStatus, AzureContainerAppsRuntimeProvider, CompletedOperationLedger,
+    AzureContainerAppsRunnerContract, SystemAcaClock, ACA_GUEST_FINALIZER,
+    ACA_REPAIR_INTERVAL_SECS, azure_container_apps_runner_contract,
 };
 pub use deployment_service::{
     AcaDeploymentRequest, AcaDeploymentResponse, AcaDeploymentService, AcaServiceError,
@@ -26,3 +28,5 @@ pub use metrics::{AcaMetricEvent, AcaMetricOutcome, AcaMetricValidationError};
 pub const ACA_IMPLEMENTATION_ID: &str = "azure-container-apps";
 /// Stable Provider resource reference.
 pub const PROVIDER_REF: &str = "Provider/runtime-azure-container-apps";
+/// Stable Guest finalizer.
+pub const FINALIZER: &str = ACA_GUEST_FINALIZER;

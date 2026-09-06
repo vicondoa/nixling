@@ -1,6 +1,9 @@
 //! Minijail launch admission and mandatory platform gate.
 
-use d2b_process_conformance::{LaunchTicket, ProcessConformanceError};
+use d2b_process_conformance::{
+    AdoptionOutcome, LaunchTicket, ProcessConformanceError, ProcessIdentityDigest, ProcessProvider,
+    ProcessStatusReport, StopClass,
+};
 
 use crate::PROVIDER_NAME;
 
@@ -62,4 +65,48 @@ pub fn validate_launch_ticket(
         return Err(ProcessConformanceError::ProviderMismatch);
     }
     gate.validate()
+}
+
+/// One typed action accepted by the minijail Process handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinijailReconcileAction<'a> {
+    /// Launch a new Process or EphemeralProcess.
+    Start(&'a LaunchTicket),
+    /// Adopt a matching running process after restart.
+    Adopt(&'a LaunchTicket),
+    /// Stop one exact process identity.
+    Stop(&'a ProcessIdentityDigest, StopClass),
+}
+
+/// Result of one minijail handler action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MinijailReconcileResult {
+    /// The effect owner launched a process.
+    Started(ProcessStatusReport),
+    /// Adoption was evaluated.
+    Adoption(AdoptionOutcome),
+    /// The exact process stop was accepted.
+    Stopped,
+}
+
+/// Dispatch one typed action without exposing the broker or a raw process
+/// handle to the Provider.
+pub async fn reconcile<P: d2b_process_conformance::ProcessLaunchEffectPort>(
+    provider: &crate::MinijailProcessProvider<P>,
+    action: MinijailReconcileAction<'_>,
+) -> Result<MinijailReconcileResult, ProcessConformanceError> {
+    match action {
+        MinijailReconcileAction::Start(ticket) => provider
+            .launch(ticket)
+            .await
+            .map(MinijailReconcileResult::Started),
+        MinijailReconcileAction::Adopt(ticket) => provider
+            .adopt(ticket)
+            .await
+            .map(MinijailReconcileResult::Adoption),
+        MinijailReconcileAction::Stop(identity, class) => provider
+            .stop(identity, class)
+            .await
+            .map(|_| MinijailReconcileResult::Stopped),
+    }
 }

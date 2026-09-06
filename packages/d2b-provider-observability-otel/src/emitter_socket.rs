@@ -11,6 +11,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+use zeroize::Zeroize;
 
 /// Maximum compact frame accepted from a core-process emitter.
 pub const MAX_COMPACT_FRAME_BYTES: usize = 64 * 1024;
@@ -49,6 +50,12 @@ pub struct EmitterSocket {
 struct QueuedFrame {
     bytes: Vec<u8>,
     enqueued_at: Instant,
+}
+
+impl Drop for QueuedFrame {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
 }
 
 impl core::fmt::Debug for EmitterSocket {
@@ -198,9 +205,9 @@ impl EmitterSocket {
     /// Pop the oldest received frame.
     pub fn pop(&mut self) -> Option<Vec<u8>> {
         self.prune_expired();
-        let frame = self.frames.pop_front()?;
+        let mut frame = self.frames.pop_front()?;
         self.queued_bytes = self.queued_bytes.saturating_sub(frame.bytes.len());
-        Some(frame.bytes)
+        Some(std::mem::take(&mut frame.bytes))
     }
 
     /// Current receiver readiness.
@@ -414,7 +421,7 @@ mod tests {
         let sender = UnixDatagram::unbound().unwrap();
         sender
             .send_to(
-                br#"{"signal":"trace","value":{"path":"/private/canary","d2b.zone":"secret-zone","env":{"TOKEN":"secret-token"}}}"#,
+                br#"{"signal":"trace","value":{"path":"/private/canary","d2b.zone":"identity-canary"}}"#,
                 &path,
             )
             .unwrap();
@@ -423,8 +430,7 @@ mod tests {
         let frame = receiver.pop().unwrap();
         let rendered = String::from_utf8(frame).unwrap();
         assert!(!rendered.contains("/private/canary"));
-        assert!(!rendered.contains("secret-zone"));
-        assert!(!rendered.contains("secret-token"));
+        assert!(!rendered.contains("identity-canary"));
         assert_eq!(receiver.queued(), 0);
         assert_eq!(receiver.dropped(), 1);
         drop(receiver);

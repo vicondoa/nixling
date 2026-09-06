@@ -1,9 +1,9 @@
 mod common;
 
 use d2b_contracts_provider::v3::credential::{
-    CredentialAuthorization, CredentialMethod, CredentialProvider, CredentialRequest,
-    CredentialResponse, CredentialServiceError, CredentialServiceErrorCode, DeliverySessionParams,
-    SensitiveDeliveryRecord,
+    CREDENTIAL_DELIVERY_NOISE_PROFILE, CredentialAuthorization, CredentialMethod,
+    CredentialProvider, CredentialRequest, CredentialResponse, CredentialServiceError,
+    CredentialServiceErrorCode, DeliverySessionParams, SensitiveDeliveryRecord,
 };
 use d2b_provider_credential_entra::EntraCredentialProvider;
 
@@ -48,6 +48,10 @@ fn refresh_response_preserves_the_authorization_owned_binding() {
 
 #[test]
 fn delivery_records_zeroize() {
+    assert_eq!(
+        CREDENTIAL_DELIVERY_NOISE_PROFILE,
+        "Noise_KK_25519_ChaChaPoly_SHA256"
+    );
     let mut record = SensitiveDeliveryRecord::new(b"access-token".to_vec(), 64).unwrap();
     let mut destination = [0; 12];
     record.copy_to(&mut destination).unwrap();

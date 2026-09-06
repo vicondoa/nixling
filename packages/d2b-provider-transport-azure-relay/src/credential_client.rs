@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use d2b_contracts_resource::v3::{ResourceRef, ZoneId};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Maximum size of one non-secret binding component.
@@ -35,6 +36,7 @@ pub struct RelayCredentialBinding {
     zone_link_uid: String,
     session_id: String,
     reconnect_generation: u64,
+    zone: Option<ZoneId>,
 }
 
 impl RelayCredentialBinding {
@@ -48,6 +50,7 @@ impl RelayCredentialBinding {
             zone_link_uid: zone_link_uid.into(),
             session_id: session_id.into(),
             reconnect_generation,
+            zone: None,
         };
         if reconnect_generation == 0
             || !valid_binding_component(&binding.zone_link_uid)
@@ -55,6 +58,19 @@ impl RelayCredentialBinding {
         {
             return Err(RelayCredentialError::InvalidBinding);
         }
+        Ok(binding)
+    }
+
+    /// Construct a binding carrying the exact Zone scope for a ResourceClient
+    /// credential read.
+    pub fn new_scoped(
+        zone: ZoneId,
+        zone_link_uid: impl Into<String>,
+        session_id: impl Into<String>,
+        reconnect_generation: u64,
+    ) -> Result<Self, RelayCredentialError> {
+        let mut binding = Self::new(zone_link_uid, session_id, reconnect_generation)?;
+        binding.zone = Some(zone);
         Ok(binding)
     }
 
@@ -72,6 +88,11 @@ impl RelayCredentialBinding {
     pub const fn reconnect_generation(&self) -> u64 {
         self.reconnect_generation
     }
+
+    /// Return the optional same-Zone scope.
+    pub const fn zone(&self) -> Option<&ZoneId> {
+        self.zone.as_ref()
+    }
 }
 
 impl fmt::Debug for RelayCredentialBinding {
@@ -81,6 +102,113 @@ impl fmt::Debug for RelayCredentialBinding {
             .field("zone_link_uid", &"<redacted>")
             .field("session_id", &"<redacted>")
             .field("reconnect_generation", &self.reconnect_generation)
+            .field("has_zone_scope", &self.zone.is_some())
+            .finish()
+    }
+}
+
+/// The narrow Credential read boundary supplied by U10's ResourceClient.
+///
+/// This request contains only non-secret, same-Zone admission data. The
+/// transport Provider does not resolve resources, own Credential rows, or
+/// retain a credential registry; U10 supplies the scoped ResourceClient/session
+/// gate through this boundary.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ScopedCredentialRequest {
+    zone: ZoneId,
+    credential_ref: ResourceRef,
+    execution_ref: ResourceRef,
+    role: RelayCredentialRole,
+    binding: RelayCredentialBinding,
+    deadline_ms: u32,
+}
+
+impl ScopedCredentialRequest {
+    /// Construct a same-Zone, Gateway-Guest-scoped Credential read.
+    pub fn new(
+        zone: ZoneId,
+        credential_ref: ResourceRef,
+        execution_ref: ResourceRef,
+        role: RelayCredentialRole,
+        binding: RelayCredentialBinding,
+        deadline_ms: u32,
+    ) -> Result<Self, RelayCredentialError> {
+        let request = Self {
+            zone,
+            credential_ref,
+            execution_ref,
+            role,
+            binding,
+            deadline_ms,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate(&self) -> Result<(), RelayCredentialError> {
+        if self.credential_ref.resource_type().as_str() != "Credential"
+            || self.execution_ref.resource_type().as_str() != "Guest"
+            || self.binding.zone() != Some(&self.zone)
+            || self.deadline_ms == 0
+        {
+            return Err(RelayCredentialError::InvalidScope);
+        }
+        Ok(())
+    }
+
+    /// Return the caller's Zone scope.
+    pub const fn zone(&self) -> &ZoneId {
+        &self.zone
+    }
+
+    /// Return the same-Zone Credential resource reference.
+    pub const fn credential_ref(&self) -> &ResourceRef {
+        &self.credential_ref
+    }
+
+    /// Return the Gateway Guest execution reference.
+    pub const fn execution_ref(&self) -> &ResourceRef {
+        &self.execution_ref
+    }
+
+    /// Return the relay role requested by the caller.
+    pub const fn role(&self) -> RelayCredentialRole {
+        self.role
+    }
+
+    /// Return the exact ZoneLink/session/generation binding.
+    pub const fn binding(&self) -> &RelayCredentialBinding {
+        &self.binding
+    }
+
+    /// Return the current bounded acquisition deadline.
+    pub const fn deadline_ms(&self) -> u32 {
+        self.deadline_ms
+    }
+
+    /// Rebind only the attempt deadline without widening scope.
+    pub fn with_deadline(&self, deadline_ms: u32) -> Result<Self, RelayCredentialError> {
+        Self::new(
+            self.zone.clone(),
+            self.credential_ref.clone(),
+            self.execution_ref.clone(),
+            self.role,
+            self.binding.clone(),
+            deadline_ms,
+        )
+    }
+}
+
+impl fmt::Debug for ScopedCredentialRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScopedCredentialRequest")
+            .field("zone", &"<redacted>")
+            .field("credential_ref", &"<redacted>")
+            .field("execution_ref", &"<redacted>")
+            .field("role", &self.role)
+            .field("binding", &self.binding)
+            .field("deadline_ms", &self.deadline_ms)
             .finish()
     }
 }
@@ -356,6 +484,8 @@ pub enum RelayCredentialError {
     AlreadyBound,
     /// A lease did not match the requested exact binding.
     BindingMismatch,
+    /// The request did not carry a valid same-Zone Guest scope.
+    InvalidScope,
     /// No lease is available.
     Unavailable,
     /// Lease is expired.
@@ -374,6 +504,7 @@ impl fmt::Display for RelayCredentialError {
             Self::BindingRequired => "relay-credential-binding-required",
             Self::AlreadyBound => "relay-credential-already-bound",
             Self::BindingMismatch => "relay-credential-binding-mismatch",
+            Self::InvalidScope => "relay-credential-scope-invalid",
             Self::Unavailable => "relay-credential-unavailable",
             Self::Expired => "relay-credential-expired",
             Self::RoleMismatch => "relay-credential-role-mismatch",
@@ -435,4 +566,24 @@ pub trait RelayCredentialPort: Send + Sync {
 
     /// Revoke one exact lease.
     async fn revoke(&self, lease: RelayCredentialLease) -> Result<(), RelayCredentialError>;
+}
+
+/// Narrow scoped credential-client boundary consumed by the Relay carriage.
+///
+/// U10 implements this boundary with its authenticated same-Zone
+/// `ResourceClient`/ComponentSession path. It deliberately exposes no list,
+/// watch, mutation, Host, or ZoneLink scheduling operations.
+#[async_trait]
+pub trait ScopedCredentialClient: Send + Sync {
+    /// Read one role credential under the already validated scope.
+    async fn read_credential(
+        &self,
+        request: &ScopedCredentialRequest,
+    ) -> Result<RelayCredentialLease, RelayCredentialError>;
+
+    /// Revoke one exact lease.
+    async fn revoke_credential(
+        &self,
+        lease: RelayCredentialLease,
+    ) -> Result<(), RelayCredentialError>;
 }

@@ -784,3 +784,26 @@ fn daemon_authority_replays_capabilities_once_across_supervisors() {
         Err(d2b_provider_shell_terminal::ShellTerminalError::CapabilityReused)
     ));
 }
+
+#[test]
+fn shell_runner_contract_keeps_pool_and_session_on_one_cutover() {
+    let contract = d2b_provider_shell_terminal::shell_runner_contract();
+    assert_eq!(
+        contract.pool_resource_type(),
+        "shell-terminal.d2bus.org.ShellPool"
+    );
+    assert_eq!(
+        contract.session_resource_type(),
+        "shell-terminal.d2bus.org.ShellSession"
+    );
+    assert_eq!(
+        contract.pool_finalizer(),
+        "shell-terminal.d2bus.org/pool-finalizer"
+    );
+    assert_eq!(
+        contract.session_finalizer(),
+        "shell-terminal.d2bus.org/session-finalizer"
+    );
+    assert_eq!(contract.repair_interval_secs(), 30);
+    assert!(contract.watched_configuration_is_dependency());
+}

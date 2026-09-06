@@ -8,9 +8,10 @@
 pkgs.testers.runNixOSTest {
   name = "d2b-guest-shell-service";
 
-  nodes.machine = { lib, ... }: {
+  nodes.machine = { lib, pkgs, ... }: {
     imports = [
       ../../nixos-modules/component-session.nix
+      ../../nixos-modules/guest-broker.nix
       {
         options.d2b.sshUser = lib.mkOption {
           type = lib.types.nullOr lib.types.str;
@@ -20,7 +21,9 @@ pkgs.testers.runNixOSTest {
       {
         _module.args = {
           d2bInputs = { inherit self; };
-          d2bHostTools = null;
+          d2bHostTools = {
+            broker = self.packages.${pkgs.system}.d2b-broker-guest-static;
+          };
           d2bHostToolOverrides = self.lib.d2bHostToolOverrides;
         };
 

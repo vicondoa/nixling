@@ -271,4 +271,19 @@ impl<P: ProcessLaunchEffectPort> ProcessProvider for SystemdProcessProvider<P> {
         }
         self.port.stop(identity, class).await
     }
+
+    async fn stop_stale(
+        &self,
+        candidate: &AdoptionCandidate,
+    ) -> Result<(), ProcessConformanceError> {
+        if candidate.identity.is_zero()
+            || candidate.wait_reap_owner != WaitReapOwner::ServiceManager
+        {
+            return Err(ProcessConformanceError::IdentityUnverified);
+        }
+        self.port.open_pidfd(candidate).await?;
+        self.port
+            .stop(&candidate.identity, StopClass::Terminate)
+            .await
+    }
 }

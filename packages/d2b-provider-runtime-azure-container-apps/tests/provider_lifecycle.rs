@@ -16,6 +16,19 @@ use d2b_provider_runtime_azure_container_apps::{
     AcaServiceMethod,
 };
 
+#[test]
+fn aca_publishes_the_shared_runner_contract() {
+    let contract =
+        d2b_provider_runtime_azure_container_apps::azure_container_apps_runner_contract();
+    assert_eq!(contract.resource_type(), "Guest");
+    assert_eq!(
+        contract.finalizer(),
+        d2b_provider_runtime_azure_container_apps::FINALIZER
+    );
+    assert_eq!(contract.repair_interval_secs(), 30);
+    assert!(contract.watched_configuration_is_dependency());
+}
+
 #[derive(Default)]
 struct FakeState {
     candidates: Vec<AcaSandboxRecord>,

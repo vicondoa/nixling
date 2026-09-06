@@ -10,10 +10,12 @@ use std::{
 
 use crate::{
     AzureRelaySocketConnector, AzureRelayTransportProvider, RelayComponentSessionTransport,
-    RelayCredentialBinding, RelayCredentialRole, RelayEnrollmentProof, RelayEnrollmentVerifier,
-    RelayRole, RelayTransportConfig, RelayTransportError, RelayTransportSettings,
+    RelayCredentialBinding, RelayCredentialError, RelayCredentialLease, RelayCredentialRole,
+    RelayEnrollmentProof, RelayEnrollmentVerifier, RelayRole, RelayTransportConfig,
+    RelayTransportError, RelayTransportSettings, ScopedCredentialClient, ScopedCredentialRequest,
 };
 use d2b_contracts_resource::v3::ResourceRef;
+use d2b_contracts_resource::v3::ZoneId;
 
 use crate::guest_credential::{
     CredentialError, CredentialFilePolicy, GatewayGuestCredentialPort, SealingKey,
@@ -76,15 +78,44 @@ impl From<RelayTransportError> for GatewayGuestZoneLinkError {
     }
 }
 
+enum GatewayGuestCredentialSource {
+    Sealed(GatewayGuestCredentialPort),
+    Scoped(Arc<dyn ScopedCredentialClient>),
+}
+
+#[async_trait::async_trait]
+impl ScopedCredentialClient for GatewayGuestCredentialSource {
+    async fn read_credential(
+        &self,
+        request: &ScopedCredentialRequest,
+    ) -> Result<RelayCredentialLease, RelayCredentialError> {
+        match self {
+            Self::Sealed(port) => port.read_credential(request).await,
+            Self::Scoped(client) => client.read_credential(request).await,
+        }
+    }
+
+    async fn revoke_credential(
+        &self,
+        lease: RelayCredentialLease,
+    ) -> Result<(), RelayCredentialError> {
+        match self {
+            Self::Sealed(port) => port.revoke_credential(lease).await,
+            Self::Scoped(client) => client.revoke_credential(lease).await,
+        }
+    }
+}
+
 /// Gateway Guest-local Azure Relay Provider and credential boundary.
 ///
-/// The sealed credential is opened only by this Guest-local constructor. The
-/// resulting Provider never exposes credential bytes and returns only an
-/// authenticated `OwnedTransport` carrying protected ComponentSession data.
+/// Credential custody is supplied either by the Guest-local sealed bootstrap
+/// or an authenticated scoped client. The resulting Provider never exposes
+/// credential bytes and returns only an authenticated `OwnedTransport`
+/// carrying protected ComponentSession data.
 pub struct GatewayGuestZoneLinkRuntime {
-    provider: AzureRelayTransportProvider<GatewayGuestCredentialPort, AzureRelaySocketConnector>,
-    credential_generation: u64,
-    credential_send_key_digest: [u8; 32],
+    provider: AzureRelayTransportProvider<GatewayGuestCredentialSource, AzureRelaySocketConnector>,
+    credential_generation: Option<u64>,
+    credential_send_key_digest: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for GatewayGuestZoneLinkRuntime {
@@ -127,14 +158,52 @@ impl GatewayGuestZoneLinkRuntime {
                 connect_timeout_seconds,
             },
             crate::RelayEndpoint { settings },
-            Arc::new(credentials),
+            Arc::new(GatewayGuestCredentialSource::Sealed(credentials)),
             Arc::new(AzureRelaySocketConnector::new()),
         )
         .map_err(|_| GatewayGuestZoneLinkError::TransportConfiguration)?;
         Ok(Self {
             provider,
-            credential_generation,
-            credential_send_key_digest,
+            credential_generation: Some(credential_generation),
+            credential_send_key_digest: Some(credential_send_key_digest),
+        })
+    }
+
+    /// Compose the Guest-local Relay Provider over a same-Zone typed
+    /// Credential session.
+    ///
+    /// The supplied client owns credential custody and delivery. This
+    /// constructor retains only the typed capability; it never opens or
+    /// serializes credential material.
+    pub fn from_scoped_client(
+        credentials: Arc<dyn ScopedCredentialClient>,
+        execution_ref: ResourceRef,
+        network_ref: ResourceRef,
+        settings: RelayTransportSettings,
+        max_concurrent_sessions: u32,
+        connect_timeout_seconds: u32,
+    ) -> Result<Self, GatewayGuestZoneLinkError> {
+        if execution_ref.resource_type().as_str() != "Guest"
+            || network_ref.resource_type().as_str() != "Network"
+        {
+            return Err(GatewayGuestZoneLinkError::InvalidPlacement);
+        }
+        let provider = AzureRelayTransportProvider::new(
+            RelayTransportConfig {
+                execution_ref,
+                network_ref,
+                max_concurrent_sessions,
+                connect_timeout_seconds,
+            },
+            crate::RelayEndpoint { settings },
+            Arc::new(GatewayGuestCredentialSource::Scoped(credentials)),
+            Arc::new(AzureRelaySocketConnector::new()),
+        )
+        .map_err(|_| GatewayGuestZoneLinkError::TransportConfiguration)?;
+        Ok(Self {
+            provider,
+            credential_generation: None,
+            credential_send_key_digest: None,
         })
     }
 
@@ -144,6 +213,12 @@ impl GatewayGuestZoneLinkRuntime {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<(), GatewayGuestZoneLinkError> {
+        let (Some(credential_generation), Some(credential_send_key_digest)) = (
+            self.credential_generation,
+            self.credential_send_key_digest,
+        ) else {
+            return Err(GatewayGuestZoneLinkError::ObservationUnavailable);
+        };
         let path = path.as_ref();
         let parent = path
             .parent()
@@ -157,8 +232,8 @@ impl GatewayGuestZoneLinkRuntime {
         let temporary = parent.join(format!(".{file_name}.{}", std::process::id()));
         let marker = format!(
             "schemaVersion=1\ngeneration={}\ndigest=sha256:{}\n",
-            self.credential_generation,
-            digest_hex(&self.credential_send_key_digest),
+            credential_generation,
+            digest_hex(&credential_send_key_digest),
         );
         let result = (|| {
             let mut file = OpenOptions::new()
@@ -185,14 +260,27 @@ impl GatewayGuestZoneLinkRuntime {
     pub async fn open_authenticated_transport<V: RelayEnrollmentVerifier>(
         &self,
         role: RelayRole,
+        zone: ZoneId,
+        credential_ref: ResourceRef,
+        execution_ref: ResourceRef,
         binding: RelayCredentialBinding,
         deadline_ms: u32,
         verifier: &V,
         transcript: &[u8],
     ) -> Result<RelayComponentSessionTransport, GatewayGuestZoneLinkError> {
+        let credential_role = Self::credential_role(role);
+        let request = crate::ScopedCredentialRequest::new(
+            zone,
+            credential_ref,
+            execution_ref,
+            credential_role,
+            binding,
+            deadline_ms,
+        )
+        .map_err(|_| GatewayGuestZoneLinkError::CredentialUnavailable)?;
         let connection = self
             .provider
-            .open_bound(role, binding, deadline_ms)
+            .open_scoped(request)
             .await
             .map_err(GatewayGuestZoneLinkError::from)?;
         let proof = RelayEnrollmentProof::authenticate(
@@ -224,10 +312,36 @@ fn digest_hex(digest: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{RelayCredentialMaterial, RelaySecret};
     use crate::guest_credential::GatewayCredential;
+    use async_trait::async_trait;
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
+
+    struct ScopedOnlyCredentials;
+
+    #[async_trait]
+    impl ScopedCredentialClient for ScopedOnlyCredentials {
+        async fn read_credential(
+            &self,
+            request: &ScopedCredentialRequest,
+        ) -> Result<RelayCredentialLease, RelayCredentialError> {
+            RelayCredentialLease::new_bound(
+                RelayCredentialMaterial::SasToken(RelaySecret::new(b"scoped-token".to_vec())?),
+                request.role(),
+                2_000,
+                request.binding().clone(),
+            )
+        }
+
+        async fn revoke_credential(
+            &self,
+            _lease: RelayCredentialLease,
+        ) -> Result<(), RelayCredentialError> {
+            Ok(())
+        }
+    }
 
     fn sealed_runtime(dir: &Path) -> GatewayGuestZoneLinkRuntime {
         let credential_path = dir.join("credential.sealed.json");
@@ -295,6 +409,27 @@ mod tests {
             result,
             Err(GatewayGuestZoneLinkError::InvalidPlacement)
         ));
+    }
+
+    #[test]
+    fn scoped_client_composition_never_requires_a_sealed_credential() {
+        let runtime = GatewayGuestZoneLinkRuntime::from_scoped_client(
+            Arc::new(ScopedOnlyCredentials),
+            ResourceRef::parse("Guest/gateway").unwrap(),
+            ResourceRef::parse("Network/relay-egress").unwrap(),
+            RelayTransportSettings::new("relns-d2b-prod", "hc-d2b").unwrap(),
+            32,
+            30,
+        )
+        .expect("scoped client runtime");
+        assert_eq!(
+            format!("{runtime:?}"),
+            "GatewayGuestZoneLinkRuntime(<redacted>)"
+        );
+        assert_eq!(
+            runtime.write_open_observation("opened").unwrap_err(),
+            GatewayGuestZoneLinkError::ObservationUnavailable
+        );
     }
 
     #[test]

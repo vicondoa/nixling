@@ -243,7 +243,7 @@ in a Volume it reconciles. The Export's `ownerRef` is the Volume.
 
 **Controller**: `Provider/volume-virtiofs` reconciles Exports. It creates and manages the
 virtiofsd worker Process for each Export, updates Export status (exportReady, worker phase,
-guestMountReady), and owns the `volume-virtiofs/export` finalizer on each Export.
+guestMountReady), and owns the `volume-virtiofs.d2bus.org/export` finalizer on each Export.
 
 **Consumer**: `Provider/volume-local` reads Export status to populate
 `Volume.status.attachmentStatuses`. volume-local does not interpret Export internal state;
@@ -261,7 +261,7 @@ metadata:
   uid: <store-generated>
   generation: 1
   ownerRef: Volume/work-state
-  finalizers: [volume-virtiofs/export]
+  finalizers: [volume-virtiofs.d2bus.org/export]
 spec:
   providerRef: Provider/volume-virtiofs
   volumeRef: Volume/work-state
@@ -520,7 +520,7 @@ Phase 1 - virtiofsd Process teardown
 Phase 2 - guest mount absent confirmation
   volume-virtiofs controller sends VirtioFsMountReady? probe to guest-control
   → probe returns MountAbsent
-  → controller clears volume-virtiofs/export finalizer on Export
+  → controller clears volume-virtiofs.d2bus.org/export finalizer on Export
   → core emits Deleted revision event for Export; row and index removed atomically
   → volume-local receives Export Deleted watch event
   → volume-local updates Volume.status.attachmentStatuses (entry removed)
@@ -914,7 +914,7 @@ reconcileConcurrency: 16          # 16 parallel Export reconciliations
 maxPendingResources: 1024
 observeIntervalSeconds: 0         # event-driven only
 finalizers:
-  - volume-virtiofs/export
+  - volume-virtiofs.d2bus.org/export
 serviceFingerprint: <sha256 of attachment.schema.json>
 ```
 
@@ -1164,7 +1164,7 @@ is required in Nix.
     "name": "vol-work-state-x-work-vm",
     "zone": "dev",
     "ownerRef": "Volume/work-state",
-    "finalizers": ["volume-virtiofs/export"]
+    "finalizers": ["volume-virtiofs.d2bus.org/export"]
   },
   "spec": {
     "providerRef": "Provider/volume-virtiofs",
@@ -1313,7 +1313,7 @@ When a Volume with virtiofs attachments is deleted:
 6. On process exit: store emits Deleted revision event for Process; row and index removed
    atomically.
 7. volume-virtiofs controller queries guest-control health probe; waits for `MountAbsent`.
-8. When mount absent confirmed, volume-virtiofs clears `volume-virtiofs/export` finalizer.
+8. When mount absent confirmed, volume-virtiofs clears `volume-virtiofs.d2bus.org/export` finalizer.
 9. Store emits Deleted revision event for Export; row and index removed atomically.
 10. volume-local receives Export Deleted events; clears `volume-local/virtiofs-attachments`
     finalizer after all Exports for the Volume are deleted.

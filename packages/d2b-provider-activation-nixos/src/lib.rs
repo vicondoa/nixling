@@ -8,9 +8,11 @@ pub mod manifest;
 pub mod runner;
 
 pub use controller::{
-    ActivationCaller, ActivationController, ActivationError, CallerRole, GenerationObservation,
-    GenerationPhase, RetentionPlan, RunnerRequest, RunnerResult, activation_runner_name,
-    activation_runner_ref, activation_runner_spec,
+    ActivationApplicationVerifier, ActivationCaller, ActivationController, ActivationError,
+    ActivationTrust, ActivationTrustExpectation, ActivationVerificationError, CallerRole,
+    FailClosedActivationVerifier, GenerationObservation, GenerationPhase, RetentionPlan,
+    RunnerRequest, RunnerResult, SignedActivationApplicationVerifier, TrustStatus,
+    activation_runner_name, activation_runner_ref, activation_runner_spec,
 };
 pub use manifest::ActivationManifest;
 pub use runner::{

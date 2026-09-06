@@ -14,11 +14,19 @@ use d2b_contracts_provider::v3::credential_controller::{
     CredentialControllerError, CredentialControllerHandlers, CredentialControllerHealth,
     CredentialObservabilityError, CredentialObserveInput, CredentialReconcileInput,
     CredentialRevocationInput, CredentialSingleFlight, CredentialTelemetryFrame,
-    CredentialTelemetryOperation, CredentialTelemetryOutcome, observe_credential,
+    CredentialProviderKind, CredentialTelemetryOperation, CredentialTelemetryOutcome,
+    observe_credential,
     reconcile_credential, revoke_credential,
 };
 
 use crate::{LockPolicy, SecretServiceConfig, SecretServiceState};
+
+/// Finalizer owned by the Secret Service Credential controller.
+pub const PROVIDER_REVOKE_FINALIZER: &str =
+    d2b_contracts_provider::v3::credential_controller::CREDENTIAL_PROVIDER_REVOKE_FINALIZER;
+/// Provider identity used by the shared controller registration.
+pub const PROVIDER_KIND: CredentialProviderKind =
+    CredentialProviderKind::SecretService;
 
 /// Closed controller health state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

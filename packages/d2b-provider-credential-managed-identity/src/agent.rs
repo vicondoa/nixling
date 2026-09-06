@@ -25,6 +25,7 @@ impl ManagedIdentityAgent {
     }
 }
 
+#[async_trait::async_trait]
 impl CredentialProvider for ManagedIdentityAgent {
     fn dispatch(
         &self,
@@ -33,6 +34,17 @@ impl CredentialProvider for ManagedIdentityAgent {
         authorization: &CredentialAuthorization,
     ) -> Result<CredentialResponse, CredentialServiceError> {
         self.provider.dispatch(method, request, authorization)
+    }
+
+    async fn dispatch_async(
+        &self,
+        method: CredentialMethod,
+        request: &CredentialRequest,
+        authorization: &CredentialAuthorization,
+    ) -> Result<CredentialResponse, CredentialServiceError> {
+        self.provider
+            .dispatch_async(method, request, authorization)
+            .await
     }
 }
 

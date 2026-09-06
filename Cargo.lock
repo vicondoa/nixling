@@ -1143,6 +1143,7 @@ dependencies = [
  "d2b-contracts-broker",
  "d2b-contracts-resource",
  "d2b-contracts-zone-session",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -1208,30 +1209,42 @@ dependencies = [
 name = "d2b-provider-credential-entra"
 version = "0.0.0-bootstrap"
 dependencies = [
+ "async-trait",
  "d2b-contracts-provider",
  "d2b-contracts-resource",
  "d2b-contracts-zone-session",
+ "d2b-provider-toolkit",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "d2b-provider-credential-managed-identity"
 version = "0.0.0-bootstrap"
 dependencies = [
+ "async-trait",
  "d2b-contracts-provider",
  "d2b-contracts-resource",
  "d2b-contracts-zone-session",
+ "d2b-provider-toolkit",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "d2b-provider-credential-secret-service"
 version = "0.0.0-bootstrap"
 dependencies = [
+ "async-trait",
  "d2b-contracts-provider",
  "d2b-contracts-resource",
  "d2b-contracts-zone-session",
+ "d2b-provider-toolkit",
+ "d2b-session",
+ "d2b-session-unix",
  "serde_json",
+ "tokio",
+ "ttrpc",
 ]
 
 [[package]]
@@ -1345,6 +1358,7 @@ dependencies = [
  "rustix 0.38.44",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -1473,9 +1487,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "d2b-provider-test-controller"
+version = "0.0.0-bootstrap"
+dependencies = [
+ "d2b-contracts-zone-session",
+ "d2b-core-controller",
+ "d2b-session",
+ "d2b-session-unix",
+ "tokio",
+]
+
+[[package]]
 name = "d2b-provider-toolkit"
 version = "0.0.0-bootstrap"
 dependencies = [
+ "async-trait",
  "d2b-contracts-provider",
  "d2b-contracts-resource",
  "d2b-contracts-zone-session",
@@ -1483,9 +1509,12 @@ dependencies = [
  "d2b-session",
  "d2b-session-unix",
  "schemars",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "ttrpc",
+ "zeroize",
 ]
 
 [[package]]
@@ -1682,6 +1711,7 @@ dependencies = [
  "tokio",
  "tokio-vsock",
  "uapi",
+ "zeroize",
 ]
 
 [[package]]
@@ -1760,6 +1790,10 @@ dependencies = [
  "d2b-provider-audio-pipewire",
  "d2b-provider-clipboard-wayland",
  "d2b-provider-config-nixos",
+ "d2b-provider-credential-entra",
+ "d2b-provider-credential-managed-identity",
+ "d2b-provider-credential-secret-service",
+ "d2b-provider-device-gpu",
  "d2b-provider-device-security-key",
  "d2b-provider-device-tpm",
  "d2b-provider-device-usbip",
@@ -1768,14 +1802,18 @@ dependencies = [
  "d2b-provider-notification-desktop",
  "d2b-provider-observability-otel",
  "d2b-provider-runtime-azure-container-apps",
+ "d2b-provider-runtime-azure-virtual-machine",
  "d2b-provider-runtime-cloud-hypervisor",
+ "d2b-provider-runtime-qemu-media",
  "d2b-provider-shell-terminal",
  "d2b-provider-supervisor",
  "d2b-provider-system-core",
  "d2b-provider-system-minijail",
  "d2b-provider-system-systemd",
+ "d2b-provider-toolkit",
  "d2b-provider-transport-azure-relay",
  "d2b-provider-volume-local",
+ "d2b-provider-volume-virtiofs",
  "d2b-resource-api",
  "d2b-resource-store",
  "d2b-resource-store-redb",

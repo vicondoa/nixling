@@ -9,6 +9,8 @@ use d2b_contracts_resource::v3::ZoneRevision;
 
 use crate::{OperationContext, ResourceKey, TriggerReason, TriggerSet};
 
+const MAX_DELETION_PRIORITY_STREAK: usize = 8;
+
 /// Queue lane. Expedited work shares the same resource single-flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriorityLane {
@@ -49,6 +51,16 @@ impl QueueHint {
             operation,
         })
     }
+
+    pub(crate) fn coalesce(&mut self, hint: &Self) {
+        if hint.high_water_revision > self.high_water_revision {
+            self.high_water_revision = hint.high_water_revision;
+        }
+        if hint.high_water_revision >= self.high_water_revision {
+            self.operation = hint.operation.clone();
+        }
+        self.reasons.union_with(&hint.reasons);
+    }
 }
 
 impl core::fmt::Debug for QueueHint {
@@ -70,6 +82,7 @@ pub struct QueuedWork {
     reasons: TriggerSet,
     lane: PriorityLane,
     operation: OperationContext,
+    persistence_operation: Option<OperationContext>,
     attempt: u32,
 }
 
@@ -99,6 +112,19 @@ impl QueuedWork {
         &self.operation
     }
 
+    /// Borrow the optional durable effect operation used for persistence.
+    pub const fn persistence_operation(&self) -> Option<&OperationContext> {
+        self.persistence_operation.as_ref()
+    }
+
+    pub(crate) fn with_persistence_operation(
+        mut self,
+        operation: Option<OperationContext>,
+    ) -> Self {
+        self.persistence_operation = operation;
+        self
+    }
+
     /// Return the one-based attempt.
     pub const fn attempt(&self) -> u32 {
         self.attempt
@@ -113,6 +139,10 @@ impl core::fmt::Debug for QueuedWork {
             .field("reasons", &self.reasons)
             .field("lane", &self.lane)
             .field("operation", &self.operation)
+            .field(
+                "has_persistence_operation",
+                &self.persistence_operation.is_some(),
+            )
             .field("attempt", &self.attempt)
             .finish()
     }
@@ -124,6 +154,7 @@ struct PendingWork {
     reasons: TriggerSet,
     lane: PriorityLane,
     operation: OperationContext,
+    persistence_operation: Option<OperationContext>,
     attempt: u32,
 }
 
@@ -134,6 +165,7 @@ impl PendingWork {
             reasons: hint.reasons.clone(),
             lane: hint.lane,
             operation: hint.operation.clone(),
+            persistence_operation: None,
             attempt: 1,
         }
     }
@@ -141,6 +173,9 @@ impl PendingWork {
     fn coalesce(&mut self, hint: &QueueHint) {
         if hint.high_water_revision > self.high_water_revision {
             self.high_water_revision = hint.high_water_revision;
+        }
+        if hint.high_water_revision >= self.high_water_revision {
+            self.operation = hint.operation.clone();
         }
         self.reasons.union_with(&hint.reasons);
     }
@@ -152,6 +187,7 @@ impl PendingWork {
             reasons: self.reasons,
             lane: self.lane,
             operation: self.operation,
+            persistence_operation: self.persistence_operation,
             attempt: self.attempt,
         }
     }
@@ -176,6 +212,7 @@ impl ResourceEntry {
 struct QueueState {
     resources: BTreeMap<ResourceKey, ResourceEntry>,
     ready: VecDeque<ResourceKey>,
+    deletion_priority_streak: usize,
 }
 
 /// Thread-safe bounded queue. A resource remains present while running.
@@ -260,7 +297,36 @@ impl PendingQueue {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while let Some(key) = state.ready.pop_front() {
+        while !state.ready.is_empty() {
+            let deletion_index = state.ready.iter().position(|key| {
+                state
+                    .resources
+                    .get(key)
+                    .and_then(|entry| entry.ordinary.as_ref())
+                    .is_some_and(|pending| {
+                        pending.reasons.contains(TriggerReason::DeletionRequested)
+                            || pending.reasons.contains(TriggerReason::FinalizerRequired)
+                    })
+            });
+            let ordinary_index = state.ready.iter().position(|key| {
+                state
+                    .resources
+                    .get(key)
+                    .and_then(|entry| entry.ordinary.as_ref())
+                    .is_some_and(|pending| {
+                        !pending.reasons.contains(TriggerReason::DeletionRequested)
+                            && !pending.reasons.contains(TriggerReason::FinalizerRequired)
+                    })
+            });
+            let index = if let Some(deletion_index) = deletion_index
+                && (state.deletion_priority_streak < MAX_DELETION_PRIORITY_STREAK
+                    || ordinary_index.is_none())
+            {
+                deletion_index
+            } else {
+                ordinary_index.unwrap_or(0)
+            };
+            let key = state.ready.remove(index)?;
             let entry = state
                 .resources
                 .get_mut(&key)
@@ -282,9 +348,20 @@ impl PendingQueue {
                 }
                 expedited.or_else(|| entry.ordinary.take())
             };
-            if let Some(pending) = pending {
+            let work = pending.map(|pending| {
+                let is_deletion = pending.reasons.contains(TriggerReason::DeletionRequested)
+                    || pending.reasons.contains(TriggerReason::FinalizerRequired);
                 entry.running = true;
-                return Some(pending.into_running(key));
+                (is_deletion, pending.into_running(key))
+            });
+            if let Some((is_deletion, work)) = work {
+                if is_deletion {
+                    state.deletion_priority_streak =
+                        state.deletion_priority_streak.saturating_add(1);
+                } else {
+                    state.deletion_priority_streak = 0;
+                }
+                return Some(work);
             }
         }
         None
@@ -318,19 +395,32 @@ impl PendingQueue {
     pub fn retry(&self, work: QueuedWork, revision: ZoneRevision) -> Result<(), QueueError> {
         let key = work.key.clone();
         let operation_id = work.operation.operation_id().to_owned();
+        let persistence_operation = work.persistence_operation.clone();
+        let retry_revision = revision.max(work.high_water_revision);
         self.finish(&key)?;
-        let mut hint = QueueHint::new(
-            key,
-            revision.max(work.high_water_revision),
-            work.reasons,
-            work.lane,
-            work.operation,
-        )?;
-        hint.reasons.insert(TriggerReason::RetryDue);
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if work.lane == PriorityLane::Ordinary
+            && let Some(entry) = state.resources.get_mut(&key)
+            && let Some(pending) = entry.ordinary.as_mut()
+        {
+            if pending.operation != work.operation {
+                return Ok(());
+            }
+            if retry_revision > pending.high_water_revision {
+                pending.high_water_revision = retry_revision;
+            }
+            pending.reasons.union_with(&work.reasons);
+            pending.reasons.insert(TriggerReason::RetryDue);
+            pending.persistence_operation = persistence_operation;
+            pending.attempt = work.attempt.saturating_add(1);
+            return Ok(());
+        }
+        let mut hint =
+            QueueHint::new(key, retry_revision, work.reasons, work.lane, work.operation)?;
+        hint.reasons.insert(TriggerReason::RetryDue);
         let outcome = Self::push_locked(
             &mut state,
             hint,
@@ -349,6 +439,7 @@ impl PendingQueue {
                 .find(|pending| pending.operation.operation_id() == operation_id),
         }
         .expect("retried work is pending");
+        pending.persistence_operation = persistence_operation;
         pending.attempt = work.attempt.saturating_add(1);
         let _ = outcome;
         Ok(())
@@ -505,6 +596,44 @@ mod tests {
         assert_eq!(work.high_water_revision(), ZoneRevision::new(7));
         assert!(work.reasons().contains(TriggerReason::DependencyChanged));
         assert!(work.reasons().contains(TriggerReason::DeletionRequested));
+    }
+
+    #[test]
+    fn ordinary_coalescing_keeps_the_newest_operation_identity() {
+        let queue = PendingQueue::new(2, 1);
+        let target = key("app", 0);
+        queue
+            .push(hint(
+                target.clone(),
+                3,
+                TriggerReason::DependencyChanged,
+                PriorityLane::Ordinary,
+                "old-operation",
+            ))
+            .unwrap();
+        queue
+            .push(hint(
+                target.clone(),
+                4,
+                TriggerReason::OwnedResourceChanged,
+                PriorityLane::Ordinary,
+                "new-operation",
+            ))
+            .unwrap();
+        queue
+            .push(hint(
+                target,
+                4,
+                TriggerReason::ManualReconcile,
+                PriorityLane::Ordinary,
+                "same-revision-operation",
+            ))
+            .unwrap();
+
+        let work = queue.pop_ready().unwrap();
+        assert_eq!(work.high_water_revision(), ZoneRevision::new(4));
+        assert_eq!(work.operation().operation_id(), "same-revision-operation");
+        assert!(work.reasons().contains(TriggerReason::OwnedResourceChanged));
     }
 
     #[test]
@@ -740,6 +869,122 @@ mod tests {
     }
 
     #[test]
+    fn retry_carries_only_the_accepted_persistence_operation() {
+        let queue = PendingQueue::new(2, 1);
+        let target = key("app", 0);
+        queue
+            .push(hint(
+                target.clone(),
+                2,
+                TriggerReason::ManualReconcile,
+                PriorityLane::Ordinary,
+                "startup:Process/app",
+            ))
+            .unwrap();
+        let running = queue.pop_ready().unwrap().with_persistence_operation(Some(
+            OperationContext::new(
+                "effect:accepted",
+                "effect:accepted",
+                "effect:accepted",
+                None,
+            )
+            .unwrap(),
+        ));
+        queue.retry(running, ZoneRevision::new(5)).unwrap();
+        queue
+            .push(hint(
+                target.clone(),
+                6,
+                TriggerReason::SpecGenerationChanged,
+                PriorityLane::Ordinary,
+                "watch:6:child:0",
+            ))
+            .unwrap();
+        let retry = queue.pop_ready().unwrap();
+        assert_eq!(
+            retry
+                .persistence_operation()
+                .map(OperationContext::operation_id),
+            Some("effect:accepted")
+        );
+        assert_eq!(retry.operation().operation_id(), "watch:6:child:0");
+    }
+
+    #[test]
+    fn ordinary_conflict_retry_preserves_a_newer_pending_operation() {
+        let queue = PendingQueue::new(2, 1);
+        let target = key("app", 0);
+        queue
+            .push(hint(
+                target.clone(),
+                5,
+                TriggerReason::ManualReconcile,
+                PriorityLane::Ordinary,
+                "op-a",
+            ))
+            .unwrap();
+        let running = queue.pop_ready().unwrap();
+        queue
+            .push(hint(
+                target.clone(),
+                6,
+                TriggerReason::SpecGenerationChanged,
+                PriorityLane::Ordinary,
+                "op-b",
+            ))
+            .unwrap();
+
+        queue.retry(running, ZoneRevision::new(6)).unwrap();
+
+        let successor = queue.pop_ready().unwrap();
+        assert_eq!(successor.operation().operation_id(), "op-b");
+        assert_eq!(successor.high_water_revision(), ZoneRevision::new(6));
+        assert_eq!(successor.attempt(), 1);
+        assert!(
+            successor
+                .reasons()
+                .contains(TriggerReason::SpecGenerationChanged)
+        );
+        assert!(!successor.reasons().contains(TriggerReason::RetryDue));
+        queue.finish(&target).unwrap();
+        assert!(queue.pop_ready().is_none());
+    }
+
+    #[test]
+    fn ordinary_conflict_retry_increments_a_matching_pending_operation() {
+        let queue = PendingQueue::new(2, 1);
+        let target = key("app", 0);
+        queue
+            .push(hint(
+                target.clone(),
+                5,
+                TriggerReason::ManualReconcile,
+                PriorityLane::Ordinary,
+                "op-a",
+            ))
+            .unwrap();
+        let running = queue.pop_ready().unwrap();
+        queue
+            .push(hint(
+                target.clone(),
+                6,
+                TriggerReason::OwnedResourceChanged,
+                PriorityLane::Ordinary,
+                "op-a",
+            ))
+            .unwrap();
+
+        queue.retry(running, ZoneRevision::new(6)).unwrap();
+
+        let retry = queue.pop_ready().unwrap();
+        assert_eq!(retry.operation().operation_id(), "op-a");
+        assert_eq!(retry.high_water_revision(), ZoneRevision::new(6));
+        assert_eq!(retry.attempt(), 2);
+        assert!(retry.reasons().contains(TriggerReason::RetryDue));
+        queue.finish(&target).unwrap();
+    }
+
+    #[test]
     fn expedited_retry_updates_its_matching_operation_not_a_neighbor() {
         let queue = PendingQueue::new(2, 3);
         let target = key("app", 0);
@@ -821,5 +1066,50 @@ mod tests {
         assert_eq!(queue.resource_count(), 2);
         queue.finish(&running_key).unwrap();
         assert_eq!(queue.resource_count(), 1);
+    }
+
+    #[test]
+    fn deletion_hints_run_before_workload_hints_without_starving_them() {
+        let queue = PendingQueue::new(16, 1);
+        let workload = key("workload", 0);
+        queue
+            .push(hint(
+                workload.clone(),
+                2,
+                TriggerReason::ManualReconcile,
+                PriorityLane::Ordinary,
+                "workload",
+            ))
+            .unwrap();
+        for index in 0..10 {
+            queue
+                .push(hint(
+                    key(&format!("delete-{index}"), index + 1),
+                    3,
+                    TriggerReason::DeletionRequested,
+                    PriorityLane::Ordinary,
+                    &format!("delete-{index}"),
+                ))
+                .unwrap();
+        }
+
+        let first = queue.pop_ready().unwrap();
+        assert!(first.reasons().contains(TriggerReason::DeletionRequested));
+        let first_key = first.key().clone();
+        queue.finish(&first_key).unwrap();
+
+        let mut saw_workload = false;
+        for _ in 0..10 {
+            let work = queue.pop_ready().unwrap();
+            if work.key() == &workload {
+                saw_workload = true;
+            }
+            let key = work.key().clone();
+            queue.finish(&key).unwrap();
+            if saw_workload {
+                break;
+            }
+        }
+        assert!(saw_workload);
     }
 }

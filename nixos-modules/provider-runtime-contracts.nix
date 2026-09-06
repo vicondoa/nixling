@@ -7,6 +7,53 @@
 
 let
   cfg = config.d2b;
+  digestPattern = "sha256:[0-9a-f]{64}";
+
+  validDigest = value:
+    builtins.isString value && builtins.match digestPattern value != null;
+
+  attrOr = attrs: name: fallback:
+    if builtins.isAttrs attrs && builtins.hasAttr name attrs
+    then attrs.${name}
+    else fallback;
+
+  appliedCatalogDigest = bundle:
+    let
+      path = attrOr bundle "path" null;
+      parsed =
+        if path == null
+        then { success = true; value = { }; }
+        else builtins.tryEval
+          (builtins.fromJSON
+            (builtins.unsafeDiscardStringContext (builtins.readFile path)));
+    in
+    if parsed.success && builtins.isAttrs parsed.value
+    then attrOr parsed.value "artifactCatalogDigest" null
+    else null;
+
+  # The path is the canonical activation/application artifact. Reading its
+  # emitted JSON keeps this check independent from the eval-time `data`
+  # projection, which is only a copy of the catalog digest.
+  bundleArtifactCatalogAssertions =
+    let
+      artifactCatalog =
+        cfg._artifactCatalogV3 or { };
+      catalogDigest = artifactCatalog.catalogDigest or null;
+      bundles =
+        (cfg._bundle or { }).zoneResourceBundles or { };
+    in
+    lib.optionals (catalogDigest != null) (lib.mapAttrsToList
+      (zoneName: bundle:
+        let bundleDigest = appliedCatalogDigest bundle;
+        in {
+          assertion = validDigest bundleDigest
+            && bundleDigest == catalogDigest;
+          message = ''
+            d2b.zones.${zoneName} activation-time artifactCatalogDigest must
+            match the digest emitted in the canonical activation bundle.
+          '';
+        })
+      bundles);
 
   parseRef = value:
     let parts = if builtins.isString value then lib.splitString "/" value else [ ];
@@ -14,11 +61,6 @@ let
       type = builtins.elemAt parts 0;
       name = builtins.elemAt parts 1;
     } else null;
-
-  attrOr = attrs: name: fallback:
-    if builtins.isAttrs attrs && builtins.hasAttr name attrs
-    then attrs.${name}
-    else fallback;
 
   secretKey = key:
     builtins.elem key [
@@ -561,5 +603,7 @@ let
     ++ lib.concatMap zoneLinkAssertions zoneLinkRows;
 in
 {
-  config.assertions = allAssertions;
+  config.assertions =
+    allAssertions
+    ++ bundleArtifactCatalogAssertions;
 }

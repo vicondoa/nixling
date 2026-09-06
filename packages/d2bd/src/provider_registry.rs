@@ -8,7 +8,6 @@
 
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
     sync::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -24,7 +23,6 @@ use d2b_contracts_resource::v3::{
     SchemaFingerprint, ZoneId, ZoneRevision, identity::ReconnectGeneration,
 };
 use d2b_contracts_zone_session::v3::zone_routing::{ZoneLabelId, ZonePath};
-use d2b_core::host::HostJson;
 use d2b_provider::instance::ProviderInstance;
 use d2b_provider::{
     ProviderCapabilitySet, ProviderClass, ProviderDescriptor, ProviderImplementationId,
@@ -104,8 +102,6 @@ pub enum ProviderCompositionError {
     GenerationInvalid,
     /// A Zone path could not be derived from the daemon's Zone identity.
     ZonePathInvalid,
-    /// The host catalog could not be fingerprinted.
-    CatalogFingerprintInvalid,
     /// The registry state lock was poisoned.
     StateUnavailable,
     /// A signed controller manifest could not be admitted for deployment.
@@ -134,7 +130,6 @@ impl ProviderCompositionError {
             Self::ProviderNotRegistered => "provider-not-registered",
             Self::GenerationInvalid => "provider-generation-invalid",
             Self::ZonePathInvalid => "provider-zone-path-invalid",
-            Self::CatalogFingerprintInvalid => "provider-catalog-fingerprint-invalid",
             Self::StateUnavailable => "provider-registry-state-unavailable",
             Self::ControllerManifestInvalid => "provider-controller-manifest-invalid",
             Self::ControllerDeployment(_) => "provider-controller-deployment-rejected",
@@ -575,7 +570,6 @@ enum ProviderRuntimeState {
 #[derive(Debug)]
 pub struct ProviderRuntime {
     state: RwLock<ProviderRuntimeState>,
-    lifecycle_state_path: Option<PathBuf>,
     process_providers: RwLock<Option<Arc<ProductionProcessProviders>>>,
 }
 
@@ -586,70 +580,8 @@ impl ProviderRuntime {
             state: RwLock::new(ProviderRuntimeState::Refused(
                 ProviderCompositionError::ProviderNotRegistered,
             )),
-            lifecycle_state_path: None,
             process_providers: RwLock::new(None),
         }
-    }
-
-    /// Construct a Provider runtime whose lifecycle admission boundary is
-    /// persisted under the daemon-owned state directory.
-    pub fn new_persistent(
-        state_path: impl Into<PathBuf>,
-    ) -> Result<Self, ProviderCompositionError> {
-        let state_path = state_path.into();
-        if !state_path.is_absolute() {
-            return Err(ProviderCompositionError::StateUnavailable);
-        }
-        if let Some(parent) = state_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|_| ProviderCompositionError::StateUnavailable)?;
-        }
-        Ok(Self {
-            state: RwLock::new(ProviderRuntimeState::Refused(
-                ProviderCompositionError::ProviderNotRegistered,
-            )),
-            lifecycle_state_path: Some(state_path),
-            process_providers: RwLock::new(None),
-        })
-    }
-
-    /// Compose the v3 catalog from the trusted host artifact.
-    ///
-    /// An absent or malformed catalog is stored as refused; lifecycle
-    /// dispatch remains unavailable until a valid catalog is installed. The
-    /// Zone identity is supplied by the committed topology rather than a
-    /// built-in root name.
-    pub fn configure_from_host(
-        &self,
-        host: &HostJson,
-        zone: &ZoneId,
-    ) -> Result<(), ProviderCompositionError> {
-        if host.runtime_providers.is_empty() {
-            let error = ProviderCompositionError::ProviderNotRegistered;
-            let mut state = self
-                .state
-                .write()
-                .map_err(|_| ProviderCompositionError::StateUnavailable)?;
-            *state = ProviderRuntimeState::Refused(error);
-            return Err(error);
-        }
-        let next = match self.compose_host_runtime(host, zone) {
-            Ok(active) => ProviderRuntimeState::Active(active),
-            Err(error) => {
-                let mut state = self
-                    .state
-                    .write()
-                    .map_err(|_| ProviderCompositionError::StateUnavailable)?;
-                *state = ProviderRuntimeState::Refused(error);
-                return Err(error);
-            }
-        };
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| ProviderCompositionError::StateUnavailable)?;
-        *state = next;
-        Ok(())
     }
 
     /// Construct an active runtime from exact bindings and Guest routes.
@@ -683,7 +615,6 @@ impl ProviderRuntime {
                 routes: route_index,
                 lifecycle: ProviderLifecycleDispatch::new(zone),
             })),
-            lifecycle_state_path: None,
             process_providers: RwLock::new(None),
         })
     }
@@ -903,73 +834,12 @@ impl ProviderRuntime {
         )
     }
 
-    fn compose_host_runtime(
-        &self,
-        host: &HostJson,
-        zone: &ZoneId,
-    ) -> Result<ActiveProviderRuntime, ProviderCompositionError> {
-        let zone = zone.clone();
-        let mut bindings = Vec::with_capacity(host.runtime_providers.len());
-        let mut provider_refs = BTreeMap::new();
-        for metadata in &host.runtime_providers {
-            let name = ResourceName::parse(metadata.provider.id.clone())
-                .map_err(|_| ProviderCompositionError::ProviderRefInvalid)?;
-            let provider_ref = ResourceRef::parse(&format!("Provider/{}", name.as_str()))
-                .map_err(|_| ProviderCompositionError::ProviderRefInvalid)?;
-            let fingerprint = runtime_catalog_fingerprint(metadata)?;
-            bindings.push(ProviderBinding::new(
-                zone.clone(),
-                provider_ref.clone(),
-                name,
-                fingerprint,
-            )?);
-            if provider_refs
-                .insert(metadata.provider.id.clone(), provider_ref)
-                .is_some()
-            {
-                return Err(ProviderCompositionError::DuplicateProvider);
-            }
-        }
-        let registry = compose_provider_registry(zone.clone(), 1, bindings)?;
-        let mut routes = BTreeMap::new();
-        for row in &host.vm_runtimes {
-            let provider_ref = provider_refs
-                .get(&row.runtime.provider.id)
-                .ok_or(ProviderCompositionError::ProviderNotRegistered)?
-                .clone();
-            if routes.insert(row.vm.clone(), provider_ref).is_some() {
-                return Err(ProviderCompositionError::DuplicateProvider);
-            }
-        }
-        Ok(ActiveProviderRuntime {
-            zone: zone.clone(),
-            registry: ProviderRegistryManager::new(registry),
-            routes,
-            lifecycle: match &self.lifecycle_state_path {
-                Some(path) => ProviderLifecycleDispatch::new_persistent(
-                    zone.clone(),
-                    path.with_file_name("provider-lifecycle.json"),
-                )
-                .map_err(|_| ProviderCompositionError::StateUnavailable)?,
-                None => ProviderLifecycleDispatch::new(zone.clone()),
-            },
-        })
-    }
 }
 
 impl Default for ProviderRuntime {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn runtime_catalog_fingerprint(
-    metadata: &d2b_core::runtime::RuntimeMetadata,
-) -> Result<String, ProviderCompositionError> {
-    let bytes = serde_json::to_vec(metadata)
-        .map_err(|_| ProviderCompositionError::CatalogFingerprintInvalid)?;
-    let digest = Sha256::digest(bytes);
-    Ok(format!("sha256:{digest:x}"))
 }
 
 /// Keep the ResourceType identity available to callers without accepting a

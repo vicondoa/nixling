@@ -27,6 +27,11 @@ enforce this conjunction. Opening a store deliberately leaves
 independent trusted-bundle step. A Zone is not published as ready before that
 step completes.
 
+This daemon-plane barrier is distinct from Guest readiness. A Cloud Hypervisor
+Guest is Ready only after its authenticated ComponentSession, exact running
+VMM Process identity, and live Cloud Hypervisor API socket are observed in the
+Guest status projection; a live Runner task alone is not readiness evidence.
+
 The status projection is emitted by the fixed system-core emitter. It contains
 one `system-core-host` and one `system-core-user` handler record; missing,
 duplicate, or `ProviderLifecycle` substitutions are refused.
@@ -48,9 +53,10 @@ uid into a request-scoped authenticated ComponentSession subject before
 calling the same Resource API client used by the registered session path.
 The uid is never accepted from the request envelope; it is included in the
 transport and transcript bindings checked by the authorizer.
-There is no fixed daemon-owned Provider identity and no public fallback to a
-static manifest, SSH, a raw broker request, a caller-supplied path, or a
-provider override.
+The fixed bootstrap Provider identities are materialized by the verified
+bundle path and active configuration generation; they are not caller-selected
+fallbacks. There is no public fallback to a static manifest, SSH, a raw broker
+request, a caller-supplied path, or a provider override.
 
 Typed shell requests are the separate authenticated Resource path and retain
 the same Zone routing and admin checks. Other public Resource operations do not

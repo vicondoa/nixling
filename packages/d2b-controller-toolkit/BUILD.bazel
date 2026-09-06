@@ -57,11 +57,12 @@ rust_test(
         "benches/support/reaction.rs",
     ],
     compile_data = ["Cargo.toml"],
-    tags = ["bench", "manual"],
+    tags = ["bench", "manual", "exclusive"],
     visibility = ["//visibility:public"],
     deps = [
         "//packages/d2b-contracts-resource:d2b_contracts_resource",
         "//packages/d2b-contracts-zone-session:d2b_contracts_zone_session",
+        "//packages/d2b-core-controller:d2b_core_controller",
         ":d2b_controller_toolkit",
         "//packages/d2b-bus:d2b_bus_production_rss_fixture",
         "//packages/d2b-process:d2b_process",
@@ -86,7 +87,7 @@ rust_test(
     name = "reaction_test",
     compile_data = ["Cargo.toml"],
     crate = ":reaction",
-    tags = ["manual"],
+    tags = ["manual", "exclusive"],
 )
 # keep
 filegroup(

@@ -13,6 +13,7 @@ unix-transport = ["dep:d2b-session-unix", "d2b-session-unix/host-socket"]
 workspace = true
 
 [dependencies]
+async-trait = "0.1"
 d2b-contracts-provider = { path = "../d2b-contracts-provider", version = "0.0.0-bootstrap" }
 d2b-contracts-zone-session = { path = "../d2b-contracts-zone-session", version = "0.0.0-bootstrap" }
 d2b-contracts-resource = { path = "../d2b-contracts-resource", version = "0.0.0-bootstrap" }
@@ -20,11 +21,16 @@ d2b-provider = { path = "../d2b-provider", version = "0.0.0-bootstrap" }
 d2b-session = { path = "../d2b-session", version = "0.0.0-bootstrap" }
 d2b-session-unix = { path = "../d2b-session-unix", version = "0.0.0-bootstrap", default-features = false, optional = true }
 schemars.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+sha2.workspace = true
+ttrpc = { version = "0.9.0", default-features = false, features = ["async", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+zeroize = "1"
 
 [dev-dependencies]
 d2b-session = { path = "../d2b-session", version = "0.0.0-bootstrap", features = ["test-support"] }
+d2b-session-unix = { path = "../d2b-session-unix", version = "0.0.0-bootstrap", features = ["test-support"] }
 sha2.workspace = true
 
 [[bin]]

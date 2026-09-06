@@ -33,8 +33,9 @@ pub use resources::{
 pub use service::{
     AttachReceipt, AttachRequest, Attachment, CONTROLLER_SERVICE, InMemoryShellAuthority,
     OpenSessionRequest, OpenSessionResult, SUPERVISOR_SERVICE, SessionCapability, SessionGrant,
-    SessionSupervisor, ShellAuthorityLedger, ShellAuthorityPort, ShellTerminalController,
-    SupervisorProcessResource, TERMINAL_STREAM,
+    SessionSupervisor, ShellAuthorityLedger, ShellAuthorityPort, ShellRunnerContract,
+    SHELL_POOL_FINALIZER, SHELL_REPAIR_INTERVAL_SECS, SHELL_SESSION_FINALIZER,
+    ShellTerminalController, SupervisorProcessResource, TERMINAL_STREAM, shell_runner_contract,
 };
 pub use session::{
     AdoptionDecision, OutputRing, SupervisorCandidate, SupervisorIdentity, adopt_supervisor,

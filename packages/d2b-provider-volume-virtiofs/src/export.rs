@@ -23,7 +23,7 @@ pub const EXPORT_RESOURCE_TYPE: &str = "virtiofs.d2bus.org.Export";
 
 /// The finalizer volume-virtiofs adds to each Export, and to nothing
 /// else.
-pub const EXPORT_FINALIZER: &str = "volume-virtiofs/export";
+pub const EXPORT_FINALIZER: &str = "volume-virtiofs.d2bus.org/export";
 
 /// The opaque identity of one Export's private listening socket.
 ///
@@ -136,6 +136,7 @@ impl ExportSpec {
         if attachment.transport() != AttachmentTransport::Virtiofs {
             return Err(VirtiofsExportError::InvalidExport);
         }
+
         Self::new(
             volume_ref,
             attachment.execution_ref().clone(),
@@ -144,6 +145,66 @@ impl ExportSpec {
             attachment.settings().clone(),
         )
         .and_then(|export| export.with_mount_path(attachment.mount_path()))
+    }
+
+    /// Parse an Export `spec` object from a Resource envelope.
+    pub fn from_resource_spec(value: &serde_json::Value) -> Result<Self, VirtiofsExportError> {
+        let provider_ref = value
+            .get("providerRef")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| ResourceRef::parse(value).ok())
+            .ok_or(VirtiofsExportError::InvalidExport)?;
+        if provider_ref != ResourceRef::parse("Provider/volume-virtiofs").unwrap() {
+            return Err(VirtiofsExportError::InvalidExport);
+        }
+        let volume_ref = value
+            .get("volumeRef")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| ResourceRef::parse(value).ok())
+            .ok_or(VirtiofsExportError::InvalidExport)?;
+        let execution_ref = value
+            .get("executionRef")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| ResourceRef::parse(value).ok())
+            .ok_or(VirtiofsExportError::InvalidExport)?;
+        let view = value
+            .get("view")
+            .cloned()
+            .ok_or(VirtiofsExportError::InvalidExport)
+            .and_then(|value| {
+                serde_json::from_value(value).map_err(|_| VirtiofsExportError::InvalidExport)
+            })?;
+        let access = value
+            .get("access")
+            .cloned()
+            .ok_or(VirtiofsExportError::InvalidExport)
+            .and_then(|value| {
+                serde_json::from_value(value).map_err(|_| VirtiofsExportError::InvalidExport)
+            })?;
+        let provider = value
+            .get("provider")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(VirtiofsExportError::InvalidExport)?;
+        if provider.get("schemaId").and_then(serde_json::Value::as_str)
+            != Some("volume-virtiofs.d2bus.org/Export/spec")
+            || provider
+                .get("schemaVersion")
+                .and_then(serde_json::Value::as_str)
+                != Some("1.0")
+        {
+            return Err(VirtiofsExportError::InvalidExport);
+        }
+        let settings = provider
+            .get("settings")
+            .cloned()
+            .ok_or(VirtiofsExportError::InvalidExport)?;
+        let settings: AttachmentSettings =
+            serde_json::from_value(settings).map_err(|_| VirtiofsExportError::InvalidExport)?;
+        let mount_path = value
+            .get("mountPath")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(VirtiofsExportError::InvalidExport)?;
+        Self::new(volume_ref, execution_ref, view, access, settings)?.with_mount_path(mount_path)
     }
 
     /// Borrow the Volume this Export serves.
@@ -200,6 +261,43 @@ impl ExportSpec {
     pub fn socket_identity(&self, zone: &BoundedToken) -> SocketIdentity {
         SocketIdentity::derive(zone, &self.volume_ref, &self.execution_ref)
     }
+
+    /// Derive the Export-owned virtiofsd Process reference.
+    pub fn worker_process_ref(&self) -> Result<ResourceRef, VirtiofsExportError> {
+        derive_child_ref("Process", &self.volume_ref, &self.execution_ref, "worker")
+    }
+
+    /// Derive the Export-owned Endpoint reference.
+    pub fn endpoint_ref(&self) -> Result<ResourceRef, VirtiofsExportError> {
+        derive_child_ref(
+            "Endpoint",
+            &self.volume_ref,
+            &self.execution_ref,
+            "endpoint",
+        )
+    }
+}
+
+fn derive_child_ref(
+    resource_type: &str,
+    volume_ref: &ResourceRef,
+    execution_ref: &ResourceRef,
+    role: &str,
+) -> Result<ResourceRef, VirtiofsExportError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"d2b/volume-virtiofs/child/v1");
+    hasher.update(volume_ref.to_canonical_string().as_bytes());
+    hasher.update([0]);
+    hasher.update(execution_ref.to_canonical_string().as_bytes());
+    hasher.update([0]);
+    hasher.update(role.as_bytes());
+    let digest = hasher.finalize();
+    let suffix = digest[..10]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    ResourceRef::parse(&format!("{resource_type}/vol-vfd-{suffix}"))
+        .map_err(|_| VirtiofsExportError::InvalidExport)
 }
 
 impl fmt::Debug for ExportSpec {

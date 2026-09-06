@@ -1274,6 +1274,13 @@ impl NativeAuthorizer {
         Ok(acceptor)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_store_seal_issuer_slot(
+        &self,
+    ) -> Arc<Mutex<Option<d2b_resource_store::mutation_seal::MutationSealIssuer>>> {
+        Arc::clone(&self.store_seal)
+    }
+
     pub fn replace_policy(
         &self,
         policy: PolicySet,
@@ -2689,6 +2696,12 @@ mod tests {
     #[test]
     fn uninstalled_resource_types_are_rejected_in_rules_and_targets() {
         let catalog = ApiCatalog::standard();
+        let export = ResourceTypeName::parse("virtiofs.d2bus.org.Export").unwrap();
+        let trusted_catalog = ApiCatalog::with_extensions([export.clone()]).unwrap();
+        assert!(trusted_catalog.contains(&export));
+        assert!(!trusted_catalog.contains(
+            &ResourceTypeName::parse("untrusted.d2bus.org.Export").unwrap()
+        ));
         let extension = ResourceTypeName::parse("example.d2bus.org.Widget").unwrap();
         assert_eq!(
             PolicyRule::new(

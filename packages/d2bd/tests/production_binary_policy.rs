@@ -1,5 +1,22 @@
 use std::{env, fs, path::PathBuf};
 
+fn read_required_d2bd_source(relative: &str) -> String {
+    let manifest_root =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap_or_else(|| ".".into()));
+    let mut candidates = vec![manifest_root.join(relative)];
+    if let Some(repo_root) = env::var_os("D2B_REPO_ROOT") {
+        candidates.push(PathBuf::from(repo_root).join("packages/d2bd").join(relative));
+    }
+    for path in candidates {
+        match fs::read_to_string(&path) {
+            Ok(source) => return source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("read required d2bd source {}: {error}", path.display()),
+        }
+    }
+    panic!("required d2bd source is missing: {relative}");
+}
+
 #[test]
 fn production_binary_contains_no_peer_override_surface() {
     let binary = fs::read(env!("CARGO_BIN_EXE_d2bd")).expect("read production d2bd binary");
@@ -21,26 +38,94 @@ fn production_binary_contains_no_peer_override_surface() {
         "relay_auth_snippet_from_config",
         "gateway_deps_from_config",
         "display_listener_from_config",
+        "run_device_binding_watch",
+        "device_binding_watch_task",
+        "reconcile_semantic_binding_resources",
+        "reconcile_wayland_session_deletion",
+        "spawn_usbip_reconcile_after_vm_start",
+        "UsbipBackgroundReconcileGuard",
+        "configure_from_host",
+        "compose_host_runtime",
+        "reconcile_snapshot",
+        "list_activation_snapshot",
+        "legacy_scheduler_disabled",
+        "CoreRegisteredSource",
+        "AcceptanceBatch",
     ] {
         assert!(
             !rendered.contains(retired),
             "production d2bd must not retain retired component-session path {retired}"
         );
     }
-    let source = [
-        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_else(|| ".".into()))
-            .join("src/composition.rs"),
-        env::var_os("D2B_REPO_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_default()
-            .join("packages/d2bd/src/composition.rs"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .and_then(|path| fs::read_to_string(path).ok())
-    .expect("read d2bd source");
+    let source = read_required_d2bd_source("src/composition.rs");
     assert!(
         !source.contains("BrokerRequest::OpenHidrawSecurityKey"),
         "production d2bd must not own the security-key hidraw opener"
     );
+    let source_paths = [
+        "src/composition.rs",
+        "src/resource_runtime.rs",
+        "src/process_resource_runtime.rs",
+        "src/activation_resource_runtime.rs",
+        "src/audio_resource_runtime.rs",
+        "src/semantic_binding_resource_runtime.rs",
+        "src/provider_registry.rs",
+    ]
+    .into_iter()
+    .map(read_required_d2bd_source)
+    .collect::<Vec<_>>();
+    for retired in [
+        "run_process_watch",
+        "run_activation_watch",
+        "run_audio_watch",
+        "run_semantic_binding_watch",
+        "run_device_binding_watch",
+        "device_binding_watch_task",
+        "reconcile_semantic_binding_resources",
+        "reconcile_wayland_session_deletion",
+        "spawn_usbip_reconcile_after_vm_start",
+        "UsbipBackgroundReconcileGuard",
+        "configure_from_host",
+        "compose_host_runtime",
+        "reconcile_snapshot",
+        "list_activation_snapshot",
+        "list_process_snapshot",
+        "list_process_snapshot_backend",
+        "legacy_scheduler_disabled",
+        "CoreRegisteredSource",
+        "AcceptanceBatch",
+    ] {
+        assert!(
+            !source_paths.iter().any(|source| source.contains(retired)),
+            "d2bd source retains retired cutover path {retired}"
+        );
+    }
+}
+
+#[test]
+fn cloud_hypervisor_guest_does_not_publish_volume_readiness() {
+    let guest_runtime = read_required_d2bd_source("src/resource_runtime.rs");
+    assert!(
+        !guest_runtime.contains("cloud-hypervisor-setup-volume-ready"),
+        "Cloud Hypervisor Guest setup must not publish Volume Ready"
+    );
+    let setup_volume_runtime = guest_runtime
+        .split_once("async fn reconcile_cloud_hypervisor_setup_volume(")
+        .and_then(|(_, remainder)| {
+            remainder.split_once("async fn ensure_cloud_hypervisor_controller_deployment(")
+        })
+        .map(|(body, _)| body)
+        .expect("Cloud Hypervisor setup Volume reconciler must remain present");
+    assert!(
+        !setup_volume_runtime.contains("persist_public_reconcile_status"),
+        "Cloud Hypervisor Guest setup must not mutate Volume status"
+    );
+
+    let volume_runtime = read_required_d2bd_source("src/resource_runtime/volume_provider_runtime.rs");
+    assert_eq!(
+        volume_runtime.matches("resource_type: \"Volume\"").count(),
+        1,
+        "volume-local must remain the sole Volume Runner owner"
+    );
+    assert!(volume_runtime.contains("provider_ref: VOLUME_LOCAL_PROVIDER_REF"));
 }

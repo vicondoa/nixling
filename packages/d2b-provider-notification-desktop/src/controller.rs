@@ -13,6 +13,52 @@ use std::collections::BTreeSet;
 
 use crate::Category;
 
+/// The bounded repair interval for the notification ComponentSession runtime.
+pub const NOTIFICATION_REPAIR_INTERVAL_SECS: u64 = 300;
+
+/// The cutover contract for the notification service-only runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotificationRunnerContract {
+    service_package: &'static str,
+    repair_interval_secs: u64,
+    watched_configuration_is_dependency: bool,
+    component_session_only: bool,
+}
+
+impl NotificationRunnerContract {
+    /// Return the notification service package.
+    pub const fn service_package(self) -> &'static str {
+        self.service_package
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Whether legacy notification scheduling is disabled.
+
+    /// Whether configuration is dependency-only.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+
+    /// Whether notification state remains on typed ComponentSession streams.
+    pub const fn component_session_only(self) -> bool {
+        self.component_session_only
+    }
+}
+
+/// Return the service-only notification cutover contract.
+pub const fn notification_runner_contract() -> NotificationRunnerContract {
+    NotificationRunnerContract {
+        service_package: crate::SERVICE_PACKAGE,
+        repair_interval_secs: NOTIFICATION_REPAIR_INTERVAL_SECS,
+        watched_configuration_is_dependency: true,
+        component_session_only: true,
+    }
+}
+
 const DISPLAY_PROVIDER_REF: &str = "Provider/display-wayland";
 const DISPLAY_SERVICE_PACKAGE: &str = "d2b.display.v3";
 const MAX_GUEST_SOURCES: usize = 16;

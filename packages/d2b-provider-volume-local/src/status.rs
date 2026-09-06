@@ -11,6 +11,7 @@ use d2b_contracts_resource::v3::ResourceRef;
 use d2b_contracts_resource::v3::execution_policy::BoundedToken;
 use d2b_contracts_resource::v3::volume::{AttachmentAccess, VolumeKind};
 
+use crate::content::NetworkConfigMaterializationEvidence;
 use crate::layout::EntryCondition;
 
 /// Coarse layout phase of a Volume.
@@ -82,6 +83,9 @@ pub struct VolumeStatusReport {
     pub layout_conditions: Vec<EntryCondition>,
     /// One entry per declared virtiofs attachment.
     pub attachment_statuses: Vec<AttachmentStatus>,
+    /// Durable evidence for a qualified content projection, when requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<NetworkConfigMaterializationEvidence>,
 }
 
 #[cfg(test)]

@@ -43,10 +43,10 @@ creates one co-located agent Process per admitted Credential binding. The
 `d2b-managed-identity-agent` binary alone holds the injected
 `ManagedIdentityCredentialClient`, serves live lease operations, and terminates
 the sensitive delivery session. The controller has no client construction path.
-The standalone binaries fail closed with exit 78 until the authenticated Zone
-runtime supplies the controller source, ComponentSession transport, and
-LaunchTicket effect-port client; this crate does not invent a host-held token
-or ambient runtime fallback.
+The daemon composes both roles through the authenticated Zone runtime, shared
+Runner, ComponentSession transport, and LaunchTicket effect-port client. The
+standalone entrypoints do not invent a host-held token or ambient runtime
+fallback.
 
 ## Placement and dependencies
 

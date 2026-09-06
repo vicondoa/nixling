@@ -6,14 +6,19 @@
 //! `system-minijail` Process Provider. The effect backend is hermetic and
 //! records the Provider effect boundary; store, API, bus, session stream,
 //! queue, handler, and status paths are production implementations.
+//!
+//! The existing `ProductionControllerSource` remains an in-handler regression
+//! profile. Its acceptance hook records ordering only; the Core source and
+//! durable operation-ledger profile are owned by the production adapter.
 
 #[path = "support/reaction.rs"]
 mod bus_support;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,24 +34,28 @@ use d2b_controller_toolkit::{
     ControllerHealth, ControllerIdentity, ControllerSelector, ControllerSource, ControllerVerb,
     DependencySnapshot, DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot, InitialList,
     ObservationResult, OperationContext, PriorityLane, ReconcileContext, ReconcilePlan,
-    ReconcileProjection, ReconcileResult, ResourceKey, ResourceReconciler, ResourceRegistration,
-    ResourceSnapshot, ResyncPolicy, Runner, RunnerConfig, SourceError, StatusPersistence,
+    ReconcileProjection, ReconcileResult, ResourceKey, ResourceReconciler,
+    ResourceRegistration, ResourceSnapshot, ResyncPolicy, Runner, RunnerConfig, SourceError,
+    StatusPersistence,
     TriggerReason, TriggerSet, UpdateAssessment, UpdateAssessmentState, UpgradePlan, UpgradeStage,
-    ValidationResult, WatchEvent, WatchFailure, WatchHint,
+    ValidationResult, WatchEvent, WatchFailure, WatchHint, MutationIntent,
 };
+use d2b_core_controller::CoreControllerSource;
 use d2b_process::{
     BackendLaunch, BackendObservation, CompiledDigests, ConfigurationDigest, IdentityBinding,
     LaunchTicket, ObservedIdentity, OperationBinding, ProcessEffectBackend, ProcessEffectError,
     ProcessIdentityDigest, ProcessRequest, ProcessStopClass, WaitReapOwner,
 };
-use d2b_process_conformance::ProcessProvider;
+use d2b_process_conformance::{AdoptionOutcome, ProcessProvider};
 use d2b_provider_supervisor::ProviderSupervisor;
 use d2b_provider_system_minijail::MinijailProcessProvider;
+use d2b_resource_api::registered::RedbRegisteredControllerApi;
 use d2b_resource_store::{
-    StoreGetRequest, StoreOperationContext, StoreProjection, StoreWatchRequest,
+    StoreGetRequest, StoreOperationContext, StoreProjection, StoreWatchRequest, StoredResource,
 };
 use d2b_resource_store_redb::{
-    BackendSignals, MAX_INITIAL_WATCH_CREDITS, RedbResourceStore, WatchSignals,
+    AuthorityOperationState, BackendSignals, MAX_INITIAL_WATCH_CREDITS, RedbResourceStore,
+    WatchSignals,
 };
 use tokio::sync::Notify;
 
@@ -55,7 +64,10 @@ const HANDLER_P95_LIMIT: Duration = Duration::from_millis(5);
 const LAUNCH_P95_LIMIT: Duration = Duration::from_millis(20);
 const LAUNCH_EFFECT_WORK: Duration = Duration::from_micros(250);
 const WATCH_TIMEOUT: Duration = Duration::from_secs(10);
-const COMMIT_BATCH: usize = 4;
+const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+const SEED_TIMEOUT: Duration = Duration::from_secs(90);
+const COMMIT_BATCH: usize = 32;
+const SEED_BATCH_MUTATIONS: usize = 8;
 
 #[derive(Debug, Clone)]
 struct HandlerRecord {
@@ -65,8 +77,14 @@ struct HandlerRecord {
 }
 
 struct ReactionMetrics {
+    effect_acceptances: Mutex<BTreeMap<ResourceUid, Instant>>,
     handlers: Mutex<BTreeMap<ResourceUid, HandlerRecord>>,
     launches: Mutex<Vec<(ResourceUid, Instant)>>,
+    handler_total: AtomicUsize,
+    launch_total: AtomicUsize,
+    startup: Mutex<BTreeSet<ResourceUid>>,
+    progress: Notify,
+    checkpoints: AtomicUsize,
     active_launches: AtomicUsize,
     max_active_launches: AtomicUsize,
     next_identity: AtomicUsize,
@@ -75,12 +93,45 @@ struct ReactionMetrics {
 impl ReactionMetrics {
     fn new() -> Self {
         Self {
+            effect_acceptances: Mutex::new(BTreeMap::new()),
             handlers: Mutex::new(BTreeMap::new()),
             launches: Mutex::new(Vec::new()),
+            handler_total: AtomicUsize::new(0),
+            launch_total: AtomicUsize::new(0),
+            startup: Mutex::new(BTreeSet::new()),
+            progress: Notify::new(),
+            checkpoints: AtomicUsize::new(0),
             active_launches: AtomicUsize::new(0),
             max_active_launches: AtomicUsize::new(0),
             next_identity: AtomicUsize::new(1),
         }
+    }
+
+    fn record_effect_acceptance(&self, context: &ReconcileContext) {
+        let mut acceptances = self
+            .effect_acceptances
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        acceptances
+            .entry(context.target().uid().clone())
+            .or_insert_with(Instant::now);
+    }
+
+    fn record_durable_effect_acceptance(&self, uid: &ResourceUid) {
+        self.effect_acceptances
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(uid.clone())
+            .or_insert_with(Instant::now);
+    }
+
+    fn effect_acceptances(&self) -> Vec<(ResourceUid, Instant)> {
+        self.effect_acceptances
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(resource_uid, accepted_at)| (resource_uid.clone(), *accepted_at))
+            .collect()
     }
 
     fn record_handler_key_at(&self, key: &ResourceKey, started_at: Instant) {
@@ -88,11 +139,53 @@ impl ReactionMetrics {
             .handlers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        handlers.entry(key.uid().clone()).or_insert(HandlerRecord {
-            resource_ref: key.resource_ref().clone(),
-            resource_uid: key.uid().clone(),
-            started_at,
-        });
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            handlers.entry(key.uid().clone())
+        {
+            entry.insert(HandlerRecord {
+                resource_ref: key.resource_ref().clone(),
+                resource_uid: key.uid().clone(),
+                started_at,
+            });
+            self.handler_total.fetch_add(1, Ordering::Release);
+            self.progress.notify_waiters();
+        }
+    }
+
+    fn record_handler_start_at(&self, key: &ResourceKey, started_at: Instant) {
+        let mut handlers = self
+            .handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(record) = handlers.get_mut(key.uid()) {
+            record.started_at = started_at;
+        } else {
+            handlers.insert(
+                key.uid().clone(),
+                HandlerRecord {
+                    resource_ref: key.resource_ref().clone(),
+                    resource_uid: key.uid().clone(),
+                    started_at,
+                },
+            );
+            self.handler_total.fetch_add(1, Ordering::Release);
+        }
+        self.progress.notify_waiters();
+    }
+
+    fn record_startup(&self, key: &ResourceKey) {
+        self.startup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.uid().clone());
+        self.progress.notify_waiters();
+    }
+
+    fn startup_count(&self) -> usize {
+        self.startup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     fn handlers(&self) -> Vec<HandlerRecord> {
@@ -104,6 +197,10 @@ impl ReactionMetrics {
             .collect()
     }
 
+    fn handler_count(&self) -> usize {
+        self.handler_total.load(Ordering::Acquire)
+    }
+
     fn launches(&self) -> Vec<(ResourceUid, Instant)> {
         self.launches
             .lock()
@@ -111,8 +208,44 @@ impl ReactionMetrics {
             .clone()
     }
 
+    fn launch_count(&self) -> usize {
+        self.launch_total.load(Ordering::Acquire)
+    }
+
     fn max_active_launches(&self) -> usize {
         self.max_active_launches.load(Ordering::Acquire)
+    }
+
+    fn record_checkpoint(&self) {
+        self.checkpoints.fetch_add(1, Ordering::AcqRel);
+        self.progress.notify_waiters();
+    }
+
+    fn checkpoint_count(&self) -> usize {
+        self.checkpoints.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_counts(&self, completed: usize) {
+        loop {
+            let notified = self.progress.notified();
+            if self.handler_count() >= completed
+                && self.launch_count() >= completed
+                && self.checkpoint_count() >= completed
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_for_startup(&self, expected: usize) {
+        loop {
+            let notified = self.progress.notified();
+            if self.startup_count() >= expected && self.checkpoint_count() >= expected {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -143,6 +276,8 @@ impl ProcessEffectBackend for RecordingEffectBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push((ticket.process_uid().clone(), Instant::now()));
+        self.metrics.launch_total.fetch_add(1, Ordering::Release);
+        self.metrics.progress.notify_waiters();
         thread::sleep(LAUNCH_EFFECT_WORK);
         self.metrics.active_launches.fetch_sub(1, Ordering::AcqRel);
 
@@ -185,6 +320,552 @@ impl ProcessEffectBackend for RecordingEffectBackend {
         _class: ProcessStopClass,
     ) -> Result<(), ProcessEffectError> {
         Ok(())
+    }
+}
+
+struct ExitProcessState {
+    alive: Mutex<BTreeMap<ResourceUid, bool>>,
+    launches: Mutex<BTreeMap<ResourceUid, usize>>,
+    identities: Mutex<BTreeMap<ProcessIdentityDigest, ResourceUid>>,
+    next_identity: AtomicUsize,
+    observes: AtomicUsize,
+    wakes: AtomicUsize,
+}
+
+impl ExitProcessState {
+    fn new() -> Self {
+        Self {
+            alive: Mutex::new(BTreeMap::new()),
+            launches: Mutex::new(BTreeMap::new()),
+            identities: Mutex::new(BTreeMap::new()),
+            next_identity: AtomicUsize::new(1),
+            observes: AtomicUsize::new(0),
+            wakes: AtomicUsize::new(0),
+        }
+    }
+
+    fn mark_exited(&self, uid: &ResourceUid) {
+        self.alive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(uid.clone(), false);
+    }
+
+    fn launch_count(&self, uid: &ResourceUid) -> usize {
+        self.launches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(uid)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn total_launches(&self) -> usize {
+        self.launches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .sum()
+    }
+
+    fn observe_count(&self) -> usize {
+        self.observes.load(Ordering::Acquire)
+    }
+
+    fn wake_count(&self) -> usize {
+        self.wakes.load(Ordering::Acquire)
+    }
+}
+
+struct ExitEffectBackend {
+    state: Arc<ExitProcessState>,
+}
+
+#[derive(Clone)]
+struct ExitHandle {
+    uid: ResourceUid,
+}
+
+impl ProcessEffectBackend for ExitEffectBackend {
+    type Handle = ExitHandle;
+
+    fn launch(
+        &self,
+        request: ProcessRequest,
+    ) -> Result<BackendLaunch<Self::Handle>, ProcessEffectError> {
+        let uid = request.ticket().process_uid().clone();
+        self.state
+            .alive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(uid.clone(), true);
+        *self
+            .state
+            .launches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(uid.clone())
+            .or_default() += 1;
+        let identity_number = self.state.next_identity.fetch_add(1, Ordering::Relaxed);
+        let mut identity_bytes = [0_u8; 32];
+        identity_bytes[..std::mem::size_of::<usize>()]
+            .copy_from_slice(&identity_number.to_le_bytes());
+        let identity = ProcessIdentityDigest::from_bytes(identity_bytes);
+        self.state
+            .identities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(identity, uid.clone());
+        let observed = ObservedIdentity::from_verified([
+            IdentityBinding::Pid,
+            IdentityBinding::ProcessStartTime,
+            IdentityBinding::Cgroup,
+            IdentityBinding::Executable,
+            IdentityBinding::Template,
+            IdentityBinding::Generation,
+        ]);
+        Ok(BackendLaunch::new(
+            BackendObservation::new(identity, observed, WaitReapOwner::Local),
+            ExitHandle { uid: uid.clone() },
+        ))
+    }
+
+    fn observe(
+        &self,
+        request: ProcessRequest,
+    ) -> Result<Option<BackendObservation>, ProcessEffectError> {
+        self.state.observes.fetch_add(1, Ordering::AcqRel);
+        let uid = request.ticket().process_uid();
+        let alive = self
+            .state
+            .alive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(uid)
+            .copied()
+            .unwrap_or(false);
+        if !alive {
+            return Ok(None);
+        }
+        let launches = self
+            .state
+            .launches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let identity_number = launches.get(uid).copied().unwrap_or(0);
+        let mut identity_bytes = [0_u8; 32];
+        identity_bytes[..std::mem::size_of::<usize>()]
+            .copy_from_slice(&identity_number.to_le_bytes());
+        let identity = ProcessIdentityDigest::from_bytes(identity_bytes);
+        let observed = ObservedIdentity::from_verified([
+            IdentityBinding::Pid,
+            IdentityBinding::ProcessStartTime,
+            IdentityBinding::Cgroup,
+            IdentityBinding::Executable,
+            IdentityBinding::Template,
+            IdentityBinding::Generation,
+        ]);
+        Ok(Some(BackendObservation::new(
+            identity,
+            observed,
+            WaitReapOwner::Local,
+        )))
+    }
+
+    fn open_pidfd(
+        &self,
+        observation: BackendObservation,
+    ) -> Result<Self::Handle, ProcessEffectError> {
+        let uid = self
+            .state
+            .identities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&observation.identity())
+            .cloned()
+            .ok_or(ProcessEffectError::PidfdUnavailable)?;
+        Ok(ExitHandle { uid })
+    }
+
+    fn wait(
+        &self,
+        handle: &Self::Handle,
+        timeout: Duration,
+    ) -> Result<(), ProcessEffectError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self
+                .state
+                .alive
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&handle.uid)
+                .copied()
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(ProcessEffectError::StopFailed);
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn stop(
+        &self,
+        _handle: &Self::Handle,
+        _class: ProcessStopClass,
+    ) -> Result<(), ProcessEffectError> {
+        Ok(())
+    }
+}
+
+struct ExitProcessReconciler {
+    descriptor: ControllerDescriptor,
+    provider: Arc<MinijailProcessProvider<ProviderSupervisor<ExitEffectBackend>>>,
+    state: Arc<ExitProcessState>,
+    restart_on_exit: bool,
+    waker: Mutex<Option<Arc<dyn Fn(ResourceKey, ZoneRevision) + Send + Sync>>>,
+}
+
+impl ExitProcessReconciler {
+    fn set_waker(&self, waker: Arc<dyn Fn(ResourceKey, ZoneRevision) + Send + Sync>) {
+        *self.waker.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(waker);
+    }
+
+    fn spawn_waiter(&self, resource: &ResourceSnapshot, identity: ProcessIdentityDigest) {
+        let Some(waker) = self
+            .waker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let provider = self.provider.port().clone();
+        let key = resource.key().clone();
+        let revision = resource.revision();
+        let wakes = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            loop {
+                match provider
+                    .wait_identity(&identity, Duration::from_millis(10))
+                    .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => continue,
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+            wakes.wakes.fetch_add(1, Ordering::AcqRel);
+            waker(key, revision);
+        });
+    }
+
+    fn phase(resource: &ResourceSnapshot) -> Option<String> {
+        serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+            .ok()
+            .and_then(|value| value.pointer("/status/phase")?.as_str().map(str::to_owned))
+    }
+
+    fn status_candidate(
+        resource: &ResourceSnapshot,
+        phase: &str,
+        code: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let mut value =
+            serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+                .map_err(|_| HandlerError)?;
+        let status = value
+            .get_mut("status")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or(HandlerError)?;
+        status.insert(
+            "phase".to_owned(),
+            serde_json::Value::String(phase.to_owned()),
+        );
+        status.insert(
+            "observedGeneration".to_owned(),
+            serde_json::Value::from(resource.generation().get()),
+        );
+        status.insert(
+            "outcome".to_owned(),
+            serde_json::json!({
+                "code": code,
+                "message": code,
+                "retryable": false,
+                "occurredAt": "2026-01-01T00:00:00.000Z",
+            }),
+        );
+        let status = status.clone();
+        serde_json::to_vec(&status).map_err(|_| HandlerError)
+    }
+
+    fn result(
+        resource: &ResourceSnapshot,
+        phase: &str,
+        code: &str,
+    ) -> Result<ReconcileResult, HandlerError> {
+        ReconcileResult::new(
+            resource.revision(),
+            resource.generation(),
+            None,
+            Some(Self::status_candidate(resource, phase, code)?),
+            d2b_controller_toolkit::ReconcileDisposition::Converged,
+            None,
+            None,
+            StatusPersistence::Pending,
+        )
+        .map_err(|_| HandlerError)
+    }
+
+    fn retry_result(
+        resource: &ResourceSnapshot,
+        phase: &str,
+        code: &str,
+        next_tick: u64,
+    ) -> Result<ReconcileResult, HandlerError> {
+        ReconcileResult::new(
+            resource.revision(),
+            resource.generation(),
+            None,
+            Some(Self::status_candidate(resource, phase, code)?),
+            d2b_controller_toolkit::ReconcileDisposition::RequeueAt,
+            Some(next_tick),
+            None,
+            StatusPersistence::Pending,
+        )
+        .map_err(|_| HandlerError)
+    }
+}
+
+impl ResourceReconciler for ExitProcessReconciler {
+    type Error = HandlerError;
+
+    fn describe(
+        &self,
+    ) -> impl Future<Output = Result<ControllerDescriptor, Self::Error>> + Send {
+        std::future::ready(Ok(self.descriptor.clone()))
+    }
+
+    fn validate_spec(
+        &self,
+        _context: &ReconcileContext,
+        _resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ValidationResult, Self::Error>> + Send {
+        std::future::ready(Ok(ValidationResult::Valid))
+    }
+
+    fn plan(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl Future<Output = Result<ReconcilePlan, Self::Error>> + Send {
+        let phase = Self::phase(resource);
+        let effect = phase.as_deref() == Some("Pending")
+            || (phase.as_deref() == Some("Ready")
+                && self.state.launch_count(resource.key().uid()) == 0)
+            || (phase.as_deref() == Some("Degraded")
+                && context.reasons().contains(TriggerReason::RetryDue));
+        std::future::ready(
+            ReconcilePlan::new(
+                effect
+                    .then_some(vec![format!(
+                        "process-lifecycle-restart-{}",
+                        self.state.launch_count(resource.key().uid())
+                    )])
+                    .unwrap_or_default(),
+                !effect,
+            )
+            .map_err(|_| HandlerError),
+        )
+    }
+
+    fn reconcile(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let result = match Self::phase(resource).as_deref() {
+            Some("Ready")
+                if self.state.launch_count(resource.key().uid()) > 0
+                    && !self
+                    .state
+                    .alive
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(resource.key().uid())
+                    .copied()
+                    .unwrap_or(false) =>
+            {
+                if self.restart_on_exit {
+                    Self::retry_result(
+                        resource,
+                        "Degraded",
+                        "process-exited",
+                        context.now_tick().saturating_add(50),
+                    )
+                } else {
+                    Self::result(resource, "Succeeded", "process-exited")
+                }
+            }
+            _ => Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            )),
+        };
+        std::future::ready(result)
+    }
+
+    fn execute_effect(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let ticket = launch_ticket(
+            resource,
+            self.descriptor.identity().controller_generation(),
+        );
+        let phase = Self::phase(resource).unwrap_or_else(|| "Unknown".to_owned());
+        let provider = Arc::clone(&self.provider);
+        let reconciler = self;
+        let initial = self.state.launch_count(resource.key().uid()) == 0;
+        let restart_on_exit = self.restart_on_exit;
+        async move {
+            context.authorize_effect().map_err(|_| HandlerError)?;
+            if phase == "Ready" && !initial {
+                match provider.adopt(&ticket).await.map_err(|_| HandlerError)? {
+                    AdoptionOutcome::Adopted(report) => {
+                        reconciler.spawn_waiter(resource, report.identity);
+                        return Ok(ReconcileResult::converged(
+                            resource.revision(),
+                            resource.generation(),
+                        ));
+                    }
+                    AdoptionOutcome::Absent if restart_on_exit => {
+                        let report = provider.launch(&ticket).await.map_err(|_| HandlerError)?;
+                        reconciler.spawn_waiter(resource, report.identity);
+                        return Self::result(resource, "Ready", "process-restarted");
+                    }
+                    AdoptionOutcome::Absent => {
+                        return Self::result(resource, "Succeeded", "process-exited");
+                    }
+                    _ => return Err(HandlerError),
+                }
+            }
+            let report = provider.launch(&ticket).await.map_err(|_| HandlerError)?;
+            reconciler.spawn_waiter(resource, report.identity);
+            Self::result(resource, "Ready", "process-started")
+        }
+    }
+
+    fn observe(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ObservationResult, Self::Error>> + Send {
+        let result = match Self::phase(resource).as_deref() {
+            Some("Ready")
+                if self.state.launch_count(resource.key().uid()) > 0
+                    && !self
+                    .state
+                    .alive
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(resource.key().uid())
+                    .copied()
+                    .unwrap_or(false) =>
+            {
+                if self.restart_on_exit {
+                    Self::retry_result(
+                        resource,
+                        "Degraded",
+                        "process-exited",
+                        context.now_tick().saturating_add(50),
+                    )
+                } else {
+                    Self::result(resource, "Succeeded", "process-exited")
+                }
+            }
+            _ => Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            )),
+        };
+        std::future::ready(result.map(ObservationResult::new))
+    }
+
+    fn finalize(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<FinalizeResult, Self::Error>> + Send {
+        std::future::ready(Ok(FinalizeResult::new(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        ))))
+    }
+
+    fn health(
+        &self,
+    ) -> impl Future<Output = Result<ControllerHealth, Self::Error>> + Send {
+        std::future::ready(Ok(ControllerHealth::Healthy))
+    }
+
+    fn drain(
+        &self,
+        _deadline_tick: u64,
+    ) -> impl Future<Output = Result<DrainResult, Self::Error>> + Send {
+        std::future::ready(Ok(DrainResult::Drained))
+    }
+
+    fn assess_update(
+        &self,
+        _context: &ReconcileContext,
+        _resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl Future<Output = Result<UpdateAssessment, Self::Error>> + Send {
+        std::future::ready(
+            UpdateAssessment::new(UpdateAssessmentState::Current, Vec::new(), true)
+                .map_err(|_| HandlerError),
+        )
+    }
+
+    fn plan_upgrade(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl Future<Output = Result<UpgradePlan, Self::Error>> + Send {
+        std::future::ready(
+            UpgradePlan::new(
+                DisruptionClass::None,
+                true,
+                vec![UpgradeStage::Recycle(resource.key().resource_ref().clone())],
+            )
+            .map_err(|_| HandlerError),
+        )
+    }
+
+    fn execute_upgrade(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &UpgradePlan,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        std::future::ready(Ok(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        )))
     }
 }
 
@@ -237,12 +918,15 @@ fn compiled_digests() -> CompiledDigests {
     }
 }
 
-fn launch_ticket(resource: &ResourceSnapshot) -> LaunchTicket {
+fn launch_ticket(
+    resource: &ResourceSnapshot,
+    controller_generation: ControllerGeneration,
+) -> LaunchTicket {
     LaunchTicket::new(
         resource.key().resource_ref().clone(),
         resource.key().uid().clone(),
         resource.generation(),
-        ControllerGeneration::new(1).expect("nonzero controller generation"),
+        controller_generation,
         BoundedToken::parse("system-core").expect("valid owner Provider"),
         BoundedToken::parse("reaction").expect("valid component"),
         BoundedToken::parse("reaction").expect("valid template"),
@@ -266,13 +950,39 @@ fn launch_ticket(resource: &ResourceSnapshot) -> LaunchTicket {
 }
 
 fn descriptor(concurrency: usize) -> ControllerDescriptor {
+    descriptor_for_generations(
+        concurrency,
+        ControllerGeneration::new(1).expect("nonzero controller generation"),
+        ResourceGeneration::new(1).expect("nonzero Provider generation"),
+    )
+}
+
+fn descriptor_for_generations(
+    concurrency: usize,
+    controller_generation: ControllerGeneration,
+    provider_generation: ResourceGeneration,
+) -> ControllerDescriptor {
+    descriptor_for_generations_with_pending(
+        concurrency,
+        concurrency,
+        controller_generation,
+        provider_generation,
+    )
+}
+
+fn descriptor_for_generations_with_pending(
+    concurrency: usize,
+    max_pending_resources: usize,
+    controller_generation: ControllerGeneration,
+    provider_generation: ResourceGeneration,
+) -> ControllerDescriptor {
     let process = ResourceTypeName::parse("Process").expect("valid ResourceType");
     let identity = ControllerIdentity::new(
         ZoneId::parse("dev").expect("valid Zone"),
         ResourceRef::parse("Process/controller").expect("valid controller ref"),
-        ControllerGeneration::new(1).expect("nonzero controller generation"),
+        controller_generation,
         ResourceRef::parse("Provider/system-minijail").expect("valid Provider ref"),
-        ResourceGeneration::new(1).expect("nonzero Provider generation"),
+        provider_generation,
         ResourceRef::parse("Process/controller").expect("valid Process ref"),
         ResourceRef::parse("Host/host-system").expect("valid Host ref"),
         None,
@@ -288,20 +998,20 @@ fn descriptor(concurrency: usize) -> ControllerDescriptor {
         vec!["host".to_owned()],
         vec![ControllerVerb::ReadSpec, ControllerVerb::WriteStatus],
         vec![
-            ControllerSelector::new(process, d2b_controller_toolkit::SelectorField::Spec, None)
+            ControllerSelector::new(process.clone(), d2b_controller_toolkit::SelectorField::Spec, None)
                 .expect("Process selector is valid"),
         ],
         Vec::new(),
-        true,
+        false,
         Vec::new(),
         vec!["reaction.service.v1".to_owned()],
         vec!["reaction.schema.v1".to_owned()],
         ControllerExecutionPolicy::new(
             concurrency,
             concurrency,
-            concurrency,
+            max_pending_resources,
             1,
-            u32::try_from(concurrency).expect("profile fits watch credit"),
+            u32::try_from(max_pending_resources).expect("profile fits watch credit"),
             ResyncPolicy::new(Some(10_000), 30_000).expect("resync policy is valid"),
         )
         .expect("execution policy is valid"),
@@ -323,6 +1033,11 @@ impl std::error::Error for HandlerError {}
 struct ProcessReconciler {
     descriptor: ControllerDescriptor,
     provider: Arc<MinijailProcessProvider<ProviderSupervisor<RecordingEffectBackend>>>,
+    metrics: Arc<ReactionMetrics>,
+    measure_handler_start: bool,
+    effect_id: &'static str,
+    status_only: bool,
+    seed_batches: Option<Arc<Mutex<Vec<Vec<MutationIntent>>>>>,
 }
 
 impl ProcessReconciler {
@@ -344,6 +1059,20 @@ impl ProcessReconciler {
         );
         Ok(CanonicalJsonValue::Object(status.clone()).to_canonical_bytes())
     }
+
+    fn status_resource(resource: &ResourceSnapshot) -> Result<Vec<u8>, HandlerError> {
+        let mut value =
+            CanonicalJsonValue::parse(resource.canonical_json()).map_err(|_| HandlerError)?;
+        let CanonicalJsonValue::Object(root) = &mut value else {
+            return Err(HandlerError);
+        };
+        let status = Self::status_candidate(resource)?;
+        root.insert(
+            "status".to_owned(),
+            CanonicalJsonValue::parse(&status).map_err(|_| HandlerError)?,
+        );
+        Ok(value.to_canonical_bytes())
+    }
 }
 
 impl ResourceReconciler for ProcessReconciler {
@@ -357,24 +1086,92 @@ impl ResourceReconciler for ProcessReconciler {
 
     fn validate_spec(
         &self,
-        _context: &ReconcileContext,
-        _resource: &ResourceSnapshot,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
     ) -> impl std::future::Future<Output = Result<ValidationResult, Self::Error>> + Send {
+        let handler_started_at = Instant::now();
+        if context.reasons().contains(TriggerReason::StartupRelist) {
+            self.metrics.record_startup(resource.key());
+        }
+        if self.measure_handler_start
+            && (!context.reasons().contains(TriggerReason::StartupRelist)
+                || context
+                    .reasons()
+                    .contains(TriggerReason::SpecGenerationChanged))
+        {
+            self.metrics
+                .record_handler_start_at(resource.key(), handler_started_at);
+        }
         std::future::ready(Ok(ValidationResult::Valid))
     }
 
     fn plan(
         &self,
-        _context: &ReconcileContext,
+        context: &ReconcileContext,
         _resource: &ResourceSnapshot,
         _dependencies: &[DependencySnapshot],
     ) -> impl std::future::Future<Output = Result<ReconcilePlan, Self::Error>> + Send {
+        if self.status_only {
+            return std::future::ready(
+                ReconcilePlan::new(Vec::new(), false).map_err(|_| HandlerError),
+            );
+        }
+        if context.reasons().contains(TriggerReason::StartupRelist)
+            && !context
+                .reasons()
+                .contains(TriggerReason::SpecGenerationChanged)
+        {
+            return std::future::ready(
+                ReconcilePlan::new(Vec::new(), false).map_err(|_| HandlerError),
+            );
+        }
+        let effect_id = self.effect_id.to_owned();
         std::future::ready(
-            ReconcilePlan::new(vec!["process-launch".to_owned()], false).map_err(|_| HandlerError),
+            ReconcilePlan::new(vec![effect_id], false).map_err(|_| HandlerError),
         )
     }
 
     fn reconcile(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        if self.status_only {
+            let mutations = self
+                .seed_batches
+                .as_ref()
+                .and_then(|batches| {
+                    batches
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .pop()
+                });
+            let result = (|| {
+                if let Some(mutations) = mutations {
+                    ReconcileResult::converged(resource.revision(), resource.generation())
+                        .with_mutation_batch(
+                            d2b_controller_toolkit::ResourceMutationBatch::new(mutations)
+                                .map_err(|_| HandlerError)?,
+                        )
+                        .map_err(|_| HandlerError)
+                } else {
+                    Ok(ReconcileResult::converged(
+                        resource.revision(),
+                        resource.generation(),
+                    ))
+                }
+            })();
+            return std::future::ready(result);
+        }
+        std::future::ready(Ok(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        )))
+    }
+
+    fn execute_effect(
         &self,
         context: &ReconcileContext,
         resource: &ResourceSnapshot,
@@ -382,10 +1179,14 @@ impl ResourceReconciler for ProcessReconciler {
         _plan: &ReconcilePlan,
     ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
         let provider = Arc::clone(&self.provider);
+        let controller_generation = self.descriptor.identity().controller_generation();
         async move {
             context.authorize_effect().map_err(|_| HandlerError)?;
             provider
-                .launch(&launch_ticket(resource))
+                .launch(&launch_ticket(
+                    resource,
+                    controller_generation,
+                ))
                 .await
                 .map_err(|_| HandlerError)?;
             let candidate = Self::status_candidate(resource)?;
@@ -659,6 +1460,7 @@ impl ControllerSource for ProductionControllerSource {
                     .await
                     .map_err(|_| WatchFailure::Disconnected)?
             };
+            let frame_received_at = Instant::now();
             let payload: serde_json::Value =
                 serde_json::from_slice(frame.payload()).map_err(|_| WatchFailure::Fatal)?;
             let mut events = VecDeque::new();
@@ -694,7 +1496,7 @@ impl ControllerSource for ProductionControllerSource {
                     resource_ref,
                     resource_uid,
                 );
-                self.metrics.record_handler_key_at(&key, Instant::now());
+                self.metrics.record_handler_key_at(&key, frame_received_at);
                 let revision = payload["revision"]
                     .as_u64()
                     .map(ZoneRevision::new)
@@ -748,6 +1550,15 @@ impl ControllerSource for ProductionControllerSource {
     async fn write_starting(&self, context: &ReconcileContext) -> Result<(), SourceError> {
         let _ = context;
         Ok(())
+    }
+
+    fn accept_effect(
+        &self,
+        context: &ReconcileContext,
+        _plan: &ReconcilePlan,
+    ) -> impl std::future::Future<Output = Result<(), SourceError>> + Send {
+        self.metrics.record_effect_acceptance(context);
+        std::future::ready(Ok(()))
     }
 
     fn await_expedited_commit(
@@ -834,6 +1645,11 @@ fn raw_micros(samples: &[Duration]) -> String {
     format!("[{}]", values.join(","))
 }
 
+fn reaction_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 async fn run_profile(profile: usize) {
     let fixture = bus_support::ProductionStore::provision().await;
     let store = fixture.store();
@@ -859,6 +1675,11 @@ async fn run_profile(profile: usize) {
     let reconciler = Arc::new(ProcessReconciler {
         descriptor: descriptor(profile),
         provider,
+        metrics: Arc::clone(&metrics),
+        measure_handler_start: false,
+        effect_id: "process-launch",
+        status_only: false,
+        seed_batches: None,
     });
     let runner = Runner::new(
         Arc::clone(&reconciler),
@@ -874,18 +1695,18 @@ async fn run_profile(profile: usize) {
     );
     let watch_ready = source.watch_ready.notified();
     let runner_task = tokio::spawn(runner.run());
+    drop(runner);
     tokio::time::timeout(WATCH_TIMEOUT, watch_ready)
         .await
         .expect("toolkit opened the authenticated production watch");
 
     for start in (0..profile).step_by(COMMIT_BATCH) {
         let end = (start + COMMIT_BATCH).min(profile);
-        let resources = fixture
+        let (resources, committed_at) = fixture
             .commit_process_batch(profile, start, end)
             .await
             .expect("commit ready Process resources through production redb backend");
         assert_eq!(resources.len(), end - start);
-        let committed_at = Instant::now();
         {
             let mut commit_times = commit_times
                 .lock()
@@ -912,9 +1733,13 @@ async fn run_profile(profile: usize) {
         .clone();
     let handlers = metrics.handlers();
     let launches = metrics.launches();
+    let effect_acceptances = metrics.effect_acceptances();
+    let effect_acceptance_count = effect_acceptances.len();
     assert_eq!(handlers.len(), profile);
     assert_eq!(launches.len(), profile);
+    assert_eq!(effect_acceptance_count, profile);
     let launch_by_uid = launches.into_iter().collect::<BTreeMap<_, _>>();
+    let acceptance_by_uid = effect_acceptances.into_iter().collect::<BTreeMap<_, _>>();
     assert_eq!(launch_by_uid.len(), profile);
 
     let handler_samples = handlers
@@ -932,18 +1757,15 @@ async fn run_profile(profile: usize) {
                 .saturating_duration_since(commit_times[&handler.resource_ref])
         })
         .collect::<Vec<_>>();
+    for handler in &handlers {
+        let accepted_at = acceptance_by_uid[&handler.resource_uid];
+        assert!(
+            accepted_at <= launch_by_uid[&handler.resource_uid],
+            "worker launch preceded durable ledger acceptance"
+        );
+    }
     let handler_p95 = percentile(&handler_samples, 95);
     let launch_p95 = percentile(&launch_samples, 95);
-    assert!(
-        handler_p95 <= HANDLER_P95_LIMIT,
-        "commit-to-handler p95 {:?} exceeded the 5 ms contract",
-        handler_p95
-    );
-    assert!(
-        launch_p95 <= LAUNCH_P95_LIMIT,
-        "commit-to-launch p95 {:?} exceeded the 20 ms contract",
-        launch_p95
-    );
     if profile > 1 {
         assert!(
             metrics.max_active_launches() >= 2,
@@ -969,7 +1791,7 @@ async fn run_profile(profile: usize) {
     assert_eq!(watch_signals.budget_used, 0);
 
     println!(
-        "reaction profile={profile} handler_raw_us={} handler_p95_us={:.3} launch_raw_us={} launch_p95_us={:.3} max_active={} dispatched={} checkpointed={} status_commits={} shared_batches={} fanout_references={}",
+        "reaction profile={profile} handler_raw_us={} handler_p95_us={:.3} launch_raw_us={} launch_p95_us={:.3} max_active={} dispatched={} checkpointed={} effect_acceptances={} status_commits={} shared_batches={} fanout_references={}",
         raw_micros(&handler_samples),
         handler_p95.as_secs_f64() * 1_000_000.0,
         raw_micros(&launch_samples),
@@ -977,6 +1799,7 @@ async fn run_profile(profile: usize) {
         metrics.max_active_launches(),
         report.dispatched,
         report.checkpointed,
+        effect_acceptance_count,
         status_revisions.len(),
         backend_signals.shared_immutable_batches,
         backend_signals.fanout_references,
@@ -992,8 +1815,1151 @@ async fn run_profile(profile: usize) {
         .expect("shutdown production redb backend");
 }
 
+async fn seed_durable_assignments(
+    fixture: &Arc<bus_support::ProductionStore>,
+    resources: &[StoredResource],
+    descriptor: &ControllerDescriptor,
+) {
+    let assignments = resources
+        .iter()
+        .map(|resource| {
+            (
+                resource.resource_ref.clone(),
+                fixture.authoritative_assignment(resource),
+            )
+        })
+        .collect();
+    let seed_batches = resources
+        .chunks(SEED_BATCH_MUTATIONS)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|resource| {
+                    let snapshot = ResourceSnapshot::new(
+                        ResourceKey::new(
+                            resource.zone.clone(),
+                            resource.resource_ref.clone(),
+                            resource.uid.clone(),
+                        ),
+                        resource.revision,
+                        resource.generation,
+                        resource.canonical_json.clone(),
+                        false,
+                    );
+                    MutationIntent::new(
+                        resource.resource_ref.clone(),
+                        Some(resource.uid.clone()),
+                        Some(resource.revision),
+                        d2b_controller_toolkit::MutationIntentKind::UpdateStatus,
+                        Some(ProcessReconciler::status_resource(&snapshot).unwrap()),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let seed_batch_count = seed_batches.len();
+    let metrics = Arc::new(ReactionMetrics::new());
+    let checkpoint_metrics = Arc::clone(&metrics);
+    let api = fixture
+        .core_registered_api_with_assignments(assignments)
+        .with_checkpoint_observer(Arc::new(move |_| {
+            checkpoint_metrics.record_checkpoint();
+        }));
+    let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+    let provider = Arc::new(MinijailProcessProvider::new(
+        ProviderSupervisor::with_limits(
+            RecordingEffectBackend::new(Arc::clone(&metrics)),
+            resources.len(),
+            Duration::from_secs(1),
+        ),
+    ));
+    let reconciler = Arc::new(ProcessReconciler {
+        descriptor: descriptor.clone(),
+        provider,
+        metrics: Arc::clone(&metrics),
+        measure_handler_start: false,
+        effect_id: "assignment-seed",
+        status_only: true,
+        seed_batches: Some(Arc::new(Mutex::new(seed_batches))),
+    });
+    let runner = Runner::new(
+        reconciler,
+        Arc::clone(&source),
+        RunnerConfig {
+            policy_revision: 1,
+            api_revision: 1,
+            configuration_revision: ConfigurationGeneration::new(1)
+                .expect("nonzero configuration generation"),
+            deadline_tick: 30_000,
+            max_attempts: 1,
+        },
+    );
+    let runner_task = tokio::spawn(runner.run());
+    drop(runner);
+    tokio::time::timeout(SEED_TIMEOUT, async {
+        loop {
+            if metrics.checkpoint_count() >= seed_batch_count {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("assignment seeding reaches every Process worker");
+    source.close_watch().unwrap();
+    let report = tokio::time::timeout(SEED_TIMEOUT, runner_task)
+        .await
+        .expect("assignment seeding runner completes")
+        .expect("assignment seeding runner joins")
+        .expect("assignment seeding runner succeeds");
+    assert!(report.dispatched >= seed_batch_count);
+    assert!(report.checkpointed >= seed_batch_count);
+    for resource in resources {
+        match fixture.assignment_fence(&resource.resource_ref).await {
+            Ok(Some(fence)) if fence.resource_uid == resource.uid => {}
+            Ok(Some(_)) => panic!("assignment seed returned a mismatched UID"),
+            Ok(None) => panic!("assignment seed did not persist a fence"),
+            Err(error) => panic!("assignment seed fence read failed: {error:?}"),
+        }
+        tokio::time::timeout(
+            SEED_TIMEOUT,
+            fixture.wait_for_newer_revision(&resource.resource_ref, resource.revision),
+        )
+        .await
+        .expect("assignment seeding reaches the production store")
+        .expect("assignment seeding status remains durable");
+    }
+}
+
+async fn assert_durable_assignment_mismatches(
+    fixture: &Arc<bus_support::ProductionStore>,
+    resource: &StoredResource,
+) {
+    let resolver = fixture.durable_core_assignment_resolver();
+    assert!(
+        resolver(
+            resource.resource_ref.clone(),
+            resource.uid.clone(),
+            resource.revision,
+        )
+        .await
+        .is_ok()
+    );
+    let wrong_uid =
+        ResourceUid::parse("123e4567-e89b-42d3-a456-999999999999").expect("valid mismatch UID");
+    assert!(matches!(
+        resolver(
+            resource.resource_ref.clone(),
+            wrong_uid,
+            resource.revision,
+        )
+        .await,
+        Err(SourceError::Integrity)
+    ));
+    assert!(matches!(
+        resolver(
+            resource.resource_ref.clone(),
+            resource.uid.clone(),
+            ZoneRevision::new(resource.revision.get() + 1),
+        )
+        .await,
+        Err(SourceError::Integrity)
+    ));
+    let current_epoch = fixture.authoritative_assignment(resource).epoch;
+    fixture.set_core_authority_epoch(current_epoch + 1);
+    assert!(matches!(
+        resolver(
+            resource.resource_ref.clone(),
+            resource.uid.clone(),
+            resource.revision,
+        )
+        .await,
+        Err(SourceError::Integrity)
+    ));
+    fixture.set_core_authority_epoch(current_epoch);
+    assert!(matches!(
+        resolver(
+            ResourceRef::parse("Host/host-system").expect("valid mismatch target"),
+            resource.uid.clone(),
+            resource.revision,
+        )
+        .await,
+        Err(SourceError::Integrity)
+    ));
+    assert!(matches!(
+        resolver(
+            ResourceRef::parse("Process/not-assigned").expect("valid missing target"),
+            resource.uid.clone(),
+            resource.revision,
+        )
+        .await,
+        Err(SourceError::Integrity)
+    ));
+}
+
+async fn run_core_profile(profile: usize) {
+    let fixture = bus_support::ProductionStore::provision().await;
+    let store = fixture.store();
+    let descriptor = descriptor_for_generations_with_pending(
+        profile.min(16),
+        profile,
+        ControllerGeneration::new(3).expect("nonzero controller generation"),
+        ResourceGeneration::new(1).expect("nonzero Provider generation"),
+    );
+    let seed_descriptor = descriptor_for_generations_with_pending(
+        1,
+        profile,
+        ControllerGeneration::new(3).expect("nonzero controller generation"),
+        ResourceGeneration::new(1).expect("nonzero Provider generation"),
+    );
+    let mut resources = Vec::with_capacity(profile);
+    for start in (0..profile).step_by(COMMIT_BATCH) {
+        let end = (start + COMMIT_BATCH).min(profile);
+        let (batch, _) = fixture
+            .commit_process_batch(profile, start, end)
+            .await
+            .expect("commit ready Process resources through production ResourceService");
+        resources.extend(batch);
+    }
+    assert_eq!(resources.len(), profile);
+    seed_durable_assignments(&fixture, &resources, &seed_descriptor).await;
+    let mut current_resources = Vec::with_capacity(resources.len());
+    for resource in &resources {
+        current_resources.push(
+            fixture
+                .get_resource(&resource.resource_ref)
+                .await
+                .expect("read seeded Process resource"),
+        );
+    }
+    if profile == 1 {
+        assert_durable_assignment_mismatches(&fixture, &current_resources[0]).await;
+    }
+
+    let metrics = Arc::new(ReactionMetrics::new());
+    let observer_metrics = Arc::clone(&metrics);
+    let checkpoint_metrics = Arc::clone(&metrics);
+    let api = fixture
+        .core_registered_api()
+        .with_assignment_fence_resolver(fixture.durable_core_assignment_resolver())
+        .with_effect_acceptance_observer(Arc::new(move |uid| {
+            observer_metrics.record_durable_effect_acceptance(uid);
+        }))
+        .with_checkpoint_observer(Arc::new(move |_| {
+            checkpoint_metrics.record_checkpoint();
+        }));
+    let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+    source
+        .register(&descriptor)
+        .await
+        .expect("register the durable Core source before read warmup");
+    for resource in &current_resources {
+        let key = ResourceKey::new(
+            resource.zone.clone(),
+            resource.resource_ref.clone(),
+            resource.uid.clone(),
+        );
+        for _ in 0..4 {
+            source
+                .read_fresh(&key)
+                .await
+                .expect("read the durable assignment before the measured pass");
+        }
+    }
+    let provider = Arc::new(MinijailProcessProvider::new(
+        ProviderSupervisor::with_limits(
+            RecordingEffectBackend::new(Arc::clone(&metrics)),
+            1,
+            Duration::from_secs(1),
+        ),
+    ));
+    let reconciler = Arc::new(ProcessReconciler {
+        descriptor: descriptor.clone(),
+        provider,
+        metrics: Arc::clone(&metrics),
+        measure_handler_start: true,
+        effect_id: "process-launch",
+        status_only: false,
+        seed_batches: None,
+    });
+    let runner = Runner::new(
+        reconciler,
+        Arc::clone(&source),
+        RunnerConfig {
+            policy_revision: 1,
+            api_revision: 1,
+            configuration_revision: ConfigurationGeneration::new(1)
+                .expect("nonzero configuration generation"),
+            deadline_tick: 30_000,
+            max_attempts: 1,
+        },
+    );
+    let runner_task = tokio::spawn(runner.run());
+    drop(runner);
+    tokio::time::timeout(SETUP_TIMEOUT, async {
+        metrics.wait_for_startup(profile).await;
+    })
+    .await
+    .expect("CoreControllerSource completes its startup relist");
+
+    let commit_times = Arc::new(Mutex::new(BTreeMap::<ResourceRef, Instant>::new()));
+    let mut updated_resources = Vec::with_capacity(profile);
+    for (index, resource) in current_resources.iter().enumerate() {
+        let operation_id = format!("reaction-trigger-{profile}-{index}");
+        let (updated, committed_at) = fixture
+            .commit_process_spec_update(std::slice::from_ref(resource), &operation_id)
+            .await
+            .expect("commit ready Process trigger through production ResourceService");
+        assert_eq!(updated.len(), 1);
+        let updated = updated
+            .into_iter()
+            .next()
+            .expect("Process trigger response is present");
+        commit_times
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(updated.resource_ref.clone(), committed_at);
+        let completed = index + 1;
+        tokio::time::timeout(WATCH_TIMEOUT, async {
+            metrics.wait_for_counts(completed).await;
+        })
+        .await
+        .expect("CoreControllerSource completes every production launch attempt");
+        tokio::time::timeout(
+            SETUP_TIMEOUT,
+            fixture.wait_for_newer_revision(&updated.resource_ref, updated.revision),
+        )
+        .await
+        .expect("measured status reaches the production store")
+        .expect("measured status remains durable");
+        updated_resources.push(updated);
+    }
+    source.close_watch().unwrap();
+    let report = tokio::time::timeout(WATCH_TIMEOUT, runner_task)
+        .await
+        .expect("CoreControllerSource runner completes")
+        .expect("CoreControllerSource runner task joins")
+        .expect("CoreControllerSource runner succeeds");
+    assert_eq!(report.dispatched, profile * 2);
+    assert!(report.checkpointed >= profile);
+
+    let handlers = metrics.handlers();
+    let launches = metrics.launches();
+    let effect_acceptances = metrics.effect_acceptances();
+    assert_eq!(handlers.len(), profile);
+    assert_eq!(
+        launches.len(),
+        profile,
+        "unexpected launch records: {:?}",
+        launches
+            .iter()
+            .map(|(uid, _)| uid.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(effect_acceptances.len(), profile);
+    let effect_acceptance_count = effect_acceptances.len();
+    let launch_by_uid = launches.into_iter().collect::<BTreeMap<_, _>>();
+    let acceptance_by_uid = effect_acceptances.into_iter().collect::<BTreeMap<_, _>>();
+    let commit_times = commit_times
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let handler_samples = handlers
+        .iter()
+        .map(|handler| {
+            handler
+                .started_at
+                .saturating_duration_since(commit_times[&handler.resource_ref])
+        })
+        .collect::<Vec<_>>();
+    let launch_samples = handlers
+        .iter()
+        .map(|handler| {
+            launch_by_uid[&handler.resource_uid]
+                .saturating_duration_since(commit_times[&handler.resource_ref])
+        })
+        .collect::<Vec<_>>();
+    let acceptance_samples = handlers
+        .iter()
+        .map(|handler| {
+            acceptance_by_uid[&handler.resource_uid]
+                .saturating_duration_since(commit_times[&handler.resource_ref])
+        })
+        .collect::<Vec<_>>();
+    for handler in &handlers {
+        let accepted_at = acceptance_by_uid[&handler.resource_uid];
+        assert!(
+            accepted_at <= launch_by_uid[&handler.resource_uid],
+            "worker launch preceded durable ledger acceptance"
+        );
+    }
+    let handler_p95 = percentile(&handler_samples, 95);
+    let launch_p95 = percentile(&launch_samples, 95);
+    println!(
+        "core measurements profile={profile} handler_raw_us={} handler_p95_us={:.3} acceptance_raw_us={} launch_raw_us={} launch_p95_us={:.3}",
+        raw_micros(&handler_samples),
+        handler_p95.as_secs_f64() * 1_000_000.0,
+        raw_micros(&acceptance_samples),
+        raw_micros(&launch_samples),
+        launch_p95.as_secs_f64() * 1_000_000.0,
+    );
+    assert!(
+        handler_p95 <= HANDLER_P95_LIMIT,
+        "CoreControllerSource commit-to-handler p95 {:?} exceeded 5 ms",
+        handler_p95
+    );
+    assert!(
+        launch_p95 <= LAUNCH_P95_LIMIT,
+        "CoreControllerSource commit-to-launch p95 {:?} exceeded 20 ms",
+        launch_p95
+    );
+    drop(source);
+    let operations = tokio::time::timeout(SETUP_TIMEOUT, async {
+        for _ in 0..8 {
+            match store.authority_operations().await {
+                Ok(operations) => return operations,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        d2b_resource_store::StoreErrorKind::Timeout
+                            | d2b_resource_store::StoreErrorKind::Backpressure
+                            | d2b_resource_store::StoreErrorKind::StoreBackpressure
+                    ) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("read durable effect ledger: {error:?}"),
+            }
+        }
+        panic!("read durable effect ledger retries exhausted")
+    })
+    .await
+    .expect("durable effect ledger read stays bounded");
+    let measured_identities = updated_resources
+        .iter()
+        .map(|resource| (resource.uid.clone(), resource.generation.get()))
+        .collect::<BTreeSet<_>>();
+    let measured_operations = operations
+        .iter()
+        .filter(|operation| {
+            serde_json::from_slice::<serde_json::Value>(&operation.payload)
+                .ok()
+                .is_some_and(|payload| {
+                    payload["effectIds"]
+                        .as_array()
+                        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some("process-launch")))
+                        && payload["resourceUid"]
+                            .as_str()
+                            .and_then(|uid| ResourceUid::parse(uid).ok())
+                            .zip(payload["generation"].as_u64())
+                            .is_some_and(|(uid, generation)| {
+                                measured_identities.contains(&(uid, generation))
+                            })
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(measured_operations.len(), profile);
+    assert!(
+        measured_operations
+            .iter()
+            .all(|operation| operation.state == AuthorityOperationState::EffectConfirmed)
+    );
+    println!(
+        "core reaction profile={profile} handler_raw_us={} handler_p95_us={:.3} launch_raw_us={} launch_p95_us={:.3} dispatched={} checkpointed={} ledger_acceptances={} ledger_confirmed={}",
+        raw_micros(&handler_samples),
+        handler_p95.as_secs_f64() * 1_000_000.0,
+        raw_micros(&launch_samples),
+        launch_p95.as_secs_f64() * 1_000_000.0,
+        report.dispatched,
+        report.checkpointed,
+        effect_acceptance_count,
+        measured_operations.len(),
+    );
+
+    drop(store);
+    let fixture = Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("all CoreControllerSource fixture handles released"));
+    fixture
+        .shutdown()
+        .await
+        .expect("shutdown CoreControllerSource production store");
+}
+
+async fn run_process_exit_profile(restart_on_exit: bool) {
+    let fixture = bus_support::ProductionStore::provision().await;
+    let descriptor = descriptor_for_generations_with_pending(
+        2,
+        2,
+        ControllerGeneration::new(3).expect("nonzero controller generation"),
+        ResourceGeneration::new(1).expect("nonzero Provider generation"),
+    );
+    let seed_descriptor = descriptor_for_generations_with_pending(
+        1,
+        2,
+        ControllerGeneration::new(3).expect("nonzero controller generation"),
+        ResourceGeneration::new(1).expect("nonzero Provider generation"),
+    );
+    let (resources, _) = fixture
+        .commit_process_batch(2, 0, 2)
+        .await
+        .expect("commit Process resources");
+    seed_durable_assignments(&fixture, &resources, &seed_descriptor).await;
+    let state = Arc::new(ExitProcessState::new());
+    let provider = Arc::new(MinijailProcessProvider::new(ProviderSupervisor::new(
+        ExitEffectBackend {
+            state: Arc::clone(&state),
+        },
+    )));
+    let reconciler = Arc::new(ExitProcessReconciler {
+        descriptor: descriptor.clone(),
+        provider: Arc::clone(&provider),
+        state: Arc::clone(&state),
+        restart_on_exit,
+        waker: Mutex::new(None),
+    });
+    let api = fixture
+        .core_registered_api()
+        .with_assignment_fence_resolver(fixture.durable_core_assignment_resolver());
+    let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+    let wake_source = Arc::downgrade(&source);
+    reconciler.set_waker(Arc::new(move |key, revision| {
+        if let Some(source) = wake_source.upgrade() {
+            let _ = source.dispatch_observation(key, revision);
+        }
+    }));
+    let runner = Runner::new(
+        Arc::clone(&reconciler),
+        Arc::clone(&source),
+        RunnerConfig {
+            policy_revision: 1,
+            api_revision: 1,
+            configuration_revision: ConfigurationGeneration::new(1)
+                .expect("nonzero configuration generation"),
+            deadline_tick: 30_000,
+            max_attempts: 1,
+        },
+    );
+    let runner_task = tokio::spawn(runner.run());
+    drop(runner);
+    let mut current_resources = Vec::with_capacity(resources.len());
+    for resource in &resources {
+        let current = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let resource = fixture
+                    .get_resource(&resource.resource_ref)
+                    .await
+                    .expect("read Process status");
+                let value = serde_json::from_slice::<serde_json::Value>(&resource.canonical_json)
+                    .expect("Process JSON");
+                let phase = value["status"]["phase"].as_str().unwrap_or_default();
+                let observed_generation = value["status"]["observedGeneration"]
+                    .as_u64()
+                    .unwrap_or_default();
+                if phase == "Ready" && observed_generation == resource.generation.get() {
+                    return resource;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial Process status reaches Ready");
+        current_resources.push(current);
+    }
+    let first = current_resources
+        .first()
+        .expect("first Process resource")
+        .clone();
+    let sibling = current_resources
+        .get(1)
+        .expect("sibling Process resource")
+        .clone();
+    let initial_generation = first.generation;
+    let initial_spec = serde_json::from_slice::<serde_json::Value>(&first.canonical_json)
+        .expect("initial Process JSON")["spec"]
+        .clone();
+    let lifecycle_operations_before = fixture
+        .store()
+        .authority_operations()
+        .await
+        .expect("read initial Process effect ledger")
+        .into_iter()
+        .filter_map(|operation| {
+            let payload = serde_json::from_slice::<serde_json::Value>(&operation.payload).ok()?;
+            (payload["effectIds"]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|id| {
+                    id.as_str()
+                        .is_some_and(|id| id.starts_with("process-lifecycle-restart-"))
+                }))
+                && payload["resourceUid"].as_str() == Some(first.uid.as_str()))
+            .then_some(operation.operation_id)
+        })
+        .collect::<BTreeSet<_>>();
+    state.mark_exited(&first.uid);
+    let terminal_wait = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let resource = fixture
+                .get_resource(&first.resource_ref)
+                .await
+                .expect("read observed Process");
+            let value = serde_json::from_slice::<serde_json::Value>(&resource.canonical_json)
+                .expect("observed Process JSON");
+            let phase = value["status"]["phase"].as_str().unwrap_or_default();
+            let observed_generation = value["status"]["observedGeneration"]
+                .as_u64()
+                .unwrap_or_default();
+            let expected_phase = if restart_on_exit { "Ready" } else { "Succeeded" };
+            let expected_launches = if restart_on_exit { 2 } else { 1 };
+            if phase == expected_phase
+                && observed_generation == initial_generation.get()
+                && state.launch_count(&first.uid) == expected_launches
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if terminal_wait.is_err() {
+        println!(
+            "exit profile terminal timeout: launches={} observes={} admission={:?}",
+            state.total_launches(),
+            state.observe_count(),
+            source.admission_counts(),
+        );
+        runner_task.abort();
+        let _ = runner_task.await;
+        panic!("production Runner persists terminal Process status");
+    }
+    source.close_watch().expect("close production test watch");
+    let report = tokio::time::timeout(Duration::from_secs(30), runner_task)
+        .await
+        .expect("production Runner drains exit observation")
+        .expect("production Runner task joins")
+        .expect("production Runner succeeds");
+    assert_eq!(report.handler_failures, 0);
+    assert_eq!(
+        state.launch_count(&first.uid),
+        if restart_on_exit { 2 } else { 1 }
+    );
+    assert_eq!(state.launch_count(&sibling.uid), 1);
+    let terminal = fixture
+        .get_resource(&first.resource_ref)
+        .await
+        .expect("read terminal Process");
+    let terminal_phase =
+        serde_json::from_slice::<serde_json::Value>(&terminal.canonical_json)
+            .expect("terminal Process JSON")["status"]["phase"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+    assert_eq!(
+        terminal_phase,
+        if restart_on_exit { "Ready" } else { "Succeeded" }
+    );
+    let lifecycle_operations_after = fixture
+        .store()
+        .authority_operations()
+        .await
+        .expect("read final Process effect ledger")
+        .into_iter()
+        .filter_map(|operation| {
+            let payload = serde_json::from_slice::<serde_json::Value>(&operation.payload).ok()?;
+            (payload["effectIds"]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|id| {
+                    id.as_str()
+                        .is_some_and(|id| id.starts_with("process-lifecycle-restart-"))
+                }))
+                && payload["resourceUid"].as_str() == Some(first.uid.as_str()))
+            .then_some(operation.operation_id)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        lifecycle_operations_after.len(),
+        lifecycle_operations_before.len() + usize::from(restart_on_exit),
+        "restart launch gets a fresh durable effect identity"
+    );
+    assert_eq!(
+        terminal.generation, initial_generation,
+        "natural exit observation must not mutate Process spec generation"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&terminal.canonical_json)
+            .expect("terminal Process JSON")["spec"],
+        initial_spec,
+        "natural exit observation must not mutate Process spec"
+    );
+    let final_launches = state.launch_count(&first.uid);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        state.launch_count(&first.uid),
+        final_launches,
+        "terminal or restarted Process does not relaunch without a new exit"
+    );
+    assert!(state.wake_count() >= 1, "exact child exit wakes its owner");
+    assert!(
+        state
+            .alive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&sibling.uid)
+            .copied()
+            == Some(true),
+        "sibling Process remains alive after one exact child exit"
+    );
+    let operations = fixture
+        .store()
+        .authority_operations()
+        .await
+        .expect("read production effect ledger");
+    assert!(
+        operations.iter().any(|operation| {
+            operation.state == AuthorityOperationState::EffectConfirmed
+                && serde_json::from_slice::<serde_json::Value>(&operation.payload)
+                    .ok()
+                    .and_then(|payload| payload["resourceUid"].as_str().map(str::to_owned))
+                    .as_deref()
+                    == Some(first.uid.as_str())
+        }),
+        "Process launch must complete its durable effect acceptance"
+    );
+    drop(reconciler);
+    drop(provider);
+    drop(source);
+    let fixture = Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("all exit profile fixture handles released"));
+    fixture
+        .shutdown()
+        .await
+        .expect("shutdown exit profile production store");
+}
+
+fn provider_descriptor(provider: &str, index: usize) -> ControllerDescriptor {
+    let resource_type = ResourceTypeName::parse("Provider").expect("valid Provider ResourceType");
+    let controller_ref = ResourceRef::parse(&format!("Process/provider-controller-{index}"))
+        .expect("valid Provider controller ref");
+    let identity = ControllerIdentity::new(
+        ZoneId::parse("dev").expect("valid Zone"),
+        controller_ref.clone(),
+        ControllerGeneration::new(3).expect("nonzero controller generation"),
+        ResourceRef::parse(&format!("Provider/{provider}")).expect("valid Provider ref"),
+        ResourceGeneration::new(1).expect("nonzero Provider generation"),
+        controller_ref,
+        ResourceRef::parse("Host/host-system").expect("valid execution target"),
+        None,
+    )
+    .expect("Provider controller identity is valid");
+    ControllerDescriptor::new(
+        identity,
+        vec![
+            ResourceRegistration::new(resource_type.clone(), vec![1], 5_000, 1)
+                .expect("Provider registration is valid"),
+        ],
+        vec!["resource-api".to_owned()],
+        vec!["system".to_owned()],
+        vec![ControllerVerb::ReadSpec],
+        vec![
+            ControllerSelector::new(
+                resource_type,
+                d2b_controller_toolkit::SelectorField::Spec,
+                None,
+            )
+            .expect("Provider selector is valid"),
+        ],
+        Vec::new(),
+        false,
+        Vec::new(),
+        vec!["d2b.resource.v3".to_owned()],
+        vec!["resources.d2bus.org/v3".to_owned()],
+        ControllerExecutionPolicy::new(
+            1,
+            1,
+            1,
+            1,
+            1,
+            ResyncPolicy::new(None, 5_000).expect("Provider resync policy is valid"),
+        )
+        .expect("Provider execution policy is valid"),
+    )
+    .expect("Provider descriptor is valid")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderWatchFailure {
+    Panic,
+    Cancel,
+    Unavailable,
+    Backpressure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderDelivery {
+    Hint,
+    Closed,
+    Unavailable,
+    RetryExhausted,
+}
+
+/// Fault valve at the ControllerSource seam around a real Core source.
+struct FailureInjectedProviderSource {
+    inner: Arc<CoreControllerSource<RedbRegisteredControllerApi>>,
+    failure: Option<ProviderWatchFailure>,
+    injected: Arc<AtomicBool>,
+}
+
+impl FailureInjectedProviderSource {
+    fn new(
+        inner: Arc<CoreControllerSource<RedbRegisteredControllerApi>>,
+        failure: Option<ProviderWatchFailure>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            failure,
+            injected: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn close(&self) {
+        self.inner
+            .close_watch()
+            .expect("close injected Provider source");
+    }
+}
+
+impl ControllerSource for FailureInjectedProviderSource {
+    fn register(
+        &self,
+        descriptor: &ControllerDescriptor,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner.register(descriptor)
+    }
+
+    fn list_initial(
+        &self,
+        descriptor: &ControllerDescriptor,
+    ) -> impl Future<Output = Result<InitialList, SourceError>> + Send {
+        self.inner.list_initial(descriptor)
+    }
+
+    fn open_watch(
+        &self,
+        descriptor: &ControllerDescriptor,
+        after_revision: ZoneRevision,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner.open_watch(descriptor, after_revision)
+    }
+
+    fn receive_watch(&self) -> impl Future<Output = Result<WatchEvent, WatchFailure>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let failure = self.failure;
+        let injected = Arc::clone(&self.injected);
+        async move {
+            let event = inner.receive_watch().await?;
+            if failure == Some(ProviderWatchFailure::Panic)
+                && injected
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                panic!("injected live Provider source panic");
+            }
+            if failure == Some(ProviderWatchFailure::Cancel)
+                && injected
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                inner.close_watch().expect("close cancelled Provider source");
+                return Ok(WatchEvent::Closed);
+            }
+            Ok(event)
+        }
+    }
+
+    fn read_fresh(
+        &self,
+        key: &ResourceKey,
+    ) -> impl Future<Output = Result<FreshSnapshot, SourceError>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let key = key.clone();
+        let failure = self.failure;
+        let injected = Arc::clone(&self.injected);
+        async move {
+            if failure == Some(ProviderWatchFailure::Unavailable)
+                && injected
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                let _ = inner.read_fresh(&key).await;
+                return Err(SourceError::Unavailable);
+            }
+            if failure == Some(ProviderWatchFailure::Backpressure) {
+                let _ = inner.read_fresh(&key).await;
+                return Err(SourceError::Backpressure);
+            }
+            inner.read_fresh(&key).await
+        }
+    }
+
+    fn write_starting(
+        &self,
+        context: &ReconcileContext,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner.write_starting(context)
+    }
+
+    fn commit_result(
+        &self,
+        context: &ReconcileContext,
+        result: &ReconcileResult,
+    ) -> impl Future<Output = Result<CommitOutcome, SourceError>> + Send {
+        self.inner.commit_result(context, result)
+    }
+
+    fn complete_expedited(
+        &self,
+        context: &ReconcileContext,
+        projection: &ReconcileProjection,
+        status_persistence: StatusPersistence,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner
+            .complete_expedited(context, projection, status_persistence)
+    }
+
+    fn persist_outcome(
+        &self,
+        projection: &ReconcileProjection,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner.persist_outcome(projection)
+    }
+
+    fn checkpoint(
+        &self,
+        context: &ReconcileContext,
+        revision: ZoneRevision,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner.checkpoint(context, revision)
+    }
+
+    fn schedule_requeue(
+        &self,
+        key: &ResourceKey,
+        at_tick: u64,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.inner.schedule_requeue(key, at_tick)
+    }
+}
+
+async fn open_provider_sources(
+    fixture: &Arc<bus_support::ProductionStore>,
+    failure_provider: Option<ProviderWatchFailure>,
+) -> Result<BTreeMap<String, Arc<FailureInjectedProviderSource>>, SourceError> {
+    let mut sources = BTreeMap::new();
+    let mut registrations = tokio::task::JoinSet::new();
+    for (index, provider) in bus_support::PROVIDER_IDS.iter().enumerate() {
+        let fixture = Arc::clone(fixture);
+        let provider = (*provider).to_owned();
+        let failure = (index == 0).then_some(failure_provider).flatten();
+        registrations.spawn(async move {
+            let descriptor = provider_descriptor(&provider, index);
+            let api = fixture.provider_registered_api(&provider, Vec::new());
+            let inner = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+            let source = FailureInjectedProviderSource::new(inner, failure);
+            retry_provider_setup(|| source.register(&descriptor)).await?;
+            let listed = retry_provider_setup(|| source.list_initial(&descriptor)).await?;
+            assert_eq!(listed.resources.len(), bus_support::PROVIDER_IDS.len());
+            retry_provider_setup(|| source.open_watch(&descriptor, listed.snapshot_revision))
+                .await?;
+            Ok::<_, SourceError>((provider, source))
+        });
+    }
+    while let Some(result) = registrations.join_next().await {
+        let (provider, source) = result.expect("Provider source setup task joins")?;
+        sources.insert(provider, source);
+    }
+    Ok(sources)
+}
+
+async fn receive_provider_delivery(
+    source: Arc<FailureInjectedProviderSource>,
+    failure: Option<ProviderWatchFailure>,
+) -> ProviderDelivery {
+    let event = tokio::time::timeout(WATCH_TIMEOUT, source.receive_watch())
+        .await
+        .expect("live Provider watch remains bounded");
+    match event.expect("live Provider watch remains healthy") {
+        WatchEvent::Hint(hint) => match failure {
+            Some(ProviderWatchFailure::Unavailable) => {
+                assert_eq!(
+                    source.read_fresh(hint.key()).await,
+                    Err(SourceError::Unavailable)
+                );
+                source.close();
+                ProviderDelivery::Unavailable
+            }
+            Some(ProviderWatchFailure::Backpressure) => {
+                let deadline = Instant::now() + Duration::from_millis(100);
+                loop {
+                    match source.read_fresh(hint.key()).await {
+                        Err(SourceError::Backpressure) if Instant::now() < deadline => {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(SourceError::Backpressure) => {
+                            source.close();
+                            break ProviderDelivery::RetryExhausted;
+                        }
+                        result => panic!("unexpected injected backpressure result: {result:?}"),
+                    }
+                }
+            }
+            None => ProviderDelivery::Hint,
+            Some(ProviderWatchFailure::Panic | ProviderWatchFailure::Cancel) => {
+                panic!("unexpected failure mode after live Provider delivery")
+            }
+        },
+        WatchEvent::Closed => ProviderDelivery::Closed,
+    }
+}
+
+async fn run_provider_failure_isolation(failure: ProviderWatchFailure) {
+    let fixture = bus_support::ProductionStore::provision().await;
+    fixture.commit_provider_catalog().await;
+    let expected = bus_support::PROVIDER_IDS
+        .iter()
+        .map(|provider| (*provider).to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected.len(), 27);
+    let mut sources = open_provider_sources(&fixture, Some(failure))
+        .await
+        .expect("all Provider source setup paths succeed");
+    assert_eq!(
+        fixture
+            .store()
+            .watch_signals()
+            .expect("read simultaneous Provider watch signals")
+            .current_registrations,
+        expected.len() as u64,
+        "all 27 Provider identities must own a live watch"
+    );
+    fixture.commit_provider_catalog_update().await;
+
+    let failed_provider = bus_support::PROVIDER_IDS[0].to_owned();
+    let mut deliveries = tokio::task::JoinSet::new();
+    for (provider, source) in &sources {
+        let provider = provider.clone();
+        let source = Arc::clone(source);
+        let mode = (provider == failed_provider).then_some(failure);
+        deliveries.spawn(async move {
+            let result = tokio::spawn(receive_provider_delivery(source, mode)).await;
+            (provider, result)
+        });
+    }
+    let mut hints = BTreeSet::new();
+    let mut failed = BTreeSet::new();
+    let mut failure_outcomes = BTreeMap::new();
+    while let Some(result) = deliveries.join_next().await {
+        let (provider, result) = result.expect("Provider delivery task joins");
+        match result {
+            Ok(ProviderDelivery::Hint) => {
+                hints.insert(provider);
+            }
+            Ok(outcome @ (ProviderDelivery::Closed
+            | ProviderDelivery::Unavailable
+            | ProviderDelivery::RetryExhausted)) => {
+                failed.insert(provider.clone());
+                failure_outcomes.insert(provider, outcome);
+            }
+            Err(error) => {
+                assert_eq!(failure, ProviderWatchFailure::Panic);
+                assert!(error.is_panic());
+                failed.insert(provider);
+            }
+        }
+    }
+    assert_eq!(hints.len(), 26);
+    assert_eq!(
+        hints,
+        expected
+            .iter()
+            .filter(|provider| *provider != &failed_provider)
+            .cloned()
+            .collect()
+    );
+    assert_eq!(failed, BTreeSet::from([failed_provider.clone()]));
+    match failure {
+        ProviderWatchFailure::Panic => {}
+        ProviderWatchFailure::Cancel => assert_eq!(
+            failure_outcomes.get(&failed_provider),
+            Some(&ProviderDelivery::Closed)
+        ),
+        ProviderWatchFailure::Unavailable => assert_eq!(
+            failure_outcomes.get(&failed_provider),
+            Some(&ProviderDelivery::Unavailable)
+        ),
+        ProviderWatchFailure::Backpressure => assert_eq!(
+            failure_outcomes.get(&failed_provider),
+            Some(&ProviderDelivery::RetryExhausted)
+        ),
+    }
+
+    if let Some(failed_source) = sources.remove(&failed_provider) {
+        failed_source.close();
+        drop(failed_source);
+    }
+    let watch_signals = fixture
+        .store()
+        .watch_signals()
+        .expect("read surviving Provider watch signals");
+    assert_eq!(watch_signals.current_registrations, 26);
+    for source in sources.values() {
+        source.close();
+    }
+    drop(sources);
+    let fixture = Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("all Provider failure fixture handles released"));
+    fixture
+        .shutdown()
+        .await
+        .expect("shutdown Provider failure fixture");
+}
+
+async fn run_all_provider_composition() {
+    for failure in [
+        ProviderWatchFailure::Panic,
+        ProviderWatchFailure::Cancel,
+        ProviderWatchFailure::Unavailable,
+        ProviderWatchFailure::Backpressure,
+    ] {
+        run_provider_failure_isolation(failure).await;
+    }
+}
+
+async fn retry_provider_setup<T, F, Fut>(mut operation: F) -> Result<T, SourceError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, SourceError>>,
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for attempt in 0..256 {
+            match operation().await {
+                Ok(value) => return Ok(value),
+                Err(SourceError::Backpressure) if attempt + 1 < 256 => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(SourceError::Backpressure)
+    })
+    .await
+    .unwrap_or(Err(SourceError::Timeout))
+}
+
 #[test]
 fn production_reaction_path() {
+    let _guard = reaction_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)
         .enable_all()
@@ -1004,4 +2970,48 @@ fn production_reaction_path() {
                 run_profile(profile).await;
             }
         });
+}
+
+#[test]
+fn production_core_source_reaction_path() {
+    let _guard = reaction_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for profile in PROFILES {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .enable_all()
+            .build()
+            .expect("create benchmark runtime")
+            .block_on(run_core_profile(profile));
+    }
+}
+
+#[test]
+fn production_process_exit_runner_path() {
+    let _guard = reaction_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("create benchmark runtime")
+        .block_on(async {
+            run_process_exit_profile(false).await;
+            run_process_exit_profile(true).await;
+        });
+}
+
+#[test]
+fn production_provider_composition() {
+    let _guard = reaction_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("create benchmark runtime")
+        .block_on(run_all_provider_composition());
 }

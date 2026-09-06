@@ -21,6 +21,10 @@ members = [
   "d2b-provider-audio-pipewire",
   "d2b-provider-clipboard-wayland",
   "d2b-provider-config-nixos",
+  "d2b-provider-credential-entra",
+  "d2b-provider-credential-managed-identity",
+  "d2b-provider-credential-secret-service",
+  "d2b-provider-device-gpu",
   "d2b-provider-device-security-key",
   "d2b-provider-device-tpm",
   "d2b-provider-device-usbip",
@@ -29,7 +33,9 @@ members = [
   "d2b-provider-notification-desktop",
   "d2b-provider-observability-otel",
   "d2b-provider-runtime-azure-container-apps",
+  "d2b-provider-runtime-azure-virtual-machine",
   "d2b-provider-runtime-cloud-hypervisor",
+  "d2b-provider-runtime-qemu-media",
   "d2b-provider-shell-terminal",
   "d2b-provider-supervisor",
   "d2b-provider-system-core",
@@ -38,6 +44,7 @@ members = [
   "d2b-provider-toolkit",
   "d2b-provider-transport-azure-relay",
   "d2b-provider-volume-local",
+  "d2b-provider-volume-virtiofs",
   "d2b-resource-api",
   "d2b-resource-store",
   "d2b-resource-store-redb",
@@ -62,6 +69,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(test_root)"] }
 
 [workspace.dependencies]
 base64 = "0.22"
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = { version = "0.8", features = ["derive"] }

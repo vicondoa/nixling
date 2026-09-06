@@ -24,6 +24,10 @@ instance. It opens, bridges, observes, and closes named streams. The native
 guest relay controller owns only its effect-port lifecycle; it does not spawn
 an independent persistent service.
 
+Every open may carry the Core-owned reconnect generation. The service rejects
+zero or mismatched generations and reconnects by opening a new carriage; it
+does not retain ZoneLink state or schedule reconnects.
+
 ## Placement and dependencies
 
 The Provider and ZoneLink are child-local. `childZoneName` self-matches, while

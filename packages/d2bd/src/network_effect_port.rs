@@ -42,7 +42,8 @@ impl<'a> DaemonNetworkBroker<'a> {
                 );
                 Err(map_broker_error(&error.kind, &error.message))
             }
-            Ok(_) => Ok(()),
+            Ok(BrokerResponse::Ack(_)) => Ok(()),
+            Ok(_) => Err(NetworkBrokerError::Rejected),
             Err(_) => Err(NetworkBrokerError::Transport),
         }
     }
@@ -220,6 +221,9 @@ impl NetworkBroker for DaemonNetworkBroker<'_> {
         let proof = context
             .network_admission()
             .ok_or(NetworkBrokerError::NetworkAdmissionRequired)?;
+        if handle.opaque_id() != fence.attachment_uid() {
+            return Err(NetworkBrokerError::NetworkAdmissionMismatch);
+        }
         self.dispatch(BrokerRequest::DeletePersistentTap(
             DeletePersistentTapRequest {
                 attachment_id: handle.opaque_id().clone(),

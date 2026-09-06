@@ -12,6 +12,7 @@ let
     "d2b-unsafe-local-helper"
     "d2b-resource-compiler"
     "d2b-wayland-proxy"
+    "d2b-provider-test-controller"
   ];
   inventoryShell = lib.escapeShellArgs inventory;
   overrideKeys = [

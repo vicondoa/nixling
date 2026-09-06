@@ -1,14 +1,14 @@
 //! Daemon-owned reconciliation for `NixosGeneration` resources.
 //!
 //! The activation Provider is a fixed daemon composition.  This module owns
-//! only the Zone-scoped durable-resource adapter: it relists and watches
-//! generation rows, applies the pure activation policy, and routes target
-//! effects through the existing broker and Guest ComponentSession boundaries.
+//! only the Zone-scoped durable-resource adapter: it applies the pure
+//! activation policy to the fresh target and routes effects through the shared
+//! Runner and existing broker boundary.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use d2b_contracts_broker::broker_wire::{
@@ -24,14 +24,23 @@ use d2b_contracts_resource::v3::{
     NixosGenerationSpec, ResourceEnvelope, ResourcePhase, ResourceRef, ResourceTypeName,
     ResourceUid, ZoneId, ZoneRevision,
 };
+use d2b_core_controller::{
+    ControllerDescriptor, ControllerExecutionPolicy, ControllerIdentity, ControllerSelector,
+    ControllerVerb, DependencySnapshot, DrainResult, FinalizeResult, HandlerFailure,
+    ObservationResult, ReconcileContext, ReconcileDisposition, ReconcilePlan, ReconcileReason,
+    ReconcileResult, ResourceReconciler, ResourceRegistration, ResourceSnapshot, ResyncPolicy,
+    SelectorField, UpdateAssessment, UpdateAssessmentState, UpgradePlan, UpgradeStage,
+    ValidationResult,
+};
 use d2b_provider_activation_nixos::{
-    ActivationCaller, ActivationController, CallerRole, GenerationObservation, GenerationPhase,
+    ActivationApplicationVerifier, ActivationCaller, ActivationController, CallerRole,
+    FailClosedActivationVerifier, GenerationObservation, GenerationPhase,
     activation_runner_ref, activation_runner_spec,
 };
-use d2b_resource_api::watch::ResourceWatch;
 use d2b_resource_api::{RedbBackend, ResourceApiClient, service::UnavailableUpgradeDispatcher};
 use d2b_resource_store::{
-    StoreListRequest, StoreOperationContext, StoreProjection, StoreWatchRequest, StoredResource,
+    StoreErrorKind, StoreGetRequest, StoreListRequest, StoreOperationContext, StoreProjection,
+    StoredResource,
 };
 use d2b_resource_store_redb::RedbResourceStore;
 
@@ -79,60 +88,6 @@ impl ActivationResourceClient for ResourceApiClient<RedbBackend, UnavailableUpgr
     }
 }
 
-/// Resource API adapter for one authenticated Guest ComponentSession.
-pub(crate) struct GuestActivationResourceClient {
-    session: Arc<d2bd_runtime::guest_component_session::GuestComponentSessionClient>,
-}
-
-impl GuestActivationResourceClient {
-    pub(crate) fn new(
-        session: Arc<d2bd_runtime::guest_component_session::GuestComponentSessionClient>,
-    ) -> Self {
-        Self { session }
-    }
-}
-
-#[async_trait::async_trait]
-impl ActivationResourceClient for GuestActivationResourceClient {
-    async fn create(&self, request: wire::CreateRequest) -> Result<wire::CreateResponse, ()> {
-        self.session
-            .resource_service_client()
-            .create(ttrpc::context::Context::default(), &request)
-            .await
-            .map_err(|_| ())
-    }
-
-    async fn update_status(
-        &self,
-        request: wire::UpdateStatusRequest,
-    ) -> Result<wire::UpdateStatusResponse, ()> {
-        self.session
-            .resource_service_client()
-            .update_status(ttrpc::context::Context::default(), &request)
-            .await
-            .map_err(|_| ())
-    }
-
-    async fn update_finalizers(
-        &self,
-        request: wire::UpdateFinalizersRequest,
-    ) -> Result<wire::UpdateFinalizersResponse, ()> {
-        self.session
-            .resource_service_client()
-            .update_finalizers(ttrpc::context::Context::default(), &request)
-            .await
-            .map_err(|_| ())
-    }
-
-    async fn delete(&self, request: wire::DeleteRequest) -> Result<wire::DeleteResponse, ()> {
-        self.session
-            .resource_service_client()
-            .delete(ttrpc::context::Context::default(), &request)
-            .await
-            .map_err(|_| ())
-    }
-}
-
 const ACTIVATION_TYPE: &str = "activation-nixos.d2bus.org.NixosGeneration";
 const ACTIVATION_FINALIZER: &str = "activation-nixos.d2bus.org/cleanup";
 const RETAINED_GENERATIONS: usize = 3;
@@ -159,6 +114,507 @@ impl core::fmt::Display for ActivationResourceRuntimeError {
 }
 
 impl std::error::Error for ActivationResourceRuntimeError {}
+
+/// Build the signed descriptor used by the shared Runner for
+/// `NixosGeneration` resources.
+pub(crate) fn activation_controller_descriptor(
+    identity: ControllerIdentity,
+) -> Result<ControllerDescriptor, ActivationResourceRuntimeError> {
+    let resource_type =
+        ResourceTypeName::parse(ACTIVATION_TYPE).expect("activation ResourceType is canonical");
+    let resource = ResourceRegistration::new(resource_type.clone(), vec![1], 5_000, 3)
+        .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
+    let provider_filter = identity.provider_ref().to_canonical_string();
+    let selectors = [
+        SelectorField::Spec,
+        SelectorField::Status,
+        SelectorField::Metadata,
+        SelectorField::Finalizers,
+        SelectorField::Deletion,
+    ]
+    .into_iter()
+    .map(|field| {
+        let exact_value = (field == SelectorField::Spec).then(|| provider_filter.clone());
+        ControllerSelector::new(resource_type.clone(), field, exact_value)
+            .expect("activation selector is bounded")
+    })
+    .collect();
+    let dependency_selectors = ["Process", "EphemeralProcess"]
+        .into_iter()
+        .map(|resource_type| {
+            ControllerSelector::new(
+                ResourceTypeName::parse(resource_type)
+                    .expect("activation dependency type is canonical"),
+                SelectorField::Metadata,
+                None,
+            )
+            .expect("activation dependency selector is bounded")
+        })
+        .collect();
+    ControllerDescriptor::new(
+        identity,
+        vec![resource],
+        vec![
+            "resource-service".to_owned(),
+            "activation-effect".to_owned(),
+        ],
+        vec!["system".to_owned()],
+        vec![
+            ControllerVerb::ReadSpec,
+            ControllerVerb::ReadStatus,
+            ControllerVerb::WriteStatus,
+            ControllerVerb::AddFinalizer,
+            ControllerVerb::RemoveFinalizer,
+        ],
+        selectors,
+        dependency_selectors,
+        true,
+        vec![ACTIVATION_FINALIZER.to_owned()],
+        vec!["activation-nixos.d2bus.org/activation-controller.v1".to_owned()],
+        vec!["sha256:0000000000000000000000000000000000000000000000000000000000000001"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        ControllerExecutionPolicy::new(
+            1,
+            1,
+            256,
+            8,
+            256,
+            ResyncPolicy::new(None, 5_000).expect("activation resync policy"),
+        )
+        .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?,
+    )
+    .map_err(|_| ActivationResourceRuntimeError::InvalidResource)
+}
+
+/// ResourceService-backed activation handler for the shared Runner.
+pub(crate) struct ActivationResourceReconciler {
+    store: Arc<RedbResourceStore>,
+    client: Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+    state: Arc<ServerState>,
+    runtime: Arc<tokio::sync::Mutex<ActivationResourceRuntime>>,
+    identity: ControllerIdentity,
+}
+
+impl ActivationResourceReconciler {
+    pub(crate) fn new(
+        store: Arc<RedbResourceStore>,
+        client: Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+        state: Arc<ServerState>,
+        identity: ControllerIdentity,
+    ) -> Self {
+        Self::with_verifier(
+            store,
+            client,
+            state,
+            identity,
+            Arc::new(FailClosedActivationVerifier),
+        )
+    }
+
+    pub(crate) fn with_verifier(
+        store: Arc<RedbResourceStore>,
+        client: Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+        state: Arc<ServerState>,
+        identity: ControllerIdentity,
+        verifier: Arc<dyn ActivationApplicationVerifier>,
+    ) -> Self {
+        let mut runtime = ActivationResourceRuntime::new(store.identity().zone().clone());
+        runtime.set_status_client(Arc::clone(&client));
+        runtime.set_verifier(verifier);
+        Self {
+            store,
+            client,
+            state,
+            runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
+            identity,
+        }
+    }
+
+    async fn reconcile_target(
+        &self,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<(), ActivationResourceRuntimeError> {
+        let resource = stored_resource_from_snapshot(resource)?;
+        let resources = fresh_generation_siblings(&self.store, &resource).await?;
+        let mut process_resources: Vec<StoredResource> = Vec::new();
+        let runner_ref = activation_runner_ref(&resource.resource_ref);
+        let runner = self
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "activation-runner-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "activation-runner-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: resource.zone.clone(),
+                target: runner_ref,
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await;
+        match runner {
+            Ok(runner) if !process_resources.iter().any(|current| {
+                current.resource_ref == runner.resource_ref && current.uid == runner.uid
+            }) =>
+            {
+                process_resources.push(runner);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {}
+            Err(_) => return Err(ActivationResourceRuntimeError::Store),
+        }
+        let mut runtime = self.runtime.lock().await;
+        runtime.set_status_client(Arc::clone(&self.client));
+        runtime
+            .reconcile(
+                Arc::clone(&self.state),
+                resources,
+                process_resources,
+                Some(&resource.resource_ref),
+            )
+            .await
+    }
+}
+
+async fn fresh_generation_siblings(
+    store: &RedbResourceStore,
+    target: &StoredResource,
+) -> Result<Vec<StoredResource>, ActivationResourceRuntimeError> {
+    let target_spec = decode_activation_spec(target)?;
+    let execution_ref = target_spec.execution_ref().clone();
+    let mut request = StoreListRequest {
+        operation: StoreOperationContext {
+            operation_id: "activation-generation-siblings".to_owned(),
+            idempotency_key: None,
+            correlation_id: "activation-generation-siblings".to_owned(),
+            trace_id: None,
+            deadline_ms: 10_000,
+        },
+        zone: target.zone.clone(),
+        resource_types: vec![
+            ResourceTypeName::parse(ACTIVATION_TYPE)
+                .expect("activation ResourceType is canonical"),
+        ],
+        resource_names: Vec::new(),
+        filters: Vec::new(),
+        page_size: 256,
+        cursor: None,
+        projection: StoreProjection::BaseOnly,
+    };
+    let mut candidates = BTreeMap::<ResourceRef, ResourceUid>::new();
+    loop {
+        let page = store
+            .list(request.clone())
+            .await
+            .map_err(|_| ActivationResourceRuntimeError::Store)?;
+        for resource in page.resources {
+            if decode_activation_spec(&resource)?.execution_ref() == &execution_ref {
+                candidates.insert(resource.resource_ref, resource.uid);
+            }
+        }
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        request.cursor = Some(cursor);
+    }
+    candidates
+        .entry(target.resource_ref.clone())
+        .or_insert_with(|| target.uid.clone());
+
+    let mut siblings = Vec::with_capacity(candidates.len());
+    for (resource_ref, uid) in candidates {
+        let resource = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "activation-generation-sibling".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "activation-generation-sibling".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: target.zone.clone(),
+                target: resource_ref.clone(),
+                expected_uid: Some(uid.clone()),
+                projection: StoreProjection::Full,
+            })
+            .await;
+        match resource {
+            Ok(resource) => {
+                if decode_activation_spec(&resource)?.execution_ref() == &execution_ref {
+                    siblings.push(resource);
+                } else if resource_ref == target.resource_ref {
+                    return Err(ActivationResourceRuntimeError::InvalidResource);
+                }
+            }
+            Err(error)
+                if error.kind() == StoreErrorKind::ResourceNotFound
+                    && resource_ref != target.resource_ref => {}
+            Err(_) => return Err(ActivationResourceRuntimeError::Store),
+        }
+    }
+    if siblings
+        .iter()
+        .all(|resource| resource.resource_ref != target.resource_ref)
+    {
+        return Err(ActivationResourceRuntimeError::Store);
+    }
+    Ok(siblings)
+}
+
+fn stored_resource_from_snapshot(
+    resource: &ResourceSnapshot,
+) -> Result<StoredResource, ActivationResourceRuntimeError> {
+    let envelope = ResourceEnvelope::from_json(resource.canonical_json())
+        .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
+    let payload_digest = envelope
+        .digest()
+        .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
+    Ok(StoredResource {
+        resource_ref: resource.key().resource_ref().clone(),
+        zone: resource.key().zone().clone(),
+        uid: resource.key().uid().clone(),
+        owner_uid: resource.owner_uid().cloned(),
+        owner_generation: resource.owner_generation(),
+        generation: resource.generation(),
+        revision: resource.revision(),
+        canonical_json: resource.canonical_json().to_vec(),
+        payload_digest,
+    })
+}
+
+impl ResourceReconciler for ActivationResourceReconciler {
+    type Error = ActivationResourceRuntimeError;
+
+    fn classify_error(&self, _error: &Self::Error) -> HandlerFailure {
+        HandlerFailure::retryable()
+    }
+
+    fn describe(
+        &self,
+    ) -> impl std::future::Future<Output = Result<ControllerDescriptor, Self::Error>> + Send {
+        std::future::ready(activation_controller_descriptor(self.identity.clone()))
+    }
+
+    fn validate_spec(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl std::future::Future<Output = Result<ValidationResult, Self::Error>> + Send {
+        let valid = resource.key().resource_ref().resource_type().as_str() == ACTIVATION_TYPE
+            && ResourceEnvelope::from_json(resource.canonical_json()).is_ok();
+        std::future::ready(Ok(if valid {
+            ValidationResult::Valid
+        } else {
+            ValidationResult::Invalid {
+                reason: ReconcileReason::InvalidSpec,
+            }
+        }))
+    }
+
+    fn plan(
+        &self,
+        _context: &ReconcileContext,
+        _resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl std::future::Future<Output = Result<ReconcilePlan, Self::Error>> + Send {
+        std::future::ready(
+            ReconcilePlan::new(vec!["activation-nixos-resource".to_owned()], false)
+                .map_err(|_| ActivationResourceRuntimeError::InvalidResource),
+        )
+    }
+
+    fn reconcile(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let result = (|| {
+            context
+                .authorize_effect()
+                .map_err(|_| ActivationResourceRuntimeError::Policy)?;
+            if !resource_has_finalizer(resource) && !resource.deleting() {
+                let mutation = d2b_core_controller::MutationIntent::new(
+                    resource.key().resource_ref().clone(),
+                    Some(resource.key().uid().clone()),
+                    Some(resource.revision()),
+                    d2b_core_controller::MutationIntentKind::UpdateFinalizers,
+                    Some(finalizer_payload(resource)?),
+                )
+                .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
+                let batch = d2b_core_controller::ResourceMutationBatch::new(vec![mutation])
+                    .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
+                return ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    Some(batch),
+                    None,
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    d2b_core_controller::StatusPersistence::NotRequested,
+                )
+                .map_err(|_| ActivationResourceRuntimeError::InvalidResource);
+            }
+            Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ))
+        })();
+        std::future::ready(result)
+    }
+
+    fn execute_effect(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let future = async move {
+            self.reconcile_target(resource, dependencies).await?;
+            Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ))
+        };
+        future
+    }
+
+    fn observe(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl std::future::Future<Output = Result<ObservationResult, Self::Error>> + Send {
+        std::future::ready(Ok(ObservationResult::new(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        ))))
+    }
+
+    fn finalize(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl std::future::Future<Output = Result<FinalizeResult, Self::Error>> + Send {
+        std::future::ready(Ok(FinalizeResult::new(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        ))))
+    }
+
+    fn execute_finalize(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let future = async move {
+            self.reconcile_target(resource, &[]).await?;
+            Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ))
+        };
+        future
+    }
+
+    fn health(
+        &self,
+    ) -> impl std::future::Future<
+        Output = Result<d2b_core_controller::ControllerHealth, Self::Error>,
+    > + Send {
+        std::future::ready(Ok(d2b_core_controller::ControllerHealth::Healthy))
+    }
+
+    fn drain(
+        &self,
+        _deadline_tick: u64,
+    ) -> impl std::future::Future<Output = Result<DrainResult, Self::Error>> + Send {
+        std::future::ready(Ok(DrainResult::Drained))
+    }
+
+    fn assess_update(
+        &self,
+        _context: &ReconcileContext,
+        _resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl std::future::Future<Output = Result<UpdateAssessment, Self::Error>> + Send {
+        std::future::ready(
+            UpdateAssessment::new(UpdateAssessmentState::Current, Vec::new(), true)
+                .map_err(|_| ActivationResourceRuntimeError::InvalidResource),
+        )
+    }
+
+    fn plan_upgrade(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl std::future::Future<Output = Result<UpgradePlan, Self::Error>> + Send {
+        std::future::ready(
+            UpgradePlan::new(
+                d2b_core_controller::DisruptionClass::Restart,
+                true,
+                vec![UpgradeStage::Restart(resource.key().resource_ref().clone())],
+            )
+            .map_err(|_| ActivationResourceRuntimeError::InvalidResource),
+        )
+    }
+
+    fn execute_upgrade(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &UpgradePlan,
+    ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        std::future::ready(Ok(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        )))
+    }
+}
+
+fn resource_has_finalizer(resource: &ResourceSnapshot) -> bool {
+    serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .ok()
+        .and_then(|value| value.pointer("/metadata/finalizers").cloned())
+        .and_then(|value| value.as_array().cloned())
+        .is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value.as_str() == Some(ACTIVATION_FINALIZER))
+        })
+}
+
+fn finalizer_payload(
+    resource: &ResourceSnapshot,
+) -> Result<Vec<u8>, ActivationResourceRuntimeError> {
+    let value = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
+    let mut finalizers = value
+        .pointer("/metadata/finalizers")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !finalizers.iter().any(|value| value.as_str() == Some(ACTIVATION_FINALIZER)) {
+        finalizers.push(serde_json::Value::String(ACTIVATION_FINALIZER.to_owned()));
+    }
+    CanonicalJsonValue::parse(
+        &serde_json::to_vec(&serde_json::json!({
+            "metadata": {"finalizers": finalizers}
+        }))
+        .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?,
+    )
+    .map(|value| value.to_canonical_bytes())
+    .map_err(|_| ActivationResourceRuntimeError::InvalidResource)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DesiredRecord {
@@ -211,7 +667,7 @@ pub(crate) struct ActivationResourceRuntime {
     controller: ActivationController,
     records: BTreeMap<ResourceRef, DesiredRecord>,
     status_client: Option<Arc<dyn ActivationResourceClient>>,
-    guest_clients: BTreeMap<ResourceRef, Arc<dyn ActivationResourceClient>>,
+    verifier: Arc<dyn ActivationApplicationVerifier>,
 }
 
 impl core::fmt::Debug for ActivationResourceRuntime {
@@ -232,7 +688,7 @@ impl ActivationResourceRuntime {
             controller: ActivationController::new(RETAINED_GENERATIONS),
             records: BTreeMap::new(),
             status_client: None,
-            guest_clients: BTreeMap::new(),
+            verifier: Arc::new(FailClosedActivationVerifier),
         }
     }
 
@@ -243,39 +699,53 @@ impl ActivationResourceRuntime {
         self.status_client = Some(status_client);
     }
 
-    pub(crate) fn set_guest_client(
+    #[allow(dead_code)]
+    pub(crate) fn set_verifier(
         &mut self,
-        guest: ResourceRef,
-        client: Arc<dyn ActivationResourceClient>,
+        verifier: Arc<dyn ActivationApplicationVerifier>,
     ) {
-        self.guest_clients.insert(guest, client);
+        self.verifier = verifier;
     }
 
-    pub(crate) fn clear_guest_clients(&mut self) {
-        self.guest_clients.clear();
+    fn application_is_verified(
+        &self,
+        request: &d2b_provider_activation_nixos::RunnerRequest,
+    ) -> bool {
+        self.verifier
+            .verify_application(&self.controller, request)
+            .is_ok()
     }
 
     fn runner_client(
         &self,
-        execution_ref: &ResourceRef,
+        _execution_ref: &ResourceRef,
     ) -> Option<Arc<dyn ActivationResourceClient>> {
-        if execution_ref.resource_type().as_str() == "Guest" {
-            self.guest_clients.get(execution_ref).cloned()
-        } else {
-            self.status_client.clone()
-        }
+        self.status_client.clone()
     }
 
-    /// Reconcile a complete durable activation snapshot.
+    /// Reconcile one fresh activation target.
     pub(crate) async fn reconcile(
         &mut self,
         state: Arc<ServerState>,
-        snapshot: Vec<StoredResource>,
-        process_snapshot: Vec<StoredResource>,
+        resources: Vec<StoredResource>,
+        process_resources: Vec<StoredResource>,
+        target: Option<&ResourceRef>,
     ) -> Result<(), ActivationResourceRuntimeError> {
-        let desired = decode_snapshot(&self.zone, snapshot)?;
+        let desired = decode_resources(&self.zone, resources)?;
         let desired_keys = desired.keys().cloned().collect::<BTreeSet<_>>();
-        self.records.retain(|key, _| desired_keys.contains(key));
+        let target_execution_ref = target
+            .and_then(|target| desired.get(target))
+            .map(|record| record.spec.execution_ref().clone());
+        if target.is_some() && target_execution_ref.is_none() {
+            return Err(ActivationResourceRuntimeError::InvalidResource);
+        }
+        if let Some(execution_ref) = target_execution_ref.as_ref() {
+            self.records.retain(|key, record| {
+                record.spec.execution_ref() != execution_ref || desired_keys.contains(key)
+            });
+        } else {
+            self.records.retain(|key, _| desired_keys.contains(key));
+        }
         let observations_by_target = desired.values().fold(
             BTreeMap::<ResourceRef, Vec<GenerationObservation>>::new(),
             |mut observations, record| {
@@ -294,6 +764,10 @@ impl ActivationResourceRuntime {
         );
 
         for (key, mut record) in desired {
+            if !selected_target(target, &key) {
+                self.records.insert(key, record);
+                continue;
+            }
             let replace = self
                 .records
                 .get(&key)
@@ -304,10 +778,12 @@ impl ActivationResourceRuntime {
 
             if !record.deletion_requested() && !record.has_finalizer() {
                 record = self.ensure_finalizer(&record).await?;
+                self.records.insert(key, record);
+                return Ok(());
             }
 
             if record.deletion_requested() {
-                if let Some(child) = find_runner_resource(&record, &process_snapshot) {
+                if let Some(child) = find_runner_resource(&record, &process_resources) {
                     if !matches!(
                         status_phase(child).unwrap_or(ResourcePhase::Pending),
                         ResourcePhase::Deleted
@@ -317,21 +793,31 @@ impl ActivationResourceRuntime {
                         {
                             if let Some(client) = self.runner_client(record.spec.execution_ref()) {
                                 self.request_delete_stored(client.as_ref(), child).await?;
+                                self.records.insert(key, record);
+                                return Ok(());
                             }
                         }
                         self.records.insert(key, record);
                         continue;
                     }
                 }
-                record = self
-                    .publish_status(
-                        &record,
-                        ResourcePhase::Deleted,
-                        ActivationDetail::Superseded,
-                        None,
-                    )
-                    .await?;
-                record = self.remove_finalizer(&record).await?;
+                if status_phase(&record.resource) != Some(ResourcePhase::Deleted) {
+                    record = self
+                        .publish_status(
+                            &record,
+                            ResourcePhase::Deleted,
+                            ActivationDetail::Superseded,
+                            None,
+                        )
+                        .await?;
+                    self.records.insert(key, record);
+                    return Ok(());
+                }
+                if record.has_finalizer() {
+                    record = self.remove_finalizer(&record).await?;
+                    self.records.insert(key, record);
+                    return Ok(());
+                }
                 self.records.insert(key, record);
                 continue;
             }
@@ -374,6 +860,8 @@ impl ActivationResourceRuntime {
                             applied.audit_codes().first().copied(),
                         )
                         .await?;
+                    self.records.insert(key, record);
+                    return Ok(());
                 }
                 self.records.insert(key, record);
                 continue;
@@ -397,21 +885,38 @@ impl ActivationResourceRuntime {
                     )
                     .await?;
                 self.records.insert(key, record);
-                continue;
+                return Ok(());
             }
-            let runner = find_runner_observation(&record, &process_snapshot);
-            if runner.is_none() {
+            if !self.application_is_verified(&request) {
+                let applied = self
+                    .controller
+                    .apply_runner_result(
+                        &record.spec,
+                        ActivationOutcomeCode::HelperRefused,
+                        observed,
+                    )
+                    .map_err(|_| ActivationResourceRuntimeError::Policy)?;
+                let detail = activation_detail(
+                    record.spec.activation_mode(),
+                    ActivationOutcomeCode::HelperRefused,
+                    applied.phase(),
+                );
                 record = self
                     .publish_status(
                         &record,
-                        ResourcePhase::Pending,
-                        ActivationDetail::Staged,
-                        None,
+                        applied.phase(),
+                        detail,
+                        applied.audit_codes().first().copied(),
                     )
                     .await?;
+                self.records.insert(key, record);
+                return Ok(());
+            }
+            let runner = find_runner_observation(&record, &process_resources);
+            if runner.is_none() {
                 self.create_runner(&record, &request).await?;
                 self.records.insert(key, record);
-                continue;
+                return Ok(());
             }
             let runner = runner.expect("checked above");
             if runner.phase == ResourcePhase::Pending {
@@ -424,7 +929,7 @@ impl ActivationResourceRuntime {
                     )
                     .await?;
                 self.records.insert(key, record);
-                continue;
+                return Ok(());
             }
             if runner.phase == ResourcePhase::Ready {
                 record = self
@@ -436,7 +941,7 @@ impl ActivationResourceRuntime {
                     )
                     .await?;
                 self.records.insert(key, record);
-                continue;
+                return Ok(());
             }
             let outcome = runner.outcome.unwrap_or_else(|| {
                 if runner.phase == ResourcePhase::Succeeded {
@@ -459,9 +964,10 @@ impl ActivationResourceRuntime {
                 )
                 .await?;
             self.records.insert(key, record);
+            return Ok(());
         }
 
-        self.apply_retention().await?;
+        self.apply_retention(target_execution_ref.as_ref()).await?;
         Ok(())
     }
 
@@ -472,8 +978,15 @@ impl ActivationResourceRuntime {
         request: &d2b_provider_activation_nixos::RunnerRequest,
         prior: &[GenerationObservation],
     ) -> ActivationOutcomeCode {
-        if request.system_artifact_id != *record.spec.system_artifact_id() {
+        if request.system_artifact_id != *record.spec.system_artifact_id()
+            || request.execution_ref != *record.spec.execution_ref()
+            || request.activation_mode != record.spec.activation_mode()
+            || request.target_generation != record.ordinal
+        {
             return ActivationOutcomeCode::TargetMismatch;
+        }
+        if !self.application_is_verified(request) {
+            return ActivationOutcomeCode::HelperRefused;
         }
         match request.execution_ref.resource_type().as_str() {
             "Host" => self
@@ -538,10 +1051,18 @@ impl ActivationResourceRuntime {
         }
     }
 
-    async fn apply_retention(&self) -> Result<(), ActivationResourceRuntimeError> {
+    async fn apply_retention(
+        &self,
+        execution_ref: Option<&ResourceRef>,
+    ) -> Result<(), ActivationResourceRuntimeError> {
         let observations = self
             .records
             .values()
+            .filter(|record| {
+                execution_ref.is_none_or(|execution_ref| {
+                    record.spec.execution_ref() == execution_ref
+                })
+            })
             .map(|record| {
                 GenerationObservation::terminal(
                     record.resource.resource_ref.name().as_str(),
@@ -553,14 +1074,22 @@ impl ActivationResourceRuntime {
             })
             .collect::<Vec<_>>();
         let delete_names = self.controller.retention_plan(&observations);
-        for name in delete_names.delete_names() {
+        for name in delete_names.delete_names().iter().take(1) {
             if let Some(record) = self
                 .records
                 .values()
-                .find(|record| record.resource.resource_ref.name().as_str() == name)
-                && !record.deletion_requested()
+                .find(|record| {
+                    record.resource.resource_ref.name().as_str() == name
+                        && execution_ref.is_none_or(|execution_ref| {
+                            record.spec.execution_ref() == execution_ref
+                        })
+                })
+                .cloned()
             {
-                self.request_delete(record).await?;
+                if !record.deletion_requested() {
+                    self.request_delete(&record).await?;
+                    break;
+                }
             }
         }
         Ok(())
@@ -633,7 +1162,6 @@ impl ActivationResourceRuntime {
         let payload = serde_json::json!({
             "apiVersion": "resources.d2bus.org/v3",
             "metadata": {
-                "configurationGeneration": record.resource.generation.get(),
                 "createdAt": "1970-01-01T00:00:00.000Z",
                 "deletionRequestedAt": null,
                 "finalizers": [],
@@ -725,6 +1253,10 @@ impl ActivationResourceRuntime {
     }
 }
 
+fn selected_target(target: Option<&ResourceRef>, candidate: &ResourceRef) -> bool {
+    target.is_none_or(|target| target == candidate)
+}
+
 fn host_handoff_outcome(response: &ApplyHostGenerationHandoffResponse) -> ActivationOutcomeCode {
     match response.state {
         HandoffState::Completed => {
@@ -813,10 +1345,10 @@ fn status_phase(resource: &StoredResource) -> Option<ResourcePhase> {
 
 fn find_runner_resource<'a>(
     record: &DesiredRecord,
-    process_snapshot: &'a [StoredResource],
+    process_resources: &'a [StoredResource],
 ) -> Option<&'a StoredResource> {
     let expected = activation_runner_ref(&record.key());
-    process_snapshot.iter().find(|resource| {
+    process_resources.iter().find(|resource| {
         resource.zone == record.resource.zone
             && resource.resource_ref == expected
             && resource_execution_ref(resource).as_ref() == Some(record.spec.execution_ref())
@@ -840,9 +1372,9 @@ fn resource_execution_ref(resource: &StoredResource) -> Option<ResourceRef> {
 
 fn find_runner_observation(
     record: &DesiredRecord,
-    process_snapshot: &[StoredResource],
+    process_resources: &[StoredResource],
 ) -> Option<RunnerObservation> {
-    let resource = find_runner_resource(record, process_snapshot)?;
+    let resource = find_runner_resource(record, process_resources)?;
     Some(RunnerObservation {
         phase: status_phase(resource).unwrap_or(ResourcePhase::Pending),
         outcome: status_outcome(resource),
@@ -885,7 +1417,7 @@ fn ordinal_from_resource(resource: &StoredResource) -> u64 {
         .unwrap_or_else(|| resource.generation.get())
 }
 
-fn decode_snapshot(
+fn decode_resources(
     zone: &ZoneId,
     resources: Vec<StoredResource>,
 ) -> Result<BTreeMap<ResourceRef, DesiredRecord>, ActivationResourceRuntimeError> {
@@ -897,12 +1429,7 @@ fn decode_snapshot(
         if resource.resource_ref.resource_type().as_str() != ACTIVATION_TYPE {
             continue;
         }
-        let envelope = ResourceEnvelope::from_json(&resource.canonical_json)
-            .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
-        let spec = serde_json::from_slice::<NixosGenerationSpec>(
-            &envelope.spec().base().to_canonical_bytes(),
-        )
-        .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
+        let spec = decode_activation_spec(&resource)?;
         let record = DesiredRecord {
             ordinal: ordinal_from_resource(&resource),
             resource,
@@ -913,6 +1440,17 @@ fn decode_snapshot(
         }
     }
     Ok(desired)
+}
+
+fn decode_activation_spec(
+    resource: &StoredResource,
+) -> Result<NixosGenerationSpec, ActivationResourceRuntimeError> {
+    let envelope = ResourceEnvelope::from_json(&resource.canonical_json)
+        .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
+    serde_json::from_slice::<NixosGenerationSpec>(
+        &envelope.spec().base_with_provider_ref().to_canonical_bytes(),
+    )
+    .map_err(|_| ActivationResourceRuntimeError::InvalidResource)
 }
 
 fn phase_json(phase: ResourcePhase) -> CanonicalJsonValue {
@@ -1057,6 +1595,7 @@ fn status_payload(
     let Some(CanonicalJsonValue::Object(status)) = root.get_mut("status") else {
         return Err(ActivationResourceRuntimeError::InvalidResource);
     };
+    redact_status_fields(status);
     let now = now_timestamp();
     status.insert("phase".to_owned(), phase_json(phase));
     status.insert(
@@ -1114,6 +1653,66 @@ fn status_payload(
     ResourceEnvelope::from_json(&canonical)
         .map_err(|_| ActivationResourceRuntimeError::InvalidResource)?;
     Ok(canonical)
+}
+
+fn redact_status_fields(status: &mut BTreeMap<String, CanonicalJsonValue>) {
+    let sensitive = status
+        .iter()
+        .filter_map(|(key, value)| {
+            (is_sensitive_status_key(key) || contains_sensitive_status_text(value))
+                .then_some(key.clone())
+        })
+        .collect::<Vec<_>>();
+    for key in sensitive {
+        status.remove(&key);
+    }
+    for value in status.values_mut() {
+        if let CanonicalJsonValue::Object(object) = value {
+            redact_status_fields(object);
+        } else if let CanonicalJsonValue::Array(values) = value {
+            for value in values {
+                if let CanonicalJsonValue::Object(object) = value {
+                    redact_status_fields(object);
+                }
+            }
+        }
+    }
+}
+
+fn is_sensitive_status_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "credential",
+        "secret",
+        "token",
+        "password",
+        "privatekey",
+        "accesskey",
+        "apikey",
+        "rawkey",
+    ]
+    .iter()
+    .any(|part| key == *part || key.contains(part))
+}
+
+fn contains_sensitive_status_text(value: &CanonicalJsonValue) -> bool {
+    match value {
+        CanonicalJsonValue::String(value) => {
+            let value = value.to_ascii_lowercase();
+            value.contains("-----begin")
+                || value.contains("bearer ")
+                || value.contains("clientsecret")
+                || value.contains("privatekey")
+                || value.contains("secret")
+                || value.contains("credential")
+                || value.contains("?sv=") && value.contains("&sig=")
+        }
+        CanonicalJsonValue::Array(values) => values.iter().any(contains_sensitive_status_text),
+        CanonicalJsonValue::Object(values) => values.values().any(contains_sensitive_status_text),
+        CanonicalJsonValue::Null | CanonicalJsonValue::Bool(_) | CanonicalJsonValue::Integer(_) => {
+            false
+        }
+    }
 }
 
 fn activation_outcome_message(outcome: ActivationOutcomeCode) -> &'static str {
@@ -1277,6 +1876,8 @@ pub(crate) fn stored_resource_from_wire(
         resource_ref,
         zone,
         uid,
+        owner_uid: None,
+        owner_generation: None,
         generation,
         revision,
         canonical_json: resource.canonical_json.clone(),
@@ -1303,170 +1904,221 @@ fn request_meta(operation: &str) -> wire::RequestMeta {
     meta
 }
 
-/// Build the generic activation relist request.
-pub(crate) fn activation_list_request(zone: &ZoneId) -> StoreListRequest {
-    StoreListRequest {
-        operation: StoreOperationContext {
-            operation_id: "activation-resource-reconcile".to_owned(),
-            idempotency_key: None,
-            correlation_id: "activation-resource-reconcile".to_owned(),
-            trace_id: None,
-            deadline_ms: 10_000,
-        },
-        zone: zone.clone(),
-        resource_types: vec![
-            ResourceTypeName::parse(ACTIVATION_TYPE).expect("static activation type"),
-        ],
-        resource_names: Vec::new(),
-        filters: Vec::new(),
-        page_size: 256,
-        cursor: None,
-        projection: StoreProjection::Full,
-    }
-}
-
-/// Build the generic activation watch request.
-pub(crate) fn activation_watch_request(zone: &ZoneId) -> StoreWatchRequest {
-    StoreWatchRequest {
-        operation: StoreOperationContext {
-            operation_id: "activation-resource-watch".to_owned(),
-            idempotency_key: None,
-            correlation_id: "activation-resource-watch".to_owned(),
-            trace_id: None,
-            deadline_ms: 10_000,
-        },
-        zone: zone.clone(),
-        resource_types: vec![
-            ResourceTypeName::parse(ACTIVATION_TYPE).expect("static activation type"),
-        ],
-        resource_names: Vec::new(),
-        filters: Vec::new(),
-        after_revision: ZoneRevision::new(0),
-        initial_credits: 64,
-        projection: StoreProjection::Full,
-    }
-}
-
-/// Relist all activation resources, preserving snapshot pagination.
-pub(crate) async fn list_activation_snapshot(
-    store: &RedbResourceStore,
-    zone: &ZoneId,
-) -> Result<Vec<StoredResource>, ActivationResourceRuntimeError> {
-    let mut request = activation_list_request(zone);
-    let mut resources = Vec::new();
-    loop {
-        let result = store
-            .list(request.clone())
-            .await
-            .map_err(|_| ActivationResourceRuntimeError::Store)?;
-        resources.extend(result.resources);
-        let Some(cursor) = result.next_cursor else {
-            break;
-        };
-        request.cursor = Some(cursor);
-    }
-    Ok(resources)
-}
-
-/// Run the relist/watch reconciliation loop for one Zone.
-pub(crate) async fn run_activation_watch(
-    mut watch: ResourceWatch,
-    store: Arc<RedbResourceStore>,
-    zone: ZoneId,
-    state: Arc<ServerState>,
-    registry: Arc<Mutex<Option<ActivationResourceRuntime>>>,
-) {
-    loop {
-        match tokio::time::timeout(Duration::from_secs(1), watch.recv()).await {
-            Ok(Some(batch)) => {
-                if watch.acknowledge(batch.revision()).await.is_err() {
-                    return;
-                }
-            }
-            Ok(None) => {
-                if watch.resume().await.is_err() {
-                    return;
-                }
-            }
-            Err(_) => {}
-        }
-        let Ok(snapshot) = list_activation_snapshot(&store, &zone).await else {
-            continue;
-        };
-        let Ok(process_snapshot) =
-            crate::process_resource_runtime::list_process_snapshot(&store, &zone).await
-        else {
-            continue;
-        };
-        let runtime = match registry.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => return,
-        };
-        let Some(mut runtime) = runtime else {
-            continue;
-        };
-        runtime.clear_guest_clients();
-        let mut process_snapshot = process_snapshot;
-        let zone_runtime = state
-            .resource_plane
-            .lock()
-            .ok()
-            .and_then(|plane| plane.clone())
-            .and_then(|plane| plane.zone(&zone).ok());
-        for guest in crate::resource_runtime::guest_activation_targets(&snapshot) {
-            let Some(zone_runtime) = zone_runtime.as_ref() else {
-                continue;
-            };
-            let Ok(target) =
-                crate::resolve_committed_guest_session_target(zone_runtime, &guest).await
-            else {
-                continue;
-            };
-            let Ok(session) =
-                crate::connect_guest_component_session_for_guest(&state, &target).await
-            else {
-                continue;
-            };
-            match crate::resource_runtime::list_guest_process_snapshot(&session, &zone, &guest)
-                .await
-            {
-                Ok(resources) => {
-                    runtime.set_guest_client(
-                        guest.clone(),
-                        Arc::new(GuestActivationResourceClient::new(Arc::clone(&session))),
-                    );
-                    process_snapshot.extend(resources);
-                }
-                Err(()) => {
-                    crate::invalidate_guest_component_session_for_guest(&state, &target).await;
-                }
-            }
-        }
-        let result = runtime
-            .reconcile(Arc::clone(&state), snapshot, process_snapshot)
-            .await;
-        if let Ok(mut guard) = registry.lock() {
-            *guard = Some(runtime);
-        } else {
-            return;
-        }
-        if result.is_err() {
-            tracing::warn!(zone = %zone.as_str(), "activation resource reconciliation degraded");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
-    #[test]
-    fn activation_requests_are_zone_scoped_and_qualified() {
-        let zone = ZoneId::parse("dev").expect("valid zone");
-        let request = activation_list_request(&zone);
-        assert_eq!(request.resource_types.len(), 1);
-        assert_eq!(request.resource_types[0].as_str(), ACTIVATION_TYPE);
-        assert_eq!(request.zone, zone);
+    #[derive(Default)]
+    struct RecordingActivationClient {
+        creates: Mutex<Vec<String>>,
+        deletes: Mutex<Vec<String>>,
+    }
+
+    struct AllowActivationVerifier;
+
+    impl ActivationApplicationVerifier for AllowActivationVerifier {
+        fn verify_application(
+            &self,
+            _controller: &ActivationController,
+            _request: &d2b_provider_activation_nixos::RunnerRequest,
+        ) -> Result<(), d2b_provider_activation_nixos::ActivationVerificationError> {
+            Ok(())
+        }
+    }
+
+    fn mutation_target(mutation: Option<&wire::Mutation>) -> String {
+        mutation
+            .and_then(|mutation| mutation.target.as_ref())
+            .map(|target| format!("{}/{}", target.resource_type, target.name))
+            .expect("activation mutation target")
+    }
+
+    #[async_trait::async_trait]
+    impl ActivationResourceClient for RecordingActivationClient {
+        async fn create(
+            &self,
+            request: wire::CreateRequest,
+        ) -> Result<wire::CreateResponse, ()> {
+            self.creates
+                .lock()
+                .unwrap()
+                .push(mutation_target(request.mutation.as_ref()));
+            Ok(wire::CreateResponse::new())
+        }
+
+        async fn update_status(
+            &self,
+            _request: wire::UpdateStatusRequest,
+        ) -> Result<wire::UpdateStatusResponse, ()> {
+            Ok(wire::UpdateStatusResponse::new())
+        }
+
+        async fn update_finalizers(
+            &self,
+            _request: wire::UpdateFinalizersRequest,
+        ) -> Result<wire::UpdateFinalizersResponse, ()> {
+            Ok(wire::UpdateFinalizersResponse::new())
+        }
+
+        async fn delete(
+            &self,
+            request: wire::DeleteRequest,
+        ) -> Result<wire::DeleteResponse, ()> {
+            self.deletes
+                .lock()
+                .unwrap()
+                .push(mutation_target(request.mutation.as_ref()));
+            Ok(wire::DeleteResponse::new())
+        }
+    }
+
+    fn test_server_state() -> (Arc<crate::ServerState>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("temporary activation state");
+        let broker_reap_log = d2bd_runtime::supervisor::pidfd_table::BrokerReapLog::new();
+        let state = crate::ServerState {
+            config: crate::DaemonConfig::default(),
+            daemon_uid: 0,
+            daemon_state_dir: directory.path().to_path_buf(),
+            pidfd_table: Arc::new(
+                d2bd_runtime::supervisor::pidfd_table::PidfdTable::new(
+                    directory.path().join("pidfd-table.json"),
+                )
+                .with_broker_reap_log(Arc::clone(&broker_reap_log)),
+            ),
+            broker_reap_log,
+            metrics_registry: Arc::new(d2bd_runtime::metrics::Registry::new()),
+            daemon_audit: Arc::new(d2bd_runtime::daemon_audit::DaemonAuditLog::no_op()),
+            exec_sessions: Arc::new(crate::exec_session::SessionTable::new(
+                crate::exec_session::ExecSessionCaps::default(),
+            )),
+            conn_semaphore: d2bd_runtime::concurrency::ConnSemaphore::new(8),
+            op_locks: d2bd_runtime::concurrency::OpLockManager::new(),
+            public_status_read_model: Arc::new(
+                d2bd_runtime::public_read_model::PublicStatusReadModel::new(),
+            ),
+            provider_runtime: Arc::new(crate::provider_registry::ProviderRuntime::new()),
+            resource_plane: Arc::new(Mutex::new(None)),
+            interaction_runtime: Arc::new(tokio::sync::Mutex::new(None)),
+            interaction_listeners: Arc::new(Mutex::new(None)),
+            typed_shell_session_targets: d2bd_runtime::typed_shell_targets::new_cache(),
+            zone_coordinator: d2bd_runtime::zone_authority::new_coordinator(),
+            config_staging: Arc::new(Mutex::new(Default::default())),
+            guest_component_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            guest_component_session_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            console_sessions: Arc::new(Mutex::new(
+                crate::console_session::ConsoleSessionTable::default(),
+            )),
+            security_key_sessions: Arc::new(parking_lot::Mutex::new(
+                crate::security_key::SkSessionTable::default(),
+            )),
+            unsafe_local_helpers: Arc::new(
+                d2bd_runtime::unsafe_local_helper::HelperRegistry::new(0, []),
+            ),
+        };
+        (Arc::new(state), directory)
+    }
+
+    fn generation_resource(
+        name: &str,
+        execution_ref: &str,
+        ordinal: u64,
+        prior: Option<&str>,
+        phase: &str,
+        deletion_requested: bool,
+    ) -> StoredResource {
+        let execution_ref = ResourceRef::parse(execution_ref).expect("execution ref");
+        let prior = prior.map(|name| {
+            ResourceRef::parse(&format!("{ACTIVATION_TYPE}/{name}")).expect("prior generation ref")
+        });
+        let spec = NixosGenerationSpec::new(
+            ResourceRef::parse("Provider/activation-nixos").expect("activation provider"),
+            execution_ref,
+            "system-artifact",
+            ActivationMode::Switch,
+            prior,
+        )
+        .expect("activation spec");
+        let uid = ResourceUid::parse(format!(
+            "00000000-0000-4000-8000-{ordinal:012x}"
+        ))
+        .expect("generation UID");
+        let resource_ref =
+            ResourceRef::parse(&format!("{ACTIVATION_TYPE}/{name}")).expect("generation ref");
+        let body = serde_json::json!({
+            "apiVersion": "resources.d2bus.org/v3",
+            "type": ACTIVATION_TYPE,
+            "metadata": {
+                "createdAt": "2026-09-03T00:00:00.000Z",
+                "updatedAt": "2026-09-03T00:00:00.000Z",
+                "managedBy": "controller",
+                "ownerRef": null,
+                "name": name,
+                "zone": "dev",
+                "uid": uid.as_str(),
+                "generation": 1,
+                "revision": ordinal.max(1),
+                "finalizers": [ACTIVATION_FINALIZER],
+                "deletionRequestedAt": if deletion_requested {
+                    serde_json::Value::String("2026-09-03T00:00:00.000Z".to_owned())
+                } else {
+                    serde_json::Value::Null
+                }
+            },
+            "spec": serde_json::to_value(spec).expect("activation spec JSON"),
+            "status": {
+                "phase": phase,
+                "observedGeneration": 0,
+                "lastReconciledAt": null,
+                "startedAt": null,
+                "completedAt": null,
+                "outcome": null,
+                "conditions": [],
+                "update": {
+                    "dependencies": {"count": 0, "refs": []},
+                    "disruption": "None",
+                    "lastAssessedAt": null,
+                    "observedGeneration": 0,
+                    "operationId": null,
+                    "owned": {"count": 0, "refs": []},
+                    "preserveState": true,
+                    "reasons": [],
+                    "state": "Unknown",
+                    "targetGeneration": 1
+                },
+                "resource": {}
+            }
+        });
+        let canonical = CanonicalJsonValue::parse(
+            &serde_json::to_vec(&body).expect("generation JSON"),
+        )
+        .expect("canonical generation JSON")
+        .to_canonical_bytes();
+        let payload_digest = ResourceEnvelope::from_json(&canonical)
+            .expect("generation envelope")
+            .digest()
+            .expect("generation digest");
+        StoredResource {
+            resource_ref,
+            zone: ZoneId::parse("dev").expect("generation zone"),
+            uid,
+            owner_uid: None,
+            owner_generation: None,
+            generation: d2b_contracts_resource::v3::ResourceGeneration::new(1)
+                .expect("generation ordinal"),
+            revision: ZoneRevision::new(ordinal.max(1)),
+            canonical_json: canonical,
+            payload_digest,
+        }
+    }
+
+    fn insert_records(runtime: &mut ActivationResourceRuntime, resources: Vec<StoredResource>) {
+        runtime
+            .records
+            .extend(decode_resources(&ZoneId::parse("dev").unwrap(), resources).unwrap());
     }
 
     #[test]
@@ -1481,6 +2133,8 @@ mod tests {
                 "123e4567-e89b-42d3-a456-426614174000",
             )
             .expect("uid"),
+            owner_uid: None,
+            owner_generation: None,
             generation: d2b_contracts_resource::v3::ResourceGeneration::new(1).expect("generation"),
             revision: ZoneRevision::new(1),
             canonical_json: Vec::new(),
@@ -1518,6 +2172,8 @@ mod tests {
                 "123e4567-e89b-42d3-a456-426614174000",
             )
             .expect("uid"),
+            owner_uid: None,
+            owner_generation: None,
             generation: d2b_contracts_resource::v3::ResourceGeneration::new(1).expect("generation"),
             revision: ZoneRevision::new(1),
             canonical_json: br#"{"status":{"outcome":{"code":"runtime-deadline"}}}"#.to_vec(),
@@ -1526,6 +2182,228 @@ mod tests {
         assert_eq!(
             status_outcome(&resource),
             Some(ActivationOutcomeCode::HelperFailed)
+        );
+    }
+
+    #[test]
+    fn activation_descriptor_owns_only_generation_resources() {
+        let identity = ControllerIdentity::new(
+            ZoneId::parse("dev").unwrap(),
+            ResourceRef::parse("Process/activation-controller").unwrap(),
+            d2b_contracts_resource::v3::ControllerGeneration::new(1).unwrap(),
+            ResourceRef::parse("Provider/activation-nixos").unwrap(),
+            d2b_contracts_resource::v3::ResourceGeneration::new(1).unwrap(),
+            ResourceRef::parse("Process/activation-controller").unwrap(),
+            ResourceRef::parse("Host/host-system").unwrap(),
+            None,
+        )
+        .unwrap();
+        let descriptor = activation_controller_descriptor(identity).unwrap();
+        assert_eq!(
+            descriptor
+                .resource_types()
+                .map(ResourceTypeName::as_str)
+                .collect::<Vec<_>>(),
+            vec![ACTIVATION_TYPE]
+        );
+        assert_eq!(descriptor.finalizers(), &[ACTIVATION_FINALIZER.to_owned()]);
+        assert!(descriptor.consumes_owner_triggers());
+    }
+
+    #[test]
+    fn activation_status_drops_credential_material_before_projection() {
+        let mut status = BTreeMap::from([
+            (
+                "credentialBytes".to_owned(),
+                CanonicalJsonValue::String("credential-value".to_owned()),
+            ),
+            (
+                "outcome".to_owned(),
+                CanonicalJsonValue::Object(BTreeMap::from([(
+                    "message".to_owned(),
+                    CanonicalJsonValue::String("secret-value".to_owned()),
+                )])),
+            ),
+            (
+                "phase".to_owned(),
+                CanonicalJsonValue::String("Pending".to_owned()),
+            ),
+        ]);
+        redact_status_fields(&mut status);
+        assert!(!status.contains_key("credentialBytes"));
+        assert!(!status.contains_key("outcome"));
+        assert_eq!(
+            status.get("phase"),
+            Some(&CanonicalJsonValue::String("Pending".to_owned()))
+        );
+    }
+
+    #[test]
+    fn production_activation_path_invokes_the_verification_gate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingVerifier {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ActivationApplicationVerifier for CountingVerifier {
+            fn verify_application(
+                &self,
+                _controller: &ActivationController,
+                _request: &d2b_provider_activation_nixos::RunnerRequest,
+            ) -> Result<(), d2b_provider_activation_nixos::ActivationVerificationError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ActivationResourceRuntime::new(ZoneId::parse("dev").unwrap());
+        runtime.set_verifier(Arc::new(CountingVerifier {
+            calls: Arc::clone(&calls),
+        }));
+        let request = d2b_provider_activation_nixos::RunnerRequest {
+            runner_name: d2b_contracts_resource::v3::ResourceName::parse("runner").unwrap(),
+            execution_ref: ResourceRef::parse("Host/host-system").unwrap(),
+            system_artifact_id: d2b_contracts_resource::v3::ArtifactId::parse("system").unwrap(),
+            activation_mode: ActivationMode::Switch,
+            target_generation: 1,
+            start_root: true,
+        };
+        assert!(runtime.application_is_verified(&request));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn missing_activation_verification_fails_closed() {
+        let runtime = ActivationResourceRuntime::new(ZoneId::parse("dev").unwrap());
+        let request = d2b_provider_activation_nixos::RunnerRequest {
+            runner_name: d2b_contracts_resource::v3::ResourceName::parse("runner").unwrap(),
+            execution_ref: ResourceRef::parse("Host/host-system").unwrap(),
+            system_artifact_id: d2b_contracts_resource::v3::ArtifactId::parse("system").unwrap(),
+            activation_mode: ActivationMode::Switch,
+            target_generation: 1,
+            start_root: true,
+        };
+        assert!(!runtime.application_is_verified(&request));
+    }
+
+    #[test]
+    fn activation_pass_selects_only_the_hinted_resource_identity() {
+        let target =
+            ResourceRef::parse("activation-nixos.d2bus.org.NixosGeneration/target").unwrap();
+        let sibling =
+            ResourceRef::parse("activation-nixos.d2bus.org.NixosGeneration/sibling").unwrap();
+        assert!(selected_target(Some(&target), &target));
+        assert!(!selected_target(Some(&target), &sibling));
+        assert!(selected_target(None, &sibling));
+    }
+
+    #[tokio::test]
+    async fn production_target_reconcile_uses_prior_sibling_without_touching_other_execution() {
+        let (state, _directory) = test_server_state();
+        let client = Arc::new(RecordingActivationClient::default());
+        let mut runtime = ActivationResourceRuntime::new(ZoneId::parse("dev").unwrap());
+        runtime.set_status_client(Arc::clone(&client));
+        runtime.set_verifier(Arc::new(AllowActivationVerifier));
+        let prior = generation_resource("gen-1", "Guest/dev-vm", 1, None, "Succeeded", false);
+        let target = generation_resource(
+            "gen-2",
+            "Guest/dev-vm",
+            2,
+            Some("gen-1"),
+            "Pending",
+            false,
+        );
+        let other = generation_resource(
+            "other-9",
+            "Guest/other-vm",
+            9,
+            None,
+            "Pending",
+            false,
+        );
+        insert_records(&mut runtime, vec![other.clone()]);
+        runtime
+            .reconcile(
+                state,
+                vec![prior.clone(), target.clone(), other.clone()],
+                Vec::new(),
+                Some(&target.resource_ref),
+            )
+            .await
+            .expect("target generation reconciles with its prior sibling");
+        assert_eq!(
+            client.creates.lock().unwrap().as_slice(),
+            &[format!(
+                "EphemeralProcess/{}",
+                activation_runner_ref(&target.resource_ref).name().as_str()
+            )]
+        );
+        assert!(runtime.records.contains_key(&prior.resource_ref));
+        assert!(runtime.records.contains_key(&target.resource_ref));
+        assert!(runtime.records.contains_key(&other.resource_ref));
+        assert!(client.deletes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn production_target_reconcile_rejects_missing_or_cross_execution_prior() {
+        let (state, _directory) = test_server_state();
+        let client = Arc::new(RecordingActivationClient::default());
+        let mut runtime = ActivationResourceRuntime::new(ZoneId::parse("dev").unwrap());
+        runtime.set_status_client(Arc::clone(&client));
+        runtime.set_verifier(Arc::new(AllowActivationVerifier));
+        let target = generation_resource(
+            "gen-2",
+            "Guest/dev-vm",
+            2,
+            Some("gen-1"),
+            "Pending",
+            false,
+        );
+        let wrong_execution = generation_resource(
+            "gen-1",
+            "Guest/other-vm",
+            1,
+            None,
+            "Succeeded",
+            false,
+        );
+        assert_eq!(
+            runtime
+                .reconcile(
+                    state,
+                    vec![target.clone(), wrong_execution],
+                    Vec::new(),
+                    Some(&target.resource_ref),
+                )
+                .await,
+            Err(ActivationResourceRuntimeError::Policy)
+        );
+        assert!(client.creates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn production_target_retention_deletes_only_old_terminal_same_execution_sibling() {
+        let client = Arc::new(RecordingActivationClient::default());
+        let mut runtime = ActivationResourceRuntime::new(ZoneId::parse("dev").unwrap());
+        runtime.set_status_client(Arc::clone(&client));
+        let execution_ref = ResourceRef::parse("Guest/dev-vm").unwrap();
+        let resources = vec![
+            generation_resource("gen-1", "Guest/dev-vm", 1, None, "Succeeded", false),
+            generation_resource("gen-2", "Guest/dev-vm", 2, None, "Succeeded", false),
+            generation_resource("gen-3", "Guest/dev-vm", 3, None, "Succeeded", false),
+            generation_resource("gen-4", "Guest/dev-vm", 4, None, "Ready", false),
+            generation_resource("other-1", "Guest/other-vm", 1, None, "Succeeded", false),
+        ];
+        insert_records(&mut runtime, resources);
+        runtime
+            .apply_retention(Some(&execution_ref))
+            .await
+            .expect("target-scoped retention succeeds");
+        assert_eq!(
+            client.deletes.lock().unwrap().as_slice(),
+            &["activation-nixos.d2bus.org.NixosGeneration/gen-1".to_owned()]
         );
     }
 }

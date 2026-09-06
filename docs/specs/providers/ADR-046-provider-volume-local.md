@@ -74,7 +74,7 @@ The v3 target name appears in parentheses or an explicit mapping.
 | Effect operations | `ProvisionLayoutEntry`, `RepairLayoutEntry`, `CleanupLayoutEntry`, `PrepareSwtpmDir`, `StoreSyncComplete`, `MountTmpfs`, `ProvisionBlockImage`, `RotateSealingKey` (all via injected `VolumeEffectPort`; no direct broker connection) |
 | Permissions | No special host-path permission; all host path resolution in core/broker adapter; broker ops not called directly from Provider process |
 | ProviderStateSet | Optional query-time logical grouping (not a ResourceType): `{ v : Volume \| ownerRef == "Provider/volume-local" }`; **empty** - volume-local declares no state Volume of its own (its bounded non-secret operational state lives in `status`/the core Operation ledger, D087). Volume-local is the **sole reconciler** for all assigned Volumes carrying `providerRef: Provider/volume-local` (operator-created Volumes and other Providers' *declared* state Volumes; Volume is its exported type) and never issues Volume create/delete API calls; **core ProviderDeployment** creates/deletes other Providers' declared state Volume instances before/after their component Processes; a declared component state Volume is created only when its payload passes the storage-need test; Nix-preprovisioned `User/<name>` layout principals; no cross-component sharing; no empty identity-only Volume |
-| Finalizers | `volume-local/layout` |
+| Finalizers | `volume-local.d2bus.org/layout` |
 | Supported Host variants | Local NixOS Host; bare-metal Host; ACA if backing filesystem is accessible |
 | Guest capability | Not applicable - volume-local does not attach to Guests |
 | Main reuse | `d2b-state` at commit `6faa5256` (copy/adapt); `d2b-priv-broker/src/ops/swtpm_dir.rs` (adapt marker algorithm) |
@@ -82,9 +82,10 @@ The v3 target name appears in parentheses or an explicit mapping.
 **D089 desired-spec shape.** `Provider/volume-local` owns the `Volume`
 ResourceType base spec: fields such as `spec.providerRef`,
 `spec.source.settings.kind`, and `spec.source.settings.sourcePolicyId` are base
-Volume fields, not Provider extensions. It carries no optional
-`spec.provider` payload today. If a future implementation-only desired setting
-is required, it must use the canonical `spec.provider = { schemaId,
+Volume fields, not Provider extensions. The optional `spec.provider` payload is
+currently limited to the typed `network-config` content projection consumed by
+the Volume controller. Any future implementation-only desired setting must use
+the canonical `spec.provider = { schemaId,
 schemaVersion, settings }` envelope, registered/signed in the Provider
 manifest, deny-unknown, bounded, versioned/digested, validated against
 `spec.providerRef` at Nix build and API admission, and forbidden to shadow base
@@ -1777,7 +1778,7 @@ Zone's configured unclaimed TTL (default 1 h).
 ### Destruction sequence
 
 1. Set `deletionRequestedAt` via resource API.
-2. Controller sets `volume-local/layout` finalizer and drains all outstanding
+2. Controller sets `volume-local.d2bus.org/layout` finalizer and drains all outstanding
    `VolumeMountToken` handles (waits for all mounting Processes to stop).
 3. Controller sends `CleanupLayoutEntry` effect requests to `VolumeEffectPort`
    for each layout entry ordered leaf-first then parent-last; adapter performs
@@ -1787,7 +1788,7 @@ Zone's configured unclaimed TTL (default 1 h).
    sends a key-shred effect request before layout removal.
 5. Controller sends `CleanupMarker` effect request.
 6. Controller sends `CleanupVolumeRoot` effect request.
-7. Controller clears the `volume-local/layout` finalizer; audit of each step
+7. Controller clears the `volume-local.d2bus.org/layout` finalizer; audit of each step
    is broker/core-owned and is never atomic with any redb write.
 8. Core emits `Deleted` event and removes resource row.
 
@@ -1880,7 +1881,7 @@ ComponentSession for:
 - `watch(EphemeralProcess)` - observe worker completion;
 - `watch(User)` - observe UID binding changes for ACL re-resolve;
 - `watch(Credential)` - observe sealing key rotation;
-- `update-finalizers(Volume)` - manage `volume-local/layout` finalizer.
+- `update-finalizers(Volume)` - manage `volume-local.d2bus.org/layout` finalizer.
 
 No direct d2b-bus protocol details are specified here; they are governed by
 `ADR-046-componentsession-and-bus`. The controller's session purpose is
@@ -2080,7 +2081,7 @@ carry raw host paths, secret bytes, or unbounded records.
 | `foreign-acl-violation` | `foreignChildPolicy: fail` with unlisted ACL entry | Degraded |
 | `invariant-violated` | `no-symlink`, `no-magic-link`, or `same-filesystem` invariant failed | Failed |
 | `entry-quarantined` | Adoption ambiguity | Degraded |
-| `volume-local/layout` finalizer timeout | Controller exceeded `maxFinalizerDurationSeconds` | Degraded/finalizer-timeout |
+| `volume-local.d2bus.org/layout` finalizer timeout | Controller exceeded `maxFinalizerDurationSeconds` | Degraded/finalizer-timeout |
 | `marker-tampered` | Marker HMAC validation failed | Failed |
 | `sealing-rotation-unauthorized` | Caller lacks the closed `volume.rotate-sealing-key` capability or Volume/policy binding | rotation-failed |
 | `sealing-rotation-precondition` | Volume generation, Resource revision, policy binding, or active/target key generation no longer matches | rotation-pending; re-read/re-plan |

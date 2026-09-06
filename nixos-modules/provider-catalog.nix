@@ -43,7 +43,17 @@ let
   digestPattern = "sha256:[0-9a-f]{64}";
   signedContractFields = shape.placementContractFields
     ++ shape.runtimeContractFields;
-  catalogFields = shape.fields ++ signedContractFields;
+  trustContractFields = shape.trustFields or [
+    "trustEpoch"
+    "revocationRef"
+    "publisherRoot"
+    "signatureId"
+    "conformanceAttestationDigest"
+  ];
+  catalogFields = shape.fields ++ signedContractFields ++ trustContractFields;
+  publicCatalogFields = shape.fields ++ signedContractFields;
+  providerIds = shape.providerIds or [ ];
+  fixedBootstrapProviderIds = shape.fixedBootstrapProviderIds or [ ];
 
   artifactModule = types.submodule ({ name, config, ... }: {
     options = {
@@ -113,19 +123,27 @@ let
 
   # The public projection. `storePath` is private catalog data retained for
   # activation and is stripped here, because a resource spec, status, or audit
-  # record never exposes a store path.
-  publicEntries = map (e: { inherit (e) id type entry; }) entries;
+  # record never exposes a store path or the private trust envelope.
+  publicEntries = map
+    (e: {
+      inherit (e) id type;
+      entry = lib.filterAttrs
+        (fieldName: _: lib.elem fieldName publicCatalogFields)
+        e.entry;
+    })
+    entries;
 
   # The provider catalog is a separate public document.  It carries only the
   # frozen package metadata; private store locations remain in the artifact
   # catalog used by activation.
+  providerEntries = lib.filter (entry: entry.type == "provider") publicEntries;
   providerCatalogEntries = lib.sort
     (left: right:
       let
         leftName = left.entry.providerName or left.id;
         rightName = right.entry.providerName or right.id;
       in leftName < rightName)
-    entries;
+    providerEntries;
   providerCatalogData = {
     schemaVersion = "v1";
     entries = map
@@ -191,6 +209,164 @@ let
   ];
   validContractDigest = value:
     builtins.isString value && builtins.match digestPattern value != null;
+
+  attrOr = attrs: name: fallback:
+    if builtins.isAttrs attrs && builtins.hasAttr name attrs
+    then attrs.${name}
+    else fallback;
+
+  firstAttr = attrs: names: fallback:
+    if names == [ ]
+    then fallback
+    else
+      let name = builtins.head names;
+      in if builtins.isAttrs attrs && builtins.hasAttr name attrs
+      then attrs.${name}
+      else firstAttr attrs (lib.tail names) fallback;
+
+  trustFieldsPresent = catalog:
+    lib.any (field: builtins.hasAttr field catalog)
+      ([ "signature" "rootEpoch" "revocationStatus" "denyStatus" ]
+        ++ trustContractFields);
+
+  trustAssertions = id:
+    let
+      catalog =
+        if builtins.isAttrs artifacts.${id}.catalog
+        then artifacts.${id}.catalog
+        else { };
+      signatureValue = catalog.signature or null;
+      signature =
+        if builtins.isAttrs signatureValue
+        then signatureValue
+        else { };
+      nestedSignatureId = firstAttr signature [ "signatureId" "id" ] null;
+      catalogSignatureId = attrOr catalog "signatureId" null;
+      signatureId = firstAttr catalog [ "signatureId" ] nestedSignatureId;
+      publisher = attrOr catalog "publisher" null;
+      nestedPublisherRoot =
+        firstAttr signature [ "publisherRoot" "root" ] null;
+      catalogPublisherRoot = attrOr catalog "publisherRoot" null;
+      publisherRoot = firstAttr catalog [ "publisherRoot" ]
+        (firstAttr signature [ "publisherRoot" "root" ] publisher);
+      rootEpoch = firstAttr catalog [ "trustEpoch" "rootEpoch" ] null;
+      legacyRootEpoch = attrOr catalog "rootEpoch" null;
+      revocationRef = attrOr catalog "revocationRef" null;
+      revocationStatus = attrOr catalog "revocationStatus" null;
+      denyStatus = attrOr catalog "denyStatus" null;
+      present = artifacts.${id}.type == "provider"
+        && trustFieldsPresent catalog;
+    in
+    lib.optionals present [
+      {
+        assertion = builtins.isString publisher
+          && builtins.match artifactIdPattern publisher != null;
+        message = ''
+          d2b.artifacts."${id}".catalog.publisher must be a bounded publisher ID
+          when trust metadata is published.
+        '';
+      }
+      {
+        assertion = builtins.isString signatureId
+          && builtins.stringLength signatureId > 0
+          && builtins.stringLength signatureId <= 128;
+        message = ''
+          d2b.artifacts."${id}".catalog signatureId must be non-empty and
+          bounded under its publisher root.
+        '';
+      }
+      {
+        assertion = catalogSignatureId == null
+          || nestedSignatureId == null
+          || catalogSignatureId == nestedSignatureId;
+        message = ''
+          d2b.artifacts."${id}".catalog publisher root/signature ID aliases
+          disagree; signature identity must be exact.
+        '';
+      }
+      {
+        assertion = builtins.isString publisherRoot
+          && builtins.stringLength publisherRoot > 0
+          && publisherRoot == publisher;
+        message = ''
+          d2b.artifacts."${id}".catalog publisher root must match publisher;
+          a different root is not an admissible signature identity.
+        '';
+      }
+      {
+        assertion = catalogPublisherRoot == null
+          || nestedPublisherRoot == null
+          || catalogPublisherRoot == nestedPublisherRoot;
+        message = ''
+          d2b.artifacts."${id}".catalog publisher root aliases disagree;
+          signature identity must be exact.
+        '';
+      }
+      {
+        assertion = builtins.isInt rootEpoch && rootEpoch >= 1
+          && (legacyRootEpoch == null || rootEpoch == legacyRootEpoch);
+        message = ''
+          d2b.artifacts."${id}".catalog trust epoch must be a positive integer
+          and trustEpoch/rootEpoch aliases must agree.
+        '';
+      }
+      {
+        assertion = revocationRef == null
+          || (builtins.isString revocationRef
+            && builtins.stringLength revocationRef > 0
+            && builtins.stringLength revocationRef <= 256);
+        message = ''
+          d2b.artifacts."${id}".catalog revocationRef must be null or a
+          bounded non-empty token.
+        '';
+      }
+      {
+        assertion = revocationStatus == "clear";
+        message = ''
+          d2b.artifacts."${id}".catalog revocation status must be clear;
+          revoked or unknown artifacts fail closed.
+        '';
+      }
+      {
+        assertion = denyStatus == "clear";
+        message = ''
+          d2b.artifacts."${id}".catalog deny status must be clear; emergency
+          denied artifacts fail closed.
+        '';
+      }
+      {
+        assertion = !(builtins.hasAttr "conformanceAttestationDigest" catalog)
+          || validContractDigest catalog.conformanceAttestationDigest;
+        message = ''
+          d2b.artifacts."${id}".catalog conformanceAttestationDigest must be
+          a lowercase sha256 digest.
+        '';
+      }
+    ];
+
+  providerMatrixAssertions =
+    let
+      declared = cfg.providerCatalog or { };
+      rows = lib.mapAttrsToList
+        (name: entry: {
+          inherit name entry;
+          path = "d2b.providerCatalog.${name}";
+        })
+        declared;
+      unknown = lib.filter
+        (row: !(builtins.elem (row.entry.artifactId or null) providerIds))
+        rows;
+    in
+    lib.optionals (rows != [ ]) [
+      {
+        assertion = unknown == [ ];
+        message = ''
+          d2b.providerCatalog contains an identity outside the closed 27-row
+          Provider matrix: ${lib.concatStringsSep ", " (map
+            (row: row.name) unknown)}.
+        '';
+      }
+    ];
 
   signedContractAssertions = id:
     let
@@ -405,7 +581,9 @@ in
     internal = true;
     visible = false;
     default = {
-      inherit entries publicEntries providerCatalogEntries providerCatalogData providerCatalogJson providerCatalogPath;
+      inherit entries publicEntries providerCatalogEntries providerCatalogData
+        providerCatalogJson providerCatalogPath providerIds
+        fixedBootstrapProviderIds;
       json = catalogJson;
       ids = artifactIds;
       shape = shape;
@@ -415,7 +593,9 @@ in
 
   config = {
     d2b._providerCatalog = {
-      inherit entries publicEntries providerCatalogEntries providerCatalogData providerCatalogJson providerCatalogPath;
+      inherit entries publicEntries providerCatalogEntries providerCatalogData
+        providerCatalogJson providerCatalogPath providerIds
+        fixedBootstrapProviderIds;
       json = catalogJson;
       ids = artifactIds;
       shape = shape;
@@ -491,5 +671,7 @@ in
     # Placement and shared-runtime fields are optional until a Provider
     # package publishes its signed manifest, but once any is present the
     # complete closed contract is validated.
-    ++ (lib.concatMap signedContractAssertions artifactIds);
+    ++ (lib.concatMap signedContractAssertions artifactIds)
+    ++ (lib.concatMap trustAssertions artifactIds)
+    ++ providerMatrixAssertions;
 }

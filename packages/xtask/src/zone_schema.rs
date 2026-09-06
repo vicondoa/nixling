@@ -64,6 +64,14 @@ pub const STANDARD_RESOURCE_TYPES: [&str; 19] = [
     "ResourceImport",
 ];
 
+/// U12 Provider-owned qualified ResourceTypes. They are generated from their
+/// signed Provider schemas and must never enter the Core standard registry.
+pub const PROVIDER_OWNED_RESOURCE_TYPES: [&str; 3] = [
+    "activation-nixos.d2bus.org.NixosGeneration",
+    "telemetry.d2bus.org.TelemetryBinding",
+    "telemetry.d2bus.org.TelemetryService",
+];
+
 /// A field default, which is also the value the bundle emitter substitutes
 /// when the operator did not author the field.
 #[derive(Clone, Copy)]
@@ -1410,6 +1418,10 @@ fn generated_resource_types_module() -> String {
          # Provider types are appended only from installed signed schemas and\n\
          # are therefore absent here.\n",
     );
+    out.push_str(&format!(
+        "# Provider-owned qualified types remain outside this registry: {}.\n",
+        PROVIDER_OWNED_RESOURCE_TYPES.join(", ")
+    ));
     out.push_str("[\n");
     for name in STANDARD_RESOURCE_TYPES {
         out.push_str(&format!("  {}\n", nix_string(name)));
@@ -1514,6 +1526,19 @@ mod tests {
                 .map(|name| (*name).to_owned())
                 .collect::<Vec<String>>()
         );
+    }
+
+    #[test]
+    fn provider_owned_u12_types_cannot_enter_the_core_registry() {
+        assert!(
+            STANDARD_RESOURCE_TYPES
+                .iter()
+                .all(|resource_type| !PROVIDER_OWNED_RESOURCE_TYPES.contains(resource_type))
+        );
+        let generated = generated_resource_types_module();
+        for resource_type in PROVIDER_OWNED_RESOURCE_TYPES {
+            assert!(!generated.contains(&format!("\"{resource_type}\"")));
+        }
     }
 
     #[test]

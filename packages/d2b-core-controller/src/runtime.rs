@@ -1,28 +1,34 @@
 //! Core-to-toolkit source and reconciler adapters.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
-use d2b_contracts_resource::v3::ZoneRevision;
+use d2b_contracts_resource::v3::{ResourceTypeName, ZoneRevision};
+use d2b_contracts_zone_session::v3::ZoneStatusResource;
 use d2b_controller_toolkit::{
-    CommitDecision, CommitOutcome, ControllerDescriptor, ControllerHealth, ControllerSource,
-    DependencySnapshot, DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot,
-    HandlerFailure, InitialList, ObservationResult, OperationContext, ReconcileContext,
-    ReconcilePlan, ReconcileProjection, ReconcileReason, ReconcileResult, ResourceKey,
-    ResourceReconciler, ResourceSnapshot, SourceError, StatusPersistence, UpdateAssessment,
-    UpdateAssessmentState, UpgradePlan, ValidationResult, WatchEvent, WatchFailure,
+    CommitOutcome, ControllerDescriptor, ControllerExecutionPolicy, ControllerHealth,
+    ControllerIdentity, ControllerSelector, ControllerSource, ControllerVerb, DependencySnapshot,
+    DescriptorError, DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot, HandlerFailure,
+    InitialList, ObservationResult, OperationContext, ReconcileContext, ReconcilePlan,
+    ReconcileDisposition, ReconcileProjection, ReconcileReason, ReconcileResult, ResourceKey,
+    ResourceRegistration, ResourceReconciler, ResourceSnapshot, ResyncPolicy, SelectorField,
+    SourceError, StatusPersistence, UpdateAssessment, UpdateAssessmentState, UpgradePlan,
+    ValidationResult, WatchEvent, WatchFailure, MutationIntent, MutationIntentKind,
+    ResourceMutationBatch,
 };
 
 use crate::{
-    ChangeRecord, ControllerHint, ControllerLeaseKey, FairAdmission, HintAdmissionError,
-    HintAdmissionOutcome, SuppressionDecision,
+    ChangeRecord, ControllerHint, ControllerLeaseKey, CoreResourceControllerRegistration,
+    FairAdmission, HintAdmissionError, HintAdmissionOutcome, SuppressionDecision,
+    WatchPlan, CORE_RESOURCE_CONTROLLER_REGISTRATIONS,
 };
+use crate::providers::{ProviderHandler, ProviderIntent, ProviderObservation, ProviderPhase};
 
 /// Core adapter construction or hint dispatch failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,15 +64,20 @@ pub struct CoreAdmissionCounts {
     pub backpressure: usize,
 }
 
-mod registered_api {
-    pub trait Sealed {}
+fn validate_watch_plan(descriptor: &ControllerDescriptor) -> bool {
+    WatchPlan::new(
+        descriptor.resource_types().cloned().collect(),
+        descriptor.watch_selectors().to_vec(),
+        descriptor.consumes_owner_triggers(),
+    )
+    .is_ok()
 }
 
 /// Registered resource/store-watch operations available to one controller.
 ///
-/// Implementations are sealed until the production store backend exists.
+/// Implementations are trusted adapters over the production resource plane.
 /// Outcome and checkpoint writes must be durable and revision-idempotent.
-pub trait RegisteredControllerApi: registered_api::Sealed + Send + Sync + 'static {
+pub trait RegisteredControllerApi: Send + Sync + 'static {
     fn register(
         &self,
         descriptor: &ControllerDescriptor,
@@ -83,6 +94,29 @@ pub trait RegisteredControllerApi: registered_api::Sealed + Send + Sync + 'stati
         after_revision: ZoneRevision,
     ) -> impl Future<Output = Result<(), SourceError>> + Send;
 
+    /// Stop a live adapter watch without dropping an admitted Core hint.
+    fn stop_watch(&self) {}
+
+    /// Whether `receive_watch_change` is backed by a live store stream.
+    ///
+    /// Test-only adapters can leave this disabled and inject changes through
+    /// [`CoreControllerSource::dispatch_change`].
+    fn has_watch_stream(&self) -> bool {
+        false
+    }
+
+    /// Receive one raw store change for Core-owned validation and admission.
+    ///
+    /// The Core source applies suppression, lease, coalescing, and fair queue
+    /// policy. `None` is a clean stream close; recoverable stream failures are
+    /// returned as the toolkit's typed watch failure.
+    fn receive_watch_change(
+        &self,
+    ) -> impl Future<Output = Result<Option<(ChangeRecord, OperationContext)>, WatchFailure>> + Send
+    {
+        std::future::ready(Err(WatchFailure::Fatal))
+    }
+
     fn read_fresh(
         &self,
         key: &ResourceKey,
@@ -92,6 +126,40 @@ pub trait RegisteredControllerApi: registered_api::Sealed + Send + Sync + 'stati
         &self,
         context: &ReconcileContext,
     ) -> impl Future<Output = Result<(), SourceError>> + Send;
+
+    fn accept_effect(
+        &self,
+        _context: &ReconcileContext,
+        _plan: &ReconcilePlan,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    /// Return the durable effect operation accepted for one pass.
+    ///
+    /// Core forwards this identity so Runner persistence retries never use a
+    /// transient watch operation as ledger authority.
+    fn accepted_effect_operation(
+        &self,
+        _context: &ReconcileContext,
+    ) -> impl Future<Output = Result<Option<OperationContext>, SourceError>> + Send {
+        std::future::ready(Ok(None))
+    }
+
+    fn complete_effect(
+        &self,
+        _context: &ReconcileContext,
+        _result: &ReconcileResult,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    fn verify_expedited_commit(
+        &self,
+        _context: &ReconcileContext,
+    ) -> impl Future<Output = Result<bool, SourceError>> + Send {
+        std::future::ready(Ok(false))
+    }
 
     fn commit_result(
         &self,
@@ -110,6 +178,14 @@ pub trait RegisteredControllerApi: registered_api::Sealed + Send + Sync + 'stati
         &self,
         projection: &ReconcileProjection,
     ) -> impl Future<Output = Result<(), SourceError>> + Send;
+
+    fn persist_outcome_with_operation(
+        &self,
+        projection: &ReconcileProjection,
+        _operation: &OperationContext,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.persist_outcome(projection)
+    }
 
     fn checkpoint(
         &self,
@@ -138,6 +214,8 @@ pub struct CoreControllerSource<A> {
     watch: Mutex<WatchState>,
     watch_signal_tx: tokio::sync::mpsc::Sender<()>,
     watch_signal_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<()>>,
+    pending_change: Mutex<Option<(ChangeRecord, OperationContext)>>,
+    watch_stream_enabled: AtomicBool,
     admitted: AtomicUsize,
     coalesced: AtomicUsize,
     backpressure: AtomicUsize,
@@ -167,6 +245,8 @@ where
             }),
             watch_signal_tx,
             watch_signal_rx: tokio::sync::Mutex::new(watch_signal_rx),
+            pending_change: Mutex::new(None),
+            watch_stream_enabled: AtomicBool::new(false),
             admitted: AtomicUsize::new(0),
             coalesced: AtomicUsize::new(0),
             backpressure: AtomicUsize::new(0),
@@ -187,10 +267,68 @@ where
         if controller != self.controller {
             return Err(CoreSourceError::Hint(HintAdmissionError::InvalidHint));
         }
+        if !self
+            .descriptor
+            .resource_types()
+            .any(|resource_type| resource_type == change.target.resource_ref().resource_type())
+        {
+            return Err(CoreSourceError::Hint(HintAdmissionError::InvalidHint));
+        }
         let target = change.target.clone();
         let revision = change.revision;
         let hint = ControllerHint::new(controller, change.target, change.revision, change.reasons)
             .map_err(CoreSourceError::Hint)?;
+        self.admit_hint(hint, target, revision, operation)
+    }
+
+    /// Wake one exact resource for a declared liveness observation.
+    ///
+    /// This path is not a store mutation and therefore bypasses convergence
+    /// suppression while still using the same bounded Core admission queue.
+    pub fn dispatch_observation(
+        &self,
+        target: ResourceKey,
+        revision: ZoneRevision,
+    ) -> Result<CoreDispatchOutcome, CoreSourceError> {
+        if revision.get() == 0
+            || target.zone() != self.controller.zone()
+            || !self
+                .descriptor
+                .resource_types()
+                .any(|resource_type| resource_type == target.resource_ref().resource_type())
+        {
+            return Err(CoreSourceError::Hint(HintAdmissionError::InvalidHint));
+        }
+        let operation_suffix = format!(
+            "{}:{}:{}",
+            target.zone().as_str(),
+            target.resource_ref().to_canonical_string(),
+            target.uid().as_str(),
+        );
+        let operation = OperationContext::new(
+            format!("process-observe:{operation_suffix}"),
+            format!("process-observe:{operation_suffix}"),
+            format!("process-observe:{operation_suffix}"),
+            None,
+        )
+        .map_err(|_| CoreSourceError::Hint(HintAdmissionError::InvalidHint))?;
+        let hint = ControllerHint::new(
+            self.controller.clone(),
+            target.clone(),
+            revision,
+            BTreeSet::from([d2b_controller_toolkit::TriggerReason::ScheduledObserve]),
+        )
+        .map_err(CoreSourceError::Hint)?;
+        self.admit_hint(hint, target, revision, operation)
+    }
+
+    fn admit_hint(
+        &self,
+        hint: ControllerHint,
+        target: ResourceKey,
+        revision: ZoneRevision,
+        operation: OperationContext,
+    ) -> Result<CoreDispatchOutcome, CoreSourceError> {
         let key = (self.controller.clone(), target);
         let outcome = {
             let mut watch = self
@@ -243,10 +381,12 @@ where
 
     /// Close the watch after all bounded admitted changes drain.
     pub fn close_watch(&self) -> Result<(), CoreSourceError> {
+        self.api.stop_watch();
         self.watch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .closed = true;
+        self.watch_stream_enabled.store(false, Ordering::Release);
         match self.watch_signal_tx.try_send(()) {
             Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(())) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
@@ -263,6 +403,11 @@ where
             backpressure: self.backpressure.load(Ordering::Relaxed),
         }
     }
+
+    /// Borrow the Zone owned by this source.
+    pub const fn zone(&self) -> &d2b_contracts_resource::v3::ZoneId {
+        self.controller.zone()
+    }
 }
 
 impl<A> ControllerSource for CoreControllerSource<A>
@@ -273,7 +418,7 @@ where
         &self,
         descriptor: &ControllerDescriptor,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
-        let valid = descriptor == &self.descriptor;
+        let valid = descriptor == &self.descriptor && validate_watch_plan(descriptor);
         async move {
             if !valid {
                 return Err(SourceError::Integrity);
@@ -286,7 +431,14 @@ where
         &self,
         descriptor: &ControllerDescriptor,
     ) -> impl Future<Output = Result<InitialList, SourceError>> + Send {
-        self.api.list_initial(descriptor)
+        let valid = descriptor == &self.descriptor && validate_watch_plan(descriptor);
+        let future = self.api.list_initial(descriptor);
+        async move {
+            if !valid {
+                return Err(SourceError::Integrity);
+            }
+            future.await
+        }
     }
 
     fn open_watch(
@@ -294,7 +446,18 @@ where
         descriptor: &ControllerDescriptor,
         after_revision: ZoneRevision,
     ) -> impl Future<Output = Result<(), SourceError>> + Send {
-        self.api.open_watch(descriptor, after_revision)
+        let valid = descriptor == &self.descriptor && validate_watch_plan(descriptor);
+        let future = self.api.open_watch(descriptor, after_revision);
+        async move {
+            if !valid {
+                return Err(SourceError::Integrity);
+            }
+            let result = future.await;
+            if result.is_ok() && self.api.has_watch_stream() {
+                self.watch_stream_enabled.store(true, Ordering::Release);
+            }
+            result
+        }
     }
 
     async fn receive_watch(&self) -> Result<WatchEvent, WatchFailure> {
@@ -319,6 +482,73 @@ where
             if let Some(event) = event {
                 return Ok(event);
             }
+            if let Some((change, operation)) = self
+                .pending_change
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                match self.dispatch_change(self.controller.clone(), change.clone(), operation.clone()) {
+                    Ok(CoreDispatchOutcome::Suppressed(_))
+                    | Ok(CoreDispatchOutcome::Admitted)
+                    | Ok(CoreDispatchOutcome::Coalesced) => continue,
+                    Err(CoreSourceError::WatchClosed) => return Ok(WatchEvent::Closed),
+                    Err(CoreSourceError::Hint(HintAdmissionError::Backpressure)) => {
+                        *self
+                            .pending_change
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some((change, operation));
+                        return Err(WatchFailure::Backpressure);
+                    }
+                    Err(_) => return Err(WatchFailure::Fatal),
+                }
+            }
+            if self.watch_stream_enabled.load(Ordering::Acquire) {
+                let mut signal_rx = self.watch_signal_rx.lock().await;
+                tokio::select! {
+                    biased;
+                    change = self.api.receive_watch_change() => {
+                        match change? {
+                            Some((change, operation)) => {
+                                match self.dispatch_change(
+                                    self.controller.clone(),
+                                    change.clone(),
+                                    operation.clone(),
+                                ) {
+                                    Ok(CoreDispatchOutcome::Suppressed(_))
+                                    | Ok(CoreDispatchOutcome::Admitted)
+                                    | Ok(CoreDispatchOutcome::Coalesced) => continue,
+                                    Err(CoreSourceError::WatchClosed) => return Ok(WatchEvent::Closed),
+                                    Err(CoreSourceError::Hint(HintAdmissionError::Backpressure)) => {
+                                        *self
+                                            .pending_change
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                            Some((change, operation));
+                                        return Err(WatchFailure::Backpressure);
+                                    }
+                                    Err(_) => return Err(WatchFailure::Fatal),
+                                }
+                            }
+                            None => {
+                                self.watch_stream_enabled.store(false, Ordering::Release);
+                                self.watch
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .closed = true;
+                                continue;
+                            }
+                        }
+                    }
+                    signal = signal_rx.recv() => {
+                        if signal.is_none() {
+                            return Ok(WatchEvent::Closed);
+                        }
+                        continue;
+                    }
+                }
+            }
             if self.watch_signal_rx.lock().await.recv().await.is_none() {
                 return Ok(WatchEvent::Closed);
             }
@@ -339,11 +569,34 @@ where
         self.api.write_starting(context)
     }
 
-    async fn await_expedited_commit(
+    fn accept_effect(
         &self,
-        _context: &ReconcileContext,
-    ) -> Result<CommitDecision, SourceError> {
-        Ok(CommitDecision::Abort)
+        context: &ReconcileContext,
+        plan: &ReconcilePlan,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.api.accept_effect(context, plan)
+    }
+
+    fn accepted_effect_operation(
+        &self,
+        context: &ReconcileContext,
+    ) -> impl Future<Output = Result<Option<OperationContext>, SourceError>> + Send {
+        self.api.accepted_effect_operation(context)
+    }
+
+    fn complete_effect(
+        &self,
+        context: &ReconcileContext,
+        result: &ReconcileResult,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.api.complete_effect(context, result)
+    }
+
+    fn verify_expedited_commit(
+        &self,
+        context: &ReconcileContext,
+    ) -> impl Future<Output = Result<bool, SourceError>> + Send {
+        self.api.verify_expedited_commit(context)
     }
 
     fn commit_result(
@@ -371,6 +624,15 @@ where
         self.api.persist_outcome(projection)
     }
 
+    fn persist_outcome_with_operation(
+        &self,
+        projection: &ReconcileProjection,
+        operation: &OperationContext,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send {
+        self.api
+            .persist_outcome_with_operation(projection, operation)
+    }
+
     fn checkpoint(
         &self,
         context: &ReconcileContext,
@@ -388,6 +650,93 @@ where
     }
 }
 
+/// Failure while constructing the fixed Core controller descriptors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreControllerDescriptorError {
+    /// A fixed Core ResourceType could not be parsed.
+    InvalidResourceType,
+    /// The shared descriptor contract rejected a fixed Core descriptor.
+    Descriptor(DescriptorError),
+}
+
+impl core::fmt::Display for CoreControllerDescriptorError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidResourceType => formatter.write_str("core-resource-type-invalid"),
+            Self::Descriptor(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CoreControllerDescriptorError {}
+
+impl From<DescriptorError> for CoreControllerDescriptorError {
+    fn from(error: DescriptorError) -> Self {
+        Self::Descriptor(error)
+    }
+}
+
+/// Build the fixed Core ResourceType descriptors from one authenticated
+/// controller identity.
+pub fn core_controller_descriptors(
+    identity: ControllerIdentity,
+) -> Result<
+    Vec<(CoreResourceControllerRegistration, ControllerDescriptor)>,
+    CoreControllerDescriptorError,
+> {
+    CORE_RESOURCE_CONTROLLER_REGISTRATIONS
+        .into_iter()
+        .map(|registration| {
+            let resource_type = ResourceTypeName::parse(registration.resource_type())
+                .map_err(|_| CoreControllerDescriptorError::InvalidResourceType)?;
+            let resource = ResourceRegistration::new(resource_type.clone(), vec![1], 5_000, 3)?;
+            let selectors = [
+                SelectorField::Spec,
+                SelectorField::Status,
+                SelectorField::Metadata,
+                SelectorField::Finalizers,
+                SelectorField::Deletion,
+            ]
+            .into_iter()
+            .map(|field| ControllerSelector::new(resource_type.clone(), field, None))
+            .collect::<Result<Vec<_>, _>>()?;
+            let finalizers = registration
+                .finalizer()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let descriptor = ControllerDescriptor::new(
+                identity.clone(),
+                vec![resource],
+                vec!["resource-api".to_owned()],
+                vec!["system".to_owned()],
+                vec![
+                    ControllerVerb::ReadSpec,
+                    ControllerVerb::ReadStatus,
+                    ControllerVerb::WriteStatus,
+                    ControllerVerb::AddFinalizer,
+                    ControllerVerb::RemoveFinalizer,
+                ],
+                selectors,
+                Vec::new(),
+                registration.consumes_owner_triggers(),
+                finalizers,
+                vec!["d2b.resource.v3".to_owned()],
+                vec!["resources.d2bus.org/v3".to_owned()],
+                ControllerExecutionPolicy::new(
+                    8,
+                    4,
+                    256,
+                    8,
+                    256,
+                    ResyncPolicy::new(None, 5_000)?,
+                )?,
+            )?;
+            Ok((registration, descriptor))
+        })
+        .collect()
+}
+
 /// Core reconcile adapter error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoreReconcileError;
@@ -400,15 +749,401 @@ impl core::fmt::Display for CoreReconcileError {
 
 impl std::error::Error for CoreReconcileError {}
 
+fn resource_has_finalizer(
+    resource: &ResourceSnapshot,
+    expected: &str,
+) -> Result<bool, CoreReconcileError> {
+    let value = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .map_err(|_| CoreReconcileError)?;
+    Ok(value
+        .pointer("/metadata/finalizers")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|finalizers| {
+            finalizers
+                .iter()
+                .any(|value| value.as_str() == Some(expected))
+        }))
+}
+
+fn status_candidate(resource: &ResourceSnapshot) -> Result<Vec<u8>, CoreReconcileError> {
+    let value = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .map_err(|_| CoreReconcileError)?;
+    let status = value.get("status").cloned().ok_or(CoreReconcileError)?;
+    if !status.is_object() {
+        return Err(CoreReconcileError);
+    }
+    serde_json::to_vec(&status).map_err(|_| CoreReconcileError)
+}
+
+fn provider_process_session_ready(
+    provider_ref: &str,
+    provider_uid: &str,
+    provider_generation: u64,
+    process: &ResourceSnapshot,
+) -> bool {
+    let process_value =
+        match serde_json::from_slice::<serde_json::Value>(process.canonical_json()) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+    let session = process_value
+        .pointer("/status/resource/controllerSession")
+        .and_then(serde_json::Value::as_object);
+    let Some(session) = session else {
+        return false;
+    };
+    let expected_process_ref = process.key().resource_ref().to_canonical_string();
+    let process_uid = process.key().uid().as_str();
+    session.get("ready").and_then(serde_json::Value::as_bool) == Some(true)
+        && session.get("providerRef").and_then(serde_json::Value::as_str)
+            == Some(provider_ref)
+        && session.get("providerUid").and_then(serde_json::Value::as_str)
+            == Some(provider_uid)
+        && session.get("processRef").and_then(serde_json::Value::as_str)
+            == Some(expected_process_ref.as_str())
+        && session.get("processUid").and_then(serde_json::Value::as_str) == Some(process_uid)
+        && session
+            .get("processGeneration")
+            .and_then(serde_json::Value::as_u64)
+            == Some(process.generation().get())
+        && session
+            .get("providerGeneration")
+            .and_then(serde_json::Value::as_u64)
+            == Some(provider_generation)
+        && session
+            .get("controllerGeneration")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|generation| generation > 0)
+        && session
+            .get("sessionGeneration")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|generation| generation > 0)
+        && session
+            .get("artifactReady")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && session
+            .get("descriptorReady")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && session
+            .get("registrationReady")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
+const SYSTEM_CORE_PROVIDER_REF: &str = "Provider/system-core";
+const SYSTEM_MINIJAIL_PROVIDER_REF: &str = "Provider/system-minijail";
+const SYSTEM_CORE_HOST_REF: &str = "Host/host-system";
+
+fn fixed_system_core_handlers_ready(dependencies: &[DependencySnapshot]) -> bool {
+    dependencies.iter().any(|dependency| {
+        let resource = dependency.resource();
+        if resource.key().resource_ref().resource_type().as_str() != "Zone" {
+            return false;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        else {
+            return false;
+        };
+        let Some(status) = value.pointer("/status/resource").cloned() else {
+            return false;
+        };
+        serde_json::from_value::<ZoneStatusResource>(status)
+            .is_ok_and(|status| status.mandatory_handlers_ready())
+    })
+}
+
+fn fixed_provider_host_ready(dependencies: &[DependencySnapshot]) -> bool {
+    dependencies.iter().any(|dependency| {
+        let resource = dependency.resource();
+        if resource.key().resource_ref().to_canonical_string() != SYSTEM_CORE_HOST_REF {
+            return false;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        else {
+            return false;
+        };
+        value
+            .pointer("/spec/providerRef")
+            .and_then(serde_json::Value::as_str)
+            == Some(SYSTEM_CORE_PROVIDER_REF)
+            && value
+                .pointer("/status/phase")
+                .and_then(serde_json::Value::as_str)
+                == Some("Ready")
+            && value
+                .pointer("/status/observedGeneration")
+                .and_then(serde_json::Value::as_u64)
+                == Some(resource.generation().get())
+    })
+}
+
+fn expected_provider_volume_refs(provider: &serde_json::Value) -> BTreeSet<String> {
+    ["/status/resource/owned/refs", "/status/update/owned/refs"]
+        .into_iter()
+        .filter_map(|path| provider.pointer(path))
+        .filter_map(serde_json::Value::as_array)
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|resource_ref| resource_ref.starts_with("Volume/"))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn provider_observation(
+    resource: &ResourceSnapshot,
+    dependencies: &[DependencySnapshot],
+) -> Result<ProviderObservation, CoreReconcileError> {
+    let provider = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .map_err(|_| CoreReconcileError)?;
+    let provider_ref = resource.key().resource_ref().to_canonical_string();
+    let spec = provider
+        .get("spec")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(CoreReconcileError)?;
+    let package_present = spec
+        .get("artifactId")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|artifact| !artifact.is_empty());
+    let config_valid = spec
+        .get("config")
+        .is_some_and(serde_json::Value::is_object);
+    let fixed_host_ready = match provider_ref.as_str() {
+        SYSTEM_CORE_PROVIDER_REF => Some(fixed_system_core_handlers_ready(dependencies)),
+        SYSTEM_MINIJAIL_PROVIDER_REF => Some(fixed_provider_host_ready(dependencies)),
+        _ => None,
+    };
+    if let Some(required_ready) = fixed_host_ready {
+        return Ok(ProviderObservation {
+            package_present: provider_ref == SYSTEM_CORE_PROVIDER_REF || package_present,
+            config_valid,
+            graph_valid: true,
+            conformance_valid: true,
+            required_dependencies_ready: required_ready,
+            required_components_ready: required_ready,
+            optional_components_degraded: false,
+            components_drained: true,
+        });
+    }
+    let mut process_count = 0_usize;
+    let mut graph_valid = true;
+    let mut conformance_valid = true;
+    let mut required_components_ready = true;
+    let mut required_dependencies_ready = true;
+    let mut optional_components_degraded = false;
+    let expected_volume_refs = expected_provider_volume_refs(&provider);
+    let mut observed_volume_refs = BTreeSet::new();
+
+    for dependency in dependencies {
+        let dependency_resource = dependency.resource();
+        let value = serde_json::from_slice::<serde_json::Value>(
+            dependency_resource.canonical_json(),
+        )
+        .map_err(|_| CoreReconcileError)?;
+        let owner_ref = value
+            .pointer("/metadata/ownerRef")
+            .and_then(serde_json::Value::as_str);
+        if owner_ref != Some(provider_ref.as_str()) {
+            continue;
+        }
+        match dependency_resource
+            .key()
+            .resource_ref()
+            .resource_type()
+            .as_str()
+        {
+            "Process" => {
+                if dependency_resource.owner_uid() != Some(resource.key().uid()) {
+                    graph_valid = false;
+                    conformance_valid = false;
+                    required_components_ready = false;
+                    required_dependencies_ready = false;
+                    continue;
+                }
+                process_count += 1;
+                let process_spec = value
+                    .get("spec")
+                    .and_then(serde_json::Value::as_object);
+                let process_valid = process_spec
+                    .and_then(|spec| spec.get("processClass"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("controller")
+                    && process_spec
+                        .and_then(|spec| spec.get("providerRef"))
+                        .and_then(serde_json::Value::as_str)
+                            .is_some_and(|provider| {
+                                matches!(
+                                    provider,
+                                    "Provider/system-minijail" | "Provider/system-systemd"
+                                )
+                            });
+                let phase = value
+                    .pointer("/status/phase")
+                    .and_then(serde_json::Value::as_str);
+                let process_ready = phase == Some("Ready")
+                    && value
+                        .pointer("/status/observedGeneration")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(dependency_resource.generation().get());
+                let provider_uid = resource.key().uid().as_str();
+                let session_ready = provider_process_session_ready(
+                    provider_ref.as_str(),
+                    provider_uid,
+                    resource.generation().get(),
+                    dependency_resource,
+                );
+                graph_valid &= process_valid;
+                conformance_valid &= process_valid && session_ready;
+                required_components_ready &= process_ready && session_ready;
+                required_dependencies_ready &= process_ready;
+                optional_components_degraded |= phase == Some("Degraded");
+            }
+            "Volume" => {
+                let volume_ref = dependency_resource
+                    .key()
+                    .resource_ref()
+                    .to_canonical_string();
+                if !expected_volume_refs.contains(&volume_ref) {
+                    continue;
+                }
+                observed_volume_refs.insert(volume_ref);
+                let owner_uid_matches =
+                    dependency_resource.owner_uid() == Some(resource.key().uid());
+                if !owner_uid_matches {
+                    required_dependencies_ready = false;
+                    continue;
+                }
+                let volume_ready = value
+                    .pointer("/status/phase")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("Ready")
+                    && value
+                        .pointer("/status/observedGeneration")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(dependency_resource.generation().get());
+                required_dependencies_ready &= volume_ready;
+            }
+            _ => {}
+        }
+    }
+    if !expected_volume_refs.is_empty()
+        && !expected_volume_refs.is_subset(&observed_volume_refs)
+    {
+        required_dependencies_ready = false;
+    }
+
+    let has_processes = process_count > 0;
+    Ok(ProviderObservation {
+        package_present: package_present && has_processes,
+        config_valid,
+        graph_valid: graph_valid && has_processes,
+        conformance_valid: conformance_valid && has_processes,
+        required_dependencies_ready: required_dependencies_ready && has_processes,
+        required_components_ready: required_components_ready && has_processes,
+        optional_components_degraded,
+        components_drained: !has_processes,
+    })
+}
+
+fn resource_status_observed_generation(
+    resource: &ResourceSnapshot,
+) -> Option<d2b_contracts_resource::v3::ResourceGeneration> {
+    let value = serde_json::from_slice::<serde_json::Value>(resource.canonical_json()).ok()?;
+    let generation = value
+        .pointer("/status/observedGeneration")
+        .and_then(serde_json::Value::as_u64)?;
+    d2b_contracts_resource::v3::ResourceGeneration::new(generation).ok()
+}
+
+fn provider_status_candidate(
+    resource: &ResourceSnapshot,
+    phase: ProviderPhase,
+    observation: ProviderObservation,
+) -> Result<Option<Vec<u8>>, CoreReconcileError> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .map_err(|_| CoreReconcileError)?;
+    let status = value
+        .get_mut("status")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or(CoreReconcileError)?;
+    let mut projection = status
+        .get("resource")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    projection.insert(
+        "providerReadiness".to_owned(),
+        serde_json::json!({
+            "artifactReady": observation.package_present,
+            "descriptorReady": observation.graph_valid,
+            "registrationReady": observation.conformance_valid,
+            "dependenciesReady": observation.required_dependencies_ready,
+            "componentsReady": observation.required_components_ready,
+        }),
+    );
+    status.insert(
+        "phase".to_owned(),
+        serde_json::Value::String(
+            match phase {
+                ProviderPhase::Ready => "Ready",
+                ProviderPhase::Degraded => "Degraded",
+                _ => "Pending",
+            }
+            .to_owned(),
+        ),
+    );
+    status.insert(
+        "observedGeneration".to_owned(),
+        serde_json::Value::from(resource.generation().get()),
+    );
+    status.insert("resource".to_owned(), serde_json::Value::Object(projection));
+    let candidate = status.clone();
+    let current = serde_json::from_slice::<serde_json::Value>(resource.canonical_json())
+        .map_err(|_| CoreReconcileError)?
+        .get("status")
+        .cloned()
+        .ok_or(CoreReconcileError)?;
+    if current == serde_json::Value::Object(candidate.clone()) {
+        return Ok(None);
+    }
+    serde_json::to_vec(&candidate)
+        .map(Some)
+        .map_err(|_| CoreReconcileError)
+}
+
 /// Core's baseline reconciler for metadata-only convergence.
 pub struct CoreResourceReconciler {
     descriptor: ControllerDescriptor,
+    handler: crate::CoreHandlerKind,
+    ensure_finalizer: bool,
 }
 
 impl CoreResourceReconciler {
     /// Bind the reconciler to its complete signed descriptor.
     pub fn new(descriptor: ControllerDescriptor) -> Arc<Self> {
-        Arc::new(Self { descriptor })
+        Arc::new(Self {
+            descriptor,
+            handler: crate::CoreHandlerKind::Store,
+            ensure_finalizer: false,
+        })
+    }
+
+    /// Bind the reconciler to one fixed Core ResourceType handler.
+    pub fn for_handler(
+        descriptor: ControllerDescriptor,
+        handler: crate::CoreHandlerKind,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor,
+            handler,
+            ensure_finalizer: true,
+        })
+    }
+
+    /// Return the fixed Core handler represented by this reconciler.
+    pub const fn handler(&self) -> crate::CoreHandlerKind {
+        self.handler
     }
 }
 
@@ -444,7 +1179,7 @@ impl ResourceReconciler for CoreResourceReconciler {
         _dependencies: &[DependencySnapshot],
     ) -> Result<ReconcilePlan, Self::Error> {
         tokio::task::yield_now().await;
-        ReconcilePlan::new(Vec::new(), true).map_err(|_| CoreReconcileError)
+        ReconcilePlan::new(Vec::new(), !self.ensure_finalizer).map_err(|_| CoreReconcileError)
     }
 
     fn reconcile(
@@ -454,12 +1189,83 @@ impl ResourceReconciler for CoreResourceReconciler {
         _dependencies: &[DependencySnapshot],
         _plan: &ReconcilePlan,
     ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
-        std::future::ready(
+        std::future::ready((|| {
             context
                 .authorize_effect()
-                .map_err(|_| CoreReconcileError)
-                .map(|_| ReconcileResult::converged(resource.revision(), resource.generation())),
-        )
+                .map_err(|_| CoreReconcileError)?;
+            if !self.ensure_finalizer {
+                return Ok(ReconcileResult::converged(
+                    resource.revision(),
+                    resource.generation(),
+                ));
+            }
+            let mut finalizer_missing = false;
+            for finalizer in self.descriptor.finalizers() {
+                if !resource_has_finalizer(resource, finalizer)? {
+                    finalizer_missing = true;
+                    break;
+                }
+            }
+            if !finalizer_missing {
+                if self.handler == crate::CoreHandlerKind::Provider {
+                    let observation = provider_observation(resource, _dependencies)?;
+                    let intent = if resource_status_observed_generation(resource)
+                        == Some(resource.generation())
+                    {
+                        ProviderIntent::Enable
+                    } else {
+                        ProviderIntent::Update
+                    };
+                    let phase = if resource.key().resource_ref().to_canonical_string()
+                        == SYSTEM_CORE_PROVIDER_REF
+                    {
+                        ProviderHandler::plan_system_core(
+                            fixed_system_core_handlers_ready(_dependencies),
+                        )
+                        .phase()
+                    } else {
+                        ProviderHandler::plan_observed(
+                            resource.key().resource_ref(),
+                            intent,
+                            observation,
+                        )
+                        .map(|plan| plan.phase())
+                        .unwrap_or(ProviderPhase::Pending)
+                    };
+                    if let Some(status) =
+                        provider_status_candidate(resource, phase, observation)?
+                    {
+                        return ReconcileResult::new(
+                            resource.revision(),
+                            resource.generation(),
+                            None,
+                            Some(status),
+                            ReconcileDisposition::Pending,
+                            None,
+                            None,
+                            StatusPersistence::Pending,
+                        )
+                        .map_err(|_| CoreReconcileError);
+                    }
+                }
+                return Ok(ReconcileResult::converged(
+                    resource.revision(),
+                    resource.generation(),
+                ));
+            }
+            let status = status_candidate(resource)?;
+            ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                None,
+                Some(status),
+                d2b_controller_toolkit::ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::Pending,
+            )
+            .map_err(|_| CoreReconcileError)
+        })())
     }
 
     fn observe(
@@ -482,6 +1288,63 @@ impl ResourceReconciler for CoreResourceReconciler {
             resource.revision(),
             resource.generation(),
         ))))
+    }
+
+    fn prepare_finalize(
+        &self,
+        context: &ReconcileContext,
+        deleting_resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let result = (|| {
+            context
+                .authorize_effect()
+                .map_err(|_| CoreReconcileError)?;
+            let Some(finalizer) = self.descriptor.finalizers().first() else {
+                return Ok(ReconcileResult::converged(
+                    deleting_resource.revision(),
+                    deleting_resource.generation(),
+                ));
+            };
+            if !resource_has_finalizer(deleting_resource, finalizer)? {
+                return Ok(ReconcileResult::converged(
+                    deleting_resource.revision(),
+                    deleting_resource.generation(),
+                ));
+            };
+            let mutation = MutationIntent::new(
+                deleting_resource.key().resource_ref().clone(),
+                Some(deleting_resource.key().uid().clone()),
+                Some(deleting_resource.revision()),
+                MutationIntentKind::UpdateFinalizers,
+                None,
+            )
+            .map_err(|_| CoreReconcileError)?;
+            let batch =
+                ResourceMutationBatch::new(vec![mutation]).map_err(|_| CoreReconcileError)?;
+            ReconcileResult::new(
+                deleting_resource.revision(),
+                deleting_resource.generation(),
+                Some(batch),
+                None,
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::NotRequested,
+            )
+            .map_err(|_| CoreReconcileError)
+        })();
+        std::future::ready(result)
+    }
+
+    fn execute_finalize(
+        &self,
+        _context: &ReconcileContext,
+        deleting_resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        std::future::ready(Ok(ReconcileResult::converged(
+            deleting_resource.revision(),
+            deleting_resource.generation(),
+        )))
     }
 
     fn health(&self) -> impl Future<Output = Result<ControllerHealth, Self::Error>> + Send {
@@ -551,8 +1414,8 @@ mod tests {
     };
     use d2b_controller_toolkit::{
         ControllerExecutionPolicy, ControllerIdentity, ControllerSelector, ControllerVerb,
-        ProjectionDisposition, ResourceRegistration, ResyncPolicy, Runner, RunnerConfig,
-        SelectorField, TriggerReason,
+        InitialResource, ProjectionDisposition, ResourceRegistration, ResyncPolicy, Runner,
+        RunnerConfig, SelectorField, TriggerReason,
     };
 
     use super::*;
@@ -565,10 +1428,16 @@ mod tests {
         snapshots: Mutex<BTreeMap<ResourceKey, FreshSnapshot>>,
         starting: Mutex<BTreeSet<(ResourceKey, ZoneRevision)>>,
         commits: Mutex<BTreeSet<(ResourceKey, ZoneRevision)>>,
+        committed_results: Mutex<Vec<ReconcileResult>>,
         checkpoints: Mutex<BTreeSet<(ResourceKey, ZoneRevision)>>,
         checkpoint_calls: AtomicUsize,
         checkpoint_notify: tokio::sync::Notify,
         outcomes: Mutex<VecDeque<(ResourceKey, ZoneRevision, ReconcileReason)>>,
+        watch_changes:
+            Mutex<VecDeque<Result<Option<(ChangeRecord, OperationContext)>, WatchFailure>>>,
+        watch_stream_enabled: AtomicBool,
+        watch_change_notify: tokio::sync::Notify,
+        watch_receive_started: tokio::sync::Notify,
     }
 
     impl TestRegisteredApi {
@@ -578,11 +1447,38 @@ mod tests {
                 snapshots: Mutex::new(snapshots),
                 starting: Mutex::new(BTreeSet::new()),
                 commits: Mutex::new(BTreeSet::new()),
+                committed_results: Mutex::new(Vec::new()),
                 checkpoints: Mutex::new(BTreeSet::new()),
                 checkpoint_calls: AtomicUsize::new(0),
                 checkpoint_notify: tokio::sync::Notify::new(),
                 outcomes: Mutex::new(VecDeque::new()),
+                watch_changes: Mutex::new(VecDeque::new()),
+                watch_stream_enabled: AtomicBool::new(false),
+                watch_change_notify: tokio::sync::Notify::new(),
+                watch_receive_started: tokio::sync::Notify::new(),
             })
+        }
+
+        fn enable_watch_stream(
+            &self,
+            changes: Vec<Result<Option<(ChangeRecord, OperationContext)>, WatchFailure>>,
+        ) {
+            self.watch_changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend(changes);
+            self.watch_stream_enabled.store(true, Ordering::Release);
+        }
+
+        fn push_watch_change(
+            &self,
+            change: Result<Option<(ChangeRecord, OperationContext)>, WatchFailure>,
+        ) {
+            self.watch_changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_back(change);
+            self.watch_change_notify.notify_one();
         }
 
         fn starting_count(&self) -> usize {
@@ -597,6 +1493,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .len()
+        }
+
+        fn committed_results(&self) -> Vec<ReconcileResult> {
+            self.committed_results
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
 
         fn checkpoint_count(&self) -> usize {
@@ -635,8 +1538,6 @@ mod tests {
         }
     }
 
-    impl registered_api::Sealed for TestRegisteredApi {}
-
     impl RegisteredControllerApi for TestRegisteredApi {
         fn register(
             &self,
@@ -658,6 +1559,30 @@ mod tests {
             _after_revision: ZoneRevision,
         ) -> impl Future<Output = Result<(), SourceError>> + Send {
             std::future::ready(Ok(()))
+        }
+
+        fn has_watch_stream(&self) -> bool {
+            self.watch_stream_enabled.load(Ordering::Acquire)
+        }
+
+        fn receive_watch_change(
+            &self,
+        ) -> impl Future<Output = Result<Option<(ChangeRecord, OperationContext)>, WatchFailure>>
+        + Send {
+            async move {
+                loop {
+                    if let Some(change) = self
+                        .watch_changes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .pop_front()
+                    {
+                        return change;
+                    }
+                    self.watch_receive_started.notify_one();
+                    self.watch_change_notify.notified().await;
+                }
+            }
         }
 
         fn read_fresh(
@@ -688,12 +1613,16 @@ mod tests {
         fn commit_result(
             &self,
             context: &ReconcileContext,
-            _result: &ReconcileResult,
+            result: &ReconcileResult,
         ) -> impl Future<Output = Result<CommitOutcome, SourceError>> + Send {
             self.commits
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert((context.target().clone(), context.revision()));
+            self.committed_results
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(result.clone());
             std::future::ready(Ok(CommitOutcome::Committed(context.revision())))
         }
 
@@ -775,7 +1704,7 @@ mod tests {
             vec![ControllerSelector::new(resource_type, SelectorField::Spec, None).unwrap()],
             Vec::new(),
             true,
-            vec!["d2b.io/core".to_owned()],
+            Vec::new(),
             vec!["service.v1".to_owned()],
             vec!["schema.v1".to_owned()],
             ControllerExecutionPolicy::new(
@@ -854,6 +1783,579 @@ mod tests {
         (api, source)
     }
 
+    fn provider_fixture(session_ready: bool) -> (ResourceSnapshot, DependencySnapshot) {
+        provider_fixture_with_process_owner_generation(session_ready, 2, Some(2))
+    }
+
+    fn provider_fixture_with_session_provider_generation(
+        session_ready: bool,
+        session_provider_generation: u64,
+    ) -> (ResourceSnapshot, DependencySnapshot) {
+        provider_fixture_with_process_owner_generation(
+            session_ready,
+            session_provider_generation,
+            Some(2),
+        )
+    }
+
+    fn provider_fixture_with_process_owner_generation(
+        session_ready: bool,
+        session_provider_generation: u64,
+        process_owner_generation: Option<u64>,
+    ) -> (ResourceSnapshot, DependencySnapshot) {
+        let zone = ZoneId::parse("work").unwrap();
+        let provider_ref = ResourceRef::parse("Provider/runtime").unwrap();
+        let provider_uid =
+            ResourceUid::parse("11111111-1111-4111-8111-111111111111").unwrap();
+        let process_ref = ResourceRef::parse("Process/runtime-controller").unwrap();
+        let process_uid =
+            ResourceUid::parse("22222222-2222-4222-8222-222222222222").unwrap();
+        let provider = ResourceSnapshot::new(
+            ResourceKey::new(zone.clone(), provider_ref, provider_uid.clone()),
+            ZoneRevision::new(4),
+            ResourceGeneration::new(2).unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": {
+                    "uid": provider_uid.as_str(),
+                    "generation": 2,
+                    "name": "runtime",
+                    "finalizers": ["core.provider-api-binding"]
+                },
+                "spec": {
+                    "artifactId": "runtime",
+                    "config": {}
+                },
+                "status": {
+                    "phase": "Pending",
+                    "observedGeneration": 0,
+                    "resource": {}
+                }
+            }))
+            .unwrap(),
+            false,
+        );
+        let process = ResourceSnapshot::new(
+            ResourceKey::new(zone, process_ref, process_uid.clone()),
+            ZoneRevision::new(4),
+            ResourceGeneration::new(3).unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": {
+                    "uid": process_uid.as_str(),
+                    "generation": 3,
+                    "ownerRef": "Provider/runtime"
+                },
+                "spec": {
+                    "processClass": "controller",
+                    "providerRef": "Provider/system-minijail"
+                },
+                "status": {
+                    "phase": "Ready",
+                    "observedGeneration": 3,
+                    "resource": {
+                        "controllerSession": {
+                            "ready": session_ready,
+                            "providerRef": "Provider/runtime",
+                            "providerUid": provider_uid.as_str(),
+                            "providerGeneration": session_provider_generation,
+                            "processRef": "Process/runtime-controller",
+                            "processUid": process_uid.as_str(),
+                            "processGeneration": 3,
+                            "controllerGeneration": 7,
+                            "sessionGeneration": 9,
+                            "artifactReady": session_ready,
+                            "descriptorReady": session_ready,
+                            "registrationReady": session_ready
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+            false,
+        )
+        .with_owner_identity(
+            Some(provider_uid.clone()),
+            process_owner_generation
+                .map(|generation| ResourceGeneration::new(generation).unwrap()),
+        );
+        (provider, DependencySnapshot::new(process))
+    }
+
+    fn provider_volume_fixture(
+        owner_uid: ResourceUid,
+        owner_generation: Option<u64>,
+    ) -> DependencySnapshot {
+        let zone = ZoneId::parse("work").unwrap();
+        let volume_ref = ResourceRef::parse("Volume/runtime-state").unwrap();
+        let volume_uid =
+            ResourceUid::parse("33333333-3333-4333-8333-333333333333").unwrap();
+        DependencySnapshot::new(
+            ResourceSnapshot::new(
+                ResourceKey::new(zone, volume_ref, volume_uid),
+                ZoneRevision::new(4),
+                ResourceGeneration::new(1).unwrap(),
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata": {
+                        "uid": "33333333-3333-4333-8333-333333333333",
+                        "generation": 1,
+                        "ownerRef": "Provider/runtime"
+                    },
+                    "status": {
+                        "phase": "Ready",
+                        "observedGeneration": 1
+                    }
+                }))
+                .unwrap(),
+                false,
+            )
+            .with_owner_identity(
+                Some(owner_uid),
+                owner_generation.map(|generation| ResourceGeneration::new(generation).unwrap()),
+            ),
+        )
+    }
+
+    fn fixed_provider_fixture(name: &str) -> ResourceSnapshot {
+        let uid = match name {
+            "system-core" => "55555555-5555-4555-8555-555555555555",
+            "system-minijail" => "66666666-6666-4666-8666-666666666666",
+            _ => "77777777-7777-4777-8777-777777777777",
+        };
+        ResourceSnapshot::new(
+            ResourceKey::new(
+                ZoneId::parse("work").unwrap(),
+                ResourceRef::parse(&format!("Provider/{name}")).unwrap(),
+                ResourceUid::parse(uid).unwrap(),
+            ),
+            ZoneRevision::new(1),
+            ResourceGeneration::new(1).unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "spec": {
+                    "artifactId": name,
+                    "config": {}
+                },
+                "status": {
+                    "phase": "Pending",
+                    "observedGeneration": 0,
+                    "resource": {}
+                }
+            }))
+            .unwrap(),
+            false,
+        )
+    }
+
+    fn fixed_zone_dependency(ready: bool) -> DependencySnapshot {
+        use d2b_contracts_zone_session::v3::{
+            ZoneHandlerName, ZoneHandlerPhase, ZoneHandlerStatus, ZoneStatusResource,
+        };
+
+        let phase = if ready {
+            d2b_contracts_resource::v3::ResourcePhase::Ready
+        } else {
+            d2b_contracts_resource::v3::ResourcePhase::Pending
+        };
+        let handler_phase = if ready {
+            ZoneHandlerPhase::Ready
+        } else {
+            ZoneHandlerPhase::Pending
+        };
+        let status = ZoneStatusResource::new(
+            1,
+            1,
+            1,
+            phase,
+            vec![
+                ZoneHandlerStatus::new(ZoneHandlerName::SystemCoreHost, handler_phase, None),
+                ZoneHandlerStatus::new(ZoneHandlerName::SystemCoreUser, handler_phase, None),
+            ],
+            1,
+            1,
+            1,
+            1,
+            false,
+            0,
+        )
+        .unwrap();
+        DependencySnapshot::new(ResourceSnapshot::new(
+            ResourceKey::new(
+                ZoneId::parse("work").unwrap(),
+                ResourceRef::parse("Zone/work").unwrap(),
+                ResourceUid::parse("88888888-8888-4888-8888-888888888888").unwrap(),
+            ),
+            ZoneRevision::new(1),
+            ResourceGeneration::new(1).unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "status": {
+                    "resource": serde_json::to_value(status).unwrap()
+                }
+            }))
+            .unwrap(),
+            false,
+        ))
+    }
+
+    fn fixed_host_dependency(ready: bool) -> DependencySnapshot {
+        DependencySnapshot::new(ResourceSnapshot::new(
+            ResourceKey::new(
+                ZoneId::parse("work").unwrap(),
+                ResourceRef::parse("Host/host-system").unwrap(),
+                ResourceUid::parse("99999999-9999-4999-8999-999999999999").unwrap(),
+            ),
+            ZoneRevision::new(1),
+            ResourceGeneration::new(1).unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "spec": {
+                    "providerRef": "Provider/system-core"
+                },
+                "status": {
+                    "phase": if ready { "Ready" } else { "Pending" },
+                    "observedGeneration": if ready { 1 } else { 0 }
+                }
+            }))
+            .unwrap(),
+            false,
+        ))
+    }
+
+    fn provider_with_expected_volume(provider: ResourceSnapshot) -> ResourceSnapshot {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(provider.canonical_json()).unwrap();
+        value["status"]["update"]["owned"] =
+            serde_json::json!({"count": 1, "refs": ["Volume/runtime-state"]});
+        ResourceSnapshot::new(
+            provider.key().clone(),
+            provider.revision(),
+            provider.generation(),
+            serde_json::to_vec(&value).unwrap(),
+            false,
+        )
+    }
+
+    #[test]
+    fn provider_readiness_requires_durable_session_evidence() {
+        for session_ready in [false, true] {
+            let (provider, process) = provider_fixture(session_ready);
+            let observation = provider_observation(&provider, &[process]).unwrap();
+            let phase = ProviderHandler::plan_observed(
+                provider.key().resource_ref(),
+                ProviderIntent::Enable,
+                observation,
+            )
+            .map(|plan| plan.phase())
+            .unwrap_or(ProviderPhase::Pending);
+            assert_eq!(
+                phase,
+                if session_ready {
+                    ProviderPhase::Ready
+                } else {
+                    ProviderPhase::Pending
+                }
+            );
+            if session_ready {
+                let status = provider_status_candidate(
+                    &provider,
+                    phase,
+                    observation,
+                )
+                .unwrap()
+                .expect("Pending -> Ready writes status");
+                let status: serde_json::Value = serde_json::from_slice(&status).unwrap();
+                assert_eq!(status["phase"], "Ready");
+                assert_eq!(status["observedGeneration"], 2);
+            }
+        }
+    }
+
+    #[test]
+    fn provider_readiness_rejects_session_evidence_from_an_older_provider_generation() {
+        let (provider, process) = provider_fixture_with_session_provider_generation(true, 1);
+        let observation = provider_observation(&provider, &[process]).unwrap();
+        let phase = ProviderHandler::plan_observed(
+            provider.key().resource_ref(),
+            ProviderIntent::Enable,
+            observation,
+        )
+        .map(|plan| plan.phase())
+        .unwrap_or(ProviderPhase::Pending);
+        assert_eq!(phase, ProviderPhase::Pending);
+    }
+
+    #[test]
+    fn provider_readiness_accepts_legacy_process_without_owner_generation() {
+        let (provider, process) =
+            provider_fixture_with_process_owner_generation(true, 2, None);
+        let observation = provider_observation(&provider, &[process]).unwrap();
+        let phase = ProviderHandler::plan_observed(
+            provider.key().resource_ref(),
+            ProviderIntent::Enable,
+            observation,
+        )
+        .map(|plan| plan.phase())
+        .unwrap_or(ProviderPhase::Pending);
+        assert_eq!(phase, ProviderPhase::Ready);
+    }
+
+    #[test]
+    fn fixed_system_core_readiness_uses_mandatory_handler_evidence_without_process() {
+        let provider = fixed_provider_fixture("system-core");
+        for ready in [false, true] {
+            let dependencies = vec![fixed_zone_dependency(ready)];
+            let observation = provider_observation(&provider, &dependencies).unwrap();
+            let phase = ProviderHandler::plan_system_core(
+                fixed_system_core_handlers_ready(&dependencies),
+            )
+            .phase();
+            assert_eq!(
+                phase,
+                if ready {
+                    ProviderPhase::Ready
+                } else {
+                    ProviderPhase::Pending
+                }
+            );
+            assert_eq!(observation.required_components_ready, ready);
+        }
+    }
+
+    #[test]
+    fn fixed_system_minijail_readiness_uses_host_evidence_without_process() {
+        let provider = fixed_provider_fixture("system-minijail");
+        for ready in [false, true] {
+            let dependencies = vec![fixed_host_dependency(ready)];
+            let observation = provider_observation(&provider, &dependencies).unwrap();
+            let phase = ProviderHandler::plan_observed(
+                provider.key().resource_ref(),
+                ProviderIntent::Enable,
+                observation,
+            )
+            .unwrap()
+            .phase();
+            assert_eq!(
+                phase,
+                if ready {
+                    ProviderPhase::Ready
+                } else {
+                    ProviderPhase::Pending
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_provider_readiness_does_not_use_controller_session_log_alone() {
+        let (_, process) = provider_fixture(true);
+        let system_minijail = fixed_provider_fixture("system-minijail");
+        let observation = provider_observation(&system_minijail, &[process]).unwrap();
+        let phase = ProviderHandler::plan_observed(
+            system_minijail.key().resource_ref(),
+            ProviderIntent::Enable,
+            observation,
+        )
+        .unwrap()
+        .phase();
+        assert_eq!(phase, ProviderPhase::Pending);
+
+        let system_core = fixed_provider_fixture("system-core");
+        let observation = provider_observation(&system_core, &[provider_fixture(true).1]).unwrap();
+        let phase = ProviderHandler::plan_system_core(
+            fixed_system_core_handlers_ready(&[provider_fixture(true).1]),
+        )
+        .phase();
+        assert_eq!(phase, ProviderPhase::Pending);
+        assert!(!observation.required_components_ready);
+    }
+
+    #[test]
+    fn provider_readiness_requires_matching_volume_owner_uid_and_observed_state() {
+        let (provider, process) = provider_fixture(true);
+        let expected_volume_provider = provider_with_expected_volume(provider.clone());
+        let stale_owner_uid =
+            ResourceUid::parse("44444444-4444-4444-8444-444444444444").unwrap();
+        let stale_volume = provider_volume_fixture(stale_owner_uid, Some(2));
+        let observation = provider_observation(
+            &expected_volume_provider,
+            &[process.clone(), stale_volume],
+        )
+        .unwrap();
+        let phase = ProviderHandler::plan_observed(
+            expected_volume_provider.key().resource_ref(),
+            ProviderIntent::Enable,
+            observation,
+        )
+        .map(|plan| plan.phase())
+        .unwrap_or(ProviderPhase::Pending);
+        assert_eq!(phase, ProviderPhase::Pending);
+
+        let old_owner_generation_volume =
+            provider_volume_fixture(provider.key().uid().clone(), Some(1));
+        let observation = provider_observation(
+            &expected_volume_provider,
+            &[provider_fixture(true).1, old_owner_generation_volume],
+        )
+        .unwrap();
+        let phase = ProviderHandler::plan_observed(
+            expected_volume_provider.key().resource_ref(),
+            ProviderIntent::Enable,
+            observation,
+        )
+        .map(|plan| plan.phase())
+        .unwrap_or(ProviderPhase::Pending);
+        assert_eq!(phase, ProviderPhase::Ready);
+
+        let absent_owner_generation_volume =
+            provider_volume_fixture(provider.key().uid().clone(), None);
+        let observation = provider_observation(
+            &expected_volume_provider,
+            &[provider_fixture(true).1, absent_owner_generation_volume],
+        )
+        .unwrap();
+        let phase = ProviderHandler::plan_observed(
+            expected_volume_provider.key().resource_ref(),
+            ProviderIntent::Enable,
+            observation,
+        )
+        .map(|plan| plan.phase())
+        .unwrap_or(ProviderPhase::Pending);
+        assert_eq!(phase, ProviderPhase::Ready);
+
+        let observation =
+            provider_observation(&expected_volume_provider, &[process.clone()]).unwrap();
+        let phase = ProviderHandler::plan_observed(
+            expected_volume_provider.key().resource_ref(),
+            ProviderIntent::Enable,
+            observation,
+        )
+        .map(|plan| plan.phase())
+        .unwrap_or(ProviderPhase::Pending);
+        assert_eq!(phase, ProviderPhase::Pending);
+
+        let optional_volume = provider_volume_fixture(
+            ResourceUid::parse("44444444-4444-4444-8444-444444444444").unwrap(),
+            Some(2),
+        );
+        let observation =
+            provider_observation(&provider, &[process.clone(), optional_volume]).unwrap();
+        let phase = ProviderHandler::plan_observed(
+            provider.key().resource_ref(),
+            ProviderIntent::Enable,
+            observation,
+        )
+        .map(|plan| plan.phase())
+        .unwrap_or(ProviderPhase::Pending);
+        assert_eq!(phase, ProviderPhase::Ready);
+
+        let observation = provider_observation(&provider, &[process]).unwrap();
+        let phase = ProviderHandler::plan_observed(
+            provider.key().resource_ref(),
+            ProviderIntent::Enable,
+            observation,
+        )
+        .map(|plan| plan.phase())
+        .unwrap_or(ProviderPhase::Pending);
+        assert_eq!(phase, ProviderPhase::Ready);
+    }
+
+    #[tokio::test]
+    async fn provider_ready_transition_is_committed_after_session_evidence() {
+        let identity = descriptor(8).identity().clone();
+        let (_, descriptor) = core_controller_descriptors(identity)
+            .unwrap()
+            .into_iter()
+            .find(|(registration, _)| registration.handler() == crate::CoreHandlerKind::Provider)
+            .unwrap();
+        let (pending_provider, pending_process) = provider_fixture(false);
+        let provider_key = pending_provider.key().clone();
+        let api = TestRegisteredApi::new(
+            InitialList {
+                resources: vec![InitialResource::new(
+                    provider_key.clone(),
+                    pending_provider.revision(),
+                )],
+                snapshot_revision: pending_provider.revision(),
+            },
+            BTreeMap::from([(
+                provider_key.clone(),
+                FreshSnapshot::Present {
+                    target: pending_provider,
+                    dependencies: vec![pending_process],
+                },
+            )]),
+        );
+        let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
+        let runner = tokio::spawn(
+            Runner::new(
+                CoreResourceReconciler::for_handler(
+                    descriptor,
+                    crate::CoreHandlerKind::Provider,
+                ),
+                Arc::clone(&source),
+                RunnerConfig {
+                    policy_revision: 1,
+                    api_revision: 1,
+                    configuration_revision: ConfigurationGeneration::new(1).unwrap(),
+                    deadline_tick: 5_000,
+                    max_attempts: 1,
+                },
+            )
+            .run(),
+        );
+        api.wait_for_checkpoint_calls(1).await;
+        let (ready_provider, ready_process) = provider_fixture(true);
+        let ready_provider = ResourceSnapshot::new(
+            provider_key.clone(),
+            ZoneRevision::new(5),
+            ready_provider.generation(),
+            ready_provider.canonical_json().to_vec(),
+            false,
+        );
+        let ready_process = DependencySnapshot::new(
+            ResourceSnapshot::new(
+                ready_process.resource().key().clone(),
+                ZoneRevision::new(5),
+                ready_process.resource().generation(),
+                ready_process.resource().canonical_json().to_vec(),
+                false,
+            )
+            .with_owner_identity(
+                Some(ready_provider.key().uid().clone()),
+                Some(ready_provider.generation()),
+            ),
+        );
+        api.snapshots
+            .lock()
+            .unwrap()
+            .insert(
+                provider_key.clone(),
+                FreshSnapshot::Present {
+                    target: ready_provider,
+                    dependencies: vec![ready_process],
+                },
+            );
+        source
+            .dispatch_change(
+                controller_key(),
+                change(
+                    provider_key,
+                    5,
+                    BTreeSet::from([CoreTriggerReason::OwnedResourceChanged]),
+                ),
+                operation("provider-ready"),
+            )
+            .unwrap();
+        api.wait_for_checkpoint_calls(2).await;
+        source.close_watch().unwrap();
+        runner.await.unwrap().unwrap();
+        let committed = api.committed_results();
+        assert_eq!(committed.len(), 2);
+        let pending_status: serde_json::Value =
+            serde_json::from_slice(committed[0].status_candidate().unwrap()).unwrap();
+        let ready_status: serde_json::Value =
+            serde_json::from_slice(committed[1].status_candidate().unwrap()).unwrap();
+        assert_eq!(pending_status["phase"], "Pending");
+        assert_eq!(ready_status["phase"], "Ready");
+        assert_eq!(ready_status["observedGeneration"], 2);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn durable_core_change_wakes_toolkit_queue_and_reconciles() {
         let target = key("app", 1);
@@ -904,6 +2406,24 @@ mod tests {
                 backpressure: 0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn declared_observation_wakeup_bypasses_convergence_suppression() {
+        let target = key("observed", 9);
+        let descriptor = descriptor(2);
+        let (_api, source) = source_with_snapshot(&descriptor, &target, 2);
+
+        assert_eq!(
+            source
+                .dispatch_observation(target, ZoneRevision::new(2))
+                .unwrap(),
+            CoreDispatchOutcome::Admitted
+        );
+        let WatchEvent::Hint(hint) = source.receive_watch().await.unwrap() else {
+            panic!("observation wakeup returned an unexpected event");
+        };
+        assert!(hint.reasons().contains(TriggerReason::ScheduledObserve));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1029,6 +2549,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn core_watch_backpressure_retains_the_unadmitted_change() {
+        let descriptor = descriptor(1);
+        let first = key("stream-first", 6);
+        let second = key("stream-second", 7);
+        let api = TestRegisteredApi::new(
+            InitialList {
+                resources: Vec::new(),
+                snapshot_revision: ZoneRevision::new(1),
+            },
+            BTreeMap::new(),
+        );
+        api.enable_watch_stream(Vec::new());
+        let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
+        source
+            .open_watch(&descriptor, ZoneRevision::new(1))
+            .await
+            .unwrap();
+
+        let waiting_source = Arc::clone(&source);
+        let pending = tokio::spawn(async move { waiting_source.receive_watch().await });
+        api.watch_receive_started.notified().await;
+        source.dispatch_change(
+            controller_key(),
+            change(
+                first.clone(),
+                2,
+                BTreeSet::from([CoreTriggerReason::SpecGenerationChanged]),
+            ),
+            operation("stream-first"),
+        )
+        .unwrap();
+        api.push_watch_change(Ok(Some((
+            change(
+                second.clone(),
+                3,
+                BTreeSet::from([CoreTriggerReason::DeletionRequested]),
+            ),
+            operation("stream-second"),
+        ))));
+        assert_eq!(
+            pending.await.unwrap(),
+            Err(WatchFailure::Backpressure)
+        );
+        let WatchEvent::Hint(first_hint) = source.receive_watch().await.unwrap() else {
+            panic!("the admitted stream change must remain available");
+        };
+        assert_eq!(first_hint.key(), &first);
+        let WatchEvent::Hint(second_hint) = source.receive_watch().await.unwrap() else {
+            panic!("the backpressured stream change must be retried");
+        };
+        assert_eq!(second_hint.key(), &second);
+        assert_eq!(second_hint.revision(), ZoneRevision::new(3));
+    }
+
+    #[tokio::test]
     async fn test_persistence_is_revision_idempotent_and_retention_bounded() {
         let api = TestRegisteredApi::new(
             InitialList {
@@ -1058,4 +2633,226 @@ mod tests {
         assert_eq!(outcomes[0].1, ZoneRevision::new(3));
         assert_eq!(outcomes[1].1, ZoneRevision::new(4));
     }
+
+    #[test]
+    fn core_controller_catalog_covers_every_fixed_resource_owner() {
+        let identity = descriptor(8).identity().clone();
+        let registrations =
+            core_controller_descriptors(identity).expect("fixed Core descriptors are valid");
+        let resource_types = registrations
+            .iter()
+            .map(|(_, descriptor)| {
+                descriptor
+                    .resource_types()
+                    .next()
+                    .expect("each Core descriptor owns one ResourceType")
+                    .as_str()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resource_types,
+            vec![
+                "Zone",
+                "ZoneLink",
+                "Provider",
+                "Role",
+                "RoleBinding",
+                "Quota",
+                "EmergencyPolicy",
+                "ResourceExport",
+                "ResourceImport",
+            ]
+        );
+        assert!(
+            registrations
+                .iter()
+                .all(|(_, descriptor)| descriptor.watch_selectors().len() == 5)
+        );
+        let provider_descriptor = registrations
+            .iter()
+            .find(|(registration, _)| registration.handler() == crate::CoreHandlerKind::Provider)
+            .map(|(_, descriptor)| descriptor)
+            .expect("Provider Core descriptor");
+        assert!(provider_descriptor.dependency_selectors().is_empty());
+        assert!(provider_descriptor.consumes_owner_triggers());
+        let mut finalizers = registrations
+            .iter()
+            .filter_map(|(_, descriptor)| descriptor.finalizers().first())
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        finalizers.sort_unstable();
+        assert_eq!(
+            finalizers,
+            vec![
+                "core.emergency-drain",
+                "core.provider-api-binding",
+                "core.quota-drain",
+                "core.resource-export-drain",
+                "core.resource-import-drain",
+                "core.role-binding-drain",
+                "core.zone-link-drain",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn core_finalize_removes_one_exact_finalizer_for_every_owner() {
+        let identity = descriptor(8).identity().clone();
+        let descriptors =
+            core_controller_descriptors(identity).expect("fixed Core descriptors are valid");
+        let mut finalizer_count = 0;
+        for (index, (registration, descriptor)) in descriptors.into_iter().enumerate() {
+            let Some(finalizer) = registration.finalizer() else {
+                continue;
+            };
+            finalizer_count += 1;
+            assert_eq!(descriptor.finalizers(), &[finalizer.to_owned()]);
+            let key = ResourceKey::new(
+                ZoneId::parse("work").unwrap(),
+                ResourceRef::parse(&format!("{}/deleting-{index}", registration.resource_type()))
+                    .unwrap(),
+                ResourceUid::parse(format!(
+                    "123e4567-e89b-42d3-a456-{index:012}"
+                ))
+                .unwrap(),
+            );
+            let resource = ResourceSnapshot::new(
+                key.clone(),
+                ZoneRevision::new(4),
+                ResourceGeneration::new(2).unwrap(),
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata": {
+                        "finalizers": [finalizer, "foreign.finalizer"]
+                    },
+                    "status": {}
+                }))
+                .unwrap(),
+                true,
+            );
+            let api = TestRegisteredApi::new(
+                InitialList {
+                    resources: vec![InitialResource::new(key.clone(), resource.revision())],
+                    snapshot_revision: resource.revision(),
+                },
+                BTreeMap::from([(
+                    key,
+                    FreshSnapshot::Present {
+                        target: resource,
+                        dependencies: Vec::new(),
+                    },
+                )]),
+            );
+            let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
+            let task = tokio::spawn(
+                Runner::new(
+                    CoreResourceReconciler::for_handler(descriptor, registration.handler()),
+                    Arc::clone(&source),
+                    RunnerConfig {
+                        policy_revision: 1,
+                        api_revision: 1,
+                        configuration_revision: ConfigurationGeneration::new(1).unwrap(),
+                        deadline_tick: 5_000,
+                        max_attempts: 1,
+                    },
+                )
+                .run(),
+            );
+            api.wait_for_checkpoint_calls(1).await;
+            source.close_watch().unwrap();
+            let report = task.await.unwrap().unwrap();
+            assert_eq!(report.checkpointed, 1);
+            let result = api
+                .committed_results()
+                .into_iter()
+                .next()
+                .expect("finalizer removal was committed");
+            let mutation = result
+                .mutation_batch()
+                .expect("present Core finalizer requires one mutation")
+                .mutations()
+                .first()
+                .expect("finalizer mutation is present");
+            assert_eq!(mutation.kind(), MutationIntentKind::UpdateFinalizers);
+            assert!(
+                mutation.canonical_resource().is_none(),
+                "finalizer removal must use the typed delta path"
+            );
+        }
+        assert_eq!(finalizer_count, 7);
+    }
+
+    #[tokio::test]
+    async fn absent_or_empty_core_finalizer_is_already_cleared() {
+        let identity = descriptor(8).identity().clone();
+        let (registration, descriptor) = core_controller_descriptors(identity)
+            .unwrap()
+            .into_iter()
+            .find(|(registration, _)| registration.finalizer().is_some())
+            .unwrap();
+        for (index, finalizers) in [Vec::<&str>::new(), vec!["foreign.finalizer"]]
+            .into_iter()
+            .enumerate()
+        {
+            let key = ResourceKey::new(
+                ZoneId::parse("work").unwrap(),
+                ResourceRef::parse(&format!(
+                    "{}/already-cleared-{index}",
+                    registration.resource_type()
+                ))
+                .unwrap(),
+                ResourceUid::parse(format!(
+                    "123e4567-e89b-42d3-a456-{:012}",
+                    index + 100
+                ))
+                .unwrap(),
+            );
+            let resource = ResourceSnapshot::new(
+                key.clone(),
+                ZoneRevision::new(4),
+                ResourceGeneration::new(2).unwrap(),
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata": {"finalizers": finalizers},
+                    "status": {}
+                }))
+                .unwrap(),
+                true,
+            );
+            let api = TestRegisteredApi::new(
+                InitialList {
+                    resources: vec![InitialResource::new(key.clone(), resource.revision())],
+                    snapshot_revision: resource.revision(),
+                },
+                BTreeMap::from([(
+                    key,
+                    FreshSnapshot::Present {
+                        target: resource,
+                        dependencies: Vec::new(),
+                    },
+                )]),
+            );
+            let source = CoreControllerSource::new(descriptor.clone(), api);
+            let task = tokio::spawn(
+                Runner::new(
+                    CoreResourceReconciler::for_handler(descriptor.clone(), registration.handler()),
+                    Arc::clone(&source),
+                    RunnerConfig {
+                        policy_revision: 1,
+                        api_revision: 1,
+                        configuration_revision: ConfigurationGeneration::new(1).unwrap(),
+                        deadline_tick: 5_000,
+                        max_attempts: 1,
+                    },
+                )
+                .run(),
+            );
+            source.close_watch().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
+
 }

@@ -74,6 +74,53 @@ pub enum AzureVmPhase {
     Finalized,
 }
 
+/// Default descriptor repair interval.
+pub const AZURE_VM_REPAIR_INTERVAL_SECS: u64 = 30;
+/// Exact Guest finalizer owned by the Azure VM runtime Provider.
+pub const AZURE_VM_GUEST_FINALIZER: &str =
+    "runtime-azure-virtual-machine.d2bus.org/guest-cleanup";
+
+/// The shared-Runner contract for the Azure VM Guest owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AzureVirtualMachineRunnerContract {
+    resource_type: &'static str,
+    finalizer: &'static str,
+    repair_interval_secs: u64,
+    watched_configuration_is_dependency: bool,
+}
+
+impl AzureVirtualMachineRunnerContract {
+    /// Return the owned ResourceType.
+    pub const fn resource_type(self) -> &'static str {
+        self.resource_type
+    }
+
+    /// Return the exact Guest finalizer.
+    pub const fn finalizer(self) -> &'static str {
+        self.finalizer
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Whether watched configuration is treated as a dependency.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+}
+
+/// Return the shared-Runner contract for Azure VM Guests.
+pub const fn azure_virtual_machine_runner_contract() -> AzureVirtualMachineRunnerContract {
+    AzureVirtualMachineRunnerContract {
+        resource_type: "Guest",
+        finalizer: AZURE_VM_GUEST_FINALIZER,
+        repair_interval_secs: AZURE_VM_REPAIR_INTERVAL_SECS,
+        watched_configuration_is_dependency: true,
+    }
+}
+
 /// Non-blocking controller result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AzureVmReconcileOutcome {

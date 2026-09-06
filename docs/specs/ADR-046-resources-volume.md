@@ -525,7 +525,7 @@ and one worker Process binary (virtiofsd itself).
    one stable `Endpoint` exist, both owned by the Export.
 3. On Export create/repair, it emits `Create` or `UpdateSpec` for those children.
 4. On Export delete, it deletes the children, confirms guest-mount absence, and
-   clears only its `volume-virtiofs/export` finalizer.
+   clears only its `volume-virtiofs.d2bus.org/export` finalizer.
 5. volume-virtiofs writes Export status. volume-local alone reads those statuses
    and writes the aggregated Volume `attachmentStatuses`.
 
@@ -869,11 +869,11 @@ ownerRef). Unrelated consumers use ordinary `volumeRef` without ownership.
 
 ### Finalizers
 
-volume-local adds finalizer `volume-local/layout` when any layout entry has
+volume-local adds finalizer `volume-local.d2bus.org/layout` when any layout entry has
 `cleanupPolicy != never`. It is cleared after cleanup completes or is skipped.
 
 volume-local adds `volume-local/virtiofs-attachments` to the Volume while any
-owned Export exists. volume-virtiofs adds `volume-virtiofs/export` only to each
+owned Export exists. volume-virtiofs adds `volume-virtiofs.d2bus.org/export` only to each
 Export; it clears that finalizer after the Export-owned Process and Endpoint are
 deleted and the guest mount is confirmed absent. Once every Export is deleted,
 volume-local clears the Volume attachment finalizer.
@@ -1014,7 +1014,7 @@ store's own authority over layout/attachment status.
 | Broker ops (dispatched via `VolumeLayoutEffectPort`/ProviderSupervisor, never called by the Provider process itself) | `ProvisionLayoutEntry`, `RepairLayoutEntry`, `CleanupLayoutEntry`, `StoreSyncComplete`, `PrepareSwtpmDir` |
 | State | Volume's own layout root; per-Volume provisioning marker for `state` kind |
 | Permissions | `volume-local/source-policy-resolve` (authorizes only a `VolumeSourceEffectPort` FD resolution call); never ambient path access; never a broker import in the Provider process |
-| Finalizers | `volume-local/layout` |
+| Finalizers | `volume-local.d2bus.org/layout` |
 | Supported Host capabilities | Local NixOS Host; bare-metal; ACA if filesystem is accessible |
 | Supported Guest capabilities | Not applicable (volume-local does not attach to Guests) |
 | Required crate layout | `src/` (controller, broker op adapters, layout engine, store_view.rs, swtpm_volume.rs, colocated unit tests); `tests/` (hermetic: layout provision/repair/cleanup/adopt, store-view invariants, ACL reconciliation, swtpm fail-closed, quota enforcement, block-image lifecycle, tmpfs mount/unmount, symlink target validation, foreignChildPolicy preserve/fail); `integration/` (container fixtures: Host path access, store-view FS boundary enforcement, quota FS fixture, swtpm marker, block-image virtio-blk attachment); `README.md` (identity, allowedHostPaths config schema, owned ResourceTypes, broker op catalogue, placement, deps/RBAC, security invariants, state/telemetry, build/test/integration commands) |
@@ -1064,7 +1064,7 @@ volume-local controller reconcile flow:
 | Broker ops (dispatched via `ProcessLaunchEffectPort`/`VolumeSourceEffectPort`/ProviderSupervisor, never called by the Provider process itself) | `SpawnRunner` (virtiofsd), `VirtiofsdLaunch`, `ProvideFdToWorker` |
 | State | Per-attachment virtiofsd export socket (boot-scoped; path is a private implementation detail of volume-virtiofs; never exposed in spec/status/API) |
 | Permissions | `volume-virtiofs/spawn-virtiofsd` (authorizes only a `ProcessLaunchEffectPort` call); receives source Volume FD from volume-local via ProviderSupervisor, never a direct cross-Provider or broker call |
-| Finalizers | `volume-virtiofs/export` on Export only |
+| Finalizers | `volume-virtiofs.d2bus.org/export` on Export only |
 | Required crate layout | `src/` (Export controller, virtiofsd argv generation, Export lifecycle, socket readiness, ADR 0021 semantic conformance validation, colocated unit tests); `tests/` (hermetic: argv golden/pinned vectors, ADR 0021 invariant rejection, Export create/ready/delete lifecycle, read-only flag per access mode, multi-Export isolation, socket path never-in-status invariant, no Volume mutation); `integration/` (container fixtures: virtiofsd launch, guest-mount readiness, Export finalizer drain under Guest restart); `README.md` (identity, virtiofsd argv options, owned ResourceTypes, ADR 0021 invariant summary, socket path privacy contract, placement, deps/RBAC, security invariants, state/telemetry, build/test/integration commands) |
 
 virtiofsd argv shape (baseline: `packages/d2b-host/src/virtiofsd_argv.rs`):
@@ -1553,7 +1553,7 @@ When a Volume is absent from the new Nix generation but its resource row carries
    the corresponding aggregated attachment status `detaching`.
 4. For each Export, volume-virtiofs deletes the Export-owned virtiofsd Process
    and Endpoint, confirms guest-mount absence, clears
-   `volume-virtiofs/export`, and allows the Export row to be deleted.
+   `volume-virtiofs.d2bus.org/export`, and allows the Export row to be deleted.
 5. After every Export is gone, volume-local clears
    `volume-local/virtiofs-attachments` and executes layout cleanup per each
    entry's `cleanupPolicy`. Entries with `cleanupPolicy: never` are preserved.
@@ -1713,7 +1713,7 @@ audit record.
 | Current source | `packages/d2b-host/src/virtiofsd_argv.rs` (`VirtiofsdArgvInput`, `generate_virtiofsd_argv`), `nixos-modules/minijail-profiles.nix` (virtiofsdProfiles; principals `d2b-<vm>-runner`, `d2b-<vm>-gctlfs`), `nixos-modules/processes-json.nix` (virtiofsdRunner shape; `roStoreSharedDir` sentinel), `packages/d2b-core/src/processes.rs` (`ProcessRole::Virtiofsd`, `VmProcessDag`; the virtiofsd dag node is a `ProcessRole::Virtiofsd` entry in a WorkloadId-keyed `VmProcessDag`), `packages/d2b-priv-broker/src/ops/spawn_runner.rs` (`SpawnRunnerPlan` for virtiofsd; current `SpawnRunnerPlanInput` carries `adr_carve_out` for virtiofsd swtpm path), `packages/d2b-priv-broker/src/sys.rs` (clone3/user-NS pre-establishment), ADR 0021 |
 | Reuse action | adapt |
 | Destination | `packages/d2b-provider-volume-virtiofs/src/` (controller, virtiofsd_argv.rs); `packages/d2b-provider-volume-virtiofs/tests/` (hermetic argv/lifecycle/ADR-0021 tests); `packages/d2b-provider-volume-virtiofs/integration/` (virtiofsd launch and guest-mount fixtures); `packages/d2b-provider-volume-virtiofs/README.md` |
-| Detailed design | volume-virtiofs controller owns `virtiofs.d2bus.org.Export` lifecycle and status, reads the referenced Volume without mutation, and creates/updates/deletes the Export-owned virtiofsd Process and Endpoint; argv generation reuses the current 14 tests; ADR 0021 invariant (`capabilityClasses: []`, `startRoot: false`, `sandbox: chroot`, user-NS via `userNamespace.mappingClass: process-principal-root`); per-Export socket readiness check (`unix-socket-exists` readiness kind; current v2 socket path: `/run/d2b/vms/<vm>/<vm>-virtiofs-<tag>.sock`; v3: stable hash-derived private path under Zone runtime directory, never exposed in spec/status/API); guest-mount status observation; `volume-virtiofs/export` finalizer drain. volume-local remains the sole Volume writer and translates Volume attachments to Exports. Primary reuse disposition: `adapt`. Preserved source-plan detail: extract and adapt. |
+| Detailed design | volume-virtiofs controller owns `virtiofs.d2bus.org.Export` lifecycle and status, reads the referenced Volume without mutation, and creates/updates/deletes the Export-owned virtiofsd Process and Endpoint; argv generation reuses the current 14 tests; ADR 0021 invariant (`capabilityClasses: []`, `startRoot: false`, `sandbox: chroot`, user-NS via `userNamespace.mappingClass: process-principal-root`); per-Export socket readiness check (`unix-socket-exists` readiness kind; current v2 socket path: `/run/d2b/vms/<vm>/<vm>-virtiofs-<tag>.sock`; v3: stable hash-derived private path under Zone runtime directory, never exposed in spec/status/API); guest-mount status observation; `volume-virtiofs.d2bus.org/export` finalizer drain. volume-local remains the sole Volume writer and translates Volume attachments to Exports. Primary reuse disposition: `adapt`. Preserved source-plan detail: extract and adapt. |
 | Integration | volume-virtiofs registered under Host; volume-local creates one Export per virtiofs attachment; virtiofsd Process and Endpoint resources are owned by the Export; guest-control health integration feeds Export status, which volume-local aggregates into Volume status |
 | Data migration | Current `processes-json.nix` virtiofsd `VmProcessDag` nodes (keyed by `WorkloadId` = current VM name, role `ProcessRole::Virtiofsd`) are replaced by Export-owned virtiofsd Process resources |
 | Validation | Migrated `virtiofsd_argv` unit tests (14 tests); `tests/tools/gen-migration-ledger.sh` virtiofsd-argv-shape gate adapted; `minijail-validator-virtiofsd` gate adapted to Process sandbox spec; new: attachment lifecycle (create/ready/delete), ADR 0021 invariant rejection test, multi-attachment isolation, readOnly flag per access mode, store-view shared-dir = store-view/live (never /nix/store) |

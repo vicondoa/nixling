@@ -472,3 +472,26 @@ fn ready_audio_service_without_an_authored_binding_has_no_children() {
         d2b_provider_audio_pipewire::AudioControllerError::Admission
     );
 }
+
+#[test]
+fn audio_runner_contract_keeps_service_and_binding_on_one_cutover() {
+    let contract = d2b_provider_audio_pipewire::audio_runner_contract();
+    assert_eq!(
+        contract.service_resource_type(),
+        "audio.d2bus.org.AudioService"
+    );
+    assert_eq!(
+        contract.binding_resource_type(),
+        "audio.d2bus.org.AudioBinding"
+    );
+    assert_eq!(
+        contract.service_finalizer(),
+        "audio.d2bus.org/service-finalizer"
+    );
+    assert_eq!(
+        contract.binding_finalizer(),
+        "audio.d2bus.org/cleanup"
+    );
+    assert_eq!(contract.repair_interval_secs(), 300);
+    assert!(contract.watched_configuration_is_dependency());
+}

@@ -31,6 +31,8 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+#[cfg(feature = "test-support")]
+use std::os::fd::AsRawFd;
 use tokio::io::unix::AsyncFd;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +84,7 @@ impl AncillaryCapacity {
 }
 
 pub struct OutboundPacket {
-    payload: Vec<u8>,
+    payload: zeroize::Zeroizing<Vec<u8>>,
     files: Vec<Arc<OwnedFd>>,
     credentials: Option<PeerCredentials>,
     credits: CreditBundle,
@@ -124,7 +126,7 @@ impl OutboundPacket {
             .reserve(file_count)
             .map_err(|_| UnixSessionError::CreditExceeded)?;
         Ok(Self {
-            payload,
+            payload: zeroize::Zeroizing::new(payload),
             files,
             credentials,
             credits,
@@ -355,6 +357,38 @@ pub fn prearmed_seqpacket_pair() -> Result<(OwnedFd, OwnedFd), UnixSessionError>
     verify_parent_prearmed(&left)?;
     verify_parent_prearmed(&right)?;
     Ok((left, right))
+}
+
+/// Duplicate one descriptor to the fixed inherited fd used by subprocess
+/// tests. The returned owner keeps the descriptor open until the child has
+/// been spawned.
+#[cfg(feature = "test-support")]
+pub fn duplicate_to_inherited_fd(
+    source: impl AsFd,
+    target: RawFd,
+) -> Result<OwnedFd, UnixSessionError> {
+    if target < 0 || source.as_fd().as_raw_fd() == target {
+        return Err(UnixSessionError::InvalidSocket);
+    }
+    let _ = nix::unistd::close(target);
+    let mut fillers = Vec::new();
+    loop {
+        let file = std::fs::File::open("/dev/null").map_err(io_error)?;
+        if file.as_raw_fd() > target {
+            return Err(UnixSessionError::InvalidSocket);
+        }
+        if file.as_raw_fd() == target {
+            let duplicated: OwnedFd = file.into();
+            nix::unistd::dup2(source.as_fd().as_raw_fd(), duplicated.as_raw_fd()).map_err(|error| {
+                UnixSessionError::Io {
+                    errno: Some(error as i32),
+                }
+            })?;
+            rustix::io::fcntl_setfd(&duplicated, FdFlags::empty()).map_err(io_error)?;
+            return Ok(duplicated);
+        }
+        fillers.push(file);
+    }
 }
 
 fn verify_parent_prearmed(fd: impl AsFd) -> Result<(), UnixSessionError> {

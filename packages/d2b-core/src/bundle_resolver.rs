@@ -2330,6 +2330,29 @@ impl BundleResolver {
         matches.next().is_none().then_some(first)
     }
 
+    /// Find the unique dynamic Provider component template for one execution
+    /// target. The controller-created Process name is intentionally not part
+    /// of this lookup.
+    pub fn find_provider_component_intent_for_template(
+        &self,
+        execution_ref: &str,
+        execution_domain: ProcessExecutionDomain,
+        user_ref: Option<&str>,
+        template: &str,
+        owner_ref: Option<&str>,
+    ) -> Option<&ResolvedRunnerIntent> {
+        let mut matches = self.runner_intents.values().filter(|intent| {
+            intent.role == ProcessRole::ProviderController
+                && intent.execution_ref == execution_ref
+                && intent.execution_domain == execution_domain
+                && intent.user_ref.as_deref() == user_ref
+                && owner_ref.is_none_or(|owner| intent.owner_ref.as_deref() == Some(owner))
+                && intent.profile_id == template
+        });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
     pub fn find_socket_intent(&self, id: &str) -> Option<&ResolvedSocketIntent> {
         self.socket_intents.get(id)
     }

@@ -31,14 +31,6 @@ rust_test(
 )
 
 rust_test(
-    name = "scaffold",
-    srcs = ["tests/scaffold.rs"],
-    compile_data = ["Cargo.toml"],
-    visibility = ["//visibility:public"],
-)
-
-
-rust_test(
     name = "audit_telemetry",
     srcs = [
         "tests/audit_telemetry.rs",
@@ -140,7 +132,7 @@ rust_test(
     name = "qemu_media_integration",
     srcs = [
         "integration/mod.rs",
-        "integration/scaffold.rs",
+        "integration/fixture.rs",
     ],
     compile_data = ["Cargo.toml"],
     crate_root = "integration/mod.rs",

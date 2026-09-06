@@ -3,11 +3,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
+    future::Future,
     io::{self, Read},
     os::unix::fs::FileTypeExt,
     path::Path,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::resource_api::{ParsedListRequest, ResourceRuntimeError};
@@ -25,18 +26,18 @@ use d2b_contracts_resource::v3::identity::{
     TransportBinding,
 };
 use d2b_contracts_resource::v3::{
-    CanonicalJsonValue, ConfigurationGeneration, ControllerGeneration, MAX_PAGE_CURSOR_BYTES,
-    MAX_RESPONSE_CANONICAL_BYTES, ManagedBy, ResourceEnvelope, ResourceError, ResourceErrorKind,
-    ResourceErrorReason, ResourceGeneration, ResourceName, ResourcePhase, ResourceRef,
-    ResourceTypeName, ResourceUid, RetryClass, SchemaFingerprint, Timestamp, ZoneId, ZoneRevision,
-    host::HOST_PROVIDER_REF, user::UserSpec,
+    CanonicalJsonObject, CanonicalJsonValue, ConfigurationGeneration, ControllerGeneration,
+    MAX_PAGE_CURSOR_BYTES, MAX_RESPONSE_CANONICAL_BYTES, ManagedBy, ResourceEnvelope,
+    ResourceError, ResourceErrorKind, ResourceErrorReason, ResourceGeneration, ResourceName,
+    ResourcePhase, ResourceRef, ResourceTypeName, ResourceUid, RetryClass, SchemaFingerprint,
+    Timestamp, ZoneId, ZoneRevision, host::HOST_PROVIDER_REF, user::UserSpec,
 };
 pub use d2b_contracts_resource::v3::{
     RESOURCE_BUNDLE_MATERIALIZATION_OPERATION_PREFIX, SYSTEM_CORE_BOOTSTRAP_ZONE_OPERATION_ID,
 };
 use d2b_contracts_zone_session::v3::{
     component_session::{EndpointPolicy, EndpointRole},
-    resource_bundle::ResourceBundle,
+    resource_bundle::{BundleResource, BundleResourceMetadata, ResourceBundle},
     role::RoleSpec,
     role_binding::RoleBindingSpec,
     zone::validate_self_resource,
@@ -49,12 +50,148 @@ use d2b_core_controller::{
         CoreProcess, RecoverySnapshot, RuntimeReadiness as CoreRuntimeReadiness, StartupError,
         StartupStage,
     },
+    SourceError,
     zone_status::ZoneRuntimeMetadata,
 };
 
 /// Provider-neutral Core assignment registry shared by Resource API and bus
 /// admission for one Zone runtime.
 pub type AssignmentRegistry = Arc<Mutex<ControllerAssignmentRegistry>>;
+
+const TRANSIENT_STORE_READ_ATTEMPTS: usize = 4;
+const TRANSIENT_STORE_READ_BUDGET: Duration = Duration::from_secs(1);
+const TRANSIENT_STORE_LIST_BUDGET: Duration = Duration::from_secs(4);
+const TRANSIENT_STORE_READ_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(5),
+    Duration::from_millis(20),
+    Duration::from_millis(80),
+];
+
+/// Retry only transient redb read pressure while preserving the original
+/// typed store error for the caller's final mapping.
+pub async fn retry_transient_store_read<T, F, Fut>(
+    zone: &ZoneId,
+    operation: &str,
+    mut read: F,
+) -> Result<T, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    retry_transient_store_read_with_budget(
+        zone,
+        operation,
+        &mut read,
+        TRANSIENT_STORE_READ_BUDGET,
+    )
+    .await
+}
+
+/// Retry a bounded list page with enough budget for redb's one-second
+/// transaction lifetime before a subsequent attempt.
+pub async fn retry_transient_store_list<T, F, Fut>(
+    zone: &ZoneId,
+    operation: &str,
+    mut read: F,
+) -> Result<T, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    retry_transient_store_read_with_budget(
+        zone,
+        operation,
+        &mut read,
+        TRANSIENT_STORE_LIST_BUDGET,
+    )
+    .await
+}
+
+async fn retry_transient_store_read_with_budget<T, F, Fut>(
+    zone: &ZoneId,
+    operation: &str,
+    read: &mut F,
+    budget: Duration,
+) -> Result<T, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    for attempt in 1..=TRANSIENT_STORE_READ_ATTEMPTS {
+        match read().await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    StoreErrorKind::Backpressure
+                        | StoreErrorKind::StoreBackpressure
+                        | StoreErrorKind::Timeout
+                ) && attempt < TRANSIENT_STORE_READ_ATTEMPTS =>
+            {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    tracing::error!(
+                        zone = %zone.as_str(),
+                        operation,
+                        attempt,
+                        max_attempts = TRANSIENT_STORE_READ_ATTEMPTS,
+                        store_error_kind = ?error.kind(),
+                        reason_code = error.reason_code(),
+                        "store read retry budget expired; returning last typed error",
+                    );
+                    return Err(error);
+                }
+                let backoff = TRANSIENT_STORE_READ_BACKOFF[attempt - 1].min(remaining);
+                tracing::warn!(
+                    zone = %zone.as_str(),
+                    operation,
+                    attempt,
+                    max_attempts = TRANSIENT_STORE_READ_ATTEMPTS,
+                    store_error_kind = ?error.kind(),
+                    reason_code = error.reason_code(),
+                    backoff_ms = backoff.as_millis(),
+                    "transient store read pressure; retrying after bounded backoff",
+                );
+                tokio::time::sleep(backoff).await;
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::error!(
+                        zone = %zone.as_str(),
+                        operation,
+                        attempt,
+                        max_attempts = TRANSIENT_STORE_READ_ATTEMPTS,
+                        store_error_kind = ?error.kind(),
+                        reason_code = error.reason_code(),
+                        "store read retry budget expired; returning last typed error",
+                    );
+                    return Err(error);
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    zone = %zone.as_str(),
+                    operation,
+                    attempt,
+                    max_attempts = TRANSIENT_STORE_READ_ATTEMPTS,
+                    store_error_kind = ?error.kind(),
+                    reason_code = error.reason_code(),
+                    "store read failed after bounded transient retries",
+                );
+                return Err(error);
+            }
+        }
+    }
+    unreachable!("startup store retry loop always returns")
+}
+
+/// Fixed Provider identities required by the generated Process resources.
+///
+/// These rows are runtime-owned bootstrap materialization, not Nix-authored
+/// declarations. Their durable UIDs and generations come from the Resource
+/// API store while the materialization operation remains bound to the
+/// verified bundle and active configuration generation.
+pub const FIXED_BOOTSTRAP_PROVIDER_IDS: [&str; 3] =
+    ["system-core", "system-minijail", "system-systemd"];
 
 /// Construct one empty Zone assignment registry.
 pub fn new_assignment_registry() -> AssignmentRegistry {
@@ -103,11 +240,12 @@ use d2b_resource_api::{
         CompiledRoleBinding, NativeAuthorizer, PolicyRule, PolicySet, RelayGrantAuthority,
         ResourceVerb, SessionVerb,
     },
+    registered::RedbRegisteredControllerApi,
     service::UnavailableUpgradeDispatcher,
 };
 use d2b_resource_store::{
-    PolicySnapshot, StoreListRequest, StoreListResult, StoreOperationContext, StoreProjection,
-    StoreSlot, StoredResource,
+    PolicySnapshot, StoreError, StoreErrorKind, StoreListRequest, StoreListResult,
+    StoreOperationContext, StoreProjection, StoreSlot, StoredResource,
 };
 use d2b_resource_store_redb::{RedbResourceStore, StoreIdentity, StoreRuntimeMetadata};
 use d2b_session::{
@@ -700,6 +838,7 @@ pub async fn register_system_core_session(
         BusIngress,
         tokio::task::JoinHandle<Result<(), SessionServerError>>,
         Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+        AuthenticatedSubjectContext,
     ),
     ResourceRuntimeError,
 > {
@@ -752,15 +891,13 @@ pub async fn register_system_core_session(
         .snapshot
         .controller_generation
         .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+    let subject_context = candidate
+        .route_binding()
+        .context()
+        .clone()
+        .with_controller_generation(controller_generation);
     let subject = authorizer
-        .issue_authenticated_subject(
-            candidate
-                .route_binding()
-                .context()
-                .clone()
-                .with_controller_generation(controller_generation),
-            authz_state,
-        )
+        .issue_authenticated_subject(subject_context.clone(), authz_state.clone())
         .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
     let service = Arc::new(
         ResourceBusAdapter::bind_component_session(api, subject)
@@ -776,7 +913,7 @@ pub async fn register_system_core_session(
         Arc::new(responder.into_driver()),
         services,
     ));
-    Ok((ingress, service_task, status_client))
+    Ok((ingress, service_task, status_client, subject_context))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -990,8 +1127,7 @@ pub async fn resolve_zone_user(
     let mut resources = Vec::new();
     let mut cursor = None;
     loop {
-        let page = store
-            .list(StoreListRequest {
+        let request = StoreListRequest {
                 operation: StoreOperationContext {
                     operation_id: operation_id.to_owned(),
                     idempotency_key: None,
@@ -1004,10 +1140,13 @@ pub async fn resolve_zone_user(
                 resource_names: Vec::new(),
                 filters: Vec::new(),
                 page_size: 500,
-                cursor,
+                cursor: cursor.clone(),
                 projection: StoreProjection::Full,
-            })
-            .await
+            };
+        let page = retry_transient_store_list(zone, operation_id, || {
+            store.list(request.clone())
+        })
+        .await
             .map_err(|_| ResourceRuntimeError::IdentityUnbound)?;
         resources.extend(page.resources);
         cursor = page.next_cursor;
@@ -1045,8 +1184,7 @@ pub async fn load_committed_policy_resources(
     for resource_type in resource_types {
         let mut cursor = None;
         loop {
-            let page = store
-                .list(StoreListRequest {
+            let request = StoreListRequest {
                     operation: StoreOperationContext {
                         operation_id: operation_id.to_owned(),
                         idempotency_key: None,
@@ -1059,10 +1197,13 @@ pub async fn load_committed_policy_resources(
                     resource_names: Vec::new(),
                     filters: Vec::new(),
                     page_size: 500,
-                    cursor,
+                    cursor: cursor.clone(),
                     projection: StoreProjection::Full,
-                })
-                .await
+                };
+            let page = retry_transient_store_list(zone, operation_id, || {
+                store.list(request.clone())
+            })
+            .await
                 .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
             resources.extend(page.resources);
             cursor = page.next_cursor;
@@ -1234,8 +1375,7 @@ pub async fn ensure_bootstrap_host_resource(
 ) -> Result<(), ResourceRuntimeError> {
     let host_type =
         ResourceTypeName::parse("Host").map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-    let page = store
-        .list(StoreListRequest {
+    let request = StoreListRequest {
             operation: StoreOperationContext {
                 operation_id: "system-core-bootstrap-list-host".to_owned(),
                 idempotency_key: None,
@@ -1250,8 +1390,11 @@ pub async fn ensure_bootstrap_host_resource(
             page_size: 2,
             cursor: None,
             projection: StoreProjection::MetadataOnly,
-        })
-        .await
+        };
+    let page = retry_transient_store_list(zone, "system-core-bootstrap-list-host", || {
+        store.list(request.clone())
+    })
+    .await
         .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
     if !page.resources.is_empty() {
         return Ok(());
@@ -1404,8 +1547,7 @@ pub async fn ensure_bootstrap_zone_resource(
 ) -> Result<(), ResourceRuntimeError> {
     let zone_type =
         ResourceTypeName::parse("Zone").map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-    let page = store
-        .list(StoreListRequest {
+    let request = StoreListRequest {
             operation: StoreOperationContext {
                 operation_id: "system-core-bootstrap-list-zone".to_owned(),
                 idempotency_key: None,
@@ -1420,8 +1562,11 @@ pub async fn ensure_bootstrap_zone_resource(
             page_size: 2,
             cursor: None,
             projection: StoreProjection::Full,
-        })
-        .await
+        };
+    let page = retry_transient_store_list(zone, "system-core-bootstrap-list-zone", || {
+        store.list(request.clone())
+    })
+    .await
         .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
     if !page.resources.is_empty() {
         return validate_zone_self_resource_rows(zone, zone_uid, &page.resources);
@@ -1494,9 +1639,12 @@ pub async fn materialize_zone_resource_bundle(
     meta.correlation_id = operation_id;
     request.meta = protobuf::MessageField::some(meta);
     request.mutations = mutations;
-    let configuration_generation = store
-        .runtime_metadata()
-        .await
+    let configuration_generation = retry_transient_store_read(
+        zone,
+        "resource-bundle-materialization-metadata",
+        || store.runtime_metadata(),
+    )
+    .await
         .map_err(|_| ResourceRuntimeError::StoreReadFailed)?
         .policy_snapshot
         .active_configuration_revision;
@@ -1549,15 +1697,17 @@ async fn plan_zone_resource_bundle(
     if store.identity().zone() != zone || store.identity().zone_uid() != bundle_zone_uid {
         return Err(ResourceRuntimeError::HandlerNotReady);
     }
-    let metadata = store
-        .runtime_metadata()
-        .await
+    let metadata = retry_transient_store_read(
+        zone,
+        "resource-bundle-materialization-metadata",
+        || store.runtime_metadata(),
+    )
+    .await
         .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
     let mut existing = BTreeMap::new();
     let mut cursor = None;
     loop {
-        let page = store
-            .list(StoreListRequest {
+        let request = StoreListRequest {
                 operation: StoreOperationContext {
                     operation_id: "resource-bundle-materialization-list".to_owned(),
                     idempotency_key: None,
@@ -1570,10 +1720,13 @@ async fn plan_zone_resource_bundle(
                 resource_names: Vec::new(),
                 filters: Vec::new(),
                 page_size: 256,
-                cursor,
+                cursor: cursor.clone(),
                 projection: StoreProjection::Full,
-            })
-            .await
+            };
+        let page = retry_transient_store_list(zone, "resource-bundle-materialization-list", || {
+            store.list(request.clone())
+        })
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         for resource in page.resources {
             existing.insert(resource.resource_ref.clone(), resource);
@@ -1585,7 +1738,9 @@ async fn plan_zone_resource_bundle(
     }
     reject_stale_guest_network_rows(&existing, bundle)?;
 
+    let fixed_bootstrap_resources = fixed_bootstrap_provider_resources(zone, bundle)?;
     let mut pending = bundle.resources.iter().collect::<Vec<_>>();
+    pending.extend(fixed_bootstrap_resources.iter());
     let mut ordered = Vec::with_capacity(pending.len());
     let mut admitted_refs = existing.keys().cloned().collect::<BTreeSet<_>>();
     while !pending.is_empty() {
@@ -1671,6 +1826,52 @@ async fn plan_zone_resource_bundle(
     Ok(mutations)
 }
 
+fn fixed_bootstrap_provider_resources(
+    zone: &ZoneId,
+    bundle: &ResourceBundle,
+) -> Result<Vec<BundleResource>, ResourceRuntimeError> {
+    let provider_type =
+        ResourceTypeName::parse("Provider").map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+    let mut resources = Vec::new();
+    for provider_name in FIXED_BOOTSTRAP_PROVIDER_IDS {
+        let existing = bundle.resources.iter().find(|resource| {
+            resource.resource_type() == &provider_type
+                && resource.metadata().name().as_str() == provider_name
+        });
+        if let Some(resource) = existing {
+            let artifact_id = resource
+                .spec()
+                .get("artifactId")
+                .and_then(|value| match value {
+                    CanonicalJsonValue::String(value) => Some(value.as_str()),
+                    _ => None,
+                })
+                .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+            if artifact_id != provider_name {
+                return Err(ResourceRuntimeError::HandlerNotReady);
+            }
+            continue;
+        }
+        let metadata = BundleResourceMetadata::new(
+            ResourceName::parse(provider_name.to_owned())
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+            zone.clone(),
+            None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let spec = CanonicalJsonObject::parse(
+            format!(r#"{{"artifactId":"{provider_name}","config":{{}}}}"#).as_bytes(),
+        )
+        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        resources.push(
+            BundleResource::new(provider_type.clone(), metadata, spec)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+        );
+    }
+    Ok(resources)
+}
+
 fn reject_stale_guest_network_rows(
     existing: &BTreeMap<ResourceRef, StoredResource>,
     bundle: &ResourceBundle,
@@ -1720,8 +1921,7 @@ pub async fn validate_zone_self_resource(
     if store.identity().zone_uid() != zone_uid || store.identity().store_uid() != store_uid {
         return Err(ResourceRuntimeError::HandlerNotReady);
     }
-    let page = store
-        .list(StoreListRequest {
+    let request = StoreListRequest {
             operation: StoreOperationContext {
                 operation_id: "zone-self-resource-validation".to_owned(),
                 idempotency_key: None,
@@ -1739,8 +1939,11 @@ pub async fn validate_zone_self_resource(
             page_size: 16,
             cursor: None,
             projection: StoreProjection::Full,
-        })
-        .await
+        };
+    let page = retry_transient_store_list(zone, "zone-self-resource-validation", || {
+        store.list(request.clone())
+    })
+    .await
         .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
     validate_zone_self_resource_rows(zone, zone_uid, &page.resources)
 }
@@ -2567,6 +2770,90 @@ pub async fn persist_resource_status_with_projection(
     if status_semantically_equal(&previous_status, &candidate_status) {
         return Ok(());
     }
+    persist_resource_status_candidate(client, resource, value, "system-core-status").await
+}
+
+/// Persist only the bounded controller-session evidence below `status.resource`.
+///
+/// Controller-session transport must not advance the owning Process status
+/// generation or phase; the Process controller owns those fields.
+pub async fn persist_resource_controller_session_evidence(
+    api: &RedbRegisteredControllerApi,
+    resource: &StoredResource,
+    controller_session: Option<&serde_json::Value>,
+) -> Result<(), ResourceRuntimeError> {
+    let Some(value) = resource_controller_session_candidate(resource, controller_session)? else {
+        return Ok(());
+    };
+    let operation = resource_status_operation_id(resource, "controller-session-evidence");
+    api.persist_assigned_status(resource, value.to_canonical_bytes(), &operation)
+        .await
+        .map_err(assigned_status_source_error)
+}
+
+fn assigned_status_source_error(error: SourceError) -> ResourceRuntimeError {
+    let kind = match error {
+        SourceError::Conflict(_) => ResourceErrorKind::ResourceConflict,
+        SourceError::Backpressure => ResourceErrorKind::Backpressure,
+        SourceError::Timeout => ResourceErrorKind::Timeout,
+        SourceError::Cancelled => ResourceErrorKind::Cancelled,
+        SourceError::Unavailable => ResourceErrorKind::ResourcePlaneUnavailable,
+        SourceError::Integrity => ResourceErrorKind::InternalIntegrityFailure,
+    };
+    ResourceRuntimeError::ResourceStatusUpdateFailed(kind)
+}
+
+fn resource_controller_session_candidate(
+    resource: &StoredResource,
+    controller_session: Option<&serde_json::Value>,
+) -> Result<Option<CanonicalJsonValue>, ResourceRuntimeError> {
+    let mut value = CanonicalJsonValue::parse(&resource.canonical_json)
+        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+    let root = match &mut value {
+        CanonicalJsonValue::Object(root) => root,
+        _ => return Err(ResourceRuntimeError::HandlerNotReady),
+    };
+    let Some(CanonicalJsonValue::Object(status)) = root.get_mut("status") else {
+        return Err(ResourceRuntimeError::HandlerNotReady);
+    };
+    let previous_status = CanonicalJsonValue::Object(status.clone());
+    let mut projection = match status.get("resource") {
+        Some(CanonicalJsonValue::Object(projection)) => projection.clone(),
+        Some(_) => return Err(ResourceRuntimeError::HandlerNotReady),
+        None => BTreeMap::new(),
+    };
+    match controller_session {
+        Some(controller_session) => {
+            let bytes = serde_json::to_vec(controller_session)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let controller_session = CanonicalJsonValue::parse(&bytes)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            if !matches!(controller_session, CanonicalJsonValue::Object(_)) {
+                return Err(ResourceRuntimeError::HandlerNotReady);
+            }
+            projection.insert("controllerSession".to_owned(), controller_session);
+        }
+        None => {
+            projection.remove("controllerSession");
+        }
+    }
+    status.insert(
+        "resource".to_owned(),
+        CanonicalJsonValue::Object(projection),
+    );
+    let candidate_status = CanonicalJsonValue::Object(status.clone());
+    if status_semantically_equal(&previous_status, &candidate_status) {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+async fn persist_resource_status_candidate(
+    client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
+    resource: &StoredResource,
+    value: CanonicalJsonValue,
+    operation_scope: &str,
+) -> Result<(), ResourceRuntimeError> {
     let canonical = value.to_canonical_bytes();
     let envelope = ResourceEnvelope::from_json(&canonical)
         .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
@@ -2592,11 +2879,7 @@ pub async fn persist_resource_status_with_projection(
     precondition.expected_revision = Some(resource.revision.get());
     precondition.expected_uid = Some(resource.uid.as_str().to_owned());
 
-    let operation = bounded_operation_id(&format!(
-        "system-core-status-{}-{}",
-        resource.resource_ref.to_canonical_string(),
-        resource.revision.get()
-    ));
+    let operation = resource_status_operation_id(resource, operation_scope);
     let mut mutation = wire::Mutation::new();
     mutation.kind = protobuf::EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_STATUS);
     mutation.target = protobuf::MessageField::some(identity);
@@ -2628,6 +2911,16 @@ pub async fn persist_resource_status_with_projection(
         return Err(ResourceRuntimeError::StoreReadFailed);
     }
     Ok(())
+}
+
+fn resource_status_operation_id(resource: &StoredResource, operation_scope: &str) -> String {
+    bounded_operation_id(&format!(
+        "{operation_scope}-{}-{}-{}-{}",
+        resource.resource_ref.to_canonical_string(),
+        resource.uid.as_str(),
+        resource.generation.get(),
+        resource.revision.get()
+    ))
 }
 
 fn status_semantically_equal(current: &CanonicalJsonValue, candidate: &CanonicalJsonValue) -> bool {
@@ -2667,6 +2960,7 @@ mod tests {
     use d2b_resource_api::authz::{
         ApiMethod, AuthorizationDenial, AuthorizationRequest, AuthorizationTarget,
     };
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn bootstrap_zone_create_body_is_complete_after_uid_placeholder() {
@@ -2700,6 +2994,186 @@ mod tests {
             "00000000-0000-4000-8000-000000000000"
         );
         assert_eq!(envelope.metadata().managed_by(), ManagedBy::Controller);
+    }
+
+    #[tokio::test]
+    async fn startup_store_reads_retry_transient_metadata_and_get_pressure() {
+        let zone = ZoneId::parse("work").unwrap();
+        for (operation, kind) in [
+            ("runtime-metadata", StoreErrorKind::StoreBackpressure),
+            ("shared-provider-runner-provider", StoreErrorKind::Backpressure),
+        ] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_for_read = Arc::clone(&calls);
+            let result = retry_transient_store_read(&zone, operation, move || {
+                let attempt = calls_for_read.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Err(StoreError::new(
+                            kind,
+                            None,
+                            None,
+                            RetryClass::Never,
+                            "test-startup-store-read",
+                        ))
+                    } else {
+                        Ok(attempt)
+                    }
+                }
+            })
+            .await;
+
+            assert_eq!(result, Ok(1));
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "{operation}");
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_store_list_timeout_retries_after_worker_lifetime() {
+        let zone = ZoneId::parse("work").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_read = Arc::clone(&calls);
+        let retry = tokio::spawn(async move {
+            retry_transient_store_list(&zone, "startup-list-timeout", move || {
+                let attempt = calls_for_read.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        tokio::time::sleep(
+                            d2b_resource_store_redb::LIST_READ_LIFETIME
+                                + Duration::from_millis(25),
+                        )
+                        .await;
+                        Err(StoreError::new(
+                            StoreErrorKind::Timeout,
+                            None,
+                            None,
+                            RetryClass::Never,
+                            "redb-read-lifetime-exceeded",
+                        ))
+                    } else {
+                        Ok(attempt)
+                    }
+                }
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(
+            d2b_resource_store_redb::LIST_READ_LIFETIME + Duration::from_millis(25),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(retry.await.unwrap(), Ok(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn startup_store_retry_uses_delayed_async_backoff() {
+        let zone = ZoneId::parse("work").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_read = Arc::clone(&calls);
+        let retry = tokio::spawn(async move {
+            retry_transient_store_read(&zone, "startup-backoff", move || {
+                let attempt = calls_for_read.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(if attempt < 2 {
+                    Err(StoreError::new(
+                        StoreErrorKind::Backpressure,
+                        None,
+                        None,
+                        RetryClass::Never,
+                        "test-startup-backpressure",
+                    ))
+                } else {
+                    Ok(attempt)
+                })
+            })
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(retry.await.unwrap(), Ok(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn startup_store_read_exhaustion_preserves_typed_error_and_fails_closed() {
+        let zone = ZoneId::parse("work").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_read = Arc::clone(&calls);
+        let exhausted = retry_transient_store_read(&zone, "process-resource-reconcile", move || {
+            calls_for_read.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Err::<(), _>(StoreError::new(
+                StoreErrorKind::Timeout,
+                None,
+                None,
+                RetryClass::Never,
+                "test-startup-store-timeout",
+            )))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(exhausted.kind(), StoreErrorKind::Timeout);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_read = Arc::clone(&calls);
+        let not_found =
+            retry_transient_store_read(&zone, "interaction-presence-providers", move || {
+                calls_for_read.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(StoreError::new(
+                    StoreErrorKind::ResourceNotFound,
+                    None,
+                    None,
+                    RetryClass::Never,
+                    "test-startup-store-not-found",
+                )))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(not_found.kind(), StoreErrorKind::ResourceNotFound);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        for kind in [
+            StoreErrorKind::AuthorizationDenied,
+            StoreErrorKind::StoreIntegrityFailure,
+        ] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_for_read = Arc::clone(&calls);
+            let error = retry_transient_store_read(&zone, "runtime-integrity-check", move || {
+                calls_for_read.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(StoreError::new(
+                    kind,
+                    None,
+                    None,
+                    RetryClass::Never,
+                    "test-startup-store-non-transient",
+                )))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     fn user_resource(name: &str, uid: &str, os_username: &str, phase: &str) -> StoredResource {
@@ -2755,6 +3229,8 @@ mod tests {
             resource_ref: ResourceRef::parse(&format!("User/{name}")).unwrap(),
             zone,
             uid: ResourceUid::parse(uid).unwrap(),
+            owner_uid: None,
+            owner_generation: None,
             generation: ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(1),
             canonical_json,
@@ -2811,6 +3287,8 @@ mod tests {
             resource_ref: ResourceRef::parse(&format!("{resource_type}/{name}")).unwrap(),
             zone,
             uid: ResourceUid::parse(uid).unwrap(),
+            owner_uid: None,
+            owner_generation: None,
             generation: ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(1),
             canonical_json,
@@ -3956,6 +4434,121 @@ mod tests {
     }
 
     #[test]
+    fn controller_session_projection_preserves_stale_process_status() {
+        let mut process = policy_resource(
+            "Process",
+            "controller",
+            "123e4567-e89b-42d3-a456-426614174000",
+            json!({
+                "processClass": "controller",
+                "providerRef": "Provider/system-minijail",
+            }),
+        );
+        set_status(&mut process, "Ready", 0);
+        let evidence = json!({
+            "ready": true,
+            "providerGeneration": 2,
+            "processGeneration": 1,
+        });
+        let candidate = resource_controller_session_candidate(&process, Some(&evidence))
+            .unwrap()
+            .expect("new controller-session evidence changes the projection");
+        let value: Value = serde_json::from_slice(&candidate.to_canonical_bytes()).unwrap();
+        assert_eq!(value["status"]["phase"], "Ready");
+        assert_eq!(value["status"]["observedGeneration"], 0);
+        assert_eq!(value["status"]["update"]["observedGeneration"], 0);
+        assert_eq!(value["status"]["resource"]["controllerSession"], evidence);
+    }
+
+    #[test]
+    fn controller_session_clear_removes_evidence_without_rewriting_process_status() {
+        let mut process = policy_resource(
+            "Process",
+            "controller",
+            "123e4567-e89b-42d3-a456-426614174000",
+            json!({
+                "processClass": "controller",
+                "providerRef": "Provider/system-minijail",
+            }),
+        );
+        set_status(&mut process, "Ready", 0);
+        let evidence = json!({
+            "ready": true,
+            "providerGeneration": 2,
+            "processGeneration": 1,
+        });
+        let with_evidence = resource_controller_session_candidate(&process, Some(&evidence))
+            .unwrap()
+            .expect("session evidence should be written");
+        let mut persisted = process.clone();
+        persisted.canonical_json = with_evidence.to_canonical_bytes();
+
+        let cleared = resource_controller_session_candidate(&persisted, None)
+            .unwrap()
+            .expect("stale session evidence should be removed");
+        let value: Value = serde_json::from_slice(&cleared.to_canonical_bytes()).unwrap();
+        assert!(value["status"]["resource"]["controllerSession"].is_null());
+        assert_eq!(value["status"]["phase"], "Ready");
+        assert_eq!(value["status"]["observedGeneration"], 0);
+        assert_eq!(value["status"]["update"]["observedGeneration"], 0);
+    }
+
+    #[test]
+    fn controller_session_evidence_uses_a_distinct_status_operation_identity() {
+        let process = policy_resource(
+            "Process",
+            "controller",
+            "123e4567-e89b-42d3-a456-426614174000",
+            json!({
+                "processClass": "controller",
+                "providerRef": "Provider/system-minijail",
+            }),
+        );
+        let status_operation = resource_status_operation_id(&process, "system-core-status");
+        let evidence_operation =
+            resource_status_operation_id(&process, "controller-session-evidence");
+        assert_ne!(status_operation, evidence_operation);
+        assert!(status_operation.starts_with("d2b-op-sha256:"));
+        assert!(evidence_operation.starts_with("d2b-op-sha256:"));
+    }
+
+    #[test]
+    fn controller_session_evidence_operation_identity_fences_recreates() {
+        let process = policy_resource(
+            "Process",
+            "controller",
+            "123e4567-e89b-42d3-a456-426614174000",
+            json!({
+                "processClass": "controller",
+                "providerRef": "Provider/system-minijail",
+            }),
+        );
+        let original = resource_status_operation_id(&process, "controller-session-evidence");
+
+        let mut recreated = process.clone();
+        set_identity(
+            &mut recreated,
+            "223e4567-e89b-42d3-a456-426614174001",
+            1,
+        );
+        assert_ne!(
+            original,
+            resource_status_operation_id(&recreated, "controller-session-evidence")
+        );
+
+        let mut regenerated = process;
+        set_identity(
+            &mut regenerated,
+            "123e4567-e89b-42d3-a456-426614174000",
+            2,
+        );
+        assert_ne!(
+            original,
+            resource_status_operation_id(&regenerated, "controller-session-evidence")
+        );
+    }
+
+    #[test]
     fn status_timestamp_only_changes_are_semantically_equal() {
         let current = CanonicalJsonValue::parse(
             br#"{"lastReconciledAt":"2026-08-19T00:00:00.000Z","phase":"Ready","update":{"lastAssessedAt":"2026-08-19T00:00:00.000Z","state":"Current"}}"#,
@@ -4029,6 +4622,8 @@ mod tests {
                 resource_ref: stale_ref.clone(),
                 zone: zone.clone(),
                 uid: ResourceUid::parse("223e4567-e89b-42d3-a456-426614174000").unwrap(),
+                owner_uid: None,
+                owner_generation: None,
                 generation: ResourceGeneration::new(1).unwrap(),
                 revision: ZoneRevision::new(1),
                 canonical_json: Vec::new(),
@@ -4089,6 +4684,8 @@ mod tests {
             resource_ref: ResourceRef::parse("Host/host-system").unwrap(),
             zone: ZoneId::parse("dev").unwrap(),
             uid: ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            owner_uid: None,
+            owner_generation: None,
             generation: ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(1),
             canonical_json: br#"{"metadata":{"managedBy":"configuration","configurationGeneration":3,"deletionRequestedAt":"2026-08-15T00:00:00Z"}}"#.to_vec(),

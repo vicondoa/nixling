@@ -92,8 +92,6 @@ pub enum ProviderRuntimeError {
     InvalidLifecycleTransition,
     /// The drain policy is not a valid policy.
     InvalidDrainPolicy,
-    /// The RPC payload was malformed or over its bound.
-    RpcPayloadInvalid,
 }
 
 impl fmt::Display for ProviderRuntimeError {
@@ -109,7 +107,6 @@ impl fmt::Display for ProviderRuntimeError {
             Self::MissingProviderBinding => "authenticated subject carries no provider binding",
             Self::InvalidLifecycleTransition => "invalid registry lifecycle transition",
             Self::InvalidDrainPolicy => "invalid registry drain policy",
-            Self::RpcPayloadInvalid => "provider RPC payload is invalid or too large",
         })
     }
 }

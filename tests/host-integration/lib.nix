@@ -9,7 +9,7 @@
 # This file is NOT a flake check: the VM tests live under the `vmChecks` flake
 # output (selected explicitly by `make test-host-integration`), so the Layer-1
 # `nix flake check --no-build --all-systems` never realizes a VM.
-{ self, lib }:
+{ self, lib, hostToolBundle ? null }:
 
 let
   # The minimal, hermetic d2b site declaration every daemon-host node shares.
@@ -29,6 +29,10 @@ let
       yubikey.enable = false;
       usePrebuiltHostTools = false;
     };
+    # The daemon's v3 bundle always carries the local-root storage row. Keep
+    # the corresponding root Zone in these minimal host fixtures so the
+    # emitted topology is sealed and the daemon can enter Ready.
+    d2b.zones.local-root = { };
     # The full daemon + broker systemd surface under test.
     d2b.daemonExperimental.enable = true;
   };
@@ -205,23 +209,20 @@ let
 
   mkAcceptanceProviderArtifact = pkgs:
     let
+      controller = if hostToolBundle == null then
+        "${self.packages.${pkgs.stdenv.hostPlatform.system}.d2b-provider-test-controller}/bin/d2b-provider-test-controller"
+      else
+        "${hostToolBundle}/bin/d2b-provider-test-controller";
       signer = pkgs.python3.withPackages
         (pythonPackages: [ pythonPackages.cryptography ]);
       manifest = ../../tests/fixtures/provider-acceptance/provider-manifest.json;
       schema = ../../tests/fixtures/provider-acceptance/config-schema.json;
       package = pkgs.runCommand "d2b-u20-acceptance-provider" {
-        nativeBuildInputs = [ pkgs.stdenv.cc signer ];
+        nativeBuildInputs = [ signer ];
       } ''
         mkdir -p "$out/bin"
-        $CC -O2 -x c -o "$out/bin/acceptance-controller" - <<'C'
-        #include <unistd.h>
-
-        int main(void) {
-          for (;;) {
-            pause();
-          }
-        }
-        C
+        cp "${controller}" "$out/bin/acceptance-controller"
+        chmod 0755 "$out/bin/acceptance-controller"
         ${signer}/bin/python3 - "${manifest}" "$out" <<'PY'
         import hashlib
         import json
@@ -348,23 +349,20 @@ let
 
   mkVolumeProviderArtifact = pkgs:
     let
+      controller = if hostToolBundle == null then
+        "${self.packages.${pkgs.stdenv.hostPlatform.system}.d2b-provider-test-controller}/bin/d2b-provider-test-controller"
+      else
+        "${hostToolBundle}/bin/d2b-provider-test-controller";
       signer = pkgs.python3.withPackages
         (pythonPackages: [ pythonPackages.cryptography ]);
       manifest = ../../tests/fixtures/provider-volume-acceptance/provider-manifest.json;
       schema = ../../tests/fixtures/provider-volume-acceptance/config-schema.json;
       package = pkgs.runCommand "d2b-volume-acceptance-provider" {
-        nativeBuildInputs = [ pkgs.stdenv.cc signer ];
+        nativeBuildInputs = [ signer ];
       } ''
         mkdir -p "$out/bin"
-        $CC -O2 -x c -o "$out/bin/acceptance-controller" - <<'C'
-        #include <unistd.h>
-
-        int main(void) {
-          for (;;) {
-            pause();
-          }
-        }
-        C
+        cp "${controller}" "$out/bin/acceptance-controller"
+        chmod 0755 "$out/bin/acceptance-controller"
         ${signer}/bin/python3 - "${manifest}" "$out" <<'PY'
         import hashlib
         import json
@@ -434,6 +432,7 @@ let
             "$(${pkgs.nix}/bin/nix --extra-experimental-features nix-command \
               hash path --type sha256 --base16 "${package}")" > "$out"
         '';
+      baseManifest = builtins.fromJSON (builtins.readFile manifest);
       catalog = {
         providerName = "volume-acceptance-provider";
         packageName = "d2b-volume-acceptance-provider";
@@ -460,8 +459,10 @@ let
           (builtins.readFile "${package}/executable-set-digest");
         manifestDigest = lib.removeSuffix "\n"
           (builtins.readFile "${package}/manifest-digest");
-        componentDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        descriptorDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        componentDigest = "sha256:${builtins.hashString
+          "sha256" (builtins.toJSON baseManifest.components)}";
+        descriptorDigest = "sha256:${builtins.hashString
+          "sha256" (builtins.toJSON baseManifest.apiBindings)}";
         configDigest = "sha256:ccb5a9d66e068ea8f4e205788589675a48e9e3754a840d8ac10120d14238e914";
       };
     in {

@@ -34,10 +34,10 @@ treated as local authority.
 
 ## Controllers / services / workers / binaries
 
-The `d2b-provider-credential-entra` binary hosts secret-free orchestration and
-the `d2b.credential.v3` handler. An injected `EntraCredentialClient` terminates
-at the identity-Guest login/token Endpoint. No production client performs
-direct Entra egress from the Host or controller.
+The `d2bd` composition attaches secret-free Entra reconciliation to the shared
+Runner and ResourceService. An injected `EntraCredentialClient` terminates at
+the identity-Guest login/token Endpoint. No production client performs direct
+Entra egress from the Host or controller.
 
 ## Placement and dependencies
 

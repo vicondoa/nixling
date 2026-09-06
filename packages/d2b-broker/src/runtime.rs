@@ -2314,11 +2314,14 @@ fn validate_spawn_runner_request_fds(
         ));
     }
     match role {
-        RunnerRole::ProviderController if inherited_fd_count == 1 && attached_fd_count == 2 => {
+        RunnerRole::ProviderController
+            if (1..=2).contains(&inherited_fd_count)
+                && attached_fd_count == usize::from(inherited_fd_count) + 1 =>
+        {
             Ok(())
         }
         RunnerRole::ProviderController => Err(BrokerError::Protocol(
-            "ProviderController requires exactly one inherited fd".to_owned(),
+            "ProviderController requires one or two inherited fds".to_owned(),
         )),
         _ if inherited_fd_count == 0 && attached_fd_count == 0 => Ok(()),
         _ => Err(BrokerError::Protocol(

@@ -37,6 +37,49 @@ use crate::{
 
 /// The finalizer owned by the Cloud Hypervisor Guest controller.
 pub const GUEST_CONTROLLER_FINALIZER: &str = "runtime-cloud-hypervisor.d2bus.org/guest";
+/// Default descriptor repair interval.
+pub const CLOUD_HYPERVISOR_REPAIR_INTERVAL_SECS: u64 = 30;
+
+/// The shared-Runner contract for the Cloud Hypervisor Guest owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudHypervisorRunnerContract {
+    resource_type: &'static str,
+    finalizer: &'static str,
+    repair_interval_secs: u64,
+    watched_configuration_is_dependency: bool,
+}
+
+impl CloudHypervisorRunnerContract {
+    /// Return the owned ResourceType.
+    pub const fn resource_type(self) -> &'static str {
+        self.resource_type
+    }
+
+    /// Return the exact Guest finalizer.
+    pub const fn finalizer(self) -> &'static str {
+        self.finalizer
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Whether watched configuration is treated as a dependency.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+}
+
+/// Return the shared-Runner contract for Cloud Hypervisor Guests.
+pub const fn cloud_hypervisor_runner_contract() -> CloudHypervisorRunnerContract {
+    CloudHypervisorRunnerContract {
+        resource_type: "Guest",
+        finalizer: GUEST_CONTROLLER_FINALIZER,
+        repair_interval_secs: CLOUD_HYPERVISOR_REPAIR_INTERVAL_SECS,
+        watched_configuration_is_dependency: true,
+    }
+}
 
 /// Errors returned by the authenticated Resource API seam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2254,6 +2297,12 @@ where
                     return Ok(());
                 }
                 FinalizationStep::DeleteChild(child) => {
+                    if child.deletion_requested() {
+                        cursor += 1;
+                        self.upgrade_progress
+                            .insert(guest.uid().clone(), (upgrade.reason(), cursor));
+                        continue;
+                    }
                     let observation = self.observe_upgrade_state(guest, child_plan).await?;
                     if observation.guest_uid() != guest.uid() {
                         return Err(CloudHypervisorError::ChildConflict);
@@ -2381,6 +2430,9 @@ where
                     self.api.update_spec(update).await?;
                 }
                 FinalizationStep::DeleteChild(child) => {
+                    if child.deletion_requested() {
+                        continue;
+                    }
                     self.api.delete_child(guest, child.clone()).await?;
                     self.retire_child(guest, child);
                 }

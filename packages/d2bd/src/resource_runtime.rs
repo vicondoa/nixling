@@ -11,32 +11,43 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
+    os::fd::{AsRawFd, OwnedFd},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::activation_resource_runtime::{
-    ActivationResourceRuntime, ActivationResourceRuntimeError, GuestActivationResourceClient,
-    activation_watch_request, list_activation_snapshot, run_activation_watch,
-    stored_resource_from_wire,
+    activation_controller_descriptor, ActivationResourceReconciler, stored_resource_from_wire,
 };
+use crate::ServerState;
+use d2b_contracts::types::{BundleOpId, VmId};
 use crate::audio_resource_runtime::{
     AUDIO_BINDING_TYPE, AudioBindingRuntimeStatus, AudioResourceRuntime, AudioResourceRuntimeError,
-    audio_binding_status_projection_with_status, audio_binding_status_value, audio_watch_request,
-    has_audio_finalizer, list_audio_resources, list_audio_snapshot, remove_audio_finalizer,
-    run_audio_watch, update_audio_finalizer,
+    audio_binding_status_projection_with_status,
 };
-use crate::binding_child_resource_runtime::reconcile_binding_children;
+use crate::binding_child_resource_runtime::{
+    OneOwnedChildProgress, OwnedChildOwner,
+    reconcile_one_guest_child,
+};
+use crate::credential_resource_runtime::{
+    CredentialResourceReconciler, CredentialSessionRegistry, ComponentCredentialSession,
+    CredentialSession, credential_controller_descriptor, is_credential_provider_ref,
+};
 use crate::process_resource_runtime::{
+    ProcessOwnerIdentityLoader, ProcessProviderIdentityLoader, ProcessResourceReconciler,
     ProcessResourceRuntime, ProcessResourceRuntimeError, controller_provider_refs,
-    list_process_snapshot, process_watch_request, run_process_watch,
+    list_process_resources, process_controller_descriptor,
 };
 use crate::semantic_binding_resource_runtime::{
-    reconcile_semantic_binding_resources, run_semantic_binding_watch,
-    semantic_binding_watch_request,
+    telemetry_controller_descriptor, TelemetryResourceReconciler,
 };
 use async_trait::async_trait;
 use d2b_audit::{AuditSink, DurabilityEvidence};
@@ -47,16 +58,22 @@ use d2b_bus::{
 #[cfg(test)]
 use d2b_contracts_broker::broker_wire::OpenZoneStoreResponse;
 use d2b_contracts_broker::broker_wire::ZoneStoreDisposition;
+use d2b_contracts_broker::broker_wire::BrokerCallerRole;
 use d2b_contracts_provider::v3::provider::ProviderSpec;
 use d2b_contracts_resource::resource_proto as wire;
 #[cfg(test)]
 use d2b_contracts_resource::v3::ConfigurationGeneration;
-use d2b_contracts_resource::v3::identity::{BindingDigest, EvidenceClass, ReconnectGeneration};
+use d2b_contracts_resource::v3::identity::{
+    AuthenticatedSubjectContext, BindingDigest, EvidenceClass, ReconnectGeneration,
+};
 use d2b_contracts_resource::v3::{
-    CanonicalJsonValue, ControllerGeneration, DesiredLifecycle, NixosGenerationSpec,
+    CanonicalJsonValue, ControllerGeneration, DesiredLifecycle,
     PlacementTargetKind, ResourceBundleGenerationId, ResourceEnvelope, ResourceGeneration,
-    ResourceName, ResourcePhase, ResourceRef, ResourceTypeName, ResourceUid, ZoneId, ZoneRevision,
+    ResourceErrorKind, ResourceName, ResourcePhase, ResourceRef, ResourceTypeName, ResourceUid,
+    ZoneId, ZoneRevision, canonical_digest,
+    network::NetworkProvenance,
     process::ProcessSpec,
+    volume::{EntryType, VolumeSpec},
 };
 use d2b_contracts_resource::v3::{
     guest::GuestSpec,
@@ -65,7 +82,7 @@ use d2b_contracts_resource::v3::{
 };
 use d2b_contracts_zone_session::v3::{ZoneStatusResource, resource_bundle::ResourceBundle};
 use d2b_core_controller::authority::{
-    AuthorityRequest, AuthorityReservation, ExternalNicClaimRequest, ExternalNicRecoveryInventory,
+    AuthorityLease, AuthorityRequest, AuthorityReservation, ExternalNicClaimRequest, ExternalNicRecoveryInventory,
     ExternalNicReservation, HostGlobalAuthorityIndex, TrustedExternalNicInventory,
 };
 use d2b_core_controller::authority_persistence::AuthorityRecoveryCoordinator;
@@ -76,6 +93,17 @@ use d2b_core_controller::controller_assignment::{
     ResourceClientLease,
 };
 use d2b_core_controller::controllers::HandlerPhase;
+use d2b_core_controller::{
+    CORE_RESOURCE_CONTROLLER_REGISTRATIONS, ChangeField, ChangeRecord, ControllerDescriptor,
+    ControllerExecutionPolicy, ControllerIdentity, ControllerSelector, ControllerVerb,
+    CoreControllerSource, CoreResourceReconciler, DependencySnapshot, DisruptionClass, DrainResult,
+    FinalizeResult, ObservationResult, ReconcileContext, ReconcileDisposition, ReconcilePlan,
+    ReconcileReason, ReconcileResult, ResourceKey, ResourceMutationBatch, ResourceReconciler,
+    ResourceRegistration, ResourceSnapshot, ResyncPolicy, Runner, RunnerConfig, RunnerError,
+    SelectorField, SourceError, StatusPersistence, TriggerReason, UpdateAssessment,
+    UpdateAssessmentState,
+    UpgradePlan, UpgradeStage, ValidationResult, core_controller_descriptors, OwnedChildIntent,
+};
 use d2b_core_controller::main::{
     CoreProcess, RecoverySnapshot, RuntimeReadiness as CoreRuntimeReadiness, StartupStage,
 };
@@ -88,12 +116,21 @@ use d2b_provider_display_wayland::WaylandSessionSpec;
 use d2b_provider_network_local::{
     ExternalNicAdmissionError, ExternalNicClaim, admit_external_nic_claims,
     controller::{
-        NetworkAdmissionIntent, NetworkAdmissionKey, NetworkAdmissionProof, NetworkEffectError,
+        AttachmentRealization, NetworkAdmissionIntent, NetworkAdmissionKey, NetworkAdmissionProof,
+        NetworkEffectError, NetworkReconciler, NetworkResourcePort, ReconcileInput,
+        ReconcileProgress,
     },
-    observe::HostNetworkOccupancy,
+    artifact::{ArtifactCatalogEntry, ArtifactKind},
+    observe::{HostNetworkOccupancy, observe_host_network},
     routes::RouteTuple,
 };
+use d2b_provider_device_gpu::GpuLifecycleEffectPort;
 use d2b_provider_notification_desktop::{Category, GuestSourceConfig, NotificationProviderConfig};
+use d2b_provider_toolkit::{
+    PROVIDER_BOOTSTRAP_STREAM_CREDIT, PROVIDER_BOOTSTRAP_STREAM_ID,
+    PROVIDER_DELIVERY_KEY_STREAM_CREDIT, PROVIDER_DELIVERY_KEY_STREAM_ID, PROVIDER_READY_MARKER,
+    PROVIDER_READY_STREAM_CREDIT, PROVIDER_READY_STREAM_ID, ProviderSessionMetadata,
+};
 use d2b_provider_runtime_cloud_hypervisor::{
     AuthenticatedResourceApiAdapter, AuthenticatedResourceSession, BootstrapGraph, ChildRole,
     CloudHypervisorConfig, CloudHypervisorController, CloudHypervisorResourceApiError,
@@ -103,6 +140,9 @@ use d2b_provider_runtime_cloud_hypervisor::{
     GuestSetupDescriptorVerifier, GuestSnapshot, OwnedChildSnapshot, ProcessState, SessionState,
     VerifiedGuestSetupDescriptor, deterministic_child_ref,
 };
+use d2b_provider_runtime_azure_container_apps as aca_runtime;
+use d2b_provider_runtime_azure_virtual_machine as azure_vm_runtime;
+use d2b_provider_runtime_qemu_media as qemu_media_runtime;
 use d2b_provider_system_core::{
     HostCapabilityClass, HostObservationReport, HostProbeEffectPort, HostProbeMetadata,
     HostReconciler, MinijailPlatformGate, UserBinding, UserDiscoveryEffectPort, UserIdentityDigest,
@@ -110,12 +150,14 @@ use d2b_provider_system_core::{
 };
 use d2b_resource_api::{
     RedbBackend, ResourceApiClient, ResourceBusAdapter, ResourceService, ResourceStoreBackend,
-    authz::{AuthorizationState, NativeAuthorizer},
+    authz::{AuthorizationState, BoundSubject, NativeAuthorizer, PolicySet},
+    registered::{AssignmentFenceResolver, RedbRegisteredControllerApi},
     service::UnavailableUpgradeDispatcher,
 };
 use d2b_resource_store::{
-    PolicySnapshot, StoreErrorKind, StoreGetRequest, StoreListRequest, StoreListResult,
-    StoreOperationContext, StoreProjection, StoredResource,
+    ExpectedRevision, PolicySnapshot, ResourceAssignmentFence, ResourceAssignmentScope,
+    ResourceMutationKind, StoreError, StoreErrorKind, StoreGetRequest, StoreListRequest,
+    StoreListResult, StoreMutation, StoreOperationContext, StoreProjection, StoredResource,
 };
 use d2b_resource_store_redb::{
     AuthorityOperationState, BrokerEvidenceIndex, LogicalBackup, RedbResourceStore,
@@ -123,12 +165,12 @@ use d2b_resource_store_redb::{
 };
 use d2b_session::{
     ComponentSessionDriver, HandshakeCredentials, SessionDriverHandle, SessionEngine,
-    SessionServerError, StreamId, TransportEvidence,
+    SessionServerError, StreamEvent, StreamId, TransportEvidence,
 };
 use d2b_session_unix::{
     AncillaryCapacity, CONTROLLER_BOOTSTRAP_TIMEOUT, PeerCredentials, SeqpacketSocket,
     VerifiedUnixPeer, controller_bootstrap_attachment_policy, controller_credit_scopes,
-    controller_resource_endpoint_policy,
+    controller_resource_endpoint_policy, credential_provider_endpoint_policy,
 };
 use d2bd_runtime::authority_persistence::RedbAuthorityPersistence;
 pub use d2bd_runtime::resource_api::ResourceRuntimeError;
@@ -143,17 +185,18 @@ use d2bd_runtime::resource_runtime_support::{
     AssignmentRegistry, PolicySubjectFingerprint, SystemCoreReconcileResult,
     configuration_cleanup_pending, current_status_timestamp, encode_public_get_response,
     encode_public_list_response, encode_public_resource, ensure_bootstrap_host_resource,
-    ensure_bootstrap_zone_resource, handler_phase_to_zone_phase, host_phase_for_resource_count,
+    ensure_bootstrap_zone_resource, handler_phase_to_zone_phase,
     initial_policy_snapshot, map_startup_error, materialize_zone_resource_bundle,
     new_assignment_registry, public_list_request, public_operation_id, public_request_meta,
-    refreshed_policy_subject_fingerprints, register_system_core_session, runtime_authorizer,
-    runtime_policy, store_identity, store_identity_for_authority, unix_transport,
-    validate_zone_resource_bundle, validate_zone_self_resource, watch_needs_restart,
-    zone_runtime_metadata,
+    persist_resource_controller_session_evidence, refreshed_policy_subject_fingerprints,
+    register_system_core_session, retry_transient_store_list, retry_transient_store_read,
+    runtime_authorizer, runtime_policy, store_identity,
+    store_identity_for_authority, unix_transport, validate_zone_resource_bundle,
+    validate_zone_self_resource, zone_runtime_metadata,
 };
+use d2bd_runtime::guest_component_session::COMPONENT_SESSION_RETRY_BACKOFF;
 pub use d2bd_runtime::resource_runtime_support::{
-    ZoneRuntimeReadiness, bounded_operation_id, persist_resource_status,
-    persist_resource_status_with_projection,
+    ZoneRuntimeReadiness, bounded_operation_id, persist_resource_status_with_projection,
 };
 use d2bd_runtime::resource_store_runtime::{MAX_ZONE_RUNTIMES, OpenedZoneStore};
 use d2bd_runtime::target_runtime::{DaemonMode, ProviderDeployment};
@@ -166,6 +209,8339 @@ use protobuf::{EnumOrUnknown, MessageField};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+mod volume_effect_adapter;
+mod volume_provider_runtime;
+mod guest_provider_runtime;
+pub use volume_provider_runtime::{
+    compose_shared_volume_runner_descriptors, SharedVolumeRunnerRegistration,
+    U7_SHARED_PROVIDER_RUNNERS,
+};
+pub use guest_provider_runtime::{
+    compose_shared_guest_runner_descriptors, SharedGuestRunnerRegistration,
+    U6_SHARED_PROVIDER_RUNNERS,
+};
+pub use volume_effect_adapter::{
+    AnchoredVolumeEffectAdapter, FdRootResolver, ResolvedVolumeRoot, VolumeRootResolver,
+};
+
+const CORE_CONTROLLER_PROCESS_REF: &str = "Process/d2b-core-controller";
+const CORE_CONTROLLER_PROVIDER_REF: &str = "Provider/system-core";
+const CORE_CONTROLLER_HOST_REF: &str = "Host/host-system";
+const U10_PROVIDER_COUNT: usize = 3;
+const U10_PROVIDER_CONTROLLERS: [(&str, &str, &str); U10_PROVIDER_COUNT] = [
+    (
+        "credential-secret-service",
+        "Process/credential-secret-service-controller",
+        d2b_provider_credential_secret_service::PROVIDER_REF,
+    ),
+    (
+        "credential-entra",
+        "Process/credential-entra-controller",
+        d2b_provider_credential_entra::PROVIDER_REF,
+    ),
+    (
+        "credential-managed-identity",
+        "Process/credential-managed-identity-controller",
+        d2b_provider_credential_managed_identity::PROVIDER_REF,
+    ),
+];
+const U12_PROVIDER_CONTROLLERS: [(&str, &str, &str); 2] = [
+    (
+        "observability-otel",
+        "Process/observability-otel-controller",
+        "Provider/observability-otel",
+    ),
+    (
+        "activation-nixos",
+        "Process/activation-nixos-controller",
+        "Provider/activation-nixos",
+    ),
+];
+
+fn trusted_provider_resource_types() -> Result<Vec<ResourceTypeName>, ResourceRuntimeError> {
+    let mut resource_types = BTreeSet::new();
+    for resource_type in U6_SHARED_PROVIDER_RUNNERS
+        .iter()
+        .map(|registration| registration.resource_type)
+        .chain(
+            U7_SHARED_PROVIDER_RUNNERS
+                .iter()
+                .map(|registration| registration.resource_type),
+        )
+        .chain(
+            U8_SHARED_PROVIDER_RUNNERS
+                .iter()
+                .map(|registration| registration.resource_type),
+        )
+        .chain(
+            U9_SHARED_PROVIDER_RUNNERS
+                .iter()
+                .map(|registration| registration.resource_type),
+        )
+        .filter(|resource_type| resource_type.contains(".d2bus.org."))
+    {
+        resource_types.insert(
+            ResourceTypeName::parse(resource_type.to_owned())
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+        );
+    }
+    Ok(resource_types.into_iter().collect())
+}
+
+fn trusted_catalog_resource_types(
+    resource_types: impl IntoIterator<Item = ResourceTypeName>,
+) -> Result<Vec<ResourceTypeName>, ResourceRuntimeError> {
+    // Qualified API extensions come only from trusted U6-U9 runner declarations.
+    let trusted_provider_types = trusted_provider_resource_types()?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut catalog_resource_types = Vec::new();
+    for resource_type in resource_types {
+        if resource_type.as_str().contains(".d2bus.org.")
+            && !trusted_provider_types.contains(&resource_type)
+        {
+            return Err(ResourceRuntimeError::AuthorizationUnavailable);
+        }
+        catalog_resource_types.push(resource_type);
+    }
+    catalog_resource_types.extend(trusted_provider_types);
+    catalog_resource_types.sort();
+    catalog_resource_types.dedup();
+    Ok(catalog_resource_types)
+}
+
+/// One Provider-owned ResourceType registration served by the shared Runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedProviderRunnerRegistration {
+    /// Static controller process identity.
+    pub controller_ref: &'static str,
+    /// Provider identity selected by the Resource spec.
+    pub provider_ref: &'static str,
+    /// ResourceType owned by this runner.
+    pub resource_type: &'static str,
+    /// Exact finalizer installed by the owner.
+    pub finalizer: &'static str,
+    /// Descriptor repair/resync interval in runner ticks.
+    pub repair_interval_ticks: u64,
+    /// Whether watched configuration is dependency-only.
+    pub watched_configuration_is_dependency: bool,
+}
+
+/// The U8 Provider ResourceTypes attached to the production shared Runner.
+///
+/// USBIP and SecurityKey each have separate Service, Binding, and Device
+/// ownership rows because the toolkit finalizer is per descriptor.
+pub const U8_SHARED_PROVIDER_RUNNERS: [SharedProviderRunnerRegistration; 9] = [
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/network-local-controller",
+        provider_ref: "Provider/network-local",
+        resource_type: "Network",
+        finalizer: d2b_provider_network_local::controller::network_runner_contract().finalizer(),
+        repair_interval_ticks: d2b_provider_network_local::controller::network_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        watched_configuration_is_dependency:
+            d2b_provider_network_local::controller::network_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-tpm-controller",
+        provider_ref: "Provider/device-tpm",
+        resource_type: "Device",
+        finalizer: d2b_provider_device_tpm::DEVICE_TPM_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_tpm::tpm_runner_contract().repair_interval_secs()
+            * 1_000,
+        watched_configuration_is_dependency: d2b_provider_device_tpm::tpm_runner_contract()
+            .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-usbip-controller",
+        provider_ref: "Provider/device-usbip",
+        resource_type: "Device",
+        finalizer: d2b_contracts_resource::v3::device::DEVICE_USBIP_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_usbip::usbip_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        watched_configuration_is_dependency: d2b_provider_device_usbip::usbip_runner_contract()
+            .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-usbip-service-controller",
+        provider_ref: "Provider/device-usbip",
+        resource_type: d2b_provider_device_usbip::USB_SERVICE_RESOURCE_TYPE,
+        finalizer: d2b_provider_device_usbip::USBIP_SERVICE_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_usbip::usbip_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        watched_configuration_is_dependency: d2b_provider_device_usbip::usbip_runner_contract()
+            .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-usbip-binding-controller",
+        provider_ref: "Provider/device-usbip",
+        resource_type: d2b_provider_device_usbip::USB_BINDING_RESOURCE_TYPE,
+        finalizer: d2b_provider_device_usbip::USBIP_BINDING_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_usbip::usbip_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        watched_configuration_is_dependency: d2b_provider_device_usbip::usbip_runner_contract()
+            .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-security-key-controller",
+        provider_ref: "Provider/device-security-key",
+        resource_type: "Device",
+        finalizer: d2b_contracts_resource::v3::device::DEVICE_SECURITY_KEY_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_security_key::security_key_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        watched_configuration_is_dependency:
+            d2b_provider_device_security_key::security_key_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-security-key-service-controller",
+        provider_ref: "Provider/device-security-key",
+        resource_type: d2b_provider_device_security_key::SECURITY_KEY_SERVICE_RESOURCE_TYPE,
+        finalizer: d2b_provider_device_security_key::SECURITY_KEY_SERVICE_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_security_key::security_key_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        watched_configuration_is_dependency:
+            d2b_provider_device_security_key::security_key_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-security-key-binding-controller",
+        provider_ref: "Provider/device-security-key",
+        resource_type: d2b_provider_device_security_key::SECURITY_KEY_BINDING_RESOURCE_TYPE,
+        finalizer: d2b_provider_device_security_key::SECURITY_KEY_BINDING_FINALIZER,
+        repair_interval_ticks: d2b_provider_device_security_key::security_key_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        watched_configuration_is_dependency:
+            d2b_provider_device_security_key::security_key_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/device-gpu-controller",
+        provider_ref: "Provider/device-gpu",
+        resource_type: "Device",
+        finalizer: d2b_provider_device_gpu::gpu_runner_contract().finalizer(),
+        repair_interval_ticks: d2b_provider_device_gpu::gpu_runner_contract()
+            .repair_interval_secs()
+            * 1_000,
+        watched_configuration_is_dependency: d2b_provider_device_gpu::gpu_runner_contract()
+            .watched_configuration_is_dependency(),
+    },
+];
+
+/// The U9 interaction and shell ResourceTypes attached to the production
+/// shared Runner. Clipboard and notification delivery remain typed
+/// ComponentSession services and therefore have no ResourceType registration.
+pub const U9_SHARED_PROVIDER_RUNNERS: [SharedProviderRunnerRegistration; 6] = [
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/display-wayland-controller",
+        provider_ref: "Provider/display-wayland",
+        resource_type: "display-wayland.d2bus.org.WaylandPolicy",
+        finalizer: "",
+        repair_interval_ticks:
+            d2b_provider_display_wayland::DISPLAY_REPAIR_INTERVAL_SECS * 1_000,
+        watched_configuration_is_dependency:
+            d2b_provider_display_wayland::display_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/display-wayland-controller",
+        provider_ref: "Provider/display-wayland",
+        resource_type: "display-wayland.d2bus.org.WaylandSession",
+        finalizer: d2b_provider_display_wayland::FINALIZER,
+        repair_interval_ticks:
+            d2b_provider_display_wayland::DISPLAY_REPAIR_INTERVAL_SECS * 1_000,
+        watched_configuration_is_dependency:
+            d2b_provider_display_wayland::display_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/audio-pipewire-controller",
+        provider_ref: "Provider/audio-pipewire",
+        resource_type: "audio.d2bus.org.AudioService",
+        finalizer: d2b_provider_audio_pipewire::AUDIO_SERVICE_FINALIZER,
+        repair_interval_ticks:
+            d2b_provider_audio_pipewire::AUDIO_REPAIR_INTERVAL_SECS * 1_000,
+        watched_configuration_is_dependency:
+            d2b_provider_audio_pipewire::audio_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/audio-pipewire-controller",
+        provider_ref: "Provider/audio-pipewire",
+        resource_type: "audio.d2bus.org.AudioBinding",
+        finalizer: d2b_provider_audio_pipewire::AUDIO_BINDING_FINALIZER,
+        repair_interval_ticks:
+            d2b_provider_audio_pipewire::AUDIO_REPAIR_INTERVAL_SECS * 1_000,
+        watched_configuration_is_dependency:
+            d2b_provider_audio_pipewire::audio_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/shell-terminal-controller",
+        provider_ref: "Provider/shell-terminal",
+        resource_type: "shell-terminal.d2bus.org.ShellPool",
+        finalizer: d2b_provider_shell_terminal::SHELL_POOL_FINALIZER,
+        repair_interval_ticks: d2b_provider_shell_terminal::SHELL_REPAIR_INTERVAL_SECS * 1_000,
+        watched_configuration_is_dependency:
+            d2b_provider_shell_terminal::shell_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+    SharedProviderRunnerRegistration {
+        controller_ref: "Process/shell-terminal-controller",
+        provider_ref: "Provider/shell-terminal",
+        resource_type: "shell-terminal.d2bus.org.ShellSession",
+        finalizer: d2b_provider_shell_terminal::SHELL_SESSION_FINALIZER,
+        repair_interval_ticks: d2b_provider_shell_terminal::SHELL_REPAIR_INTERVAL_SECS * 1_000,
+        watched_configuration_is_dependency:
+            d2b_provider_shell_terminal::shell_runner_contract()
+                .watched_configuration_is_dependency(),
+    },
+];
+
+const U9_PROVIDER_REFS: [&str; 5] = [
+    "Provider/display-wayland",
+    "Provider/audio-pipewire",
+    "Provider/clipboard-wayland",
+    "Provider/notification-desktop",
+    "Provider/shell-terminal",
+];
+
+/// Closed Provider handler set used by the shared Runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedProviderResourceKind {
+    Network,
+    TpmDevice,
+    UsbipDevice,
+    UsbipService,
+    UsbipBinding,
+    SecurityKeyDevice,
+    SecurityKeyService,
+    SecurityKeyBinding,
+    GpuDevice,
+    CloudHypervisorGuest,
+    QemuMediaGuest,
+    AzureContainerAppsGuest,
+    AzureVirtualMachineGuest,
+    DisplayWaylandPolicy,
+    DisplayWaylandSession,
+    AudioService,
+    AudioBinding,
+    ShellPool,
+    ShellSession,
+}
+
+impl SharedProviderResourceKind {
+    fn from_registration(
+        registration: SharedProviderRunnerRegistration,
+    ) -> Result<Self, ResourceRuntimeError> {
+        match (
+            registration.provider_ref,
+            registration.resource_type,
+            registration.controller_ref,
+        ) {
+            ("Provider/network-local", "Network", "Process/network-local-controller") => {
+                Ok(Self::Network)
+            }
+            ("Provider/device-tpm", "Device", "Process/device-tpm-controller") => {
+                Ok(Self::TpmDevice)
+            }
+            ("Provider/device-usbip", "Device", "Process/device-usbip-controller") => {
+                Ok(Self::UsbipDevice)
+            }
+            (
+                "Provider/device-usbip",
+                d2b_provider_device_usbip::USB_SERVICE_RESOURCE_TYPE,
+                "Process/device-usbip-service-controller",
+            ) => Ok(Self::UsbipService),
+            (
+                "Provider/device-usbip",
+                d2b_provider_device_usbip::USB_BINDING_RESOURCE_TYPE,
+                "Process/device-usbip-binding-controller",
+            ) => Ok(Self::UsbipBinding),
+            ("Provider/device-security-key", "Device", "Process/device-security-key-controller") => {
+                Ok(Self::SecurityKeyDevice)
+            }
+            (
+                "Provider/device-security-key",
+                d2b_provider_device_security_key::SECURITY_KEY_SERVICE_RESOURCE_TYPE,
+                "Process/device-security-key-service-controller",
+            ) => Ok(Self::SecurityKeyService),
+            (
+                "Provider/device-security-key",
+                d2b_provider_device_security_key::SECURITY_KEY_BINDING_RESOURCE_TYPE,
+                "Process/device-security-key-binding-controller",
+            ) => Ok(Self::SecurityKeyBinding),
+            ("Provider/device-gpu", "Device", "Process/device-gpu-controller") => {
+                Ok(Self::GpuDevice)
+            }
+            (
+                "Provider/runtime-cloud-hypervisor",
+                "Guest",
+                "Process/cloud-hypervisor-controller",
+            ) => Ok(Self::CloudHypervisorGuest),
+            (
+                "Provider/runtime-qemu-media",
+                "Guest",
+                "Process/runtime-qemu-media-controller",
+            ) => Ok(Self::QemuMediaGuest),
+            (
+                "Provider/runtime-azure-container-apps",
+                "Guest",
+                "Process/aca-controller",
+            ) => Ok(Self::AzureContainerAppsGuest),
+            (
+                "Provider/runtime-azure-virtual-machine",
+                "Guest",
+                "Process/azure-vm-controller-process",
+            ) => Ok(Self::AzureVirtualMachineGuest),
+            (
+                "Provider/display-wayland",
+                "display-wayland.d2bus.org.WaylandPolicy",
+                "Process/display-wayland-controller",
+            ) => Ok(Self::DisplayWaylandPolicy),
+            (
+                "Provider/display-wayland",
+                "display-wayland.d2bus.org.WaylandSession",
+                "Process/display-wayland-controller",
+            ) => Ok(Self::DisplayWaylandSession),
+            (
+                "Provider/audio-pipewire",
+                "audio.d2bus.org.AudioService",
+                "Process/audio-pipewire-controller",
+            ) => Ok(Self::AudioService),
+            (
+                "Provider/audio-pipewire",
+                "audio.d2bus.org.AudioBinding",
+                "Process/audio-pipewire-controller",
+            ) => Ok(Self::AudioBinding),
+            (
+                "Provider/shell-terminal",
+                "shell-terminal.d2bus.org.ShellPool",
+                "Process/shell-terminal-controller",
+            ) => Ok(Self::ShellPool),
+            (
+                "Provider/shell-terminal",
+                "shell-terminal.d2bus.org.ShellSession",
+                "Process/shell-terminal-controller",
+            ) => Ok(Self::ShellSession),
+            _ => Err(ResourceRuntimeError::HandlerNotReady),
+        }
+    }
+
+    const fn effect_id(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::TpmDevice => "device-tpm",
+            Self::UsbipDevice => "device-usbip",
+            Self::UsbipService => "device-usbip-service",
+            Self::UsbipBinding => "device-usbip-binding",
+            Self::SecurityKeyDevice => "device-security-key",
+            Self::SecurityKeyService => "device-security-key-service",
+            Self::SecurityKeyBinding => "device-security-key-binding",
+            Self::GpuDevice => "device-gpu",
+            Self::CloudHypervisorGuest => "runtime-cloud-hypervisor-guest",
+            Self::QemuMediaGuest => "runtime-qemu-media-guest",
+            Self::AzureContainerAppsGuest => "runtime-azure-container-apps-guest",
+            Self::AzureVirtualMachineGuest => "runtime-azure-virtual-machine-guest",
+            Self::DisplayWaylandPolicy => "display-wayland-policy",
+            Self::DisplayWaylandSession => "display-wayland-session",
+            Self::AudioService => "audio-service",
+            Self::AudioBinding => "audio-binding",
+            Self::ShellPool => "shell-pool",
+            Self::ShellSession => "shell-session",
+        }
+    }
+
+    const fn provider_ref(self) -> &'static str {
+        match self {
+            Self::Network => "Provider/network-local",
+            Self::TpmDevice => "Provider/device-tpm",
+            Self::UsbipDevice | Self::UsbipService | Self::UsbipBinding => {
+                "Provider/device-usbip"
+            }
+            Self::SecurityKeyDevice
+            | Self::SecurityKeyService
+            | Self::SecurityKeyBinding => "Provider/device-security-key",
+            Self::GpuDevice => "Provider/device-gpu",
+            Self::CloudHypervisorGuest => "Provider/runtime-cloud-hypervisor",
+            Self::QemuMediaGuest => "Provider/runtime-qemu-media",
+            Self::AzureContainerAppsGuest => "Provider/runtime-azure-container-apps",
+            Self::AzureVirtualMachineGuest => "Provider/runtime-azure-virtual-machine",
+            Self::DisplayWaylandPolicy | Self::DisplayWaylandSession => "Provider/display-wayland",
+            Self::AudioService | Self::AudioBinding => "Provider/audio-pipewire",
+            Self::ShellPool | Self::ShellSession => "Provider/shell-terminal",
+        }
+    }
+
+    const fn resource_type(self) -> &'static str {
+        match self {
+            Self::Network => "Network",
+            Self::TpmDevice
+            | Self::UsbipDevice
+            | Self::SecurityKeyDevice
+            | Self::GpuDevice => "Device",
+            Self::UsbipService => d2b_provider_device_usbip::USB_SERVICE_RESOURCE_TYPE,
+            Self::UsbipBinding => d2b_provider_device_usbip::USB_BINDING_RESOURCE_TYPE,
+            Self::SecurityKeyService => {
+                d2b_provider_device_security_key::SECURITY_KEY_SERVICE_RESOURCE_TYPE
+            }
+            Self::SecurityKeyBinding => {
+                d2b_provider_device_security_key::SECURITY_KEY_BINDING_RESOURCE_TYPE
+            }
+            Self::CloudHypervisorGuest
+            | Self::QemuMediaGuest
+            | Self::AzureContainerAppsGuest
+            | Self::AzureVirtualMachineGuest => "Guest",
+            Self::DisplayWaylandPolicy => "display-wayland.d2bus.org.WaylandPolicy",
+            Self::DisplayWaylandSession => "display-wayland.d2bus.org.WaylandSession",
+            Self::AudioService => "audio.d2bus.org.AudioService",
+            Self::AudioBinding => "audio.d2bus.org.AudioBinding",
+            Self::ShellPool => "shell-terminal.d2bus.org.ShellPool",
+            Self::ShellSession => "shell-terminal.d2bus.org.ShellSession",
+        }
+    }
+
+    const fn usbip_component(self) -> Option<UsbipResourceComponent> {
+        match self {
+            Self::UsbipDevice => Some(UsbipResourceComponent::Device),
+            Self::UsbipService => Some(UsbipResourceComponent::Service),
+            Self::UsbipBinding => Some(UsbipResourceComponent::Binding),
+            _ => None,
+        }
+    }
+
+    const fn security_key_component(self) -> Option<SecurityKeyResourceComponent> {
+        match self {
+            Self::SecurityKeyDevice => Some(SecurityKeyResourceComponent::Device),
+            Self::SecurityKeyService => Some(SecurityKeyResourceComponent::Service),
+            Self::SecurityKeyBinding => Some(SecurityKeyResourceComponent::Binding),
+            _ => None,
+        }
+    }
+}
+
+/// USBIP resource owner selected by a shared-Runner descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsbipResourceComponent {
+    Device,
+    Service,
+    Binding,
+}
+
+/// SecurityKey resource owner selected by a shared-Runner descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecurityKeyResourceComponent {
+    Device,
+    Service,
+    Binding,
+}
+
+/// Identity and assignment evidence passed to one Provider effect adapter.
+#[derive(Clone)]
+pub(crate) struct SharedProviderEffectContext {
+    pub(crate) identity: ControllerIdentity,
+    pub(crate) target: ResourceKey,
+    pub(crate) operation_id: String,
+}
+
+/// Result returned by one typed Provider effect adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedProviderEffectPhase {
+    Ready,
+    Pending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SharedProviderEffectResult {
+    pub(crate) phase: SharedProviderEffectPhase,
+    pub(crate) child_mutated: bool,
+    pub(crate) resource_projection: Option<Value>,
+}
+
+impl SharedProviderEffectResult {
+    const fn phase(phase: SharedProviderEffectPhase) -> Self {
+        Self {
+            phase,
+            child_mutated: false,
+            resource_projection: None,
+        }
+    }
+}
+
+/// Closed failure surface for shared Provider adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedProviderEffectError {
+    /// The Provider path is not currently available and should retry.
+    Unavailable,
+    /// Fresh resource or assignment evidence failed closed.
+    InvalidResource,
+}
+
+impl core::fmt::Display for SharedProviderEffectError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "shared-provider-effect-unavailable",
+            Self::InvalidResource => "shared-provider-resource-invalid",
+        })
+    }
+}
+
+impl std::error::Error for SharedProviderEffectError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameworkAzureOperation {
+    Provision,
+    Delete,
+    ChildCleanup,
+    Extension,
+    Update,
+}
+
+/// Framework-only QEMU effect evidence for non-Cloud-Hypervisor Guest owners.
+///
+/// The real Process/ComponentSession path remains owned by the selected
+/// child Providers; this adapter exercises the typed lifecycle state machine
+/// without claiming Cloud Hypervisor host liveness.
+struct FrameworkQemuEffect {
+    guest_ref: ResourceRef,
+    identity: Option<qemu_media_runtime::ProcessIdentity>,
+    qmp_ready: bool,
+}
+
+impl FrameworkQemuEffect {
+    fn new(guest_ref: ResourceRef) -> Self {
+        Self {
+            guest_ref,
+            identity: None,
+            qmp_ready: false,
+        }
+    }
+
+    fn qmp_ready(&self) -> bool {
+        self.qmp_ready
+    }
+}
+
+impl qemu_media_runtime::QemuMediaEffectPort for FrameworkQemuEffect {
+    fn launch(
+        &mut self,
+        _ticket: &qemu_media_runtime::LaunchTicket,
+    ) -> Result<qemu_media_runtime::ProcessIdentity, qemu_media_runtime::QemuMediaError> {
+        let template_digest: [u8; 32] = Sha256::digest(b"qemu-media-runner").into();
+        let identity_digest: [u8; 32] =
+            Sha256::digest(self.guest_ref.to_canonical_string().as_bytes()).into();
+        let identity = qemu_media_runtime::ProcessIdentity {
+            pid: 1,
+            start_time_ticks: 1,
+            cgroup_digest: identity_digest,
+            executable_digest: identity_digest,
+            template_digest,
+            generation: 1,
+        };
+        self.identity = Some(identity.clone());
+        Ok(identity)
+    }
+
+    fn observe(
+        &mut self,
+    ) -> Result<
+        Option<qemu_media_runtime::ProcessIdentity>,
+        qemu_media_runtime::QemuMediaError,
+    > {
+        Ok(self.identity.clone())
+    }
+
+    fn open_pidfd(
+        &mut self,
+        _identity: &qemu_media_runtime::ProcessIdentity,
+    ) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        self.qmp_ready = true;
+        Ok(())
+    }
+
+    fn reserve_device_authority(
+        &mut self,
+        _authority_key: [u8; 32],
+        _owner_ref: &ResourceRef,
+    ) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        Ok(())
+    }
+
+    fn close_media_effects(&mut self) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        self.qmp_ready = false;
+        Ok(())
+    }
+
+    fn continue_guest(&mut self) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        Ok(())
+    }
+
+    fn stop(
+        &mut self,
+        _identity: &qemu_media_runtime::ProcessIdentity,
+    ) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        self.identity = None;
+        self.qmp_ready = false;
+        Ok(())
+    }
+
+    fn release_device_authority(&mut self) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        Ok(())
+    }
+
+    fn delete_runtime_volume(&mut self) -> Result<(), qemu_media_runtime::QemuMediaError> {
+        Ok(())
+    }
+}
+
+struct FrameworkAcaState {
+    provider_generation: u64,
+    disk_image: Option<aca_runtime::AcaDiskImageRecord>,
+    sandbox: Option<aca_runtime::AcaSandboxRecord>,
+}
+
+impl FrameworkAcaState {
+    fn new(provider_generation: u64) -> Self {
+        Self {
+            provider_generation,
+            disk_image: None,
+            sandbox: None,
+        }
+    }
+}
+
+struct FrameworkAcaControl {
+    state: Arc<tokio::sync::Mutex<FrameworkAcaState>>,
+}
+
+struct FrameworkAcaLease;
+
+#[async_trait]
+impl aca_runtime::AcaCredentialLeaseClient for FrameworkAcaLease {
+    async fn acquire(
+        &self,
+        request: &aca_runtime::AcaCredentialLeaseRequest,
+    ) -> Result<aca_runtime::AcaCredentialLease, aca_runtime::AcaControlError> {
+        let handle = d2b_contracts_provider::v3::credential::CredentialLeaseHandle::parse(
+            "u6-framework-lease",
+        )
+        .map_err(|_| {
+            aca_runtime::AcaControlError::new(aca_runtime::AcaControlErrorKind::Authentication)
+        })?;
+        Ok(aca_runtime::AcaCredentialLease::from_metadata(
+            handle,
+            request.requested_expiry_unix_ms(),
+        ))
+    }
+
+    async fn revoke(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+    ) -> Result<(), aca_runtime::AcaControlError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl aca_runtime::AcaControl for FrameworkAcaControl {
+    async fn health(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+    ) -> Result<aca_runtime::AcaControlHealth, aca_runtime::AcaControlError> {
+        Ok(if self
+            .state
+            .lock()
+            .await
+            .sandbox
+            .as_ref()
+            .is_some_and(|sandbox| {
+                sandbox.lifecycle == aca_runtime::AcaSandboxLifecycle::Running
+            }) {
+            aca_runtime::AcaControlHealth::Ready
+        } else {
+            aca_runtime::AcaControlHealth::Unavailable
+        })
+    }
+
+    async fn find_sandboxes(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        _query: &aca_runtime::AcaWorkloadQuery,
+    ) -> Result<
+        aca_runtime::AcaSandboxCandidates,
+        aca_runtime::AcaControlError,
+    > {
+        let mut state = self.state.lock().await;
+        if state
+            .sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.lifecycle == aca_runtime::AcaSandboxLifecycle::Creating)
+        {
+            if let Some(sandbox) = state.sandbox.as_mut() {
+                sandbox.lifecycle = aca_runtime::AcaSandboxLifecycle::Running;
+            }
+        }
+        aca_runtime::AcaSandboxCandidates::new(
+            state.sandbox.clone().into_iter().collect(),
+        )
+        .map_err(|_| {
+            aca_runtime::AcaControlError::new(aca_runtime::AcaControlErrorKind::InvalidResponse)
+        })
+    }
+
+    async fn find_disk_images(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        _desired: &aca_runtime::AcaDesiredDiskImage,
+    ) -> Result<
+        aca_runtime::AcaDiskImageCandidates,
+        aca_runtime::AcaControlError,
+    > {
+        let state = self.state.lock().await;
+        aca_runtime::AcaDiskImageCandidates::new(
+            state.disk_image.clone().into_iter().collect(),
+        )
+        .map_err(|_| {
+            aca_runtime::AcaControlError::new(aca_runtime::AcaControlErrorKind::InvalidResponse)
+        })
+    }
+
+    async fn create_disk_image(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        _desired: &aca_runtime::AcaDesiredDiskImage,
+    ) -> Result<aca_runtime::AcaDiskImageRecord, aca_runtime::AcaControlError> {
+        let record = aca_runtime::AcaDiskImageRecord {
+            id: aca_runtime::AcaDiskImageId::parse("u6-framework-disk").map_err(|_| {
+                aca_runtime::AcaControlError::new(aca_runtime::AcaControlErrorKind::InvalidResponse)
+            })?,
+            generation: self.state.lock().await.provider_generation,
+        };
+        self.state.lock().await.disk_image = Some(record.clone());
+        Ok(record)
+    }
+
+    async fn create_sandbox(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        desired: &aca_runtime::AcaDesiredSandbox,
+    ) -> Result<aca_runtime::AcaSandboxRecord, aca_runtime::AcaControlError> {
+        let record = aca_runtime::AcaSandboxRecord {
+            id: aca_runtime::AcaSandboxId::parse("u6-framework-sandbox").map_err(|_| {
+                aca_runtime::AcaControlError::new(aca_runtime::AcaControlErrorKind::InvalidResponse)
+            })?,
+            lifecycle: aca_runtime::AcaSandboxLifecycle::Creating,
+            generation: desired.binding.provider_generation,
+        };
+        self.state.lock().await.sandbox = Some(record.clone());
+        Ok(record)
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        sandbox_id: &aca_runtime::AcaSandboxId,
+    ) -> Result<aca_runtime::AcaSandboxRecord, aca_runtime::AcaControlError> {
+        let mut state = self.state.lock().await;
+        let Some(sandbox) = state.sandbox.as_mut() else {
+            return Err(aca_runtime::AcaControlError::new(
+                aca_runtime::AcaControlErrorKind::NotFound,
+            ));
+        };
+        if sandbox.id != *sandbox_id {
+            return Err(aca_runtime::AcaControlError::new(
+                aca_runtime::AcaControlErrorKind::Conflict,
+            ));
+        }
+        sandbox.lifecycle = aca_runtime::AcaSandboxLifecycle::Running;
+        Ok(sandbox.clone())
+    }
+
+    async fn stop_sandbox(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        sandbox_id: &aca_runtime::AcaSandboxId,
+    ) -> Result<aca_runtime::AcaSandboxRecord, aca_runtime::AcaControlError> {
+        let mut state = self.state.lock().await;
+        let Some(sandbox) = state.sandbox.as_mut() else {
+            return Err(aca_runtime::AcaControlError::new(
+                aca_runtime::AcaControlErrorKind::NotFound,
+            ));
+        };
+        if sandbox.id != *sandbox_id {
+            return Err(aca_runtime::AcaControlError::new(
+                aca_runtime::AcaControlErrorKind::Conflict,
+            ));
+        }
+        sandbox.lifecycle = aca_runtime::AcaSandboxLifecycle::Stopped;
+        Ok(sandbox.clone())
+    }
+
+    async fn delete_sandbox(
+        &self,
+        _lease: &aca_runtime::AcaCredentialLease,
+        _context: &aca_runtime::AcaControlContext,
+        sandbox_id: &aca_runtime::AcaSandboxId,
+    ) -> Result<aca_runtime::AcaDeleteOutcome, aca_runtime::AcaControlError> {
+        let mut state = self.state.lock().await;
+        if state
+            .sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.id != *sandbox_id)
+        {
+            return Err(aca_runtime::AcaControlError::new(
+                aca_runtime::AcaControlErrorKind::Conflict,
+            ));
+        }
+        state.sandbox = None;
+        Ok(aca_runtime::AcaDeleteOutcome::Deleted)
+    }
+}
+
+struct FrameworkAzureState {
+    state: azure_vm_runtime::AzureVmState,
+    handle: Option<azure_vm_runtime::AzureVmHandle>,
+    tags: azure_vm_runtime::TagDigest,
+    operation: Option<(
+        azure_vm_runtime::AzureOperationHandle,
+        FrameworkAzureOperation,
+    )>,
+    extension_present: bool,
+}
+
+impl FrameworkAzureState {
+    fn new(settings: &azure_vm_runtime::AzureVmGuestSettings) -> Self {
+        Self {
+            state: azure_vm_runtime::AzureVmState::Absent,
+            handle: None,
+            tags: azure_vm_runtime::TagDigest::from_tags(&settings.azure_tags),
+            operation: None,
+            extension_present: false,
+        }
+    }
+
+    fn operation(
+        &mut self,
+        operation_id: &str,
+        kind: FrameworkAzureOperation,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        let operation = azure_vm_runtime::AzureOperationHandle::from_core(
+            format!("u6-{operation_id}-{kind:?}"),
+        )?;
+        self.operation = Some((operation.clone(), kind));
+        Ok(operation)
+    }
+}
+
+struct FrameworkAzureEffect {
+    state: Arc<tokio::sync::Mutex<FrameworkAzureState>>,
+}
+
+struct FrameworkAzureCredential;
+
+#[async_trait]
+impl azure_vm_runtime::AzureCredentialPort for FrameworkAzureCredential {
+    async fn acquire_token(
+        &self,
+        _audience: &str,
+        _deadline_ms: u32,
+    ) -> Result<azure_vm_runtime::AzureAccessToken, azure_vm_runtime::AzureVmError> {
+        Ok(vec![0_u8].into())
+    }
+}
+
+#[async_trait]
+impl azure_vm_runtime::AzureEffectPort for FrameworkAzureEffect {
+    async fn start_vm_provision(
+        &self,
+        _settings: &azure_vm_runtime::AzureVmGuestSettings,
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        let mut state = self.state.lock().await;
+        state.state = azure_vm_runtime::AzureVmState::Provisioning;
+        state.operation(operation_id, FrameworkAzureOperation::Provision)
+    }
+
+    async fn poll_lro(
+        &self,
+        operation: &azure_vm_runtime::AzureOperationHandle,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::LroStatus, azure_vm_runtime::AzureVmError> {
+        let mut state = self.state.lock().await;
+        let Some((current, kind)) = state.operation.take() else {
+            return Err(azure_vm_runtime::AzureVmError::InvalidOperationHandle);
+        };
+        if &current != operation {
+            return Err(azure_vm_runtime::AzureVmError::InvalidOperationHandle);
+        }
+        match kind {
+            FrameworkAzureOperation::Provision => {
+                state.state = azure_vm_runtime::AzureVmState::Running;
+                state.handle = Some(
+                    azure_vm_runtime::AzureVmHandle::from_core("u6-framework-vm")?,
+                );
+            }
+            FrameworkAzureOperation::Delete => {
+                state.state = azure_vm_runtime::AzureVmState::Absent;
+                state.handle = None;
+            }
+            FrameworkAzureOperation::Extension => state.extension_present = false,
+            FrameworkAzureOperation::ChildCleanup
+            | FrameworkAzureOperation::Update => {}
+        }
+        Ok(azure_vm_runtime::LroStatus::Succeeded)
+    }
+
+    async fn get_vm_state(
+        &self,
+        _settings: &azure_vm_runtime::AzureVmGuestSettings,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<
+        (
+            azure_vm_runtime::AzureVmState,
+            Option<azure_vm_runtime::AzureVmHandle>,
+            Option<azure_vm_runtime::TagDigest>,
+        ),
+        azure_vm_runtime::AzureVmError,
+    > {
+        let state = self.state.lock().await;
+        Ok((state.state, state.handle.clone(), Some(state.tags)))
+    }
+
+    async fn put_vm_extension(
+        &self,
+        _handle: &azure_vm_runtime::AzureVmHandle,
+        _payload: azure_vm_runtime::PskExtensionPayload,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        let mut state = self.state.lock().await;
+        state.extension_present = true;
+        state.operation("extension", FrameworkAzureOperation::Extension)
+    }
+
+    async fn delete_vm_extension(
+        &self,
+        _settings: &azure_vm_runtime::AzureVmGuestSettings,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        let mut state = self.state.lock().await;
+        state.operation("extension-cleanup", FrameworkAzureOperation::Extension)
+    }
+
+    async fn start_vm_resize(
+        &self,
+        _handle: &azure_vm_runtime::AzureVmHandle,
+        _size: &str,
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        self.state
+            .lock()
+            .await
+            .operation(operation_id, FrameworkAzureOperation::Update)
+    }
+
+    async fn start_vm_delete(
+        &self,
+        _handle: &azure_vm_runtime::AzureVmHandle,
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        self.state
+            .lock()
+            .await
+            .operation(operation_id, FrameworkAzureOperation::Delete)
+    }
+
+    async fn start_child_resource_cleanup(
+        &self,
+        _settings: &azure_vm_runtime::AzureVmGuestSettings,
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        self.state
+            .lock()
+            .await
+            .operation(operation_id, FrameworkAzureOperation::ChildCleanup)
+    }
+
+    async fn start_disk_attach(
+        &self,
+        _handle: &azure_vm_runtime::AzureVmHandle,
+        _disk: &azure_vm_runtime::DataDiskSpec,
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        self.state
+            .lock()
+            .await
+            .operation(operation_id, FrameworkAzureOperation::Update)
+    }
+
+    async fn start_disk_detach(
+        &self,
+        _handle: &azure_vm_runtime::AzureVmHandle,
+        _lun: u8,
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        self.state
+            .lock()
+            .await
+            .operation(operation_id, FrameworkAzureOperation::Update)
+    }
+
+    async fn update_vm_tags(
+        &self,
+        _handle: &azure_vm_runtime::AzureVmHandle,
+        _tags: &[(String, String)],
+        operation_id: &str,
+        _token: &azure_vm_runtime::AzureAccessToken,
+    ) -> Result<azure_vm_runtime::AzureOperationHandle, azure_vm_runtime::AzureVmError> {
+        self.state
+            .lock()
+            .await
+            .operation(operation_id, FrameworkAzureOperation::Update)
+    }
+}
+
+enum GuestRuntimeController {
+    Qemu {
+        controller: qemu_media_runtime::QemuMediaController<FrameworkQemuEffect>,
+        effect: FrameworkQemuEffect,
+    },
+    Aca {
+        controller: aca_runtime::AcaController<FrameworkAcaControl, FrameworkAcaLease>,
+    },
+    AzureVm {
+        controller: azure_vm_runtime::AzureVmController<FrameworkAzureEffect>,
+    },
+}
+
+impl GuestRuntimeController {
+    fn finalizer_installed(&self) -> bool {
+        match self {
+            Self::Qemu { controller, .. } => controller.finalizer_installed(),
+            Self::Aca { controller } => controller.finalizer_installed(),
+            Self::AzureVm { controller } => controller.finalizer_installed(),
+        }
+    }
+}
+
+/// Typed Provider effect boundary owned by the d2bd composition root.
+#[async_trait]
+pub(crate) trait SharedProviderEffectExecutor: Send + Sync {
+    /// Reconcile one Network resource through the Network-local controller.
+    async fn reconcile_network(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let _ = (context, resource, dependencies);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one TPM Device through the persistent TPM controller.
+    async fn reconcile_tpm(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let _ = (context, resource, dependencies);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one USBIP resource through its typed lifecycle controller.
+    async fn reconcile_usbip(
+        &self,
+        component: UsbipResourceComponent,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let _ = (component, context, resource, dependencies);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one SecurityKey resource through its typed lifecycle
+    /// controller.
+    async fn reconcile_security_key(
+        &self,
+        component: SecurityKeyResourceComponent,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let _ = (component, context, resource, dependencies);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one GPU Device through the authority-fenced lifecycle.
+    async fn reconcile_gpu(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let _ = (context, resource, dependencies);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one display-wayland ResourceType.
+    async fn reconcile_display(
+        &self,
+        _kind: SharedProviderResourceKind,
+        _context: &SharedProviderEffectContext,
+        _resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one audio-pipewire ResourceType.
+    async fn reconcile_audio(
+        &self,
+        _kind: SharedProviderResourceKind,
+        _context: &SharedProviderEffectContext,
+        _resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one shell-terminal ResourceType.
+    async fn reconcile_shell(
+        &self,
+        _kind: SharedProviderResourceKind,
+        _context: &SharedProviderEffectContext,
+        _resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Reconcile one Guest through its selected runtime Provider.
+    async fn reconcile_guest(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let _ = (kind, context, resource, dependencies);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    async fn reconcile_guest_result(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        self.reconcile_guest(kind, context, resource, dependencies)
+            .await
+            .map(SharedProviderEffectResult::phase)
+    }
+
+    async fn reconcile_result(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        if matches!(
+            kind,
+            SharedProviderResourceKind::CloudHypervisorGuest
+                | SharedProviderResourceKind::QemuMediaGuest
+                | SharedProviderResourceKind::AzureContainerAppsGuest
+                | SharedProviderResourceKind::AzureVirtualMachineGuest
+        ) {
+            self.reconcile_guest_result(kind, context, resource, dependencies)
+                .await
+        } else if matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+        ) {
+            self.reconcile_display(kind, context, resource, dependencies)
+                .await
+        } else if matches!(
+            kind,
+            SharedProviderResourceKind::AudioService
+                | SharedProviderResourceKind::AudioBinding
+        ) {
+            self.reconcile_audio(kind, context, resource, dependencies)
+                .await
+        } else if matches!(
+            kind,
+            SharedProviderResourceKind::ShellPool | SharedProviderResourceKind::ShellSession
+        ) {
+            self.reconcile_shell(kind, context, resource, dependencies)
+                .await
+        } else {
+            self.reconcile(kind, context, resource, dependencies)
+                .await
+                .map(SharedProviderEffectResult::phase)
+        }
+    }
+
+    async fn observe_result(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        if matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+                | SharedProviderResourceKind::AudioService
+                | SharedProviderResourceKind::AudioBinding
+                | SharedProviderResourceKind::ShellPool
+                | SharedProviderResourceKind::ShellSession
+        ) {
+            self.reconcile_result(kind, context, resource, &[]).await
+        } else {
+            self.observe(kind, context, resource)
+                .await
+                .map(SharedProviderEffectResult::phase)
+        }
+    }
+
+    /// Dispatch the closed Provider kind to its typed effect port.
+    async fn reconcile(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        match kind {
+            SharedProviderResourceKind::Network => {
+                self.reconcile_network(context, resource, dependencies).await
+            }
+            SharedProviderResourceKind::TpmDevice => {
+                self.reconcile_tpm(context, resource, dependencies).await
+            }
+            SharedProviderResourceKind::UsbipDevice
+            | SharedProviderResourceKind::UsbipService
+            | SharedProviderResourceKind::UsbipBinding => self
+                .reconcile_usbip(
+                    kind.usbip_component().expect("USBIP kind has a component"),
+                    context,
+                    resource,
+                    dependencies,
+                )
+                .await,
+            SharedProviderResourceKind::SecurityKeyDevice
+            | SharedProviderResourceKind::SecurityKeyService
+            | SharedProviderResourceKind::SecurityKeyBinding => self
+                .reconcile_security_key(
+                    kind.security_key_component()
+                        .expect("SecurityKey kind has a component"),
+                    context,
+                    resource,
+                    dependencies,
+                )
+                .await,
+            SharedProviderResourceKind::GpuDevice => {
+                self.reconcile_gpu(context, resource, dependencies).await
+            }
+            SharedProviderResourceKind::CloudHypervisorGuest
+            | SharedProviderResourceKind::QemuMediaGuest
+            | SharedProviderResourceKind::AzureContainerAppsGuest
+            | SharedProviderResourceKind::AzureVirtualMachineGuest => self
+                .reconcile_guest(kind, context, resource, dependencies)
+                .await,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+            | SharedProviderResourceKind::DisplayWaylandSession => self
+                .reconcile_display(kind, context, resource, dependencies)
+                .await
+                .map(|result| result.phase),
+            SharedProviderResourceKind::AudioService
+            | SharedProviderResourceKind::AudioBinding => self
+                .reconcile_audio(kind, context, resource, dependencies)
+                .await
+                .map(|result| result.phase),
+            SharedProviderResourceKind::ShellPool
+            | SharedProviderResourceKind::ShellSession => self
+                .reconcile_shell(kind, context, resource, dependencies)
+                .await
+                .map(|result| result.phase),
+        }
+    }
+
+    /// Observe or repair one exact Provider-owned resource.
+    async fn observe(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        self.reconcile(kind, context, resource, &[]).await
+    }
+
+    /// Run provider cleanup before the owner finalizer is removed.
+    async fn finalize(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<(), SharedProviderEffectError> {
+        if matches!(
+            kind,
+            SharedProviderResourceKind::CloudHypervisorGuest
+                | SharedProviderResourceKind::QemuMediaGuest
+                | SharedProviderResourceKind::AzureContainerAppsGuest
+                | SharedProviderResourceKind::AzureVirtualMachineGuest
+        ) {
+            return self.finalize_guest(kind, context, resource).await;
+        }
+        if matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+                | SharedProviderResourceKind::AudioService
+                | SharedProviderResourceKind::AudioBinding
+                | SharedProviderResourceKind::ShellPool
+                | SharedProviderResourceKind::ShellSession
+        ) {
+            return Ok(());
+        }
+        let _ = (kind, context, resource);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Finalize one Guest through its selected runtime Provider.
+    async fn finalize_guest(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<(), SharedProviderEffectError> {
+        let _ = (kind, context, resource);
+        Err(SharedProviderEffectError::Unavailable)
+    }
+
+    /// Run an accepted upgrade through the typed Provider lifecycle.
+    async fn upgrade(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        self.reconcile(kind, context, resource, dependencies).await
+    }
+
+    async fn upgrade_result(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        if matches!(
+            kind,
+            SharedProviderResourceKind::CloudHypervisorGuest
+                | SharedProviderResourceKind::QemuMediaGuest
+                | SharedProviderResourceKind::AzureContainerAppsGuest
+                | SharedProviderResourceKind::AzureVirtualMachineGuest
+        ) {
+            self.reconcile_result(kind, context, resource, dependencies)
+                .await
+        } else if matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+                | SharedProviderResourceKind::AudioService
+                | SharedProviderResourceKind::AudioBinding
+                | SharedProviderResourceKind::ShellPool
+                | SharedProviderResourceKind::ShellSession
+        ) {
+            self.reconcile_result(kind, context, resource, dependencies)
+                .await
+        } else {
+            self.upgrade(kind, context, resource, dependencies)
+                .await
+                .map(SharedProviderEffectResult::phase)
+        }
+    }
+}
+
+/// Explicit unavailable adapter used only before production composition
+/// supplies the daemon-owned typed effect boundary.
+struct UnavailableSharedProviderEffects;
+
+#[async_trait]
+impl SharedProviderEffectExecutor for UnavailableSharedProviderEffects {
+}
+
+/// Production composition adapter for the closed shared-Runner Provider set.
+///
+/// The adapter performs the Provider-owned typed admission before any
+/// effect-port call. A missing live broker/resource binding is returned as a
+/// retryable refusal; it is never converted into generic convergence.
+pub(crate) struct DaemonSharedProviderEffects {
+    state: Arc<ServerState>,
+    zone: ZoneId,
+    usbip_ledger: Arc<
+        std::sync::Mutex<
+            crate::usbip_production::AuthorityLedger,
+        >,
+    >,
+    usbip_services: Arc<Mutex<BTreeSet<ResourceUid>>>,
+    gpu_controllers: Arc<Mutex<BTreeMap<ResourceUid, d2b_provider_device_gpu::GpuController>>>,
+    gpu_authority_leases: Arc<Mutex<BTreeMap<[u8; 16], AuthorityLease>>>,
+    gpu_processes: Arc<
+        Mutex<
+            BTreeMap<
+                (ResourceUid, u8),
+                d2b_provider_device_gpu::GpuProcessIdentity,
+            >,
+        >,
+    >,
+    gpu_opened_devices: Arc<Mutex<BTreeMap<ResourceUid, Vec<OwnedFd>>>>,
+    tpm_controllers:
+        Arc<Mutex<BTreeMap<ResourceUid, d2b_provider_device_tpm::TpmResourceController>>>,
+    guest_controllers: Arc<
+        tokio::sync::Mutex<
+            BTreeMap<(ResourceRef, ResourceUid, u64, u64, u64, u64), GuestRuntimeController>,
+        >,
+    >,
+}
+
+impl DaemonSharedProviderEffects {
+    pub(crate) fn new(state: Arc<ServerState>, zone: ZoneId) -> Self {
+        Self {
+            state,
+            zone,
+            usbip_ledger: crate::usbip_production::new_authority_ledger(),
+            usbip_services: Arc::new(Mutex::new(BTreeSet::new())),
+            gpu_controllers: Arc::new(Mutex::new(BTreeMap::new())),
+            gpu_authority_leases: Arc::new(Mutex::new(BTreeMap::new())),
+            gpu_processes: Arc::new(Mutex::new(BTreeMap::new())),
+            gpu_opened_devices: Arc::new(Mutex::new(BTreeMap::new())),
+            tpm_controllers: Arc::new(Mutex::new(BTreeMap::new())),
+            guest_controllers: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    fn project_network_volume_spec(
+        spec: Value,
+        volume_uid: &ResourceUid,
+        content: &d2b_provider_network_local::controller::NetworkConfigContent,
+        fence: &SharedRunnerNetworkContentFence,
+        owner_ref: &ResourceRef,
+    ) -> Result<Value, NetworkEffectError> {
+        network_config_spec_with_content(spec, volume_uid, content, fence, owner_ref)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_reconcile_registration(
+        &self,
+        registration: SharedProviderRunnerRegistration,
+        resource: &ResourceSnapshot,
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let controller_ref = ResourceRef::parse(registration.controller_ref)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let provider_ref = ResourceRef::parse(registration.provider_ref)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let identity = ControllerIdentity::new(
+            resource.key().zone().clone(),
+            controller_ref.clone(),
+            ControllerGeneration::new(1)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+            provider_ref,
+            ResourceGeneration::new(1)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+            controller_ref,
+            ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+            None,
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let context = SharedProviderEffectContext {
+            identity,
+            target: resource.key().clone(),
+            operation_id: "test-daemon-provider-effect".to_owned(),
+        };
+        let kind = SharedProviderResourceKind::from_registration(registration)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        <Self as SharedProviderEffectExecutor>::reconcile(self, kind, &context, resource, &[])
+            .await
+    }
+
+    fn validate(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<Value, SharedProviderEffectError> {
+        if context.operation_id.is_empty() {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        if context.target != *resource.key()
+            || context.identity.zone() != resource.key().zone()
+            || resource.key().zone() != &self.zone
+            || resource.key().resource_ref().resource_type().as_str() != kind.resource_type()
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let value = serde_json::from_slice::<Value>(resource.canonical_json())
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        if !matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+        ) && value.pointer("/spec/providerRef").and_then(Value::as_str)
+            != Some(kind.provider_ref())
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        Ok(value)
+    }
+
+    fn owner_ref(value: &Value) -> Result<ResourceRef, SharedProviderEffectError> {
+        value
+            .pointer("/metadata/ownerRef")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceRef::parse(value).ok())
+            .ok_or(SharedProviderEffectError::InvalidResource)
+    }
+
+    fn runtime(&self) -> Result<Arc<ZoneResourceRuntime>, SharedProviderEffectError> {
+        self.state
+            .resource_plane
+            .lock()
+            .ok()
+            .and_then(|plane| plane.as_ref().and_then(|plane| plane.zone(&self.zone).ok()))
+            .ok_or(SharedProviderEffectError::Unavailable)
+    }
+
+    async fn finalization_resource(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<StoredResource, SharedProviderEffectError> {
+        if !resource.canonical_json().is_empty() {
+            return Ok(stored_resource_from_snapshot(resource));
+        }
+        let stored = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: context.operation_id.clone(),
+                    idempotency_key: None,
+                    correlation_id: context.operation_id.clone(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: resource.key().resource_ref().clone(),
+                expected_uid: Some(resource.key().uid().clone()),
+                projection: StoreProjection::Full,
+            })
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if stored.zone != self.zone
+            || stored.resource_ref != *resource.key().resource_ref()
+            || stored.uid != *resource.key().uid()
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        Ok(stored)
+    }
+
+    async fn fresh_audio_dependency(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        context: &SharedProviderEffectContext,
+        target: &ResourceRef,
+        candidate: Option<&DependencySnapshot>,
+    ) -> Result<StoredResource, SharedProviderEffectError> {
+        let authoritative = match runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: context.operation_id.clone(),
+                    idempotency_key: None,
+                    correlation_id: context.operation_id.clone(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+        {
+            Ok(resource) => resource,
+            Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+            Err(_) => return Err(SharedProviderEffectError::Unavailable),
+        };
+        validate_audio_dependency_identity(&authoritative, target, &self.zone)?;
+        self.validate_audio_assignment(runtime, context, &authoritative, false)
+            .await?;
+
+        let Some(candidate) = candidate else {
+            return Ok(authoritative);
+        };
+        let candidate = stored_resource_from_snapshot(candidate.resource());
+        if validate_audio_dependency_identity(&candidate, target, &self.zone).is_ok()
+            && candidate.uid == authoritative.uid
+            && candidate.generation == authoritative.generation
+            && candidate.revision == authoritative.revision
+        {
+            Ok(candidate)
+        } else {
+            Ok(authoritative)
+        }
+    }
+
+    async fn validate_audio_assignment(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        context: &SharedProviderEffectContext,
+        resource: &StoredResource,
+        owner: bool,
+    ) -> Result<(), SharedProviderEffectError> {
+        let Some(assignment) = runtime
+            .store
+            .assignment_fence(self.zone.clone(), resource.resource_ref.clone())
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+        else {
+            return Ok(());
+        };
+        if assignment.resource_uid != resource.uid
+            || assignment.resource_revision != resource.revision
+            || assignment.epoch == 0
+            || assignment.provider_generation.get() == 0
+            || assignment.controller_generation.get() == 0
+            || assignment.session_generation.get() == 0
+            || !matches!(assignment.scope, ResourceAssignmentScope::Primary)
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        if owner {
+            let zone_target = ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            if assignment.provider_generation != context.identity.provider_generation()
+                || assignment.controller_generation != context.identity.controller_generation()
+                || assignment.controller_role != *context.identity.controller_ref()
+                || assignment.target != zone_target
+            {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+            let session_generation = runtime
+                .core_controller_subject
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .as_ref()
+                .map(|subject| subject.reconnect_generation())
+                .ok_or(SharedProviderEffectError::Unavailable)?;
+            if assignment.session_generation != session_generation {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+        }
+        Ok(())
+    }
+
+    async fn usbip_service_port(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        value: &Value,
+    ) -> Result<(ResourceUid, bool, SharedRunnerUsbipPort<'_>), SharedProviderEffectError> {
+        let runtime = self.runtime()?;
+        let zone_uid = runtime
+            .authority_zone_uid()
+            .cloned()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let device_ref = value
+            .pointer("/spec/backingDeviceRef")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceRef::parse(value).ok())
+            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        let device = runtime
+            .committed_resource_value(&device_ref, &context.operation_id)
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let device_uid = device
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        if device.pointer("/spec/providerRef").and_then(Value::as_str)
+                != Some(d2b_provider_device_usbip::PROVIDER_REF)
+            || device.pointer("/status/phase").and_then(Value::as_str) != Some("Ready")
+        {
+            return Err(SharedProviderEffectError::Unavailable);
+        }
+        let env = value
+            .pointer("/spec/env")
+            .and_then(Value::as_str)
+            .unwrap_or(resource.key().resource_ref().name().as_str());
+        let physical_key =
+            d2b_core::device_usbip_adapter::UsbipCoreAdapter::physical_usb_backing_key(
+                device_uid.as_str().as_bytes(),
+            )
+            .as_bytes();
+        let binding_context = crate::usbip_production::UsbipBindingContext::new(
+            resource.key().resource_ref().name().as_str(),
+            env,
+            format!("shared-usbip-bind-{}", resource.key().uid().as_str()),
+            format!("shared-usbip-runner-{}", resource.key().uid().as_str()),
+            physical_key,
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let port = crate::usbip_production::DaemonUsbipDispatcher::new(
+            &self.state,
+            binding_context,
+            Arc::clone(&self.usbip_ledger),
+            SharedRunnerUsbipChildren,
+        )
+        .into_port();
+        let opted_in =
+            value.pointer("/spec/mode").and_then(Value::as_str) == Some("authority");
+        Ok((zone_uid, opted_in, port))
+    }
+
+    fn dependencies_ready(dependencies: &[DependencySnapshot]) -> bool {
+        dependencies.iter().all(|dependency| {
+            serde_json::from_slice::<Value>(dependency.resource().canonical_json())
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/status/phase")
+                        .and_then(Value::as_str)
+                        .map(|phase| phase == "Ready")
+                })
+                == Some(true)
+        })
+    }
+
+    async fn finalize_u9(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<(), SharedProviderEffectError> {
+        let runtime = self.runtime()?;
+        match kind {
+            SharedProviderResourceKind::DisplayWaylandPolicy => Ok(()),
+            SharedProviderResourceKind::DisplayWaylandSession => {
+                let target = self
+                    .finalization_resource(&runtime, context, resource)
+                    .await?;
+                let envelope = ResourceEnvelope::from_json(&target.canonical_json)
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let _spec = serde_json::from_slice::<WaylandSessionSpec>(
+                    &envelope.spec().base().to_canonical_bytes(),
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let owner = crate::binding_child_resource_runtime::OwnedChildOwner {
+                    resource: target,
+                    desired: None,
+                    fenced: false,
+                };
+                let client = runtime
+                    .process_resource_client()
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let converged =
+                    crate::binding_child_resource_runtime::reconcile_owned_children(
+                        &runtime.store,
+                        &client,
+                        &self.zone,
+                        std::slice::from_ref(&owner),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if converged.contains(resource.key().resource_ref()) {
+                    Ok(())
+                } else {
+                    Err(SharedProviderEffectError::Unavailable)
+                }
+            }
+            SharedProviderResourceKind::AudioService => {
+                let bindings = runtime
+                    .committed_resources_of_type(AUDIO_BINDING_TYPE)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if bindings.iter().any(|binding| {
+                    binding
+                        .pointer("/spec/serviceRef")
+                        .and_then(Value::as_str)
+                        == Some(resource.key().resource_ref().to_canonical_string().as_str())
+                }) {
+                    Err(SharedProviderEffectError::Unavailable)
+                } else {
+                    Ok(())
+                }
+            }
+            SharedProviderResourceKind::AudioBinding => {
+                let target = self
+                    .finalization_resource(&runtime, context, resource)
+                    .await?;
+                let owner = {
+                    let mut audio = runtime
+                        .audio_runtime
+                        .lock()
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                    let registry = audio
+                        .get_or_insert_with(|| {
+                            AudioResourceRuntime::new(self.zone.clone(), self.state.clone())
+                        });
+                    registry
+                        .finalize_binding_resource(&target)
+                        .map_err(map_audio_effect_error)?;
+                    registry
+                        .child_owner_for(&target)
+                        .map_err(map_audio_effect_error)?
+                };
+                let client = runtime
+                    .process_resource_client()
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let converged =
+                    crate::binding_child_resource_runtime::reconcile_binding_children(
+                        &runtime.store,
+                        &client,
+                        &self.zone,
+                        std::slice::from_ref(&owner),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if converged.contains(resource.key().resource_ref()) {
+                    Ok(())
+                } else {
+                    Err(SharedProviderEffectError::Unavailable)
+                }
+            }
+            SharedProviderResourceKind::ShellPool => {
+                let sessions = runtime
+                    .committed_resources_of_type("shell-terminal.d2bus.org.ShellSession")
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let pool_ref = resource.key().resource_ref().to_canonical_string();
+                if sessions.iter().any(|session| {
+                    session
+                        .pointer("/spec/poolRef")
+                        .and_then(Value::as_str)
+                        == Some(pool_ref.as_str())
+                }) {
+                    Err(SharedProviderEffectError::Unavailable)
+                } else {
+                    Ok(())
+                }
+            }
+            SharedProviderResourceKind::ShellSession => {
+                let target = self
+                    .finalization_resource(&runtime, context, resource)
+                    .await?;
+                let owner = crate::binding_child_resource_runtime::OwnedChildOwner {
+                    resource: target,
+                    desired: None,
+                    fenced: false,
+                };
+                let client = runtime
+                    .process_resource_client()
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let converged =
+                    crate::binding_child_resource_runtime::reconcile_owned_children(
+                        &runtime.store,
+                        &client,
+                        &self.zone,
+                        std::slice::from_ref(&owner),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if converged.contains(resource.key().resource_ref()) {
+                    Ok(())
+                } else {
+                    Err(SharedProviderEffectError::Unavailable)
+                }
+            }
+            _ => Err(SharedProviderEffectError::InvalidResource),
+        }
+    }
+
+    async fn network_admission(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        resource: &ResourceSnapshot,
+        value: &Value,
+        spec: &d2b_contracts_resource::v3::network::NetworkSpec,
+        resolver: &d2b_core::bundle_resolver::BundleResolver,
+        operation_id: &str,
+    ) -> Result<NetworkAdmissionProof, SharedProviderEffectError> {
+        let zone_uid = runtime
+            .authority_zone_uid()
+            .cloned()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let network_generation = resource.generation();
+        let network_ref = resource.key().resource_ref().to_canonical_string();
+        let mut guest_uids = Vec::new();
+        let mut attachment_generation = network_generation.get();
+        for attachment in spec.attachments() {
+            let attached = self
+                .stored_resource(
+                    runtime,
+                    attachment.execution_ref(),
+                    None,
+                    operation_id,
+                )
+                .await?;
+            if attached.zone != self.zone {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+            attachment_generation = attachment_generation.max(attached.generation.get());
+            if attachment.execution_ref().resource_type().as_str() == "Guest" {
+                guest_uids.push(attached.uid);
+            }
+            let attached_value = serde_json::from_slice::<Value>(&attached.canonical_json)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            let reciprocal = attached_value
+                .pointer("/spec/networkAttachments")
+                .and_then(Value::as_array)
+                .is_some_and(|attachments| {
+                    attachments.iter().any(|candidate| {
+                        candidate.get("networkRef").and_then(Value::as_str)
+                            == Some(network_ref.as_str())
+                    })
+                });
+            if !reciprocal {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+        }
+        for guest in runtime
+            .committed_resources_of_type("Guest")
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+        {
+            let attached = guest
+                .pointer("/spec/networkAttachments")
+                .and_then(Value::as_array)
+                .is_some_and(|attachments| {
+                    attachments.iter().any(|candidate| {
+                        candidate.get("networkRef").and_then(Value::as_str)
+                            == Some(network_ref.as_str())
+                    })
+                });
+            if !attached {
+                continue;
+            }
+            if guest.pointer("/metadata/zone").and_then(Value::as_str)
+                != Some(self.zone.as_str())
+            {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+            let guest_uid = guest
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+                .ok_or(SharedProviderEffectError::InvalidResource)?;
+            guest_uids.push(guest_uid);
+            let generation = guest
+                .pointer("/metadata/generation")
+                .and_then(Value::as_u64)
+                .and_then(|value| ResourceGeneration::new(value).ok())
+                .ok_or(SharedProviderEffectError::InvalidResource)?;
+            attachment_generation = attachment_generation.max(generation.get());
+        }
+        let installed_generation = resolver
+            .installed_generation_identity()
+            .and_then(|identity| ResourceBundleGenerationId::parse(identity.as_str().to_owned()).ok())
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        if value.pointer("/metadata/uid").and_then(Value::as_str)
+            != Some(resource.key().uid().as_str())
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let attachment_generation = ResourceGeneration::new(attachment_generation)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let intent = NetworkAdmissionIntent::new(
+            NetworkAdmissionKey::new(
+                zone_uid,
+                resource.key().uid().clone(),
+                network_generation,
+                attachment_generation,
+                installed_generation,
+            ),
+            spec.clone(),
+            guest_uids,
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let plane = self
+            .state
+            .resource_plane
+            .lock()
+            .ok()
+            .and_then(|plane| plane.clone())
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let occupancy =
+            observe_host_network().map_err(|_| SharedProviderEffectError::Unavailable)?;
+        plane
+            .network_admission_index()
+            .lock()
+            .await
+            .admit(intent, &occupancy)
+            .map_err(|_| SharedProviderEffectError::Unavailable)
+    }
+
+    async fn network_assignment(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<ResourceAssignmentFence, SharedProviderEffectError> {
+        let assignment = runtime
+            .store
+            .assignment_fence(self.zone.clone(), resource.key().resource_ref().clone())
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let session_generation = runtime
+            .core_controller_subject
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .as_ref()
+            .map(|subject| subject.reconnect_generation())
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let host_ref = ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        if assignment.epoch == 0
+            || assignment.resource_uid != *resource.key().uid()
+            || assignment.provider_generation != context.identity.provider_generation()
+            || assignment.controller_generation != context.identity.controller_generation()
+            || assignment.controller_role != *context.identity.controller_ref()
+            || assignment.target != host_ref
+            || assignment.session_generation != session_generation
+            || !matches!(assignment.scope, ResourceAssignmentScope::Primary)
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        Ok(assignment)
+    }
+
+    fn gpu_digest(
+        domain: &str,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        assignment_epoch: u64,
+        extra: &str,
+    ) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(domain.as_bytes());
+        digest.update([0]);
+        digest.update(resource.key().uid().as_str().as_bytes());
+        digest.update([0]);
+        digest.update(context.identity.provider_generation().get().to_be_bytes());
+        digest.update(context.identity.controller_generation().get().to_be_bytes());
+        digest.update(assignment_epoch.to_be_bytes());
+        digest.update(extra.as_bytes());
+        digest.finalize().into()
+    }
+
+    async fn gpu_admission(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        value: &Value,
+    ) -> Result<
+        (
+            Arc<ZoneResourceRuntime>,
+            d2b_provider_device_gpu::GpuAuthorityAdmission,
+            d2b_provider_device_gpu::GpuEffectTokenSet,
+            d2b_provider_device_gpu::GpuSettings,
+            ResourceRef,
+        ),
+        SharedProviderEffectError,
+    > {
+        let runtime = self.runtime()?;
+        if runtime.authority_zone_uid().is_none() {
+            return Err(SharedProviderEffectError::Unavailable);
+        }
+        let holder_ref = Self::owner_ref(value)?;
+        if !matches!(holder_ref.resource_type().as_str(), "Guest" | "Host") {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let _holder = self
+            .stored_resource(&runtime, &holder_ref, None, &context.operation_id)
+            .await?;
+        let hosts = runtime
+            .committed_resources_of_type("Host")
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let [host] = hosts.as_slice() else {
+            return Err(SharedProviderEffectError::InvalidResource);
+        };
+        let host_uid = host
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        let settings: d2b_provider_device_gpu::GpuSettings =
+            match value.pointer("/spec/provider/settings") {
+                Some(settings) => serde_json::from_value(settings.clone())
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+                None => d2b_provider_device_gpu::GpuSettings::default(),
+            };
+        let arbitration: d2b_contracts_resource::v3::device::DeviceArbitration =
+            serde_json::from_value(
+                value
+                    .pointer("/spec/arbitration")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("exclusive".to_owned())),
+            )
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let max_holders = value
+            .pointer("/spec/maxConcurrentClaims")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(1);
+        let session_generation = runtime
+            .core_controller_subject
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .as_ref()
+            .map(|subject| subject.reconnect_generation().get())
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let assignment = runtime
+            .store
+            .assignment_fence(self.zone.clone(), resource.key().resource_ref().clone())
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        if assignment.epoch == 0
+            || assignment.provider_generation != context.identity.provider_generation()
+            || assignment.controller_generation != context.identity.controller_generation()
+            || assignment.controller_role != *context.identity.controller_ref()
+            || assignment.target
+                != ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?
+            || assignment.session_generation.get() != session_generation
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let assignment_epoch = assignment.epoch;
+        let mut backing_digest = Self::gpu_digest(
+            "d2b:gpu-backing/v2",
+            context,
+            resource,
+            assignment_epoch,
+            "backing",
+        );
+        backing_digest[..8].copy_from_slice(&session_generation.to_be_bytes());
+        let platform_digest = Self::gpu_digest(
+            "d2b:gpu-platform/v2",
+            context,
+            resource,
+            assignment_epoch,
+            host_uid.as_str(),
+        );
+        let gpu_principal_digest = Self::gpu_digest(
+            "d2b:gpu-principal/v2",
+            context,
+            resource,
+            assignment_epoch,
+            "gpu",
+        );
+        let owner = d2b_provider_device_gpu::GpuOwnerProof::new(
+            ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+            holder_ref.clone(),
+            resource.key().uid().clone(),
+            host_uid,
+            resource.generation(),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let mut admission = d2b_provider_device_gpu::GpuAuthorityAdmission::new(
+            owner,
+            d2b_provider_device_gpu::GpuBackingToken::from_core(backing_digest),
+            d2b_provider_device_gpu::GpuPlatformToken::from_core(platform_digest),
+            arbitration,
+            u32::try_from(max_holders).map_err(|_| SharedProviderEffectError::InvalidResource)?,
+            settings.render_node_only,
+            d2b_provider_device_gpu::GpuPrincipalToken::from_core(gpu_principal_digest),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        if settings.video_sidecar {
+            admission = admission
+                .with_video_principal(d2b_provider_device_gpu::GpuPrincipalToken::from_core(
+                    Self::gpu_digest(
+                        "d2b:gpu-principal/v2",
+                        context,
+                        resource,
+                        assignment_epoch,
+                        "video",
+                    ),
+                ))
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        }
+        let mut token_values = vec!["dri"];
+        if !settings.render_node_only {
+            token_values.extend(["kvm", "udmabuf"]);
+        }
+        if settings.video_sidecar && settings.video_nvidia_decode {
+            token_values.extend(["nvidia-ctl", "nvidia-device", "nvidia-uvm"]);
+        }
+        let tokens = d2b_provider_device_gpu::GpuEffectTokenSet::from_core(
+            token_values
+                .into_iter()
+                .map(|device_class| {
+                    d2b_provider_device_gpu::GpuEffectToken::from_core(Self::gpu_digest(
+                        "d2b:gpu-device-grant/v2",
+                        context,
+                        resource,
+                        assignment_epoch,
+                        device_class,
+                    ))
+                })
+                .collect(),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        Ok((runtime, admission, tokens, settings, holder_ref))
+    }
+
+    async fn stored_resource(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        target: &ResourceRef,
+        expected_uid: Option<ResourceUid>,
+        operation_id: &str,
+    ) -> Result<StoredResource, SharedProviderEffectError> {
+        let resource = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: operation_id.to_owned(),
+                    idempotency_key: None,
+                    correlation_id: operation_id.to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: target.clone(),
+                expected_uid,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if resource.zone != self.zone || resource.resource_ref != *target {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        Ok(resource)
+    }
+
+    async fn reconcile_binding_children(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        owner: &ResourceSnapshot,
+        desired: d2b_contracts_provider::v3::semantic_services::child_resources::BindingChildSet,
+        operation_id: &str,
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let owner = self
+            .stored_resource(
+                runtime,
+                owner.key().resource_ref(),
+                Some(owner.key().uid().clone()),
+                operation_id,
+            )
+            .await?;
+        let owner_ref = owner.resource_ref.clone();
+        let client = runtime
+            .process_resource_client()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let converged = crate::binding_child_resource_runtime::reconcile_binding_children(
+            &runtime.store,
+            &client,
+            &self.zone,
+            &[crate::binding_child_resource_runtime::BindingChildOwner {
+                resource: owner,
+                desired: Some(desired),
+                fenced: false,
+            }],
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        Ok(if converged.contains(&owner_ref) {
+            SharedProviderEffectPhase::Ready
+        } else {
+            SharedProviderEffectPhase::Pending
+        })
+    }
+
+    async fn cleanup_binding_children(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        owner: &ResourceSnapshot,
+        operation_id: &str,
+    ) -> Result<bool, SharedProviderEffectError> {
+        let stored = self
+            .stored_resource(
+                runtime,
+                owner.key().resource_ref(),
+                Some(owner.key().uid().clone()),
+                operation_id,
+            )
+            .await?;
+        let children = crate::binding_child_resource_runtime::list_binding_children(
+            &runtime.store,
+            &self.zone,
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let has_children = children.iter().any(|child| {
+            ResourceEnvelope::from_json(&child.canonical_json)
+                .ok()
+                .and_then(|envelope| envelope.metadata().owner_ref().cloned())
+                == Some(stored.resource_ref.clone())
+        });
+        if !has_children {
+            return Ok(true);
+        }
+        let client = runtime
+            .process_resource_client()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        crate::binding_child_resource_runtime::reconcile_binding_children(
+            &runtime.store,
+            &client,
+            &self.zone,
+            &[crate::binding_child_resource_runtime::BindingChildOwner {
+                resource: stored,
+                desired: None,
+                fenced: false,
+            }],
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let remaining = crate::binding_child_resource_runtime::list_binding_children(
+            &runtime.store,
+            &self.zone,
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        Ok(!remaining.iter().any(|child| {
+            ResourceEnvelope::from_json(&child.canonical_json)
+                .ok()
+                .and_then(|envelope| envelope.metadata().owner_ref().cloned())
+                == Some(owner.key().resource_ref().clone())
+        }))
+    }
+
+    fn take_gpu_opened_devices(
+        &self,
+        device_uid: &ResourceUid,
+    ) -> Result<Vec<OwnedFd>, SharedProviderEffectError> {
+        Ok(self
+            .gpu_opened_devices
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .remove(device_uid)
+            .unwrap_or_default())
+    }
+
+    fn retain_gpu_opened_devices(
+        &self,
+        device_uid: &ResourceUid,
+        opened_devices: Vec<OwnedFd>,
+    ) -> Result<(), SharedProviderEffectError> {
+        self.gpu_opened_devices
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .insert(device_uid.clone(), opened_devices);
+        Ok(())
+    }
+
+    async fn guest_provider_resource(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<Value, SharedProviderEffectError> {
+        let value = self.validate(kind, context, resource)?;
+        if resource.key().resource_ref().resource_type().as_str() != "Guest"
+            || resource.key().uid().as_str().is_empty()
+            || resource.generation().get() == 0
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        Ok(value)
+    }
+
+    fn guest_phase(value: &Value) -> SharedProviderEffectPhase {
+        if value.pointer("/status/phase").and_then(Value::as_str) == Some("Ready")
+            && value
+                .pointer("/status/observedGeneration")
+                .and_then(Value::as_u64)
+                == value.pointer("/metadata/generation").and_then(Value::as_u64)
+        {
+            SharedProviderEffectPhase::Ready
+        } else {
+            SharedProviderEffectPhase::Pending
+        }
+    }
+
+    fn related_guest_dependency(
+        guest: &Value,
+        dependency: &DependencySnapshot,
+    ) -> Result<bool, SharedProviderEffectError> {
+        let dependency_value = serde_json::from_slice::<Value>(dependency.resource().canonical_json())
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let dependency_ref = dependency.resource().key().resource_ref().to_canonical_string();
+        if Self::value_contains_resource_ref(guest, &dependency_ref) {
+            Ok(dependency_value.pointer("/status/phase").and_then(Value::as_str) == Some("Ready"))
+        } else {
+            Ok(true)
+        }
+    }
+
+    fn value_contains_resource_ref(value: &Value, expected: &str) -> bool {
+        match value {
+            Value::String(value) => value == expected,
+            Value::Array(values) => values
+                .iter()
+                .any(|value| Self::value_contains_resource_ref(value, expected)),
+            Value::Object(values) => values
+                .values()
+                .any(|value| Self::value_contains_resource_ref(value, expected)),
+            Value::Null | Value::Bool(_) | Value::Number(_) => false,
+        }
+    }
+
+    fn validate_qemu_guest(value: &Value) -> Result<(), SharedProviderEffectError> {
+        let settings = value
+            .pointer("/spec/provider/settings")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        serde_json::from_value::<d2b_provider_runtime_qemu_media::GuestProviderSpecSettings>(
+            settings,
+        )
+        .map(|_| ())
+        .map_err(|_| SharedProviderEffectError::InvalidResource)
+    }
+
+    fn validate_azure_vm_guest(value: &Value) -> Result<(), SharedProviderEffectError> {
+        let settings = Self::azure_vm_guest_settings_value(value)?;
+        serde_json::from_value::<d2b_provider_runtime_azure_virtual_machine::AzureVmGuestSettings>(
+            settings,
+        )
+        .map(|_| ())
+        .map_err(|_| SharedProviderEffectError::InvalidResource)
+    }
+
+    fn azure_vm_guest_settings_value(value: &Value) -> Result<Value, SharedProviderEffectError> {
+        if let Some(settings) = value.pointer("/spec/provider/settings").cloned() {
+            return Ok(settings);
+        }
+        #[cfg(test)]
+        if value
+            .pointer("/metadata/annotations/d2b.test~1azure-vm-settings")
+            .and_then(Value::as_str)
+            == Some("framework")
+        {
+            return Ok(json!({
+                "subscriptionId": "subscription",
+                "resourceGroup": "resource-group",
+                "region": "eastus",
+                "vmSize": "standard-d4",
+                "imageRef": "image-1",
+                "diskSku": "Premium_LRS",
+                "osDiskSizeGb": 64,
+                "adminUser": "azureuser",
+                "vnetSubscriptionId": null,
+                "vnetResourceGroup": null,
+                "vnetName": "vnet",
+                "subnetName": "guests",
+                "assignPublicIp": false,
+                "dataDisks": [],
+                "bootstrapPskDelivery": "vm-extension",
+                "bootstrapDeadlineMs": 60000,
+                "childZoneHosting": false,
+                "azureTags": [["owner", "d2b"]]
+            }));
+        }
+        Err(SharedProviderEffectError::InvalidResource)
+    }
+
+    async fn validate_gateway_custody(
+        &self,
+        provider_ref: &ResourceRef,
+        credential_fields: &[&str],
+        context: &SharedProviderEffectContext,
+    ) -> Result<(), SharedProviderEffectError> {
+        let runtime = self.runtime()?;
+        let provider = runtime
+            .committed_resource_value(provider_ref, &context.operation_id)
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let config = provider
+            .pointer("/spec/config")
+            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        let gateway = config
+            .get("gatewayExecutionRef")
+            .or_else(|| config.get("controllerExecutionRef"))
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceRef::parse(value).ok())
+            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        if gateway.resource_type().as_str() != "Guest" {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let gateway_resource = runtime
+            .committed_resource_value(&gateway, &context.operation_id)
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if gateway_resource.pointer("/metadata/zone").and_then(Value::as_str)
+            != Some(self.zone.as_str())
+            || gateway_resource.pointer("/status/phase").and_then(Value::as_str)
+                != Some("Ready")
+        {
+            return Err(SharedProviderEffectError::Unavailable);
+        }
+        for field in credential_fields {
+            let Some(credential_ref) = config
+                .get(*field)
+                .and_then(Value::as_str)
+                .and_then(|value| ResourceRef::parse(value).ok())
+            else {
+                continue;
+            };
+            if credential_ref.resource_type().as_str() != "Credential" {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+            let credential = runtime
+                .committed_resource_value(&credential_ref, &context.operation_id)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            // U10 owns token acquisition and delivery. U6 consumes only the
+            // stable, typed Credential scope contract at admission.
+            let scope = credential
+                .pointer("/spec/scope")
+                .cloned()
+                .ok_or(SharedProviderEffectError::InvalidResource)?;
+            let scope = serde_json::from_value::<
+                d2b_contracts_provider::v3::credential::CredentialScope,
+            >(scope)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            if scope.execution_ref() != Some(&gateway) {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_guest_runtime_fence(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<Arc<ZoneResourceRuntime>, SharedProviderEffectError> {
+        let runtime = self.runtime()?;
+        let expected_controller = ResourceRef::parse(match kind {
+            SharedProviderResourceKind::QemuMediaGuest => {
+                "Process/runtime-qemu-media-controller"
+            }
+            SharedProviderResourceKind::AzureContainerAppsGuest => "Process/aca-controller",
+            SharedProviderResourceKind::AzureVirtualMachineGuest => {
+                "Process/azure-vm-controller-process"
+            }
+            SharedProviderResourceKind::CloudHypervisorGuest => {
+                "Process/cloud-hypervisor-controller"
+            }
+            _ => return Err(SharedProviderEffectError::InvalidResource),
+        })
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        if context.identity.controller_ref() != &expected_controller
+            || context.identity.zone() != resource.key().zone()
+            || resource.key().zone() != &self.zone
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let metadata = runtime
+            .store
+            .runtime_metadata()
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if metadata.policy_snapshot.controller_generation
+            != Some(context.identity.controller_generation())
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let provider_ref = ResourceRef::parse(kind.provider_ref())
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let provider = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: context.operation_id.clone(),
+                    idempotency_key: None,
+                    correlation_id: context.operation_id.clone(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: provider_ref,
+                expected_uid: None,
+                projection: StoreProjection::MetadataOnly,
+            })
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if provider.zone != self.zone
+            || provider.generation != context.identity.provider_generation()
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let Some(fence) = runtime
+            .store
+            .assignment_fence(
+                self.zone.clone(),
+                resource.key().resource_ref().clone(),
+            )
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+        else {
+            return Err(SharedProviderEffectError::Unavailable);
+        };
+        let session_generation = runtime
+            .core_controller_subject
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .as_ref()
+            .map(AuthenticatedSubjectContext::reconnect_generation)
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        if fence.resource_uid != *resource.key().uid()
+            || fence.resource_revision != resource.revision()
+            || fence.provider_generation != context.identity.provider_generation()
+            || fence.controller_generation != context.identity.controller_generation()
+            || fence.controller_role != expected_controller
+            || fence.session_generation != session_generation
+            || fence.epoch == 0
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        Ok(runtime)
+    }
+
+    async fn stored_guest(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        resource: &ResourceSnapshot,
+        operation_id: &str,
+    ) -> Result<StoredResource, SharedProviderEffectError> {
+        runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: operation_id.to_owned(),
+                    idempotency_key: None,
+                    correlation_id: operation_id.to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: resource.key().resource_ref().clone(),
+                expected_uid: Some(resource.key().uid().clone()),
+                projection: StoreProjection::Full,
+            })
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)
+    }
+
+    fn guest_child_resource(
+        target: &ResourceRef,
+        owner: &ResourceRef,
+        zone: &ZoneId,
+        spec: Value,
+    ) -> Result<Vec<u8>, SharedProviderEffectError> {
+        let value = json!({
+            "apiVersion": "resources.d2bus.org/v3",
+            "type": target.resource_type().as_str(),
+            "metadata": {
+                "name": target.name().as_str(),
+                "zone": zone.as_str(),
+                "ownerRef": owner.to_canonical_string(),
+                "finalizers": [],
+                "deletionRequestedAt": null,
+                "createdAt": "1970-01-01T00:00:00.000Z",
+                "updatedAt": "1970-01-01T00:00:00.000Z",
+                "generation": 1,
+                "revision": 1,
+                "managedBy": "controller"
+            },
+            "spec": spec,
+            "status": {
+                "observedGeneration": 0,
+                "phase": "Pending",
+                "conditions": [],
+                "lastReconciledAt": null,
+                "startedAt": null,
+                "completedAt": null,
+                "outcome": null,
+                "update": {
+                    "dependencies": {"count": 0, "refs": []},
+                    "disruption": "None",
+                    "observedGeneration": 0,
+                    "lastAssessedAt": null,
+                    "operationId": null,
+                    "owned": {"count": 0, "refs": []},
+                    "preserveState": true,
+                    "reasons": [],
+                    "state": "Unknown",
+                    "targetGeneration": 1
+                },
+                "resource": {}
+            }
+        });
+        CanonicalJsonValue::parse(
+            &serde_json::to_vec(&value)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+        )
+        .map(|value| value.to_canonical_bytes())
+        .map_err(|_| SharedProviderEffectError::InvalidResource)
+    }
+
+    fn qemu_guest_children(
+        value: &Value,
+        provider: &Value,
+        owner: &ResourceRef,
+        zone: &ZoneId,
+    ) -> Result<Vec<OwnedChildIntent>, SharedProviderEffectError> {
+        let config = serde_json::from_value::<qemu_media_runtime::ProviderConfig>(
+            provider
+                .pointer("/spec/config")
+                .cloned()
+                .ok_or(SharedProviderEffectError::InvalidResource)?,
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let runtime_volume_ref = ResourceRef::parse(&format!(
+            "Volume/{}-runtime",
+            owner.name().as_str()
+        ))
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let device_ref = value
+            .pointer("/spec/deviceAttachments")
+            .and_then(Value::as_array)
+            .and_then(|attachments| attachments.first())
+            .and_then(|attachment| attachment.get("deviceRef"))
+            .and_then(Value::as_str)
+            .map(ResourceRef::parse)
+            .transpose()
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let network_refs = value
+            .pointer("/spec/networkAttachments")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|attachment| attachment.get("networkRef").and_then(Value::as_str))
+            .map(ResourceRef::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let process = qemu_media_runtime::build_process_spec(
+            config.controller_execution_ref.clone(),
+            runtime_volume_ref,
+            device_ref,
+            network_refs,
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let mut process_spec =
+            serde_json::to_value(process).map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        process_spec
+            .as_object_mut()
+            .ok_or(SharedProviderEffectError::InvalidResource)?
+            .insert(
+                "providerRef".to_owned(),
+                Value::String("Provider/system-minijail".to_owned()),
+            );
+        let process_ref = ResourceRef::parse(&format!("Process/{}-qemu", owner.name().as_str()))
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let process = Self::guest_child_resource(&process_ref, owner, zone, process_spec)?;
+        let digest = d2b_core_controller::semantic_child_digest(&process)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let process = OwnedChildIntent::new(process_ref, process, digest)
+            .and_then(|process| {
+                process
+                    .with_dependencies([ResourceRef::parse(&format!(
+                        "Volume/{}-runtime",
+                        owner.name().as_str()
+                    ))
+                    .map_err(|_| {
+                        d2b_core_controller::OwnerReconcileError::InvalidChild
+                    })?])
+            })
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let volume_ref = ResourceRef::parse(&format!(
+            "Volume/{}-runtime",
+            owner.name().as_str()
+        ))
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let volume_spec = json!({
+            "providerRef": "Provider/volume-local",
+            "source": {
+                "executionRef": config.controller_execution_ref.to_canonical_string(),
+                "settings": {"kind": "tmpfs"}
+            },
+            "kind": "ephemeral",
+            "layout": [],
+            "views": {
+                "runner": {
+                    "path": "",
+                    "rights": ["read", "write", "create", "delete", "traverse"]
+                }
+            },
+            "attachments": [],
+            "quota": {
+                "maxBytes": config.runtime_tmpfs_quota_bytes,
+                "maxInodes": config.runtime_tmpfs_quota_inodes,
+                "enforcement": "hard"
+            }
+        });
+        let volume = Self::guest_child_resource(&volume_ref, owner, zone, volume_spec)?;
+        let volume_digest = d2b_core_controller::semantic_child_digest(&volume)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let volume = OwnedChildIntent::new(volume_ref, volume, volume_digest)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        Ok(vec![volume, process])
+    }
+
+    fn aca_guest_children(
+        owner: &ResourceRef,
+        zone: &ZoneId,
+    ) -> Result<Vec<OwnedChildIntent>, SharedProviderEffectError> {
+        let target = ResourceRef::parse(&format!("Endpoint/{}-sandbox-agent", owner.name().as_str()))
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let spec = json!({
+            "providerRef": aca_runtime::PROVIDER_REF,
+            "producerRef": owner.to_canonical_string(),
+            "endpointClass": "control",
+            "transport": "opaque-carriage",
+            "purpose": "aca-sandbox-agent",
+            "locality": "cross-domain",
+            "visibility": "provider",
+            "attachmentPolicy": {
+                "supported": false,
+                "maxAttachments": 0
+            },
+            "consumerPolicy": {
+                "allowedSubjects": [aca_runtime::PROVIDER_REF],
+                "allowedOperations": ["resolve"]
+            },
+            "lifecyclePolicy": "recycle-with-producer"
+        });
+        let canonical = Self::guest_child_resource(&target, owner, zone, spec)?;
+        let digest = d2b_core_controller::semantic_child_digest(&canonical)
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        Ok(vec![
+            OwnedChildIntent::new(target, canonical, digest)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+        ])
+    }
+
+    async fn guest_child_progress(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        resource: &ResourceSnapshot,
+        desired: Option<Vec<OwnedChildIntent>>,
+    ) -> Result<OneOwnedChildProgress, SharedProviderEffectError> {
+        let owner = self
+            .stored_guest(runtime, resource, "u6-guest-child-owner")
+            .await?;
+        let client = runtime
+            .status_client()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        reconcile_one_guest_child(
+            &runtime.store,
+            &client,
+            &self.zone,
+            &OwnedChildOwner {
+                resource: owner,
+                desired,
+                fenced: false,
+            },
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)
+    }
+
+    async fn guest_children_ready(
+        &self,
+        runtime: &ZoneResourceRuntime,
+        owner: &ResourceSnapshot,
+        desired: &[OwnedChildIntent],
+    ) -> Result<bool, SharedProviderEffectError> {
+        let owner_ref = owner.key().resource_ref().to_canonical_string();
+        let mut children = Vec::new();
+        for resource_type in ["Process", "EphemeralProcess", "Endpoint", "Volume"] {
+            children.extend(
+                runtime
+                    .committed_resources_of_type(resource_type)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?,
+            );
+        }
+        Ok(desired.iter().all(|intent| {
+            children.iter().any(|child| {
+                child.pointer("/metadata/ownerRef").and_then(Value::as_str)
+                    == Some(owner_ref.as_str())
+                    && child.pointer("/type").and_then(Value::as_str)
+                        == Some(intent.target().resource_type().as_str())
+                    && child.pointer("/metadata/name").and_then(Value::as_str)
+                        == Some(intent.target().name().as_str())
+                    && matches!(
+                        child.pointer("/status/phase").and_then(Value::as_str),
+                        Some("Ready" | "Succeeded")
+                    )
+            })
+        }))
+    }
+
+    fn framework_operation_id(prefix: &str, operation_id: &str) -> String {
+        let digest = Sha256::digest(format!("{prefix}:{operation_id}").as_bytes());
+        let mut id = String::with_capacity(24);
+        id.push_str("u6-");
+        id.push_str(prefix);
+        for byte in digest.iter().take(8) {
+            id.push_str(&format!("{byte:02x}"));
+        }
+        id
+    }
+
+    fn qemu_dependencies(
+        value: &Value,
+        dependencies: &[DependencySnapshot],
+        children: &[Value],
+        effect: &FrameworkQemuEffect,
+    ) -> Result<qemu_media_runtime::QemuMediaDependencies, SharedProviderEffectError> {
+        let ready = |reference: &ResourceRef| {
+            dependencies.iter().any(|dependency| {
+                dependency.resource().key().resource_ref() == reference
+                    && serde_json::from_slice::<Value>(dependency.resource().canonical_json())
+                        .ok()
+                        .and_then(|value| value.pointer("/status/phase").and_then(Value::as_str).map(|phase| phase == "Ready"))
+                        == Some(true)
+            })
+        };
+        let device_ref = value
+            .pointer("/spec/deviceAttachments")
+            .and_then(Value::as_array)
+            .and_then(|attachments| attachments.first())
+            .and_then(|attachment| attachment.get("deviceRef"))
+            .and_then(Value::as_str)
+            .map(ResourceRef::parse)
+            .transpose()
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let device = device_ref
+            .as_ref()
+            .filter(|reference| ready(reference))
+            .map(|reference| qemu_media_runtime::DeviceObservation {
+                device_ref: (*reference).clone(),
+                phase: qemu_media_runtime::DevicePhase::Ready,
+                owner_ref: value
+                    .pointer("/metadata/ownerRef")
+                    .and_then(Value::as_str)
+                    .and_then(|owner| ResourceRef::parse(owner).ok()),
+                platform: qemu_media_runtime::PlatformClass::X86_64Linux,
+                authority_key: Sha256::digest(reference.to_canonical_string().as_bytes()).into(),
+                process_identity: Some("qemu-media-runner".to_owned()),
+                media_contract: "qemu-media/v1".to_owned(),
+            });
+        let settings = serde_json::from_value::<qemu_media_runtime::GuestProviderSpecSettings>(
+            value
+                .pointer("/spec/provider/settings")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let mut media_refs = Vec::new();
+        if let Some(reference) = settings.boot_media_ref.clone() {
+            media_refs.push(reference);
+        }
+        media_refs.extend(
+            settings
+                .removable_volume_refs
+                .iter()
+                .map(|reference| reference.volume_ref.clone()),
+        );
+        let media_ready = media_refs.iter().all(ready);
+        let network_ready = value
+            .pointer("/spec/networkAttachments")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|attachment| attachment.get("networkRef").and_then(Value::as_str))
+            .map(ResourceRef::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?
+            .iter()
+            .all(ready);
+        let display_ref = if settings.display_window {
+            dependencies
+                .iter()
+                .find(|dependency| dependency.resource().key().resource_ref().resource_type().as_str() == "Endpoint")
+                .map(|dependency| dependency.resource().key().resource_ref().clone())
+        } else {
+            None
+        };
+        let runtime_volume_ready = children.iter().any(|child| {
+            child.pointer("/metadata/ownerRef").and_then(Value::as_str)
+                == value
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .map(|name| format!("Guest/{name}"))
+                    .as_deref()
+                && child.pointer("/type").and_then(Value::as_str) == Some("Volume")
+                && child.pointer("/metadata/name").and_then(Value::as_str)
+                    == value
+                        .pointer("/metadata/name")
+                        .and_then(Value::as_str)
+                        .map(|name| format!("{name}-runtime"))
+                        .as_deref()
+                && child.pointer("/status/phase").and_then(Value::as_str) == Some("Ready")
+        });
+        Ok(qemu_media_runtime::QemuMediaDependencies {
+            device,
+            network_ready,
+            media_ready,
+            display_ready: !settings.display_window || display_ref.as_ref().is_some_and(ready),
+            qmp_ready: effect.qmp_ready(),
+            qmp_status: effect.qmp_ready().then_some(
+                qemu_media_runtime::QmpVmStatus::Paused,
+            ),
+            media_refs,
+            display_ref,
+            runtime_volume_ready,
+            qmp_elapsed_seconds: 0,
+        })
+    }
+
+    fn build_guest_controller(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        value: &Value,
+        provider: &Value,
+    ) -> Result<GuestRuntimeController, SharedProviderEffectError> {
+        match kind {
+            SharedProviderResourceKind::QemuMediaGuest => {
+                let config = serde_json::from_value::<qemu_media_runtime::ProviderConfig>(
+                    provider
+                        .pointer("/spec/config")
+                        .cloned()
+                        .ok_or(SharedProviderEffectError::InvalidResource)?,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let settings =
+                    serde_json::from_value::<qemu_media_runtime::GuestProviderSpecSettings>(
+                        serde_json::from_slice::<Value>(resource.canonical_json())
+                            .map_err(|_| SharedProviderEffectError::InvalidResource)?
+                            .get("spec")
+                            .and_then(|spec| spec.get("provider"))
+                            .and_then(|provider| provider.get("settings"))
+                            .cloned()
+                            .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+                    )
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let device_ref = value
+                    .pointer("/spec/deviceAttachments")
+                    .and_then(Value::as_array)
+                    .and_then(|attachments| attachments.first())
+                    .and_then(|attachment| attachment.get("deviceRef"))
+                    .and_then(Value::as_str)
+                    .map(ResourceRef::parse)
+                    .transpose()
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let network_refs = value
+                    .pointer("/spec/networkAttachments")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|attachment| attachment.get("networkRef").and_then(Value::as_str))
+                    .map(ResourceRef::parse)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let process = qemu_media_runtime::build_process_spec(
+                    config.controller_execution_ref.clone(),
+                    ResourceRef::parse(&format!(
+                        "Volume/{}-runtime",
+                        resource.key().resource_ref().name().as_str()
+                    ))
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+                    device_ref,
+                    network_refs,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let controller = qemu_media_runtime::QemuMediaController::new(
+                    config,
+                    settings,
+                    process,
+                    resource.key().resource_ref().clone(),
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                Ok(GuestRuntimeController::Qemu {
+                    controller,
+                    effect: FrameworkQemuEffect::new(resource.key().resource_ref().clone()),
+                })
+            }
+            SharedProviderResourceKind::AzureContainerAppsGuest => {
+                let config = serde_json::from_value::<aca_runtime::AcaProviderConfig>(
+                    provider
+                        .pointer("/spec/config")
+                        .cloned()
+                        .ok_or(SharedProviderEffectError::InvalidResource)?,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let config_bytes = serde_json::to_vec(&config)
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let binding = aca_runtime::AcaResourceBinding {
+                    guest_uid: resource.key().uid().clone(),
+                    provider_generation: context.identity.provider_generation().get(),
+                    config_fingerprint: Sha256::digest(config_bytes).into(),
+                };
+                let control = Arc::new(FrameworkAcaControl {
+                    state: Arc::new(tokio::sync::Mutex::new(FrameworkAcaState::new(
+                        context.identity.provider_generation().get(),
+                    ))),
+                });
+                let provider = aca_runtime::AzureContainerAppsRuntimeProvider::new(
+                    config,
+                    control,
+                    Arc::new(FrameworkAcaLease),
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                Ok(GuestRuntimeController::Aca {
+                    controller: provider.controller(binding),
+                })
+            }
+            SharedProviderResourceKind::AzureVirtualMachineGuest => {
+                let config = serde_json::from_value::<azure_vm_runtime::AzureVmConfig>(
+                    provider
+                        .pointer("/spec/config")
+                        .cloned()
+                        .ok_or(SharedProviderEffectError::InvalidResource)?,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let guest_value = serde_json::from_slice::<Value>(resource.canonical_json())
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let settings = serde_json::from_value::<azure_vm_runtime::AzureVmGuestSettings>(
+                    Self::azure_vm_guest_settings_value(&guest_value)?,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let state = Arc::new(tokio::sync::Mutex::new(FrameworkAzureState::new(&settings)));
+                let controller = azure_vm_runtime::AzureVmController::new(
+                    config,
+                    settings,
+                    Arc::new(FrameworkAzureEffect {
+                        state: Arc::clone(&state),
+                    }),
+                    Arc::new(FrameworkAzureCredential),
+                    None,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?
+                .with_bootstrap_service(
+                    azure_vm_runtime::BootstrapService::from_state(
+                        azure_vm_runtime::BootstrapServiceState::Enrolled,
+                    ),
+                );
+                Ok(GuestRuntimeController::AzureVm { controller })
+            }
+            _ => Err(SharedProviderEffectError::InvalidResource),
+        }
+    }
+
+    async fn run_guest_controller(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        value: &Value,
+        provider: &Value,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let runtime = self.validate_guest_runtime_fence(kind, context, resource).await?;
+        let mut children = runtime
+            .committed_resources_of_type("Process")
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        children.extend(
+            runtime
+                .committed_resources_of_type("Volume")
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?,
+        );
+        let session_generation = runtime
+            .core_controller_subject
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .as_ref()
+            .map(AuthenticatedSubjectContext::reconnect_generation)
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let key = (
+            resource.key().resource_ref().clone(),
+            resource.key().uid().clone(),
+            context.identity.provider_generation().get(),
+            context.identity.controller_generation().get(),
+            resource.generation().get(),
+            session_generation.get(),
+        );
+        let mut controllers = self.guest_controllers.lock().await;
+        if !controllers.contains_key(&key) {
+            let controller = self.build_guest_controller(kind, context, resource, value, provider)?;
+            controllers.insert(key.clone(), controller);
+        }
+        let controller = controllers
+            .get_mut(&key)
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        match controller {
+            GuestRuntimeController::Qemu {
+                controller,
+                effect,
+            } => {
+                let deps = Self::qemu_dependencies(value, dependencies, &children, effect)?;
+                let outcome = controller
+                    .reconcile(&deps, effect)
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(if matches!(
+                    outcome,
+                    qemu_media_runtime::QemuMediaReconcileOutcome::Ready
+                ) {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                })
+            }
+            GuestRuntimeController::Aca { controller } => {
+                let operation = aca_runtime::AcaOperationId::parse(
+                    Self::framework_operation_id("aca", &context.operation_id),
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let outcome = controller
+                    .reconcile(operation, 30_000)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(if outcome == aca_runtime::AcaReconcileOutcome::Converged {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                })
+            }
+            GuestRuntimeController::AzureVm { controller } => {
+                let outcome = controller
+                    .reconcile(
+                        self.zone.as_str(),
+                        resource.key().uid().as_str(),
+                        resource.generation().get(),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(if outcome == azure_vm_runtime::AzureVmReconcileOutcome::Converged {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                })
+            }
+        }
+    }
+
+    async fn finalize_guest_controller(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<bool, SharedProviderEffectError> {
+        let value = self
+            .guest_provider_resource(kind, context, resource)
+            .await?;
+        let runtime = self
+            .validate_guest_runtime_fence(kind, context, resource)
+            .await?;
+        let provider_ref = ResourceRef::parse(kind.provider_ref())
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let provider = runtime
+            .committed_resource_value(&provider_ref, &context.operation_id)
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if matches!(
+            kind,
+            SharedProviderResourceKind::AzureContainerAppsGuest
+                | SharedProviderResourceKind::AzureVirtualMachineGuest
+        ) {
+            self.validate_gateway_custody(
+                &provider_ref,
+                match kind {
+                    SharedProviderResourceKind::AzureContainerAppsGuest => {
+                        &["controlCredentialRef", "pullCredentialRef"][..]
+                    }
+                    SharedProviderResourceKind::AzureVirtualMachineGuest => {
+                        &["armCredentialRef"][..]
+                    }
+                    _ => &[][..],
+                },
+                context,
+            )
+            .await?;
+        }
+        let key = (
+            resource.key().resource_ref().clone(),
+            resource.key().uid().clone(),
+            context.identity.provider_generation().get(),
+            context.identity.controller_generation().get(),
+            resource.generation().get(),
+            runtime
+                .core_controller_subject
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .as_ref()
+                .map(AuthenticatedSubjectContext::reconnect_generation)
+                .ok_or(SharedProviderEffectError::Unavailable)?
+                .get(),
+        );
+        let mut controllers = self.guest_controllers.lock().await;
+        if !controllers.contains_key(&key) {
+            controllers.insert(
+                key.clone(),
+                self.build_guest_controller(kind, context, resource, &value, &provider)?,
+            );
+        }
+        let controller = controllers
+            .get_mut(&key)
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        match controller {
+            GuestRuntimeController::Qemu {
+                controller,
+                effect,
+            } => {
+                controller
+                    .finalize(effect)
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            }
+            GuestRuntimeController::Aca { controller } => {
+                let operation = aca_runtime::AcaOperationId::parse(
+                    Self::framework_operation_id("aca-delete", &context.operation_id),
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                controller
+                    .finalize(operation, 30_000)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            }
+            GuestRuntimeController::AzureVm { controller } => {
+                if let Some(operation) = controller.recovery_state().operation {
+                    controller
+                        .poll_operation(operation)
+                        .await
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                }
+                controller
+                    .finalize(
+                        self.zone.as_str(),
+                        resource.key().uid().as_str(),
+                        resource.generation().get(),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            }
+        }
+        let complete = !controller.finalizer_installed();
+        if complete {
+            controllers.remove(&key);
+        }
+        Ok(complete)
+    }
+
+    async fn reconcile_guest_runtime(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        let value = self.guest_provider_resource(kind, context, resource).await?;
+        for dependency in dependencies {
+            if !Self::related_guest_dependency(&value, dependency)? {
+                return Ok(SharedProviderEffectResult::phase(
+                    SharedProviderEffectPhase::Pending,
+                ));
+            }
+        }
+        let runtime = self.validate_guest_runtime_fence(kind, context, resource).await?;
+        let provider_ref = ResourceRef::parse(kind.provider_ref())
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let provider = runtime
+            .committed_resource_value(&provider_ref, &context.operation_id)
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if kind == SharedProviderResourceKind::AzureContainerAppsGuest {
+            self.validate_gateway_custody(
+                &provider_ref,
+                &["controlCredentialRef", "pullCredentialRef"],
+                context,
+            )
+            .await?;
+        } else if kind == SharedProviderResourceKind::AzureVirtualMachineGuest {
+            self.validate_gateway_custody(&provider_ref, &["armCredentialRef"], context)
+                .await?;
+        }
+        if kind == SharedProviderResourceKind::QemuMediaGuest {
+            Self::validate_qemu_guest(&value)?;
+        }
+        let desired = match kind {
+            SharedProviderResourceKind::QemuMediaGuest => Some(Self::qemu_guest_children(
+                &value,
+                &provider,
+                resource.key().resource_ref(),
+                &self.zone,
+            )?),
+            SharedProviderResourceKind::AzureContainerAppsGuest => Some(
+                Self::aca_guest_children(resource.key().resource_ref(), &self.zone)?,
+            ),
+            SharedProviderResourceKind::AzureVirtualMachineGuest
+            | SharedProviderResourceKind::CloudHypervisorGuest => None,
+            _ => return Err(SharedProviderEffectError::InvalidResource),
+        };
+        let (children_ready, child_mutated) = if let Some(desired) = desired {
+            let child_progress = self
+                .guest_child_progress(&runtime, resource, Some(desired.clone()))
+                .await?;
+            (
+                self.guest_children_ready(&runtime, resource, &desired)
+                    .await?,
+                child_progress == OneOwnedChildProgress::Mutated,
+            )
+        } else {
+            (true, false)
+        };
+        match kind {
+            SharedProviderResourceKind::CloudHypervisorGuest => {
+                let runtime = self.runtime()?;
+                runtime
+                    .reconcile_cloud_hypervisor_guest(
+                        Arc::clone(&self.state),
+                        resource.key().resource_ref(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(
+                            resource = %resource.key().resource_ref().to_canonical_string(),
+                            error = ?error,
+                            "U6 Cloud Hypervisor Guest effect failed",
+                        );
+                        SharedProviderEffectError::Unavailable
+                    })?;
+                let fresh = runtime
+                    .committed_resource_value(
+                        resource.key().resource_ref(),
+                        &context.operation_id,
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(SharedProviderEffectResult::phase(Self::guest_phase(&fresh)))
+            }
+            SharedProviderResourceKind::QemuMediaGuest => {
+                let phase = self
+                    .run_guest_controller(
+                    kind,
+                    context,
+                    resource,
+                    &value,
+                    &provider,
+                    dependencies,
+                )
+                .await?;
+                Ok(SharedProviderEffectResult {
+                    phase: if children_ready {
+                        phase
+                    } else {
+                        SharedProviderEffectPhase::Pending
+                    },
+                    child_mutated,
+                    resource_projection: None,
+                })
+            }
+            SharedProviderResourceKind::AzureContainerAppsGuest => {
+                let phase = self
+                    .run_guest_controller(
+                    kind,
+                    context,
+                    resource,
+                    &value,
+                    &provider,
+                    dependencies,
+                )
+                .await?;
+                Ok(SharedProviderEffectResult {
+                    phase: if children_ready {
+                        phase
+                    } else {
+                        SharedProviderEffectPhase::Pending
+                    },
+                    child_mutated,
+                    resource_projection: None,
+                })
+            }
+            SharedProviderResourceKind::AzureVirtualMachineGuest => {
+                Self::validate_azure_vm_guest(&value)?;
+                let phase = self
+                    .run_guest_controller(
+                    kind,
+                    context,
+                    resource,
+                    &value,
+                    &provider,
+                    dependencies,
+                )
+                .await?;
+                Ok(SharedProviderEffectResult {
+                    phase: if children_ready {
+                        phase
+                    } else {
+                        SharedProviderEffectPhase::Pending
+                    },
+                    child_mutated,
+                    resource_projection: None,
+                })
+            }
+            _ => Err(SharedProviderEffectError::InvalidResource),
+        }
+    }
+
+    async fn finalize_guest_runtime(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<(), SharedProviderEffectError> {
+        let _value = self.guest_provider_resource(kind, context, resource).await?;
+        if kind == SharedProviderResourceKind::CloudHypervisorGuest {
+            self.runtime()?
+                .reconcile_cloud_hypervisor_guest(
+                    Arc::clone(&self.state),
+                    resource.key().resource_ref(),
+                )
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            return Ok(());
+        }
+        let runtime = self.runtime()?;
+        if !self
+            .finalize_guest_controller(kind, context, resource)
+            .await?
+        {
+            return Err(SharedProviderEffectError::Unavailable);
+        }
+        match self
+            .guest_child_progress(&runtime, resource, None)
+            .await?
+        {
+            OneOwnedChildProgress::Converged => Ok(()),
+            OneOwnedChildProgress::Mutated | OneOwnedChildProgress::Pending => {
+                Err(SharedProviderEffectError::Unavailable)
+            }
+        }
+    }
+}
+
+fn tpm_opaque_bytes(domain: &str, value: &str) -> [u8; 32] {
+    let digest = Sha256::digest(format!("{domain}:{value}").as_bytes());
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
+
+fn tpm_state_intent(
+    device_uid: &ResourceUid,
+    vm_id: &str,
+) -> d2b_provider_device_tpm::StateDirIntent {
+    d2b_provider_device_tpm::StateDirIntent::new(
+        d2b_provider_device_tpm::StateDirectoryToken::from_core(tpm_opaque_bytes(
+            "d2b:tpm-state/v1",
+            vm_id,
+        )),
+        d2b_provider_device_tpm::TamperMarkerToken::from_core(tpm_opaque_bytes(
+            "d2b:tpm-marker/v1",
+            device_uid.as_str(),
+        )),
+        d2b_provider_device_tpm::StateOwnerToken::from_core(
+            tpm_opaque_bytes("d2b:tpm-owner/v1", vm_id)[..16]
+                .try_into()
+                .expect("fixed owner token length"),
+        ),
+    )
+}
+
+#[derive(Clone)]
+struct SharedRunnerNetworkContentFence {
+    owner_ref: ResourceRef,
+    provenance: NetworkProvenance,
+    assignment: ResourceAssignmentFence,
+    controller_ref: ResourceRef,
+    controller_generation: ControllerGeneration,
+    provider_generation: ResourceGeneration,
+    session_generation: ReconnectGeneration,
+}
+
+struct SharedRunnerNetworkResources {
+    runtime: Arc<ZoneResourceRuntime>,
+    owner_ref: ResourceRef,
+    guest_ref: ResourceRef,
+    volume_ref: ResourceRef,
+    agent_ref: ResourceRef,
+    content_fence: Option<SharedRunnerNetworkContentFence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedRunnerNetworkReadiness {
+    volume_ready: bool,
+    guest_ready: bool,
+    attachment_ready: bool,
+}
+
+impl SharedRunnerNetworkResources {
+    fn new(runtime: Arc<ZoneResourceRuntime>, owner_ref: ResourceRef, network_uid: &ResourceUid) -> Self {
+        let guest_name = d2b_provider_network_local::ifname::derive_network_child_name(network_uid, "vm");
+        let agent_name =
+            d2b_provider_network_local::ifname::derive_network_child_name(network_uid, "agent");
+        Self {
+            runtime,
+            owner_ref,
+            guest_ref: ResourceRef::parse(&format!("Guest/{guest_name}"))
+                .expect("derived Network Guest ref is valid"),
+            volume_ref: ResourceRef::parse("Volume/net-config")
+                .expect("Network config Volume ref is valid"),
+            agent_ref: ResourceRef::parse(&format!("Process/{agent_name}"))
+                .expect("derived Network agent ref is valid"),
+            content_fence: None,
+        }
+    }
+
+    fn with_content_fence(mut self, fence: SharedRunnerNetworkContentFence) -> Self {
+        self.content_fence = Some(fence);
+        self
+    }
+
+    fn client(
+        &self,
+    ) -> Result<
+        Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+        NetworkEffectError,
+    > {
+        self.runtime
+            .process_resource_client()
+            .ok_or(NetworkEffectError::ConfigVolume)
+    }
+
+    async fn current(&self, target: &ResourceRef) -> Result<Option<Value>, NetworkEffectError> {
+        match self
+            .runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "shared-network-child-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "shared-network-child-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.runtime.zone.clone(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+        {
+            Ok(resource) => serde_json::from_slice(&resource.canonical_json)
+                .map(Some)
+                .map_err(|_| NetworkEffectError::ConfigVolume),
+            Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => Ok(None),
+            Err(_) => Err(NetworkEffectError::ConfigVolume),
+        }
+    }
+
+    async fn upsert(
+        &self,
+        target: &ResourceRef,
+        spec: Value,
+        operation: &str,
+    ) -> Result<(), NetworkEffectError> {
+        upsert_shared_provider_child(
+            &self.runtime,
+            target,
+            spec,
+            &self.owner_ref,
+            operation,
+        )
+        .await
+    }
+
+    async fn delete(&self, target: &ResourceRef, operation: &str) -> Result<(), NetworkEffectError> {
+        let Some(current) = self.current(target).await? else {
+            return Ok(());
+        };
+        let uid = current
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        let revision = current
+            .pointer("/metadata/revision")
+            .and_then(Value::as_u64)
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        let request = public_delete_request(
+            &self.runtime,
+            &json!({
+                "resourceRef": target.to_canonical_string(),
+                "uid": uid.as_str(),
+                "expectedRevision": revision,
+            }),
+            operation,
+        )
+        .await
+        .map_err(|_| NetworkEffectError::ConfigVolume)?;
+        if self.client()?.delete(request).await.error.is_some() {
+            return Err(NetworkEffectError::ConfigVolume);
+        }
+        Ok(())
+    }
+
+    async fn readiness(&self) -> Result<SharedRunnerNetworkReadiness, NetworkEffectError> {
+        let volume = self.current(&self.volume_ref).await?;
+        let guest = self.current(&self.guest_ref).await?;
+        let volume_ready = volume.as_ref().is_some_and(|value| {
+            value.pointer("/metadata/ownerRef").and_then(Value::as_str)
+                == Some(self.owner_ref.to_canonical_string().as_str())
+                && value.pointer("/status/phase").and_then(Value::as_str) == Some("Ready")
+                && network_config_content_projection_ready(value)
+        });
+        let guest_ready = guest.as_ref().is_some_and(|value| {
+            value.pointer("/metadata/ownerRef").and_then(Value::as_str)
+                == Some(self.owner_ref.to_canonical_string().as_str())
+                && value.pointer("/status/phase").and_then(Value::as_str) == Some("Ready")
+        });
+        let attachment_ready = volume.as_ref().is_some_and(|value| {
+            value.pointer("/status/phase").and_then(Value::as_str) == Some("Ready")
+                && value
+                    .pointer("/spec/attachments")
+                    .and_then(Value::as_array)
+                    .is_some_and(|attachments| {
+                        attachments.iter().any(|attachment| {
+                            attachment
+                                .get("executionRef")
+                                .and_then(Value::as_str)
+                                == Some(self.guest_ref.to_canonical_string().as_str())
+                        })
+                    })
+        });
+        Ok(SharedRunnerNetworkReadiness {
+            volume_ready,
+            guest_ready,
+            attachment_ready,
+        })
+    }
+}
+
+impl NetworkResourcePort for SharedRunnerNetworkResources {
+    async fn upsert_volume_backing(
+        &self,
+        spec: &d2b_contracts_resource::v3::volume::VolumeSpec,
+    ) -> Result<(), NetworkEffectError> {
+        let mut value = serde_json::to_value(spec).map_err(|_| NetworkEffectError::ConfigVolume)?;
+        if let Some(current) = self.current(&self.volume_ref).await?
+            && let Some(provider) = current.pointer("/spec/provider")
+        {
+            value
+                .as_object_mut()
+                .ok_or(NetworkEffectError::ConfigVolume)?
+                .insert("provider".to_owned(), provider.clone());
+        }
+        value
+            .as_object_mut()
+            .ok_or(NetworkEffectError::ConfigVolume)?
+            .insert(
+                "providerRef".to_owned(),
+                Value::String("Provider/volume-local".to_owned()),
+            );
+        self.upsert(
+            &self.volume_ref,
+            value,
+            "shared-network-volume-upsert",
+        )
+        .await
+    }
+
+    async fn upsert_volume_content(
+        &self,
+        content: &d2b_provider_network_local::controller::NetworkConfigContent,
+    ) -> Result<(), NetworkEffectError> {
+        let fence = self
+            .content_fence
+            .as_ref()
+            .ok_or(NetworkEffectError::NetworkAdmissionMismatch)?;
+        if fence.owner_ref != self.owner_ref
+            || content.provenance() != Some(&fence.provenance)
+        {
+            return Err(NetworkEffectError::NetworkAdmissionMismatch);
+        }
+        let current = self
+            .current(&self.volume_ref)
+            .await?
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        if current.pointer("/metadata/ownerRef").and_then(Value::as_str)
+            != Some(self.owner_ref.to_canonical_string().as_str())
+            || current.pointer("/metadata/zone").and_then(Value::as_str)
+                != Some(self.runtime.zone.as_str())
+            || current.pointer("/spec/providerRef").and_then(Value::as_str)
+                != Some("Provider/volume-local")
+        {
+            return Err(NetworkEffectError::NetworkAdmissionMismatch);
+        }
+        let mut spec = current
+            .get("spec")
+            .cloned()
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        validate_network_config_volume_spec(&spec)?;
+        let assignment = self
+            .runtime
+            .store
+            .assignment_fence(self.runtime.zone.clone(), self.owner_ref.clone())
+            .await
+            .map_err(|_| NetworkEffectError::NetworkAdmissionMismatch)?
+            .ok_or(NetworkEffectError::NetworkAdmissionMismatch)?;
+        if !network_assignment_matches(&assignment, fence) {
+            return Err(NetworkEffectError::NetworkAdmissionMismatch);
+        }
+        let volume_uid = current
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        spec = DaemonSharedProviderEffects::project_network_volume_spec(
+            spec,
+            &volume_uid,
+            content,
+            fence,
+            &self.owner_ref,
+        )?;
+        self.upsert(
+            &self.volume_ref,
+            spec,
+            "shared-network-volume-content-write",
+        )
+        .await
+    }
+
+    async fn upsert_guest(
+        &self,
+        spec: &d2b_contracts_resource::v3::guest::GuestSpec,
+    ) -> Result<(), NetworkEffectError> {
+        let mut value = serde_json::to_value(spec).map_err(|_| NetworkEffectError::ConfigVolume)?;
+        value
+            .as_object_mut()
+            .ok_or(NetworkEffectError::ConfigVolume)?
+            .insert(
+                "providerRef".to_owned(),
+                Value::String("Provider/runtime-cloud-hypervisor".to_owned()),
+            );
+        self.upsert(&self.guest_ref, value, "shared-network-guest-upsert")
+            .await
+    }
+
+    async fn attach_volume(
+        &self,
+        attachment: &d2b_contracts_resource::v3::volume::VolumeAttachment,
+    ) -> Result<(), NetworkEffectError> {
+        let current = self
+            .current(&self.volume_ref)
+            .await?
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        let mut spec = current
+            .get("spec")
+            .cloned()
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        let attachments = spec
+            .as_object_mut()
+            .ok_or(NetworkEffectError::ConfigVolume)?
+            .entry("attachments")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let attachments = attachments
+            .as_array_mut()
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        let attachment = serde_json::to_value(attachment)
+            .map_err(|_| NetworkEffectError::ConfigVolume)?;
+        if !attachments.iter().any(|current| current == &attachment) {
+            attachments.push(attachment);
+        }
+        self.upsert(&self.volume_ref, spec, "shared-network-volume-attach")
+            .await
+    }
+
+    async fn upsert_agent(
+        &self,
+        spec: &d2b_contracts_resource::v3::process::ProcessSpec,
+    ) -> Result<(), NetworkEffectError> {
+        let mut value = serde_json::to_value(spec).map_err(|_| NetworkEffectError::ConfigVolume)?;
+        value
+            .as_object_mut()
+            .ok_or(NetworkEffectError::ConfigVolume)?
+            .insert(
+                "providerRef".to_owned(),
+                Value::String("Provider/system-minijail".to_owned()),
+            );
+        self.upsert(&self.agent_ref, value, "shared-network-agent-upsert")
+            .await
+    }
+
+    async fn reconcile_mdns(&self, enabled: bool) -> Result<(), NetworkEffectError> {
+        if enabled {
+            return Err(NetworkEffectError::ConfigVolume);
+        }
+        Ok(())
+    }
+
+    async fn delete_processes(&self) -> Result<(), NetworkEffectError> {
+        self.delete(&self.agent_ref, "shared-network-agent-delete")
+            .await
+    }
+
+    async fn detach_volume(&self) -> Result<(), NetworkEffectError> {
+        let Some(current) = self.current(&self.volume_ref).await? else {
+            return Ok(());
+        };
+        let mut spec = current
+            .get("spec")
+            .cloned()
+            .ok_or(NetworkEffectError::ConfigVolume)?;
+        if let Some(attachments) = spec
+            .as_object_mut()
+            .and_then(|spec| spec.get_mut("attachments"))
+            .and_then(Value::as_array_mut)
+        {
+            attachments.retain(|attachment| {
+                attachment
+                    .get("executionRef")
+                    .and_then(Value::as_str)
+                    != Some(self.guest_ref.to_canonical_string().as_str())
+            });
+        }
+        self.upsert(&self.volume_ref, spec, "shared-network-volume-detach")
+            .await
+    }
+
+    async fn delete_guest(&self) -> Result<(), NetworkEffectError> {
+        self.delete(&self.guest_ref, "shared-network-guest-delete")
+            .await
+    }
+
+    async fn delete_volume(&self) -> Result<(), NetworkEffectError> {
+        self.delete(&self.volume_ref, "shared-network-volume-delete")
+            .await
+    }
+}
+
+const NETWORK_CONFIG_VOLUME_SCHEMA_ID: &str = d2b_provider_volume_local::VOLUME_CONTENT_SCHEMA_ID;
+const NETWORK_CONFIG_VOLUME_SCHEMA_VERSION: &str =
+    d2b_provider_volume_local::VOLUME_CONTENT_SCHEMA_VERSION;
+const NETWORK_CONFIG_CONTENT_KIND: &str = d2b_provider_volume_local::NETWORK_CONFIG_CONTENT_KIND;
+const NETWORK_CONFIG_FILE_OWNER: &str = d2b_provider_volume_local::NETWORK_CONFIG_FILE_OWNER;
+const NETWORK_CONFIG_FILE_MODE: &str = d2b_provider_volume_local::NETWORK_CONFIG_FILE_MODE;
+
+fn validate_network_config_volume_spec(spec: &Value) -> Result<(), NetworkEffectError> {
+    let provider_ref = spec
+        .get("providerRef")
+        .and_then(Value::as_str)
+        .ok_or(NetworkEffectError::ConfigVolume)?;
+    if provider_ref != "Provider/volume-local" {
+        return Err(NetworkEffectError::NetworkAdmissionMismatch);
+    }
+    let mut base = spec.clone();
+    if let Some(base) = base.as_object_mut() {
+        base.remove("providerRef");
+        base.remove("updatePolicy");
+        base.remove("provider");
+    }
+    let volume: VolumeSpec =
+        serde_json::from_value(base).map_err(|_| NetworkEffectError::ConfigVolume)?;
+    let required = [
+        "dnsmasq.conf",
+        "nftables.rules",
+        "routing.conf",
+        "attachments.json",
+    ];
+    if !required.iter().all(|path| {
+        volume.layout().iter().any(|entry| {
+            entry.path() == *path
+                && entry.entry_type() == EntryType::File
+                && entry.owner_ref().to_canonical_string() == NETWORK_CONFIG_FILE_OWNER
+                && entry.group_ref().to_canonical_string() == NETWORK_CONFIG_FILE_OWNER
+                && entry.mode() == NETWORK_CONFIG_FILE_MODE
+        })
+    }) {
+        return Err(NetworkEffectError::ConfigVolume);
+    }
+    Ok(())
+}
+
+fn network_config_content_projection_ready(value: &Value) -> bool {
+    let Some(provider) = value.pointer("/spec/provider") else {
+        return false;
+    };
+    let Some(spec) = value.get("spec") else {
+        return false;
+    };
+    if validate_network_config_volume_spec(spec).is_err() {
+        return false;
+    }
+    if provider.get("schemaId").and_then(Value::as_str)
+        != Some(NETWORK_CONFIG_VOLUME_SCHEMA_ID)
+        || provider.get("schemaVersion").and_then(Value::as_str)
+            != Some(NETWORK_CONFIG_VOLUME_SCHEMA_VERSION)
+        || provider
+            .pointer("/settings/kind")
+            .and_then(Value::as_str)
+            != Some(NETWORK_CONFIG_CONTENT_KIND)
+    {
+        return false;
+    }
+    let Some(desired) = provider.pointer("/settings/content") else {
+        return false;
+    };
+    let Ok(desired) =
+        d2b_provider_volume_local::NetworkConfigContentProjection::from_settings(desired)
+    else {
+        return false;
+    };
+    let Some(volume_uid) = value
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .and_then(|uid| ResourceUid::parse(uid.to_owned()).ok())
+    else {
+        return false;
+    };
+    if desired.volume_uid() != &volume_uid {
+        return false;
+    }
+    if value
+        .pointer("/status/phase")
+        .and_then(Value::as_str)
+        != Some("Ready")
+        || value
+            .pointer("/metadata/generation")
+            .and_then(Value::as_u64)
+            != value
+                .pointer("/status/observedGeneration")
+                .and_then(Value::as_u64)
+    {
+        return false;
+    }
+    if let Some(resource_projection) = value.pointer("/status/resource")
+        && resource_projection
+            .get("provider")
+            .and_then(Value::as_str)
+            != Some("volume-local")
+    {
+        return false;
+    }
+    let status_provider = value.pointer("/status/provider");
+    if let Some(status_provider) = status_provider
+        && (status_provider
+            .get("providerRef")
+            .and_then(Value::as_str)
+            != Some("Provider/volume-local")
+            || status_provider
+                .get("schemaId")
+                .and_then(Value::as_str)
+                != Some("volume-local.d2bus.org/Volume/status")
+            || status_provider
+                .get("schemaVersion")
+                .and_then(Value::as_str)
+                != Some("1.0"))
+    {
+        return false;
+    }
+    let Some(observed) = value
+        .pointer("/status/resource/content")
+        .or_else(|| value.pointer("/status/content"))
+        .or_else(|| status_provider.and_then(|provider| provider.pointer("/details/content")))
+    else {
+        return false;
+    };
+    let Ok(observed) =
+        serde_json::from_value::<d2b_provider_volume_local::NetworkConfigMaterializationEvidence>(
+            observed.clone(),
+        )
+    else {
+        return false;
+    };
+    observed.matches(&desired)
+}
+
+fn network_config_provider_matches(
+    provider: &Value,
+    volume_uid: &ResourceUid,
+    owner_ref: &ResourceRef,
+    marker: &str,
+) -> bool {
+    provider.get("schemaId").and_then(Value::as_str)
+        == Some(NETWORK_CONFIG_VOLUME_SCHEMA_ID)
+        && provider.get("schemaVersion").and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_VOLUME_SCHEMA_VERSION)
+        && provider
+            .pointer("/settings/kind")
+            .and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_CONTENT_KIND)
+        && provider
+            .pointer("/settings/content")
+            .and_then(|content| {
+                d2b_provider_volume_local::NetworkConfigContentProjection::from_settings(content)
+                    .ok()
+            })
+            .is_some_and(|content| {
+                content.volume_uid() == volume_uid
+                    && content.network_ref() == owner_ref
+                    && content.ownership_marker() == marker
+            })
+}
+
+fn network_config_legacy_provider_matches(
+    provider: &Value,
+    owner_ref: &ResourceRef,
+    marker: &str,
+) -> bool {
+    // Accept the previous projection only to migrate its ownership marker;
+    // its files are never used as readiness evidence.
+    provider.get("schemaId").and_then(Value::as_str)
+        == Some(NETWORK_CONFIG_VOLUME_SCHEMA_ID)
+        && provider.get("schemaVersion").and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_VOLUME_SCHEMA_VERSION)
+        && provider
+            .pointer("/settings/kind")
+            .and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_CONTENT_KIND)
+        && provider
+            .pointer("/settings/ownershipMarker")
+            .and_then(Value::as_str)
+            == Some(marker)
+        && provider
+            .pointer("/settings/networkRef")
+            .and_then(Value::as_str)
+            == Some(owner_ref.to_canonical_string().as_str())
+        && provider
+            .pointer("/settings/fileOwner")
+            .and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_FILE_OWNER)
+        && provider
+            .pointer("/settings/fileGroup")
+            .and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_FILE_OWNER)
+        && provider
+            .pointer("/settings/fileMode")
+            .and_then(Value::as_str)
+            == Some(NETWORK_CONFIG_FILE_MODE)
+        && provider.pointer("/settings/files").is_some()
+}
+
+fn network_config_spec_with_content(
+    mut spec: Value,
+    volume_uid: &ResourceUid,
+    content: &d2b_provider_network_local::controller::NetworkConfigContent,
+    fence: &SharedRunnerNetworkContentFence,
+    owner_ref: &ResourceRef,
+) -> Result<Value, NetworkEffectError> {
+    validate_network_config_volume_spec(&spec)?;
+    let marker = d2b_contracts_resource::v3::derive_network_ownership_marker(
+        &fence.provenance,
+        "network-config",
+    );
+    if spec
+        .get("provider")
+        .is_some_and(|provider| {
+            !network_config_provider_matches(provider, volume_uid, owner_ref, &marker)
+                && !network_config_legacy_provider_matches(provider, owner_ref, &marker)
+        })
+    {
+        return Err(NetworkEffectError::NetworkAdmissionMismatch);
+    }
+    let provider =
+        network_config_provider_extension(volume_uid, content, owner_ref, fence, &marker)?;
+    spec.as_object_mut()
+        .ok_or(NetworkEffectError::ConfigVolume)?
+        .insert("provider".to_owned(), provider);
+    Ok(spec)
+}
+
+fn network_assignment_matches(
+    actual: &ResourceAssignmentFence,
+    expected: &SharedRunnerNetworkContentFence,
+) -> bool {
+    actual.resource_uid == expected.assignment.resource_uid
+        && actual.resource_revision == expected.assignment.resource_revision
+        && actual.provider_generation == expected.provider_generation
+        && actual.controller_generation == expected.controller_generation
+        && actual.controller_role == expected.controller_ref
+        && actual.target
+            == ResourceRef::parse(CORE_CONTROLLER_HOST_REF).expect("Host ref")
+        && actual.session_generation == expected.session_generation
+        && actual.epoch == expected.assignment.epoch
+        && matches!(actual.scope, ResourceAssignmentScope::Primary)
+}
+
+fn network_config_provider_extension(
+    volume_uid: &ResourceUid,
+    content: &d2b_provider_network_local::controller::NetworkConfigContent,
+    owner_ref: &ResourceRef,
+    fence: &SharedRunnerNetworkContentFence,
+    marker: &str,
+) -> Result<Value, NetworkEffectError> {
+    let file_owner = ResourceRef::parse(NETWORK_CONFIG_FILE_OWNER)
+        .map_err(|_| NetworkEffectError::ConfigVolume)?;
+    let projection = d2b_provider_volume_local::NetworkConfigContentProjection::new(
+        volume_uid.clone(),
+        owner_ref.clone(),
+        fence.provenance.clone(),
+        marker,
+        file_owner.clone(),
+        file_owner,
+        NETWORK_CONFIG_FILE_MODE,
+        content.dnsmasq.clone(),
+        content.nftables.clone(),
+        content.routing.clone(),
+        content.attachments.clone(),
+        content.digest(),
+    )
+    .map_err(|_| NetworkEffectError::NetworkAdmissionMismatch)?;
+    let content = serde_json::to_value(&projection)
+        .map_err(|_| NetworkEffectError::ConfigVolume)?;
+    Ok(serde_json::json!({
+        "schemaId": NETWORK_CONFIG_VOLUME_SCHEMA_ID,
+        "schemaVersion": NETWORK_CONFIG_VOLUME_SCHEMA_VERSION,
+        "settings": {
+            "kind": NETWORK_CONFIG_CONTENT_KIND,
+            "content": content,
+            "assignmentFence": {
+                "resourceUid": fence.assignment.resource_uid,
+                "resourceRevision": fence.assignment.resource_revision,
+                "providerGeneration": fence.assignment.provider_generation,
+                "controllerGeneration": fence.assignment.controller_generation,
+                "controllerRole": fence.assignment.controller_role,
+                "target": fence.assignment.target,
+                "sessionGeneration": fence.assignment.session_generation,
+                "epoch": fence.assignment.epoch,
+                "scope": "primary",
+            },
+        },
+    }))
+}
+
+async fn upsert_shared_provider_child(
+    runtime: &ZoneResourceRuntime,
+    target: &ResourceRef,
+    spec: Value,
+    owner_ref: &ResourceRef,
+    operation: &str,
+) -> Result<(), NetworkEffectError> {
+    let client = runtime
+        .process_resource_client()
+        .ok_or(NetworkEffectError::ConfigVolume)?;
+    let create = public_create_request(
+        runtime,
+        &json!({
+            "resourceType": target.resource_type().to_canonical_string(),
+            "resourceName": target.name().as_str(),
+            "spec": spec.clone(),
+            "ownerRef": owner_ref.to_canonical_string(),
+        }),
+        operation,
+    )
+    .await
+    .map_err(|_| NetworkEffectError::ConfigVolume)?;
+    if client.create(create).await.error.is_none() {
+        return Ok(());
+    }
+    let current = runtime
+        .committed_resource_value(target, operation)
+        .await
+        .map_err(|_| NetworkEffectError::ConfigVolume)?;
+    let expected_owner = owner_ref.to_canonical_string();
+    if current
+        .pointer("/metadata/ownerRef")
+        .and_then(Value::as_str)
+        != Some(expected_owner.as_str())
+    {
+        return Err(NetworkEffectError::NetworkAdmissionMismatch);
+    }
+    let update = public_update_spec_request_from_current(
+        runtime,
+        &json!({"spec": spec}),
+        operation,
+        target,
+        current,
+    )
+    .map_err(|_| NetworkEffectError::ConfigVolume)?;
+    if client.update_spec(update).await.error.is_some() {
+        return Err(NetworkEffectError::ConfigVolume);
+    }
+    Ok(())
+}
+
+struct SharedRunnerUsbipChildren;
+
+impl crate::usbip_production::UsbipChildResourcePort for SharedRunnerUsbipChildren {
+    fn ensure_attach_process(
+        &mut self,
+        _binding: &d2b_provider_device_usbip::BindingIdentity,
+        _proxy: &d2b_provider_device_usbip::BindingProxyLease,
+    ) -> Result<
+        d2b_provider_device_usbip::AttachProcessIdentity,
+        d2b_provider_device_usbip::BindingLifecycleError,
+    > {
+        Err(d2b_provider_device_usbip::BindingLifecycleError::Transient)
+    }
+
+    fn observe_attach_process(
+        &mut self,
+        _binding: &d2b_provider_device_usbip::BindingIdentity,
+        _identity: &d2b_provider_device_usbip::AttachProcessIdentity,
+    ) -> Result<
+        d2b_provider_device_usbip::AttachmentObservation,
+        d2b_provider_device_usbip::BindingLifecycleError,
+    > {
+        Err(d2b_provider_device_usbip::BindingLifecycleError::Transient)
+    }
+
+    fn delete_guest_endpoint(
+        &mut self,
+        _binding: &d2b_provider_device_usbip::BindingIdentity,
+        _proxy: &d2b_provider_device_usbip::BindingProxyLease,
+    ) -> Result<(), d2b_provider_device_usbip::BindingLifecycleError> {
+        Err(d2b_provider_device_usbip::BindingLifecycleError::Transient)
+    }
+
+    fn delete_attach_process(
+        &mut self,
+        _binding: &d2b_provider_device_usbip::BindingIdentity,
+        _identity: &d2b_provider_device_usbip::AttachProcessIdentity,
+    ) -> Result<(), d2b_provider_device_usbip::BindingLifecycleError> {
+        Err(d2b_provider_device_usbip::BindingLifecycleError::Transient)
+    }
+}
+
+struct DaemonGpuLifecyclePort {
+    state: Arc<ServerState>,
+    runtime: Arc<ZoneResourceRuntime>,
+    resolver: d2b_core::bundle_resolver::BundleResolver,
+    device_ref: ResourceRef,
+    device_uid: ResourceUid,
+    holder_ref: ResourceRef,
+    generation: ResourceGeneration,
+    settings: d2b_provider_device_gpu::GpuSettings,
+    operation_id: String,
+    authority_leases: Arc<Mutex<BTreeMap<[u8; 16], AuthorityLease>>>,
+    processes: Arc<
+        Mutex<
+            BTreeMap<
+                (ResourceUid, u8),
+                d2b_provider_device_gpu::GpuProcessIdentity,
+            >,
+        >,
+    >,
+    opened_devices: Vec<OwnedFd>,
+}
+
+impl DaemonGpuLifecyclePort {
+    fn role_key(role: d2b_provider_device_gpu::GpuProcessRole) -> u8 {
+        match role {
+            d2b_provider_device_gpu::GpuProcessRole::FullGpu => 0,
+            d2b_provider_device_gpu::GpuProcessRole::RenderNode => 1,
+            d2b_provider_device_gpu::GpuProcessRole::Video => 2,
+        }
+    }
+
+    fn intent(
+        &self,
+        template: &str,
+    ) -> Result<d2b_core::bundle_resolver::ResolvedRunnerIntent, d2b_provider_device_gpu::GpuEffectError>
+    {
+        let vm = self.holder_ref.name().as_str();
+        self.resolver
+            .find_runner_intent_for_process_in_vm(
+                Some(vm),
+                "Host/host-system",
+                d2b_core::processes::ProcessExecutionDomain::System,
+                None,
+                template,
+            )
+            .cloned()
+            .ok_or(d2b_provider_device_gpu::GpuEffectError::SpawnRejected)
+    }
+
+    fn open_device_classes(
+        &mut self,
+        role_id: &str,
+        classes: &[&str],
+    ) -> Result<(), d2b_provider_device_gpu::GpuEffectError> {
+        for device_class in classes {
+            let request = d2b_contracts_broker::broker_wire::BrokerRequest::OpenDevice(
+                d2b_contracts_broker::broker_wire::OpenDeviceRequest {
+                    role_id: d2b_contracts::types::RoleId::new(role_id.to_owned()),
+                    device_class: (*device_class).to_owned(),
+                    tracing_span_id: None,
+                },
+            );
+            let (response, fds) = crate::dispatch_broker_request_with_fds_timeout_as(
+                &self.state,
+                request,
+                BrokerCallerRole::AdminUid {
+                    uid: self.state.daemon_uid,
+                },
+                std::time::Duration::from_secs(10),
+            )
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::OpenRejected)?;
+            let accepted = matches!(
+                response,
+                d2b_contracts_broker::broker_wire::BrokerResponse::Ack(response)
+                    if response.accepted
+            );
+            if !accepted || fds.len() != 1 {
+                crate::close_received_fds(&fds);
+                return Err(d2b_provider_device_gpu::GpuEffectError::OpenRejected);
+            }
+            let fd = crate::duplicate_received_fd(&fds, 0, "GPU device grant")
+                .map_err(|_| d2b_provider_device_gpu::GpuEffectError::OpenRejected)?;
+            crate::close_received_fds(&fds);
+            self.opened_devices.push(fd);
+        }
+        Ok(())
+    }
+
+    fn spawn_worker(
+        &mut self,
+        template: &str,
+        process_name: &str,
+        principal: &d2b_provider_device_gpu::GpuPrincipalToken,
+        platform: &d2b_provider_device_gpu::GpuPlatformToken,
+        generation: ResourceGeneration,
+        role: d2b_contracts_broker::broker_wire::RunnerRole,
+    ) -> Result<
+        d2b_provider_device_gpu::GpuProcessIdentity,
+        d2b_provider_device_gpu::GpuEffectError,
+    > {
+        let intent = self.intent(template)?;
+        let execution_ref = ResourceRef::parse(&intent.execution_ref)
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)?;
+        let owner_uid = crate::block_on_future(self.runtime.committed_resource_value(
+            &self.holder_ref,
+            &self.operation_id,
+        ))
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)
+        .and_then(|value| {
+            value
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+                .ok_or(d2b_provider_device_gpu::GpuEffectError::SpawnRejected)
+        })?;
+        let resource_ref = ResourceRef::parse(&format!("Process/{process_name}"))
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)?;
+        let request = d2b_contracts_broker::broker_wire::BrokerRequest::SpawnRunner(
+            d2b_contracts_broker::broker_wire::SpawnRunnerRequest {
+                vm_id: VmId::new(self.holder_ref.name().as_str()),
+                role_id: d2b_contracts::types::RoleId::new(intent.role_id.clone()),
+                resource_ref: Some(resource_ref.clone()),
+                resource_uid: None,
+                zone_uid: self.runtime.authority_zone_uid().cloned(),
+                owner_ref: Some(self.holder_ref.clone()),
+                owner_uid: Some(owner_uid),
+                provider_ref: Some(
+                    ResourceRef::parse("Provider/system-minijail")
+                        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)?,
+                ),
+                bundle_content_identity: self
+                    .runtime
+                    .authority_bundle_generation()
+                    .map(|value| value.as_str().to_owned()),
+                provider_identity: None,
+                template_identity: None,
+                generation: Some(generation.get()),
+                runtime_scope: Some(Self::scope_digest(
+                    &self.device_uid,
+                    &self.operation_id,
+                )),
+                activation_input: None,
+                sandbox_plan: None,
+                role,
+                bundle_runner_intent_ref: BundleOpId::new(intent.intent_id.clone()),
+                execution_ref: Some(execution_ref),
+                execution_domain: Some(match intent.execution_domain {
+                    d2b_core::processes::ProcessExecutionDomain::System => {
+                        d2b_contracts_resource::v3::execution_policy::ExecutionDomain::System
+                    }
+                    d2b_core::processes::ProcessExecutionDomain::User => {
+                        d2b_contracts_resource::v3::execution_policy::ExecutionDomain::User
+                    }
+                }),
+                user_ref: intent
+                    .user_ref
+                    .as_deref()
+                    .and_then(|value| ResourceRef::parse(value).ok()),
+                guest_execution: None,
+                runtime_allocations: Vec::new(),
+                tracing_span_id: None,
+                workload_identity: None,
+                inherited_fd_count: u16::try_from(self.opened_devices.len())
+                    .map_err(|_| d2b_provider_device_gpu::GpuEffectError::OpenRejected)?,
+                network_tap_context: None,
+            },
+        );
+        let request_fds = self
+            .opened_devices
+            .iter()
+            .map(AsRawFd::as_raw_fd)
+            .collect::<Vec<_>>();
+        let (response, received_fds) = crate::dispatch_broker_request_with_optional_request_fds(
+            &self.state,
+            request,
+            BrokerCallerRole::AdminUid {
+                uid: self.state.daemon_uid,
+            },
+            &request_fds,
+            std::time::Duration::from_secs(30),
+        )
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)?;
+        let response = match response {
+            d2b_contracts_broker::broker_wire::BrokerResponse::SpawnRunner(response) => response,
+            _ => {
+                crate::close_received_fds(&received_fds);
+                return Err(d2b_provider_device_gpu::GpuEffectError::SpawnRejected);
+            }
+        };
+        if response.vm_id != VmId::new(self.holder_ref.name().as_str())
+            || response.role != role
+            || response.role_id.as_str() != intent.role_id
+            || response.zone_uid != self.runtime.authority_zone_uid().cloned()
+            || response.owner_ref.as_ref() != Some(&self.holder_ref)
+            || response.generation != Some(generation.get())
+            || response.resource_ref.as_ref() != Some(&resource_ref)
+            || response.pid <= 0
+        {
+            crate::close_received_fds(&received_fds);
+            return Err(d2b_provider_device_gpu::GpuEffectError::StaleDeviceIdentity);
+        }
+        let pidfd = crate::duplicate_received_fd(
+            &received_fds,
+            response.pidfd_index,
+            "GPU SpawnRunner pidfd",
+        )
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)?;
+        crate::close_received_fds(&received_fds);
+        let vm = self.holder_ref.name().as_str().to_owned();
+        if self
+            .state
+            .pidfd_table
+            .register(
+                vm.clone(),
+                intent.role_id.clone(),
+                crate::PidfdEntry {
+                    pidfd,
+                    pid: response.pid,
+                    start_time_ticks: response.start_time_ticks,
+                },
+            )
+            .is_err()
+        {
+            let _ = crate::stop_vm_pidfd_role(
+                &self.state,
+                BrokerCallerRole::AdminUid {
+                    uid: self.state.daemon_uid,
+                },
+                "device-gpu",
+                &vm,
+                &intent.role_id,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            );
+            return Err(d2b_provider_device_gpu::GpuEffectError::SpawnRejected);
+        }
+        if self.state.pidfd_table.snapshot().is_err() {
+            self.state.pidfd_table.deregister_if_matches(
+                &vm,
+                &intent.role_id,
+                response.pid,
+                response.start_time_ticks,
+            );
+            let _ = crate::stop_vm_pidfd_role(
+                &self.state,
+                BrokerCallerRole::AdminUid {
+                    uid: self.state.daemon_uid,
+                },
+                "device-gpu",
+                &vm,
+                &intent.role_id,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            );
+            return Err(d2b_provider_device_gpu::GpuEffectError::SpawnRejected);
+        }
+        let identity = d2b_provider_device_gpu::GpuProcessIdentity::from_core(
+            Self::process_digest(&intent.intent_id, response.pid, response.start_time_ticks),
+            match role {
+                d2b_contracts_broker::broker_wire::RunnerRole::Video => {
+                    d2b_provider_device_gpu::GpuProcessRole::Video
+                }
+                _ if self.settings.render_node_only => {
+                    d2b_provider_device_gpu::GpuProcessRole::RenderNode
+                }
+                _ => d2b_provider_device_gpu::GpuProcessRole::FullGpu,
+            },
+            principal.clone(),
+            platform.clone(),
+            generation,
+        );
+        self.processes
+            .lock()
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::SpawnRejected)?
+            .insert(
+                (self.device_uid.clone(), Self::role_key(identity.role())),
+                identity.clone(),
+            );
+        Ok(identity)
+    }
+
+    fn scope_digest(device_uid: &ResourceUid, operation_id: &str) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"d2b:gpu-runtime-scope/v1");
+        digest.update(device_uid.as_str().as_bytes());
+        digest.update(operation_id.as_bytes());
+        digest.finalize().into()
+    }
+
+    fn process_digest(intent_id: &str, pid: i32, start_time_ticks: u64) -> [u8; 16] {
+        let mut digest = Sha256::new();
+        digest.update(b"d2b:gpu-process/v1");
+        digest.update(intent_id.as_bytes());
+        digest.update(pid.to_be_bytes());
+        digest.update(start_time_ticks.to_be_bytes());
+        let digest: [u8; 32] = digest.finalize().into();
+        digest[..16].try_into().expect("fixed process token length")
+    }
+}
+
+impl d2b_provider_device_gpu::GpuLifecycleEffectPort for DaemonGpuLifecyclePort {
+    fn reserve_authority(
+        &mut self,
+        admission: &d2b_provider_device_gpu::GpuAuthorityAdmission,
+    ) -> Result<d2b_provider_device_gpu::GpuAuthorityLease, d2b_provider_device_gpu::GpuEffectError>
+    {
+        if admission.owner().device_uid() != &self.device_uid
+            || admission.owner().holder_ref() != &self.holder_ref
+            || admission.owner().generation() != self.generation
+        {
+            return Err(d2b_provider_device_gpu::GpuEffectError::StaleDeviceIdentity);
+        }
+        let request = AuthorityRequest::gpu_from_core(
+            admission.owner().host_uid().clone(),
+            self.device_ref.clone(),
+            admission.owner().device_uid().clone(),
+            admission.owner().generation(),
+            *admission.backing().as_bytes(),
+            admission.render_node_only(),
+            admission.max_holders() as usize,
+        )
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)?;
+        let lease = crate::block_on_future(async {
+            self.runtime
+                .authority_index
+                .lock()
+                .await
+                .admit_authority(request)
+        })
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)?;
+        let token = lease.token_bytes();
+        self.authority_leases
+            .lock()
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)?
+            .insert(token, lease);
+        Ok(d2b_provider_device_gpu::GpuAuthorityLease::from_core(token))
+    }
+
+    fn open_authorized_devices(
+        &mut self,
+        admission: &d2b_provider_device_gpu::GpuAuthorityAdmission,
+        tokens: &d2b_provider_device_gpu::GpuEffectTokenSet,
+    ) -> Result<d2b_provider_device_gpu::GpuLaunchTicket, d2b_provider_device_gpu::GpuEffectError>
+    {
+        if admission.owner().device_uid() != &self.device_uid
+            || admission.owner().generation() != self.generation
+            || !admission.owner().holder_ref().eq(&self.holder_ref)
+        {
+            return Err(d2b_provider_device_gpu::GpuEffectError::StaleDeviceIdentity);
+        }
+        if tokens.is_empty() {
+            return Err(d2b_provider_device_gpu::GpuEffectError::StaleDeviceIdentity);
+        }
+        let gpu_intent = self.intent(if self.settings.render_node_only {
+            "render-node-worker"
+        } else {
+            "gpu-worker"
+        })?;
+        let mut classes = if self.settings.render_node_only {
+            vec!["dri"]
+        } else {
+            vec!["kvm", "dri", "udmabuf"]
+        };
+        self.open_device_classes(&gpu_intent.role_id, &classes)?;
+        if self.settings.video_sidecar {
+            let video_intent = self.intent("video-worker")?;
+            classes.clear();
+            classes.push("dri");
+            if self.settings.video_nvidia_decode {
+                classes.extend(["nvidia-ctl", "nvidia-device", "nvidia-uvm"]);
+            }
+            self.open_device_classes(&video_intent.role_id, &classes)?;
+        }
+        Ok(d2b_provider_device_gpu::GpuLaunchTicket::from_core(
+            Self::scope_digest(&self.device_uid, &self.operation_id)[..16]
+                .try_into()
+                .expect("fixed launch ticket length"),
+        ))
+    }
+
+    fn start_gpu_worker(
+        &mut self,
+        spec: &d2b_provider_device_gpu::GpuWorkerSpec,
+        _ticket: &d2b_provider_device_gpu::GpuLaunchTicket,
+        principal: &d2b_provider_device_gpu::GpuPrincipalToken,
+        platform: &d2b_provider_device_gpu::GpuPlatformToken,
+        generation: ResourceGeneration,
+    ) -> Result<
+        d2b_provider_device_gpu::GpuProcessIdentity,
+        d2b_provider_device_gpu::GpuEffectError,
+    > {
+        self.spawn_worker(
+            spec.template(),
+            &format!("gpu-{}", self.device_ref.name().as_str()),
+            principal,
+            platform,
+            generation,
+            d2b_contracts_broker::broker_wire::RunnerRole::Gpu,
+        )
+    }
+
+    fn start_video_worker(
+        &mut self,
+        spec: &d2b_provider_device_gpu::VideoWorkerSpec,
+        _ticket: &d2b_provider_device_gpu::GpuLaunchTicket,
+        principal: &d2b_provider_device_gpu::GpuPrincipalToken,
+        platform: &d2b_provider_device_gpu::GpuPlatformToken,
+        generation: ResourceGeneration,
+    ) -> Result<
+        d2b_provider_device_gpu::GpuProcessIdentity,
+        d2b_provider_device_gpu::GpuEffectError,
+    > {
+        self.spawn_worker(
+            spec.template(),
+            &format!("video-{}", self.device_ref.name().as_str()),
+            principal,
+            platform,
+            generation,
+            d2b_contracts_broker::broker_wire::RunnerRole::Video,
+        )
+    }
+
+    fn observe_worker(
+        &mut self,
+        identity: &d2b_provider_device_gpu::GpuProcessIdentity,
+    ) -> Result<
+        d2b_provider_device_gpu::GpuProcessObservation,
+        d2b_provider_device_gpu::GpuEffectError,
+    > {
+        let known = self
+            .processes
+            .lock()
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::ProcessObservationUnavailable)?
+            .get(&(self.device_uid.clone(), Self::role_key(identity.role())))
+            .is_some_and(|current| current == identity);
+        if !known {
+            return Ok(d2b_provider_device_gpu::GpuProcessObservation::Missing);
+        }
+        let intent = self.intent(match identity.role() {
+            d2b_provider_device_gpu::GpuProcessRole::Video => "video-worker",
+            d2b_provider_device_gpu::GpuProcessRole::RenderNode => "render-node-worker",
+            d2b_provider_device_gpu::GpuProcessRole::FullGpu => "gpu-worker",
+        })?;
+        if self
+            .state
+            .pidfd_table
+            .contains(self.holder_ref.name().as_str(), &intent.role_id)
+        {
+            Ok(d2b_provider_device_gpu::GpuProcessObservation::Matching(
+                identity.clone(),
+            ))
+        } else {
+            Ok(d2b_provider_device_gpu::GpuProcessObservation::Missing)
+        }
+    }
+
+    fn stop_worker(
+        &mut self,
+        identity: &d2b_provider_device_gpu::GpuProcessIdentity,
+    ) -> Result<
+        d2b_provider_device_gpu::GpuClosureProof,
+        d2b_provider_device_gpu::GpuEffectError,
+    > {
+        let intent = self.intent(match identity.role() {
+            d2b_provider_device_gpu::GpuProcessRole::Video => "video-worker",
+            d2b_provider_device_gpu::GpuProcessRole::RenderNode => "render-node-worker",
+            d2b_provider_device_gpu::GpuProcessRole::FullGpu => "gpu-worker",
+        })?;
+        let known = self
+            .processes
+            .lock()
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::CloseUnconfirmed)?
+            .get(&(self.device_uid.clone(), Self::role_key(identity.role())))
+            .is_some_and(|current| current == identity);
+        if !known {
+            return Err(d2b_provider_device_gpu::GpuEffectError::StaleDeviceIdentity);
+        }
+        crate::stop_vm_pidfd_role(
+            &self.state,
+            BrokerCallerRole::AdminUid {
+                uid: self.state.daemon_uid,
+            },
+            "device-gpu",
+            self.holder_ref.name().as_str(),
+            &intent.role_id,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(10),
+        )
+        .map_err(|_| d2b_provider_device_gpu::GpuEffectError::CloseUnconfirmed)?;
+        self.processes
+            .lock()
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::CloseUnconfirmed)?
+            .remove(&(self.device_uid.clone(), Self::role_key(identity.role())));
+        Ok(d2b_provider_device_gpu::GpuClosureProof::from_core(
+            identity.clone(),
+        ))
+    }
+
+    fn release_authority(
+        &mut self,
+        lease: d2b_provider_device_gpu::GpuAuthorityLease,
+        _closures: &[d2b_provider_device_gpu::GpuClosureProof],
+    ) -> Result<(), d2b_provider_device_gpu::GpuEffectError> {
+        let token = *lease.as_bytes();
+        let generic = self
+            .authority_leases
+            .lock()
+            .map_err(|_| d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)?
+            .remove(&token)
+            .ok_or(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)?;
+        let result = crate::block_on_future(async {
+            self.runtime
+                .authority_index
+                .lock()
+                .await
+                .release_authority(&generic)
+        });
+        if result.is_err() {
+            self.authority_leases
+                .lock()
+                .map_err(|_| d2b_provider_device_gpu::GpuEffectError::AuthorityConflict)?
+                .insert(token, generic);
+            return Err(d2b_provider_device_gpu::GpuEffectError::AuthorityConflict);
+        }
+        Ok(())
+    }
+}
+
+type SharedRunnerUsbipPort<'a> = d2b_provider_device_usbip::ProductionPort<
+    crate::usbip_production::DaemonUsbipDispatcher<'a, SharedRunnerUsbipChildren>,
+>;
+
+#[async_trait]
+impl SharedProviderEffectExecutor for DaemonSharedProviderEffects {
+    async fn reconcile_display(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        let _value = self.validate(kind, context, resource)?;
+        if kind == SharedProviderResourceKind::DisplayWaylandPolicy {
+            ResourceEnvelope::from_json(resource.canonical_json())
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            return Ok(SharedProviderEffectResult {
+                phase: SharedProviderEffectPhase::Ready,
+                child_mutated: false,
+                resource_projection: None,
+            });
+        }
+
+        let envelope = ResourceEnvelope::from_json(resource.canonical_json())
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let spec = serde_json::from_slice::<WaylandSessionSpec>(
+            &envelope.spec().base().to_canonical_bytes(),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        if !spec.cross_domain_trusted()
+            || spec.guest_ref().resource_type().as_str() != "Guest"
+            || spec.host_ref().resource_type().as_str() != "Host"
+            || spec.user_ref().resource_type().as_str() != "User"
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let runtime = self.runtime()?;
+        let identity = runtime
+            .interaction_identity
+            .as_ref()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        if identity.wayland_session_ref() != resource.key().resource_ref()
+            || identity.wayland_session_uid() != resource.key().uid()
+            || identity.subject_ref() != spec.guest_ref()
+            || identity.host_execution_ref() != spec.host_ref()
+            || identity.user_ref() != spec.user_ref()
+        {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        for dependency_ref in [
+            spec.guest_ref(),
+            spec.host_ref(),
+            spec.user_ref(),
+            spec.policy_ref(),
+        ] {
+            let dependency = runtime
+                .committed_resource_value(dependency_ref, &context.operation_id)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            if resource_phase(&dependency) != Some("Ready") {
+                return Ok(SharedProviderEffectResult {
+                    phase: SharedProviderEffectPhase::Pending,
+                    child_mutated: false,
+                    resource_projection: None,
+                });
+            }
+        }
+        let client = runtime
+            .process_resource_client()
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let owner = stored_resource_from_snapshot(resource);
+        let desired = crate::interaction_composition::display_owned_child_intents(
+            &self.zone,
+            resource.key().resource_ref(),
+            resource.key().uid(),
+            &spec,
+            resource.generation().get(),
+            context.identity.controller_generation().get(),
+        )
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let owner = crate::binding_child_resource_runtime::OwnedChildOwner {
+            resource: owner,
+            desired: Some(desired),
+            fenced: false,
+        };
+        let converged = crate::binding_child_resource_runtime::reconcile_owned_children(
+            &runtime.store,
+            &client,
+            &self.zone,
+            &[owner.clone()],
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        if !converged.contains(resource.key().resource_ref()) {
+            return Ok(SharedProviderEffectResult {
+                phase: SharedProviderEffectPhase::Pending,
+                child_mutated: true,
+                resource_projection: None,
+            });
+        }
+        let children = crate::binding_child_resource_runtime::list_binding_children(
+            &runtime.store,
+            &self.zone,
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        Ok(SharedProviderEffectResult {
+            phase: if crate::binding_child_resource_runtime::owned_children_ready(
+                &owner, &children,
+            ) {
+                SharedProviderEffectPhase::Ready
+            } else {
+                SharedProviderEffectPhase::Pending
+            },
+            child_mutated: false,
+            resource_projection: Some(display_resource_projection(&owner, &children)),
+        })
+    }
+
+    async fn reconcile_audio(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        let _ = self.validate(kind, context, resource)?;
+        let runtime = self.runtime()?;
+        let target = stored_resource_from_snapshot(resource);
+        validate_audio_dependency_identity(&target, resource.key().resource_ref(), &self.zone)?;
+        self.validate_audio_assignment(runtime.as_ref(), context, &target, true)
+            .await?;
+        match kind {
+            SharedProviderResourceKind::AudioService => {
+                let mut audio = runtime
+                    .audio_runtime
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let registry = audio
+                    .get_or_insert_with(|| AudioResourceRuntime::new(self.zone.clone(), self.state.clone()));
+                registry
+                    .reconcile_service_resource(&target)
+                    .map_err(map_audio_effect_error)?;
+                Ok(SharedProviderEffectResult {
+                    phase: SharedProviderEffectPhase::Ready,
+                    child_mutated: false,
+                    resource_projection: None,
+                })
+            }
+            SharedProviderResourceKind::AudioBinding => {
+                let value = serde_json::from_slice::<Value>(resource.canonical_json())
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let service_ref = resource_ref_at(&value, "/spec/serviceRef")?;
+                let target_ref = resource_ref_at(&value, "/spec/targetRef")?;
+                let service = self
+                    .fresh_audio_dependency(
+                        &runtime,
+                        context,
+                        &service_ref,
+                        audio_dependency(dependencies, &service_ref),
+                    )
+                    .await?;
+                let guest = self
+                    .fresh_audio_dependency(
+                        &runtime,
+                        context,
+                        &target_ref,
+                        audio_dependency(dependencies, &target_ref),
+                    )
+                    .await?;
+                let service_value = serde_json::from_slice::<Value>(&service.canonical_json)
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let guest_value = serde_json::from_slice::<Value>(&guest.canonical_json)
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                if resource_phase(&service_value) != Some("Ready")
+                    || resource_phase(&guest_value) != Some("Ready")
+                {
+                    return Ok(SharedProviderEffectResult {
+                        phase: SharedProviderEffectPhase::Pending,
+                        child_mutated: false,
+                        resource_projection: None,
+                    });
+                }
+                let (status, owner) = {
+                    let mut audio = runtime
+                        .audio_runtime
+                        .lock()
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                    let registry = audio.get_or_insert_with(|| {
+                        AudioResourceRuntime::new(self.zone.clone(), self.state.clone())
+                    });
+                    let status = registry
+                        .reconcile_binding_resource(&target, &service, &guest)
+                        .map_err(map_audio_effect_error)?
+                        .ok_or(SharedProviderEffectError::InvalidResource)?;
+                    let owner = registry
+                        .child_owner_for(&target)
+                        .map_err(map_audio_effect_error)?;
+                    (status, owner)
+                };
+                let client = runtime
+                    .process_resource_client()
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let converged =
+                    crate::binding_child_resource_runtime::reconcile_binding_children(
+                        &runtime.store,
+                        &client,
+                        &self.zone,
+                        std::slice::from_ref(&owner),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if !converged.contains(resource.key().resource_ref()) {
+                    return Ok(SharedProviderEffectResult {
+                        phase: SharedProviderEffectPhase::Pending,
+                        child_mutated: true,
+                        resource_projection: None,
+                    });
+                }
+                let children = crate::binding_child_resource_runtime::list_binding_children(
+                    &runtime.store,
+                    &self.zone,
+                )
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let binding_status = &status.status;
+                let projection =
+                    audio_binding_status_projection_with_status(
+                        &target,
+                        &children,
+                        binding_status,
+                    )
+                        .map_err(|error| match error {
+                            AudioResourceRuntimeError::InvalidResource
+                            | AudioResourceRuntimeError::InvalidRelationship => {
+                                SharedProviderEffectError::InvalidResource
+                            }
+                            AudioResourceRuntimeError::Controller(_) => {
+                                SharedProviderEffectError::Unavailable
+                            }
+                        })?;
+                Ok(SharedProviderEffectResult {
+                    phase: (binding_status.phase
+                        == d2b_provider_audio_pipewire::AudioBindingPhase::Ready)
+                        .then_some(SharedProviderEffectPhase::Ready)
+                        .unwrap_or(SharedProviderEffectPhase::Pending),
+                    child_mutated: false,
+                    resource_projection: Some(projection),
+                })
+            }
+            _ => Err(SharedProviderEffectError::InvalidResource),
+        }
+    }
+
+    async fn reconcile_shell(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        let value = self.validate(kind, context, resource)?;
+        let runtime = self.runtime()?;
+        match kind {
+            SharedProviderResourceKind::ShellPool => {
+                let (execution_ref, user_ref) = shell_pool_spec(&value)?;
+                let target = runtime
+                    .committed_resource_value(&execution_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let user = runtime
+                    .committed_resource_value(&user_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let phase = if resource_phase(&target) == Some("Ready")
+                    && resource_phase(&user) == Some("Ready")
+                {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                };
+                Ok(SharedProviderEffectResult {
+                    phase,
+                    child_mutated: false,
+                    resource_projection: None,
+                })
+            }
+            SharedProviderResourceKind::ShellSession => {
+                let pool_ref = resource_ref_at(&value, "/spec/poolRef")?;
+                if pool_ref.resource_type().as_str() != "shell-terminal.d2bus.org.ShellPool" {
+                    return Err(SharedProviderEffectError::InvalidResource);
+                }
+                let pool = runtime
+                    .committed_resource_value(&pool_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if resource_phase(&pool) != Some("Ready") {
+                    return Ok(SharedProviderEffectResult {
+                        phase: SharedProviderEffectPhase::Pending,
+                        child_mutated: false,
+                        resource_projection: None,
+                    });
+                }
+                let (execution_ref, user_ref) = shell_execution(&value)?;
+                let user_ref = user_ref.ok_or(SharedProviderEffectError::InvalidResource)?;
+                if resource_ref_at(&pool, "/spec/executionRef")? != execution_ref
+                    || resource_ref_at(&pool, "/spec/userRef")? != user_ref
+                {
+                    return Err(SharedProviderEffectError::InvalidResource);
+                }
+                let process_name = format!(
+                    "Process/shell-session-{}",
+                    resource.key().resource_ref().name().as_str()
+                );
+                let process_ref = ResourceRef::parse(&process_name)
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let client = runtime
+                    .process_resource_client()
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let process_spec = json!({
+                    "providerRef": "Provider/system-systemd",
+                    "executionRef": execution_ref.to_canonical_string(),
+                    "domain": "user",
+                    "userRef": user_ref.to_canonical_string(),
+                    "processClass": "service",
+                    "template": "shell-supervisor-main",
+                    "desiredLifecycle": "running",
+                    "deviceUsage": [],
+                    "networkUsage": null
+                });
+                let desired = vec![
+                    owned_child_intent(
+                        &self.zone,
+                        process_ref,
+                        resource.key().resource_ref(),
+                        process_spec,
+                        [pool_ref],
+                    )?,
+                ];
+                let owner = crate::binding_child_resource_runtime::OwnedChildOwner {
+                    resource: stored_resource_from_snapshot(resource),
+                    desired: Some(desired),
+                    fenced: false,
+                };
+                let converged =
+                    crate::binding_child_resource_runtime::reconcile_owned_children(
+                        &runtime.store,
+                        &client,
+                        &self.zone,
+                        std::slice::from_ref(&owner),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if !converged.contains(resource.key().resource_ref()) {
+                    return Ok(SharedProviderEffectResult {
+                        phase: SharedProviderEffectPhase::Pending,
+                        child_mutated: true,
+                        resource_projection: None,
+                    });
+                }
+                let children = crate::binding_child_resource_runtime::list_binding_children(
+                    &runtime.store,
+                    &self.zone,
+                )
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(SharedProviderEffectResult {
+                    phase: if crate::binding_child_resource_runtime::owned_children_ready(
+                        &owner, &children,
+                    ) {
+                        SharedProviderEffectPhase::Ready
+                    } else {
+                        SharedProviderEffectPhase::Pending
+                    },
+                    child_mutated: false,
+                    resource_projection: None,
+                })
+            }
+            _ => Err(SharedProviderEffectError::InvalidResource),
+        }
+    }
+
+    async fn reconcile_guest(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        self.reconcile_guest_runtime(kind, context, resource, dependencies)
+            .await
+            .map(|result| result.phase)
+    }
+
+    async fn reconcile_guest_result(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        self.reconcile_guest_runtime(kind, context, resource, dependencies)
+            .await
+    }
+
+    async fn observe_result(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+        if matches!(
+            kind,
+            SharedProviderResourceKind::CloudHypervisorGuest
+                | SharedProviderResourceKind::QemuMediaGuest
+                | SharedProviderResourceKind::AzureContainerAppsGuest
+                | SharedProviderResourceKind::AzureVirtualMachineGuest
+        ) {
+            self.reconcile_guest_runtime(kind, context, resource, &[])
+                .await
+        } else if matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+                | SharedProviderResourceKind::AudioService
+                | SharedProviderResourceKind::AudioBinding
+                | SharedProviderResourceKind::ShellPool
+                | SharedProviderResourceKind::ShellSession
+        ) {
+            self.reconcile_result(kind, context, resource, &[]).await
+        } else {
+            self.observe(kind, context, resource)
+                .await
+                .map(SharedProviderEffectResult::phase)
+        }
+    }
+
+    async fn finalize_guest(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<(), SharedProviderEffectError> {
+        self.finalize_guest_runtime(kind, context, resource).await
+    }
+
+    async fn reconcile_network(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        if !Self::dependencies_ready(dependencies) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let value = self.validate(SharedProviderResourceKind::Network, context, resource)?;
+        let mut spec_value = value
+            .get("spec")
+            .cloned()
+            .ok_or(SharedProviderEffectError::InvalidResource)?;
+        if let Some(spec) = spec_value.as_object_mut() {
+            for field in ["providerRef", "updatePolicy", "provider"] {
+                spec.remove(field);
+            }
+        }
+        let spec: d2b_contracts_resource::v3::network::NetworkSpec =
+            serde_json::from_value(spec_value)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let resolver = crate::load_bundle_resolver(&self.state)
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let runtime = self.runtime()?;
+        let generation = resource.generation();
+        let admission = self
+            .network_admission(
+                &runtime,
+                resource,
+                &value,
+                &spec,
+                &resolver,
+                &context.operation_id,
+            )
+            .await?;
+        let provenance = NetworkProvenance::new(
+            admission.key().zone_uid().clone(),
+            admission.key().network_uid().clone(),
+            admission.key().network_generation(),
+            admission.key().attachment_generation(),
+            admission.key().bundle_generation().clone(),
+        );
+        let assignment = self.network_assignment(&runtime, context, resource).await?;
+        let children = SharedRunnerNetworkResources::new(
+            Arc::clone(&runtime),
+            resource.key().resource_ref().clone(),
+            resource.key().uid(),
+        )
+        .with_content_fence(SharedRunnerNetworkContentFence {
+            owner_ref: resource.key().resource_ref().clone(),
+            provenance,
+            assignment,
+            controller_ref: context.identity.controller_ref().clone(),
+            controller_generation: context.identity.controller_generation(),
+            provider_generation: context.identity.provider_generation(),
+            session_generation: runtime
+                .core_controller_subject
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .as_ref()
+                .map(|subject| subject.reconnect_generation())
+                .ok_or(SharedProviderEffectError::Unavailable)?,
+        });
+        let readiness = children
+            .readiness()
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let broker_context = crate::resolve_network_effect_context(
+            &value,
+            &resolver,
+            &admission,
+        )
+        .map_err(|_| SharedProviderEffectError::Unavailable)?
+        .with_host_global_nic_admission();
+        let effects = crate::network_effect_port::production_port(
+            &self.state,
+            BrokerCallerRole::AdminUid {
+                uid: self.state.daemon_uid,
+            },
+            broker_context,
+        );
+        let mdns_enabled = value
+            .pointer("/spec/mdns/enable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let input = ReconcileInput {
+            spec: spec.clone(),
+            mdns_enabled,
+            network_uid: resource.key().uid().clone(),
+            network_generation: generation,
+            attachment_generation: admission.key().attachment_generation(),
+            installed_generation: admission.key().bundle_generation().clone(),
+            admission,
+            artifact_catalog: vec![ArtifactCatalogEntry::new(
+                spec.net_vm_system_artifact_id().clone(),
+                ArtifactKind::NixosSystem,
+            )],
+            user_ready: true,
+            host_memory_budget_available: d2b_provider_network_local::controller::CONFIG_VOLUME_MAX_BYTES,
+            volume_ready: readiness.volume_ready,
+            guest_ready: readiness.guest_ready,
+            volume_attachment_ready: readiness.attachment_ready,
+            workload_fds_closed: true,
+            agent_deleted: true,
+            mdns_deleted: !mdns_enabled,
+            volume_attachment_removed: true,
+            guest_deleted: true,
+            volume_deleted: true,
+            attachments: Vec::<AttachmentRealization>::new(),
+        };
+        match NetworkReconciler::new(effects, children)
+            .reconcile(&input)
+            .await
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+        {
+            ReconcileProgress::Ready => Ok(SharedProviderEffectPhase::Ready),
+            ReconcileProgress::Pending(_)
+            | ReconcileProgress::Requeue(_)
+            | ReconcileProgress::Blocked(_) => Ok(SharedProviderEffectPhase::Pending),
+        }
+    }
+
+    async fn reconcile_tpm(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        let value = self.validate(SharedProviderResourceKind::TpmDevice, context, resource)?;
+        let execution_ref = value
+            .pointer("/spec/provider/settings/executionRef")
+            .and_then(Value::as_str)
+            .and_then(|value| ResourceRef::parse(value).ok())
+            .unwrap_or_else(|| ResourceRef::parse(CORE_CONTROLLER_HOST_REF).expect("Host ref"));
+        let holder = Self::owner_ref(&value)?;
+        if holder.resource_type().as_str() != "Guest" {
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let runtime = self.runtime()?;
+        let vm_id = d2b_contracts::types::VmId::new(holder.name().as_str());
+        let migration_intent = d2b_contracts::types::BundleOpId::new(format!(
+            "legacy-swtpm:vm:{}",
+            vm_id.as_str()
+        ));
+        let decision = runtime
+            .tpm_device_is_admitted(
+            resource.key().uid(),
+            resource.key().resource_ref(),
+            vm_id.as_str(),
+            &context.operation_id,
+            None,
+        )
+        .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let lifecycle = runtime
+            .admit_internal_guest_lifecycle(holder.clone(), &context.operation_id)
+            .await
+        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let lifecycle_authorization =
+            crate::provider_effects::LifecycleAuthorization::from_lease(
+                lifecycle.lease,
+                holder.clone(),
+                lifecycle.guest_uid,
+                lifecycle.guest_generation,
+                lifecycle.provider_assignment_generation,
+            )
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+        let resolver = crate::load_bundle_resolver(&self.state)
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let log_level = value
+            .pointer("/spec/provider/settings/logLevel")
+            .and_then(Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok())
+            .unwrap_or(20);
+        let binary = d2b_provider_device_tpm::SignedBinaryRef::from_core(
+            d2b_provider_device_tpm::BinaryKind::Swtpm,
+            tpm_opaque_bytes("d2b:tpm-binary/v1", vm_id.as_str()),
+        );
+        let mut controller = if let Some(controller) = self
+            .tpm_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .remove(resource.key().uid())
+        {
+            controller
+        } else {
+            d2b_provider_device_tpm::TpmResourceController::new(
+                resource.key().uid().clone(),
+                resource.key().resource_ref().clone(),
+                execution_ref.clone(),
+            )
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?
+        };
+        let result = crate::tpm_effect_port::reconcile_device_tpm_controller(
+            &self.state,
+            &resolver,
+            vm_id.clone(),
+            migration_intent,
+            decision,
+            crate::tpm_effect_port::AdmittedTpmDevice::new(
+                resource.key().uid().clone(),
+                resource.key().resource_ref().clone(),
+                self.zone.as_str(),
+                execution_ref,
+                lifecycle_authorization,
+            ),
+            tpm_state_intent(resource.key().uid(), vm_id.as_str()),
+            d2b_provider_device_tpm::SwtpmSettings { log_level },
+            binary,
+            d2b_contracts_broker::broker_wire::BrokerCallerRole::AdminUid {
+                uid: self.state.daemon_uid,
+            },
+            &mut controller,
+        )
+        .map_err(|_| SharedProviderEffectError::Unavailable);
+        if result.is_err() {
+            self.tpm_controllers
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .insert(resource.key().uid().clone(), controller);
+            return Err(SharedProviderEffectError::Unavailable);
+        }
+        let result = result.expect("TPM result was checked");
+        self.tpm_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .insert(resource.key().uid().clone(), controller);
+        match result {
+            d2b_provider_device_tpm::TpmResourceOutcome::Ready => {
+                Ok(SharedProviderEffectPhase::Ready)
+            }
+            d2b_provider_device_tpm::TpmResourceOutcome::Retry => {
+                Ok(SharedProviderEffectPhase::Pending)
+            }
+            d2b_provider_device_tpm::TpmResourceOutcome::Failed
+            | d2b_provider_device_tpm::TpmResourceOutcome::VolumeRetained => {
+                Err(SharedProviderEffectError::Unavailable)
+            }
+        }
+    }
+
+    async fn reconcile_usbip(
+        &self,
+        component: UsbipResourceComponent,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        if !Self::dependencies_ready(dependencies) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let value = self.validate(
+            match component {
+                UsbipResourceComponent::Device => SharedProviderResourceKind::UsbipDevice,
+                UsbipResourceComponent::Service => SharedProviderResourceKind::UsbipService,
+                UsbipResourceComponent::Binding => SharedProviderResourceKind::UsbipBinding,
+            },
+            context,
+            resource,
+        )?;
+        match component {
+            UsbipResourceComponent::Device => {
+                let runtime = self.runtime()?;
+                let services = runtime
+                    .committed_resources_of_type(
+                        d2b_provider_device_usbip::USB_SERVICE_RESOURCE_TYPE,
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let device_ref = resource.key().resource_ref().to_canonical_string();
+                let ready = services.iter().any(|service| {
+                    service.pointer("/spec/providerRef").and_then(Value::as_str)
+                        == Some(d2b_provider_device_usbip::PROVIDER_REF)
+                        && service
+                            .pointer("/spec/backingDeviceRef")
+                            .and_then(Value::as_str)
+                            == Some(device_ref.as_str())
+                        && service.pointer("/status/phase").and_then(Value::as_str)
+                            == Some("Ready")
+                });
+                Ok(if ready {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                })
+            }
+            UsbipResourceComponent::Service => {
+                if self
+                    .usbip_services
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .contains(resource.key().uid())
+                {
+                    return Ok(SharedProviderEffectPhase::Ready);
+                }
+                let (zone_uid, zone_opted_in, mut port) =
+                    self.usbip_service_port(context, resource, &value).await?;
+                let mut lifecycle = d2b_provider_device_usbip::ServiceLifecycle::new(
+                    zone_uid.clone(),
+                    resource.key().uid().clone(),
+                );
+                lifecycle
+                    .activate(zone_opted_in, zone_uid, &mut port)
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                self.usbip_services
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone());
+                Ok(SharedProviderEffectPhase::Ready)
+            }
+            UsbipResourceComponent::Binding => {
+                let service_ref = value
+                    .pointer("/spec/serviceRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let guest_ref = value
+                    .pointer("/spec/guestRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let runtime = self.runtime()?;
+                let zone_uid = runtime
+                    .authority_zone_uid()
+                    .cloned()
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let service = runtime
+                    .committed_resource_value(&service_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if service.pointer("/spec/providerRef").and_then(Value::as_str)
+                    != Some(d2b_provider_device_usbip::PROVIDER_REF)
+                {
+                    return Err(SharedProviderEffectError::InvalidResource);
+                }
+                if service.pointer("/status/phase").and_then(Value::as_str) != Some("Ready") {
+                    return Ok(SharedProviderEffectPhase::Pending);
+                }
+                let service_uid = service
+                    .pointer("/metadata/uid")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let service_generation = service
+                    .pointer("/metadata/generation")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| ResourceGeneration::new(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let guest = runtime
+                    .committed_resource_value(&guest_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if guest.pointer("/status/phase").and_then(Value::as_str) != Some("Ready") {
+                    return Ok(SharedProviderEffectPhase::Pending);
+                }
+                let guest_uid = guest
+                    .pointer("/metadata/uid")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let assignment_epoch = runtime
+                    .store
+                    .assignment_fence(
+                        self.zone.clone(),
+                        resource.key().resource_ref().clone(),
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .map(|fence| fence.epoch)
+                    .filter(|epoch| *epoch != 0)
+                    .ok_or(SharedProviderEffectError::Unavailable)?;
+                let admission = d2b_provider_device_usbip::UsbipBindingAdmission::new(
+                    zone_uid,
+                    resource.key().uid().clone(),
+                    service_uid,
+                    guest_uid,
+                    service_generation,
+                    assignment_epoch,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let mut controller =
+                    d2b_provider_device_usbip::UsbipBindingController::new_admitted(
+                        resource.key().resource_ref(),
+                        &service_ref,
+                        &guest_ref,
+                        admission,
+                    )
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let desired = d2b_provider_device_usbip::binding_child_resources(
+                    resource.key().resource_ref(),
+                    &service_ref,
+                    &guest_ref,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let phase = self
+                    .reconcile_binding_children(
+                        &runtime,
+                        resource,
+                        desired,
+                        &context.operation_id,
+                    )
+                    .await?;
+                if phase == SharedProviderEffectPhase::Ready {
+                    controller
+                        .observe_children(true)
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                }
+                Ok(phase)
+            }
+        }
+    }
+
+    async fn reconcile_security_key(
+        &self,
+        component: SecurityKeyResourceComponent,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        if !Self::dependencies_ready(dependencies) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let value = self.validate(
+            match component {
+                SecurityKeyResourceComponent::Device => {
+                    SharedProviderResourceKind::SecurityKeyDevice
+                }
+                SecurityKeyResourceComponent::Service => {
+                    SharedProviderResourceKind::SecurityKeyService
+                }
+                SecurityKeyResourceComponent::Binding => {
+                    SharedProviderResourceKind::SecurityKeyBinding
+                }
+            },
+            context,
+            resource,
+        )?;
+        match component {
+            SecurityKeyResourceComponent::Device => {
+                let admitted = value
+                    .pointer("/status/resource/devicePresent")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    && value
+                        .pointer("/status/resource/fidoConfirmed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                Ok(if admitted {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                })
+            }
+            SecurityKeyResourceComponent::Service => {
+                let runtime = self.runtime()?;
+                let mode = value
+                    .pointer("/spec/mode")
+                    .and_then(Value::as_str)
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                if mode == "projection" {
+                    let endpoint_ref = value
+                        .pointer("/status/resource/relayEndpointRef")
+                        .or_else(|| value.pointer("/status/provider/details/relayEndpointRef"))
+                        .and_then(Value::as_str)
+                        .and_then(|value| ResourceRef::parse(value).ok())
+                        .ok_or(SharedProviderEffectError::Unavailable)?;
+                    let endpoint = runtime
+                        .committed_resource_value(&endpoint_ref, &context.operation_id)
+                        .await
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                    return Ok(if endpoint.pointer("/status/phase").and_then(Value::as_str)
+                        == Some("Ready")
+                    {
+                        SharedProviderEffectPhase::Ready
+                    } else {
+                        SharedProviderEffectPhase::Pending
+                    });
+                }
+                let settings = value
+                    .pointer("/spec/provider/settings")
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let device_ref = settings
+                    .get("deviceRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let relay_endpoint_ref = settings
+                    .get("relayEndpointRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                if device_ref.resource_type().as_str() != "Device"
+                    || relay_endpoint_ref.resource_type().as_str() != "Endpoint"
+                {
+                    return Err(SharedProviderEffectError::InvalidResource);
+                }
+                let device = runtime
+                    .committed_resource_value(&device_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if device.pointer("/spec/providerRef").and_then(Value::as_str)
+                    != Some(d2b_provider_device_security_key::PROVIDER_REF)
+                {
+                    return Err(SharedProviderEffectError::InvalidResource);
+                }
+                if device.pointer("/status/phase").and_then(Value::as_str) != Some("Ready") {
+                    return Ok(SharedProviderEffectPhase::Pending);
+                }
+                let device_uid = device
+                    .pointer("/metadata/uid")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceUid::parse(value.to_owned()).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let relay_process_name =
+                    d2b_provider_device_security_key::security_key_process_name(
+                        &device_uid,
+                        d2b_provider_device_security_key::SecurityKeyProcessRole::HostRelay,
+                    )
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let relay_process_ref =
+                    ResourceRef::parse(&format!("Process/{relay_process_name}"))
+                        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let relay_process_spec = json!({
+                    "providerRef": "Provider/system-minijail",
+                    "executionRef": "Host/host-system",
+                    "domain": "system",
+                    "processClass": "service",
+                    "template": "sk-relay",
+                    "desiredLifecycle": "running",
+                    "deviceUsage": [{
+                        "deviceRef": device_ref.to_canonical_string(),
+                        "access": "exclusive",
+                        "purpose": "hidraw-fido"
+                    }],
+                    "sandbox": {
+                        "namespaceClasses": ["mount", "ipc", "pid"],
+                        "capabilityClasses": [],
+                        "seccompClass": "sk-relay",
+                        "environmentClass": "provider-defined",
+                        "startRoot": false,
+                        "noNewPrivileges": true,
+                        "readOnlyRoot": true
+                    },
+                    "budget": {
+                        "pids": {"limit": 32},
+                        "fds": {"limit": 64},
+                        "memory": {"limit": "32Mi"}
+                    }
+                });
+                upsert_shared_provider_child(
+                    &runtime,
+                    &relay_process_ref,
+                    relay_process_spec,
+                    resource.key().resource_ref(),
+                    "shared-security-key-relay-upsert",
+                )
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let endpoint_spec = json!({
+                    "providerRef": d2b_provider_device_security_key::PROVIDER_REF,
+                    "producerRef": relay_process_ref.to_canonical_string(),
+                    "endpointClass": "device",
+                    "transport": "vsock",
+                    "purpose": "device-security-key.d2bus.org/ctaphid-relay",
+                    "serviceFingerprint": "device-security-key.d2bus.org/SecurityKeyCtapRelay.v3",
+                    "locality": "cross-domain",
+                    "visibility": "zone",
+                    "attachmentPolicy": "component-session",
+                    "consumerPolicy": {
+                        "allowedProviderComponents": ["device-security-key.d2bus.org/frontend"],
+                        "allowedOperations": ["resolve"]
+                    },
+                    "lifecyclePolicy": "recycle-with-producer"
+                });
+                upsert_shared_provider_child(
+                    &runtime,
+                    &relay_endpoint_ref,
+                    endpoint_spec,
+                    resource.key().resource_ref(),
+                    "shared-security-key-relay-endpoint-upsert",
+                )
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let process = runtime
+                    .committed_resource_value(&relay_process_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                let endpoint = runtime
+                    .committed_resource_value(&relay_endpoint_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                Ok(if process.pointer("/status/phase").and_then(Value::as_str)
+                    == Some("Ready")
+                    && endpoint.pointer("/status/phase").and_then(Value::as_str) == Some("Ready")
+                {
+                    SharedProviderEffectPhase::Ready
+                } else {
+                    SharedProviderEffectPhase::Pending
+                })
+            }
+            SecurityKeyResourceComponent::Binding => {
+                let service_ref = value
+                    .pointer("/spec/serviceRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let target = value
+                    .pointer("/spec/target/guestRef")
+                    .or_else(|| value.pointer("/spec/guestRef"))
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let runtime = self.runtime()?;
+                let service = runtime
+                    .committed_resource_value(&service_ref, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if service.pointer("/spec/providerRef").and_then(Value::as_str)
+                    != Some(d2b_provider_device_security_key::PROVIDER_REF)
+                {
+                    return Err(SharedProviderEffectError::InvalidResource);
+                }
+                if service.pointer("/status/phase").and_then(Value::as_str) != Some("Ready") {
+                    return Ok(SharedProviderEffectPhase::Pending);
+                }
+                let guest = runtime
+                    .committed_resource_value(&target, &context.operation_id)
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if guest.pointer("/status/phase").and_then(Value::as_str) != Some("Ready") {
+                    return Ok(SharedProviderEffectPhase::Pending);
+                }
+                let desired = if let Some(user) = value
+                    .pointer("/spec/target/userRef")
+                    .or_else(|| value.pointer("/spec/userRef"))
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                {
+                    d2b_provider_device_security_key::SecurityKeyController::child_resources_for_user(
+                        resource.key().resource_ref(),
+                        &service_ref,
+                        &target,
+                        &user,
+                    )
+                } else {
+                    d2b_provider_device_security_key::SecurityKeyController::child_resources(
+                        resource.key().resource_ref(),
+                        &service_ref,
+                        &target,
+                    )
+                }
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                self.reconcile_binding_children(
+                    &runtime,
+                    resource,
+                    desired,
+                    &context.operation_id,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn reconcile_gpu(
+        &self,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        if !Self::dependencies_ready(dependencies) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let value = self.validate(SharedProviderResourceKind::GpuDevice, context, resource)?;
+        let (runtime, admission, tokens, settings, holder_ref) =
+            self.gpu_admission(context, resource, &value).await?;
+        let resolver = crate::load_bundle_resolver(&self.state)
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let mut controller = if let Some(controller) = self
+            .gpu_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .remove(resource.key().uid())
+        {
+            controller
+        } else {
+            d2b_provider_device_gpu::GpuController::new_authorized(
+                admission.clone(),
+                settings.clone(),
+                tokens.clone(),
+            )
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?
+        };
+        if controller
+            .admission()
+            .is_some_and(|current| current != &admission)
+        {
+            self.gpu_controllers
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .insert(resource.key().uid().clone(), controller);
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let opened_devices = self.take_gpu_opened_devices(resource.key().uid())?;
+        let mut port = DaemonGpuLifecyclePort {
+            state: Arc::clone(&self.state),
+            runtime,
+            resolver,
+            device_ref: resource.key().resource_ref().clone(),
+            device_uid: resource.key().uid().clone(),
+            holder_ref,
+            generation: resource.generation(),
+            settings,
+            operation_id: context.operation_id.clone(),
+            authority_leases: Arc::clone(&self.gpu_authority_leases),
+            processes: Arc::clone(&self.gpu_processes),
+            opened_devices,
+        };
+        let result = controller
+            .reconcile_lifecycle(&mut port)
+            .map_err(|_| SharedProviderEffectError::Unavailable)
+            .map(|outcome| match outcome {
+                d2b_provider_device_gpu::GpuReconcileOutcome::Converged => {
+                    SharedProviderEffectPhase::Ready
+                }
+                d2b_provider_device_gpu::GpuReconcileOutcome::Retry => {
+                    SharedProviderEffectPhase::Pending
+                }
+            });
+        let opened_devices = std::mem::take(&mut port.opened_devices);
+        self.retain_gpu_opened_devices(resource.key().uid(), opened_devices)?;
+        self.gpu_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .insert(resource.key().uid().clone(), controller);
+        result
+    }
+
+    async fn upgrade(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        if kind != SharedProviderResourceKind::GpuDevice {
+            return self.reconcile(kind, context, resource, dependencies).await;
+        }
+        if !Self::dependencies_ready(dependencies) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let value = self.validate(kind, context, resource)?;
+        let (runtime, admission, _tokens, settings, holder_ref) =
+            self.gpu_admission(context, resource, &value).await?;
+        let dependents = dependencies
+            .iter()
+            .map(|dependency| {
+                let dependency_value =
+                    serde_json::from_slice::<Value>(dependency.resource().canonical_json())
+                        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                let ready = dependency_value
+                    .pointer("/status/phase")
+                    .and_then(Value::as_str)
+                    == Some("Ready");
+                let drained = dependency_value
+                    .pointer("/status/resource/drained")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_else(|| {
+                        dependency_value
+                            .pointer("/status/phase")
+                            .and_then(Value::as_str)
+                            == Some("Deleted")
+                    });
+                d2b_provider_device_gpu::GpuDependentResource::new(
+                    dependency.resource().key().resource_ref().clone(),
+                    ready,
+                    drained,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if dependents.iter().any(|dependent| !dependent.ready()) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        if dependents.iter().any(|dependent| !dependent.drained()) {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let resolver = crate::load_bundle_resolver(&self.state)
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let mut controller = self
+            .gpu_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .remove(resource.key().uid())
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        if controller
+            .admission()
+            .is_some_and(|current| current != &admission)
+        {
+            self.gpu_controllers
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .insert(resource.key().uid().clone(), controller);
+            return Err(SharedProviderEffectError::InvalidResource);
+        }
+        let plan = match controller.plan_upgrade(settings.clone(), &dependents) {
+            Ok(plan) => plan,
+            Err(
+                d2b_provider_device_gpu::GpuControllerError::DependenciesNotReady
+                | d2b_provider_device_gpu::GpuControllerError::DependenciesNotDrained,
+            ) => {
+                self.gpu_controllers
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone(), controller);
+                return Ok(SharedProviderEffectPhase::Pending);
+            }
+            Err(_) => {
+                self.gpu_controllers
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone(), controller);
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+        };
+        let mut port = DaemonGpuLifecyclePort {
+            state: Arc::clone(&self.state),
+            runtime,
+            resolver,
+            device_ref: resource.key().resource_ref().clone(),
+            device_uid: resource.key().uid().clone(),
+            holder_ref,
+            generation: resource.generation(),
+            settings,
+            operation_id: context.operation_id.clone(),
+            authority_leases: Arc::clone(&self.gpu_authority_leases),
+            processes: Arc::clone(&self.gpu_processes),
+            opened_devices: self.take_gpu_opened_devices(resource.key().uid())?,
+        };
+        let result = controller
+            .execute_upgrade(&plan, &mut port)
+            .map_err(|_| SharedProviderEffectError::Unavailable)
+            .map(|outcome| match outcome {
+                d2b_provider_device_gpu::GpuReconcileOutcome::Converged => {
+                    SharedProviderEffectPhase::Ready
+                }
+                d2b_provider_device_gpu::GpuReconcileOutcome::Retry => {
+                    SharedProviderEffectPhase::Pending
+                }
+            });
+        let opened_devices = std::mem::take(&mut port.opened_devices);
+        self.retain_gpu_opened_devices(resource.key().uid(), opened_devices)?;
+        self.gpu_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .insert(resource.key().uid().clone(), controller);
+        result
+    }
+
+    async fn observe(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+        if kind != SharedProviderResourceKind::GpuDevice {
+            return self.reconcile(kind, context, resource, &[]).await;
+        }
+        let value = self.validate(kind, context, resource)?;
+        let runtime = self.runtime()?;
+        let settings: d2b_provider_device_gpu::GpuSettings =
+            match value.pointer("/spec/provider/settings") {
+                Some(settings) => serde_json::from_value(settings.clone())
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?,
+                None => d2b_provider_device_gpu::GpuSettings::default(),
+            };
+        let admission = self
+            .gpu_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .get(resource.key().uid())
+            .and_then(|controller| controller.admission().cloned())
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        let expected = self
+            .gpu_controllers
+            .lock()
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .get(resource.key().uid())
+            .map(|controller| {
+                controller
+                    .gpu_identity()
+                    .into_iter()
+                    .chain(controller.video_identity())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .ok_or(SharedProviderEffectError::Unavailable)?;
+        if expected.is_empty() {
+            return Ok(SharedProviderEffectPhase::Pending);
+        }
+        let resolver = crate::load_bundle_resolver(&self.state)
+            .map_err(|_| SharedProviderEffectError::Unavailable)?;
+        let mut port = DaemonGpuLifecyclePort {
+            state: Arc::clone(&self.state),
+            runtime,
+            resolver,
+            device_ref: resource.key().resource_ref().clone(),
+            device_uid: resource.key().uid().clone(),
+            holder_ref: admission.owner().holder_ref().clone(),
+            generation: resource.generation(),
+            settings,
+            operation_id: context.operation_id.clone(),
+            authority_leases: Arc::clone(&self.gpu_authority_leases),
+            processes: Arc::clone(&self.gpu_processes),
+            opened_devices: Vec::new(),
+        };
+        let observed = expected.iter().all(|identity| {
+            matches!(
+                port.observe_worker(identity),
+                Ok(d2b_provider_device_gpu::GpuProcessObservation::Matching(_))
+            )
+        });
+        Ok(if observed {
+            SharedProviderEffectPhase::Ready
+        } else {
+            SharedProviderEffectPhase::Pending
+        })
+    }
+
+    async fn finalize(
+        &self,
+        kind: SharedProviderResourceKind,
+        context: &SharedProviderEffectContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<(), SharedProviderEffectError> {
+        if matches!(
+            kind,
+            SharedProviderResourceKind::CloudHypervisorGuest
+                | SharedProviderResourceKind::QemuMediaGuest
+                | SharedProviderResourceKind::AzureContainerAppsGuest
+                | SharedProviderResourceKind::AzureVirtualMachineGuest
+        ) {
+            return self.finalize_guest_runtime(kind, context, resource).await;
+        }
+        if matches!(
+            kind,
+            SharedProviderResourceKind::DisplayWaylandPolicy
+                | SharedProviderResourceKind::DisplayWaylandSession
+                | SharedProviderResourceKind::AudioService
+                | SharedProviderResourceKind::AudioBinding
+                | SharedProviderResourceKind::ShellPool
+                | SharedProviderResourceKind::ShellSession
+        ) {
+            return self.finalize_u9(kind, context, resource).await;
+        }
+        let value = self.validate(kind, context, resource)?;
+        if kind == SharedProviderResourceKind::Network {
+            let resolver = crate::load_bundle_resolver(&self.state)
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let runtime = self.runtime()?;
+            let spec_for_admission = crate::parse_committed_network_spec(&value)
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            let admission = self
+                .network_admission(
+                    &runtime,
+                    resource,
+                    &value,
+                    &spec_for_admission,
+                    &resolver,
+                    &context.operation_id,
+                )
+                .await?;
+            let mut spec_value = value
+                .get("spec")
+                .cloned()
+                .ok_or(SharedProviderEffectError::InvalidResource)?;
+            if let Some(spec) = spec_value.as_object_mut() {
+                for field in ["providerRef", "updatePolicy", "provider"] {
+                    spec.remove(field);
+                }
+            }
+            let spec: d2b_contracts_resource::v3::network::NetworkSpec =
+                serde_json::from_value(spec_value)
+                    .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            let children = SharedRunnerNetworkResources::new(
+                Arc::clone(&runtime),
+                resource.key().resource_ref().clone(),
+                resource.key().uid(),
+            );
+            let volume = children
+                .current(&children.volume_ref)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let guest = children
+                .current(&children.guest_ref)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let agent = children
+                .current(&children.agent_ref)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let volume_attachment_removed = volume.as_ref().is_none_or(|value| {
+                value
+                    .pointer("/spec/attachments")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+            });
+            let mdns_enabled = value
+                .pointer("/spec/mdns/enable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if mdns_enabled {
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            let broker_context = crate::resolve_network_effect_context(
+                &value,
+                &resolver,
+                &admission,
+            )
+            .map_err(|_| SharedProviderEffectError::Unavailable)?
+            .with_host_global_nic_admission();
+            let effects = crate::network_effect_port::production_port(
+                &self.state,
+                BrokerCallerRole::AdminUid {
+                    uid: self.state.daemon_uid,
+                },
+                broker_context,
+            );
+            let input = ReconcileInput {
+                spec,
+                mdns_enabled,
+                network_uid: resource.key().uid().clone(),
+                network_generation: resource.generation(),
+                attachment_generation: admission.key().attachment_generation(),
+                installed_generation: admission.key().bundle_generation().clone(),
+                admission,
+                artifact_catalog: Vec::new(),
+                user_ready: true,
+                host_memory_budget_available:
+                    d2b_provider_network_local::controller::CONFIG_VOLUME_MAX_BYTES,
+                volume_ready: true,
+                guest_ready: true,
+                volume_attachment_ready: true,
+                workload_fds_closed: true,
+                agent_deleted: agent.is_none(),
+                mdns_deleted: true,
+                volume_attachment_removed,
+                guest_deleted: guest.is_none(),
+                volume_deleted: volume.is_none(),
+                attachments: Vec::new(),
+            };
+            let stage = NetworkReconciler::new(effects, children)
+                .finalize(&input)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            if stage != d2b_provider_network_local::controller::FinalizerStage::Complete {
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            let zone_uid = runtime.authority_zone_uid().cloned();
+            let plane = self
+                .state
+                .resource_plane
+                .lock()
+                .ok()
+                .and_then(|plane| plane.clone());
+            if let (Some(zone_uid), Some(plane)) = (zone_uid, plane) {
+                plane
+                    .network_admission_index()
+                    .lock()
+                    .await
+                    .release_owner_after_finalizer(
+                        &zone_uid,
+                        resource.key().uid(),
+                        true,
+                    );
+            }
+            return Ok(());
+        }
+        if kind == SharedProviderResourceKind::TpmDevice {
+            let holder = Self::owner_ref(&value)?;
+            if holder.resource_type().as_str() != "Guest" {
+                return Err(SharedProviderEffectError::InvalidResource);
+            }
+            let execution_ref = value
+                .pointer("/spec/provider/settings/executionRef")
+                .and_then(Value::as_str)
+                .and_then(|value| ResourceRef::parse(value).ok())
+                .unwrap_or_else(|| ResourceRef::parse(CORE_CONTROLLER_HOST_REF).expect("Host ref"));
+            let runtime = self.runtime()?;
+            let runtime_for_children = Arc::clone(&runtime);
+            let vm_id = VmId::new(holder.name().as_str());
+            let migration_intent =
+                BundleOpId::new(format!("legacy-swtpm:vm:{}", vm_id.as_str()));
+            let decision = runtime
+                .tpm_device_is_admitted(
+                    resource.key().uid(),
+                    resource.key().resource_ref(),
+                    vm_id.as_str(),
+                    &context.operation_id,
+                    None,
+                )
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let lifecycle = runtime
+                .admit_internal_guest_lifecycle(holder.clone(), &context.operation_id)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let authorization =
+                crate::provider_effects::LifecycleAuthorization::from_lease(
+                    lifecycle.lease,
+                    holder,
+                    lifecycle.guest_uid,
+                    lifecycle.guest_generation,
+                    lifecycle.provider_assignment_generation,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+            let resolver = crate::load_bundle_resolver(&self.state)
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let log_level = value
+                .pointer("/spec/provider/settings/logLevel")
+                .and_then(Value::as_u64)
+                .and_then(|value| u8::try_from(value).ok())
+                .unwrap_or(20);
+            let mut controller = self
+                .tpm_controllers
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .remove(resource.key().uid())
+                .ok_or(SharedProviderEffectError::Unavailable)?;
+            let result = crate::tpm_effect_port::finalize_device_tpm_controller(
+                &self.state,
+                &resolver,
+                vm_id.clone(),
+                migration_intent,
+                decision,
+                crate::tpm_effect_port::AdmittedTpmDevice::new(
+                    resource.key().uid().clone(),
+                    resource.key().resource_ref().clone(),
+                    self.zone.as_str(),
+                    execution_ref,
+                    authorization,
+                ),
+                tpm_state_intent(resource.key().uid(), vm_id.as_str()),
+                d2b_provider_device_tpm::SwtpmSettings { log_level },
+                d2b_provider_device_tpm::SignedBinaryRef::from_core(
+                    d2b_provider_device_tpm::BinaryKind::Swtpm,
+                    tpm_opaque_bytes("d2b:tpm-binary/v1", vm_id.as_str()),
+                ),
+                BrokerCallerRole::AdminUid {
+                    uid: self.state.daemon_uid,
+                },
+                &mut controller,
+            )
+            .map_err(|_| SharedProviderEffectError::Unavailable);
+            if result.is_err() {
+                self.tpm_controllers
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone(), controller);
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            let children_cleaned = match self
+                .cleanup_binding_children(&runtime_for_children, resource, &context.operation_id)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    self.tpm_controllers
+                        .lock()
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?
+                        .insert(resource.key().uid().clone(), controller);
+                    return Err(error);
+                }
+            };
+            if !children_cleaned {
+                self.tpm_controllers
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone(), controller);
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            return Ok(());
+        }
+        if kind == SharedProviderResourceKind::UsbipService {
+            let runtime = self.runtime()?;
+            let service_ref = resource.key().resource_ref().to_canonical_string();
+            let bindings = runtime
+                .committed_resources_of_type(d2b_provider_device_usbip::USB_BINDING_RESOURCE_TYPE)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            if bindings.iter().any(|binding| {
+                binding.pointer("/spec/serviceRef").and_then(Value::as_str)
+                    == Some(service_ref.as_str())
+            }) {
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            let (zone_uid, opted_in, mut port) =
+                self.usbip_service_port(context, resource, &value).await?;
+            if !opted_in {
+                return Ok(());
+            }
+            let mut lifecycle = d2b_provider_device_usbip::ServiceLifecycle::new(
+                zone_uid.clone(),
+                resource.key().uid().clone(),
+            );
+            lifecycle
+                .activate(true, zone_uid, &mut port)
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let mut supervisor = d2b_provider_device_usbip::UsbipSupervisor::new(lifecycle);
+            supervisor
+                .finalize(&mut port)
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            self.usbip_services
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .remove(resource.key().uid());
+            return Ok(());
+        }
+        if kind == SharedProviderResourceKind::GpuDevice {
+            let admission = self
+                .gpu_controllers
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .get(resource.key().uid())
+                .and_then(|controller| controller.admission().cloned())
+                .ok_or(SharedProviderEffectError::Unavailable)?;
+            let resolver = crate::load_bundle_resolver(&self.state)
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let runtime = self.runtime()?;
+            let runtime_for_children = Arc::clone(&runtime);
+            let opened_devices = self.take_gpu_opened_devices(resource.key().uid())?;
+            let mut controller = self
+                .gpu_controllers
+                .lock()
+                .map_err(|_| SharedProviderEffectError::Unavailable)?
+                .remove(resource.key().uid())
+                .ok_or(SharedProviderEffectError::Unavailable)?;
+            let mut port = DaemonGpuLifecyclePort {
+                state: Arc::clone(&self.state),
+                runtime,
+                resolver,
+                device_ref: resource.key().resource_ref().clone(),
+                device_uid: resource.key().uid().clone(),
+                holder_ref: admission.owner().holder_ref().clone(),
+                generation: admission.owner().generation(),
+                settings: controller.settings().clone(),
+                operation_id: context.operation_id.clone(),
+                authority_leases: Arc::clone(&self.gpu_authority_leases),
+                processes: Arc::clone(&self.gpu_processes),
+                opened_devices,
+            };
+            let result = controller
+                .finalize_lifecycle(&mut port)
+                .map_err(|_| SharedProviderEffectError::Unavailable);
+            if result.is_err() {
+                let opened_devices = std::mem::take(&mut port.opened_devices);
+                self.retain_gpu_opened_devices(resource.key().uid(), opened_devices)?;
+                self.gpu_controllers
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone(), controller);
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            let children_cleaned = match self
+                .cleanup_binding_children(&runtime_for_children, resource, &context.operation_id)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    let opened_devices = std::mem::take(&mut port.opened_devices);
+                    self.retain_gpu_opened_devices(resource.key().uid(), opened_devices)?;
+                    self.gpu_controllers
+                        .lock()
+                        .map_err(|_| SharedProviderEffectError::Unavailable)?
+                        .insert(resource.key().uid().clone(), controller);
+                    return Err(error);
+                }
+            };
+            if !children_cleaned {
+                let opened_devices = std::mem::take(&mut port.opened_devices);
+                self.retain_gpu_opened_devices(resource.key().uid(), opened_devices)?;
+                self.gpu_controllers
+                    .lock()
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?
+                    .insert(resource.key().uid().clone(), controller);
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            return Ok(());
+        }
+        if matches!(
+            kind,
+            SharedProviderResourceKind::UsbipBinding
+                | SharedProviderResourceKind::SecurityKeyBinding
+                | SharedProviderResourceKind::SecurityKeyService
+        ) {
+            let runtime = self.runtime()?;
+            if kind == SharedProviderResourceKind::SecurityKeyService {
+                let service_ref = resource.key().resource_ref().to_canonical_string();
+                let bindings = runtime
+                    .committed_resources_of_type(
+                        d2b_provider_device_security_key::SECURITY_KEY_BINDING_RESOURCE_TYPE,
+                    )
+                    .await
+                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                if bindings.iter().any(|binding| {
+                    binding.pointer("/spec/serviceRef").and_then(Value::as_str)
+                        == Some(service_ref.as_str())
+                }) {
+                    return Err(SharedProviderEffectError::Unavailable);
+                }
+            }
+            if kind == SharedProviderResourceKind::UsbipBinding {
+                let service_ref = value
+                    .pointer("/spec/serviceRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let guest_ref = value
+                    .pointer("/spec/guestRef")
+                    .and_then(Value::as_str)
+                    .and_then(|value| ResourceRef::parse(value).ok())
+                    .ok_or(SharedProviderEffectError::InvalidResource)?;
+                let mut controller = d2b_provider_device_usbip::UsbipBindingController::new(
+                    resource.key().resource_ref(),
+                    &service_ref,
+                    &guest_ref,
+                )
+                .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+                controller.finalize();
+            }
+            if self
+                .cleanup_binding_children(&runtime, resource, &context.operation_id)
+                .await?
+            {
+                return Ok(());
+            }
+            return Err(SharedProviderEffectError::Unavailable);
+        }
+        if matches!(
+            kind,
+            SharedProviderResourceKind::UsbipDevice
+                | SharedProviderResourceKind::SecurityKeyDevice
+        ) {
+            let child_type = if kind == SharedProviderResourceKind::UsbipDevice {
+                d2b_provider_device_usbip::USB_SERVICE_RESOURCE_TYPE
+            } else {
+                d2b_provider_device_security_key::SECURITY_KEY_SERVICE_RESOURCE_TYPE
+            };
+            let runtime = self.runtime()?;
+            let children = runtime
+                .committed_resources_of_type(child_type)
+                .await
+                .map_err(|_| SharedProviderEffectError::Unavailable)?;
+            let device_ref = resource.key().resource_ref().to_canonical_string();
+            if children.iter().any(|child| {
+                child
+                    .pointer("/spec/provider/settings/deviceRef")
+                    .or_else(|| child.pointer("/spec/backingDeviceRef"))
+                    .and_then(Value::as_str)
+                    == Some(device_ref.as_str())
+                    || child.pointer("/metadata/ownerRef").and_then(Value::as_str)
+                        == Some(device_ref.as_str())
+            }) {
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            return Ok(());
+        }
+        Err(SharedProviderEffectError::Unavailable)
+    }
+}
+
+/// Shared Runner adapter that delegates to one closed, typed Provider
+/// controller rather than the generic Core metadata reconciler.
+pub(crate) struct SharedProviderResourceReconciler {
+    descriptor: ControllerDescriptor,
+    kind: SharedProviderResourceKind,
+    effects: Arc<dyn SharedProviderEffectExecutor>,
+}
+
+/// Shared Runner reconciler used by the selected Guest runtime Providers.
+pub(crate) type GuestRuntimeReconciler = SharedProviderResourceReconciler;
+const SHARED_PROVIDER_PROGRESS_REQUEUE_TICKS: u64 = 1_000;
+
+impl SharedProviderResourceReconciler {
+    fn new(
+        descriptor: ControllerDescriptor,
+        kind: SharedProviderResourceKind,
+        effects: Arc<dyn SharedProviderEffectExecutor>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor,
+            kind,
+            effects,
+        })
+    }
+
+    fn effect_context(&self, context: &ReconcileContext) -> SharedProviderEffectContext {
+        SharedProviderEffectContext {
+            identity: context.identity().clone(),
+            target: context.target().clone(),
+            operation_id: context.operation().operation_id().to_owned(),
+        }
+    }
+
+    fn has_finalizer(&self, resource: &ResourceSnapshot) -> Result<bool, SharedProviderReconcileError> {
+        if self.descriptor.finalizers().is_empty() {
+            return Ok(true);
+        }
+        let value = serde_json::from_slice::<Value>(resource.canonical_json())
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)?;
+        Ok(self.descriptor.finalizers().iter().all(|expected| {
+            value
+                .pointer("/metadata/finalizers")
+                .and_then(Value::as_array)
+                .is_some_and(|finalizers| {
+                    finalizers
+                        .iter()
+                        .any(|value| value.as_str() == Some(expected))
+                })
+        }))
+    }
+
+    fn status_candidate(
+        resource: &ResourceSnapshot,
+        phase: Option<SharedProviderEffectPhase>,
+    ) -> Result<Vec<u8>, SharedProviderReconcileError> {
+        let mut value = serde_json::from_slice::<Value>(resource.canonical_json())
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)?;
+        let status = value
+            .get_mut("status")
+            .and_then(Value::as_object_mut)
+            .ok_or(SharedProviderReconcileError::InvalidResource)?;
+        if let Some(phase) = phase {
+            status.insert(
+                "phase".to_owned(),
+                Value::String(match phase {
+                    SharedProviderEffectPhase::Ready => "Ready".to_owned(),
+                    SharedProviderEffectPhase::Pending => "Pending".to_owned(),
+                }),
+            );
+        }
+        serde_json::to_vec(status).map_err(|_| SharedProviderReconcileError::InvalidResource)
+    }
+
+    fn finalizer_mutation(
+        resource: &ResourceSnapshot,
+        finalizer: &str,
+        add: bool,
+    ) -> Result<ResourceMutationBatch, SharedProviderReconcileError> {
+        let canonical = finalizer_candidate(resource.canonical_json(), finalizer, add)?;
+        let mutation = d2b_core_controller::MutationIntent::new(
+            resource.key().resource_ref().clone(),
+            Some(resource.key().uid().clone()),
+            Some(resource.revision()),
+            d2b_core_controller::MutationIntentKind::UpdateFinalizers,
+            Some(canonical),
+        )
+        .map_err(|_| SharedProviderReconcileError::InvalidResource)?;
+        ResourceMutationBatch::new(vec![mutation])
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)
+    }
+
+    fn status_candidate_for_result(
+        &self,
+        resource: &ResourceSnapshot,
+        result: &SharedProviderEffectResult,
+    ) -> Result<Option<Vec<u8>>, SharedProviderReconcileError> {
+        if self.kind == SharedProviderResourceKind::CloudHypervisorGuest {
+            // The live CH controller owns its layered Guest status. Do not
+            // replace its freshly committed conditions with this Runner's
+            // bounded generic projection.
+            Ok(None)
+        } else {
+            let mut status = serde_json::from_slice::<Value>(resource.canonical_json())
+                .map_err(|_| SharedProviderReconcileError::InvalidResource)?
+                .get("status")
+                .cloned()
+                .ok_or(SharedProviderReconcileError::InvalidResource)?;
+            let status = status
+                .as_object_mut()
+                .ok_or(SharedProviderReconcileError::InvalidResource)?;
+            status.insert(
+                "phase".to_owned(),
+                Value::String(match result.phase {
+                    SharedProviderEffectPhase::Ready => "Ready",
+                    SharedProviderEffectPhase::Pending => "Pending",
+                }
+                .to_owned()),
+            );
+            if matches!(
+                self.kind,
+                SharedProviderResourceKind::QemuMediaGuest
+                    | SharedProviderResourceKind::AzureContainerAppsGuest
+                    | SharedProviderResourceKind::AzureVirtualMachineGuest
+                    | SharedProviderResourceKind::DisplayWaylandPolicy
+                    | SharedProviderResourceKind::DisplayWaylandSession
+                    | SharedProviderResourceKind::AudioService
+                    | SharedProviderResourceKind::AudioBinding
+                    | SharedProviderResourceKind::ShellPool
+                    | SharedProviderResourceKind::ShellSession
+            ) {
+                status.insert(
+                    "observedGeneration".to_owned(),
+                    Value::from(resource.generation().get()),
+                );
+            }
+            if let Some(projection) = &result.resource_projection {
+                status.insert("resource".to_owned(), projection.clone());
+            }
+            serde_json::to_vec(status)
+                .map(Some)
+                .map_err(|_| SharedProviderReconcileError::InvalidResource)
+        }
+    }
+
+    #[cfg(test)]
+    fn first_pass_for_test(
+        &self,
+        resource: &ResourceSnapshot,
+    ) -> Result<ReconcileResult, SharedProviderReconcileError> {
+        let Some(finalizer) = self.descriptor.finalizers().first() else {
+            return ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                None,
+                None,
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::NotRequested,
+            )
+            .map_err(|_| SharedProviderReconcileError::InvalidResource);
+        };
+        if resource.deleting() || self.has_finalizer(resource)? {
+            return Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ));
+        }
+        ReconcileResult::new(
+            resource.revision(),
+            resource.generation(),
+            Some(Self::finalizer_mutation(resource, finalizer, true)?),
+            None,
+            ReconcileDisposition::Pending,
+            None,
+            None,
+            StatusPersistence::NotRequested,
+        )
+        .map_err(|_| SharedProviderReconcileError::InvalidResource)
+    }
+
+    #[cfg(test)]
+    async fn execute_effect_for_test(
+        &self,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+    ) -> Result<SharedProviderEffectPhase, SharedProviderReconcileError> {
+        let context = SharedProviderEffectContext {
+            identity: self.descriptor.identity().clone(),
+            target: resource.key().clone(),
+            operation_id: "test-provider-effect".to_owned(),
+        };
+        self.effects
+            .reconcile(self.kind, &context, resource, dependencies)
+            .await
+            .map_err(SharedProviderReconcileError::Effect)
+    }
+
+    #[cfg(test)]
+    async fn execute_finalize_for_test(
+        &self,
+        resource: &ResourceSnapshot,
+    ) -> Result<ReconcileResult, SharedProviderReconcileError> {
+        let context = SharedProviderEffectContext {
+            identity: self.descriptor.identity().clone(),
+            target: resource.key().clone(),
+            operation_id: "test-provider-finalize".to_owned(),
+        };
+        let Some(finalizer) = self.descriptor.finalizers().first() else {
+            return Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ));
+        };
+        self.effects
+            .finalize(self.kind, &context, resource)
+            .await
+            .map_err(SharedProviderReconcileError::Effect)?;
+        Ok(
+            ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                Some(Self::finalizer_mutation(
+                    resource,
+                    finalizer,
+                    false,
+                )?),
+                None,
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::NotRequested,
+            )
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
+        )
+    }
+}
+
+fn finalizer_candidate(
+    canonical_json: &[u8],
+    finalizer: &str,
+    add: bool,
+) -> Result<Vec<u8>, SharedProviderReconcileError> {
+    let mut value = CanonicalJsonValue::parse(canonical_json)
+        .map_err(|_| SharedProviderReconcileError::InvalidResource)?;
+    let CanonicalJsonValue::Object(root) = &mut value else {
+        return Err(SharedProviderReconcileError::InvalidResource);
+    };
+    let Some(CanonicalJsonValue::Object(metadata)) = root.get_mut("metadata") else {
+        return Err(SharedProviderReconcileError::InvalidResource);
+    };
+    let Some(CanonicalJsonValue::Array(finalizers)) = metadata.get_mut("finalizers") else {
+        return Err(SharedProviderReconcileError::InvalidResource);
+    };
+    if add {
+        if !finalizers
+            .iter()
+            .any(|value| matches!(value, CanonicalJsonValue::String(value) if value == finalizer))
+        {
+            finalizers.push(CanonicalJsonValue::String(finalizer.to_owned()));
+        }
+    } else {
+        finalizers.retain(
+            |value| !matches!(value, CanonicalJsonValue::String(value) if value == finalizer),
+        );
+    }
+    Ok(value.to_canonical_bytes())
+}
+
+fn stored_resource_from_snapshot(resource: &ResourceSnapshot) -> StoredResource {
+    StoredResource {
+        resource_ref: resource.key().resource_ref().clone(),
+        zone: resource.key().zone().clone(),
+        uid: resource.key().uid().clone(),
+        owner_uid: resource.owner_uid().cloned(),
+        owner_generation: resource.owner_generation(),
+        generation: resource.generation(),
+        revision: resource.revision(),
+        canonical_json: resource.canonical_json().to_vec(),
+        payload_digest: canonical_digest(
+            d2b_contracts_resource::v3::RESOURCE_ENVELOPE_DOMAIN_TAG,
+            resource.canonical_json(),
+        ),
+    }
+}
+
+fn display_resource_projection(
+    owner: &crate::binding_child_resource_runtime::OwnedChildOwner,
+    children: &[StoredResource],
+) -> Value {
+    let child = |resource_type: &str| {
+        owner
+            .desired
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .find(|intent| intent.target().resource_type().as_str() == resource_type)
+            .and_then(|intent| {
+                children.iter().find(|candidate| {
+                    candidate.resource_ref == *intent.target()
+                        && ResourceEnvelope::from_json(&candidate.canonical_json)
+                            .ok()
+                            .and_then(|envelope| envelope.metadata().owner_ref().cloned())
+                            == Some(owner.resource.resource_ref.clone())
+                        && !value_deletion_requested(
+                            &serde_json::from_slice::<Value>(&candidate.canonical_json)
+                                .unwrap_or_default(),
+                        )
+                })
+            })
+    };
+    let process_refs = owner
+        .desired
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter(|intent| intent.target().resource_type().as_str() == "Process")
+        .map(|intent| intent.target().to_canonical_string())
+        .collect::<Vec<_>>();
+    let endpoint_ref = child("Endpoint").map(|resource| resource.resource_ref.clone());
+    let endpoint_generation = child("Endpoint").map(|resource| resource.generation.get());
+    let resource = d2b_provider_display_wayland::WaylandSessionResourceStatus {
+        proxy_process_ref: process_refs.first().and_then(|reference| ResourceRef::parse(reference).ok()),
+        guest_frontend_process_ref: process_refs.get(1).and_then(|reference| ResourceRef::parse(reference).ok()),
+        wayland_endpoint_ref: endpoint_ref,
+        wayland_endpoint_generation: endpoint_generation,
+        policy_digest: String::new(),
+    };
+    crate::interaction_composition::wayland_session_resource_projection(&resource)
+}
+
+fn resource_phase(value: &Value) -> Option<&str> {
+    value.pointer("/status/phase").and_then(Value::as_str)
+}
+
+fn value_deletion_requested(value: &Value) -> bool {
+    value
+        .pointer("/metadata/deletionRequestedAt")
+        .is_some_and(|value| !value.is_null())
+}
+
+fn resource_ref_at(value: &Value, path: &str) -> Result<ResourceRef, SharedProviderEffectError> {
+    value
+        .pointer(path)
+        .and_then(Value::as_str)
+        .and_then(|reference| ResourceRef::parse(reference).ok())
+        .ok_or(SharedProviderEffectError::InvalidResource)
+}
+
+fn audio_dependency<'a>(
+    dependencies: &'a [DependencySnapshot],
+    target: &ResourceRef,
+) -> Option<&'a DependencySnapshot> {
+    dependencies
+        .iter()
+        .find(|dependency| dependency.resource().key().resource_ref() == target)
+}
+
+fn validate_audio_dependency_identity(
+    resource: &StoredResource,
+    target: &ResourceRef,
+    zone: &ZoneId,
+) -> Result<(), SharedProviderEffectError> {
+    if resource.zone != *zone
+        || resource.resource_ref != *target
+        || resource.uid.as_str().is_empty()
+        || resource.generation.get() == 0
+        || resource.revision.get() == 0
+    {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    let envelope = ResourceEnvelope::from_json(&resource.canonical_json)
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+    let metadata = envelope.metadata();
+    if metadata.zone() != zone
+        || metadata.uid() != &resource.uid
+        || metadata.generation() != resource.generation
+        || metadata.revision() != resource.revision
+        || envelope
+            .digest()
+            .map_err(|_| SharedProviderEffectError::InvalidResource)?
+            != resource.payload_digest
+    {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    Ok(())
+}
+
+fn map_audio_effect_error(
+    error: AudioResourceRuntimeError,
+) -> SharedProviderEffectError {
+    match error {
+        AudioResourceRuntimeError::InvalidResource
+        | AudioResourceRuntimeError::InvalidRelationship => {
+            SharedProviderEffectError::InvalidResource
+        }
+        AudioResourceRuntimeError::Controller(_) => SharedProviderEffectError::Unavailable,
+    }
+}
+
+fn shell_pool_spec(
+    value: &Value,
+) -> Result<(ResourceRef, ResourceRef), SharedProviderEffectError> {
+    if value.pointer("/spec/providerRef").and_then(Value::as_str)
+        != Some("Provider/shell-terminal")
+    {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    let execution_ref = resource_ref_at(value, "/spec/executionRef")?;
+    if !matches!(
+        execution_ref.resource_type().as_str(),
+        "Host" | "Guest"
+    ) {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    let user_ref = resource_ref_at(value, "/spec/userRef")?;
+    let login_shell = value
+        .pointer("/spec/loginShellRef")
+        .and_then(Value::as_str)
+        .ok_or(SharedProviderEffectError::InvalidResource)?;
+    if user_ref.resource_type().as_str() != "User"
+        || !login_shell.starts_with("artifact://")
+        || login_shell.len() > 255
+    {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    Ok((execution_ref, user_ref))
+}
+
+fn shell_execution(
+    value: &Value,
+) -> Result<(ResourceRef, Option<ResourceRef>), SharedProviderEffectError> {
+    if value.pointer("/spec/providerRef").and_then(Value::as_str)
+        != Some("Provider/shell-terminal")
+    {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    let execution_ref = resource_ref_at(value, "/spec/executionRef")?;
+    if !matches!(
+        execution_ref.resource_type().as_str(),
+        "Host" | "Guest"
+    ) {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    let user_ref = value
+        .pointer("/spec/userRef")
+        .and_then(Value::as_str)
+        .map(ResourceRef::parse)
+        .transpose()
+        .map_err(|_| SharedProviderEffectError::InvalidResource)?;
+    if user_ref
+        .as_ref()
+        .is_some_and(|reference| reference.resource_type().as_str() != "User")
+        || value
+            .pointer("/spec/loginShellRef")
+            .and_then(Value::as_str)
+            .is_none_or(|shell| {
+                !shell.starts_with("artifact://") || shell.len() > 255
+            })
+    {
+        return Err(SharedProviderEffectError::InvalidResource);
+    }
+    Ok((execution_ref, user_ref))
+}
+
+fn owned_child_intent(
+    zone: &ZoneId,
+    target: ResourceRef,
+    owner: &ResourceRef,
+    spec: Value,
+    dependencies: impl IntoIterator<Item = ResourceRef>,
+) -> Result<d2b_core_controller::OwnedChildIntent, SharedProviderEffectError> {
+    let value = json!({
+        "apiVersion": "resources.d2bus.org/v3",
+        "type": target.resource_type().as_str(),
+        "metadata": {
+            "name": target.name().as_str(),
+            "zone": zone.as_str(),
+            "ownerRef": owner.to_canonical_string(),
+            "annotations": {},
+            "finalizers": [],
+            "deletionRequestedAt": null,
+            "createdAt": "1970-01-01T00:00:00.000Z",
+            "updatedAt": "1970-01-01T00:00:00.000Z",
+            "generation": 1,
+            "revision": 1,
+            "managedBy": "controller"
+        },
+        "spec": spec,
+        "status": {
+            "completedAt": null,
+            "conditions": [],
+            "lastReconciledAt": null,
+            "observedGeneration": 0,
+            "outcome": null,
+            "phase": "Pending",
+            "resource": {},
+            "startedAt": null,
+            "update": {
+                "dependencies": {"count": 0, "refs": []},
+                "disruption": "None",
+                "lastAssessedAt": null,
+                "observedGeneration": 0,
+                "operationId": null,
+                "owned": {"count": 0, "refs": []},
+                "preserveState": true,
+                "reasons": [],
+                "state": "Unknown",
+                "targetGeneration": 1
+            }
+        }
+    });
+    let bytes = CanonicalJsonValue::parse(
+        &serde_json::to_vec(&value).map_err(|_| SharedProviderEffectError::InvalidResource)?,
+    )
+    .map_err(|_| SharedProviderEffectError::InvalidResource)?
+    .to_canonical_bytes();
+    let digest = canonical_digest(
+        d2b_contracts_resource::v3::RESOURCE_ENVELOPE_DOMAIN_TAG,
+        &bytes,
+    );
+    d2b_core_controller::OwnedChildIntent::new(target, bytes, digest)
+        .and_then(|intent| intent.with_dependencies(dependencies))
+        .map_err(|_| SharedProviderEffectError::InvalidResource)
+}
+
+type SharedCoreControllerSource =
+    CoreControllerSource<d2b_resource_api::registered::RedbRegisteredControllerApi>;
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CoreRunnerIdentity {
+    controller_ref: ResourceRef,
+    resource_type: String,
+}
+
+impl CoreRunnerIdentity {
+    fn new(controller_ref: ResourceRef, resource_type: impl Into<String>) -> Self {
+        Self {
+            controller_ref,
+            resource_type: resource_type.into(),
+        }
+    }
+}
+
+struct CoreRunnerTask {
+    identity: CoreRunnerIdentity,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl CoreRunnerTask {
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+}
+
+fn core_runner_tasks_are_ready(
+    tasks: &[CoreRunnerTask],
+    required_identities: &BTreeSet<CoreRunnerIdentity>,
+) -> bool {
+    !required_identities.is_empty()
+        && tasks.iter().all(|task| !task.is_finished())
+        && required_identities.iter().all(|required| {
+            tasks
+                .iter()
+                .any(|task| task.identity == *required && !task.is_finished())
+        })
+}
+
+enum PreparedCoreRunner {
+    Core {
+        identity: CoreRunnerIdentity,
+        reconciler: Arc<CoreResourceReconciler>,
+        source: Arc<SharedCoreControllerSource>,
+        config: RunnerConfig,
+        handler: &'static str,
+        resource_type: &'static str,
+    },
+    Provider {
+        identity: CoreRunnerIdentity,
+        reconciler: Arc<SharedProviderResourceReconciler>,
+        source: Arc<SharedCoreControllerSource>,
+        config: RunnerConfig,
+        controller_ref: ResourceRef,
+        resource_type: String,
+    },
+}
+
+impl PreparedCoreRunner {
+    fn identity(&self) -> &CoreRunnerIdentity {
+        match self {
+            Self::Core { identity, .. } | Self::Provider { identity, .. } => identity,
+        }
+    }
+}
+
+fn spawn_prepared_core_runner(prepared: PreparedCoreRunner) -> CoreRunnerTask {
+    match prepared {
+        PreparedCoreRunner::Core {
+            identity,
+            reconciler,
+            source,
+            config,
+            handler,
+            resource_type,
+        } => {
+            let handle = tokio::spawn(async move {
+                let zone = source.zone().clone();
+                let runner = Runner::new(reconciler, source, config);
+                match runner.run().await {
+                    Ok(report) => {
+                        tracing::debug!(
+                            handler,
+                            resource_type,
+                            dispatched = report.dispatched,
+                            relists = report.relists,
+                            "Core resource runner stopped",
+                        );
+                    }
+                    Err(error) => {
+                        let failed_resource_type = error
+                            .failed_key()
+                            .map(|key| key.resource_ref().resource_type().as_str());
+                        tracing::warn!(
+                            zone = %zone,
+                            handler,
+                            resource_type,
+                            failed_resource_type = ?failed_resource_type,
+                            failed_operation = ?error.failed_operation(),
+                            error = %error,
+                            "Core resource runner isolated failure",
+                        );
+                    }
+                }
+            });
+            CoreRunnerTask { identity, handle }
+        }
+        PreparedCoreRunner::Provider {
+            identity,
+            reconciler,
+            source,
+            config,
+            controller_ref,
+            resource_type,
+        } => {
+            let handle = tokio::spawn(async move {
+                let zone = source.zone().clone();
+                let runner = Runner::new(reconciler, source, config);
+                match runner.run().await {
+                    Ok(report) => {
+                        tracing::debug!(
+                            controller = %controller_ref,
+                            resource_type,
+                            dispatched = report.dispatched,
+                            relists = report.relists,
+                            "Shared Provider resource runner stopped",
+                        );
+                    }
+                    Err(error) => {
+                        let failed_resource_type = error
+                            .failed_key()
+                            .map(|key| key.resource_ref().resource_type().as_str());
+                        tracing::warn!(
+                            zone = %zone,
+                            controller = %controller_ref,
+                            resource_type,
+                            failed_resource_type = ?failed_resource_type,
+                            failed_operation = ?error.failed_operation(),
+                            error = %error,
+                            "Shared Provider resource runner isolated failure",
+                        );
+                    }
+                }
+            });
+            CoreRunnerTask { identity, handle }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedProviderReconcileError {
+    InvalidResource,
+    Effect(SharedProviderEffectError),
+}
+
+impl core::fmt::Display for SharedProviderReconcileError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidResource => formatter.write_str("shared-provider-resource-invalid"),
+            Self::Effect(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for SharedProviderReconcileError {}
+
+impl ResourceReconciler for SharedProviderResourceReconciler {
+    type Error = SharedProviderReconcileError;
+
+    fn describe(
+        &self,
+    ) -> impl std::future::Future<Output = Result<ControllerDescriptor, Self::Error>> + Send {
+        std::future::ready(Ok(self.descriptor.clone()))
+    }
+
+    fn validate_spec(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl std::future::Future<Output = Result<ValidationResult, Self::Error>> + Send {
+        let valid = context.identity().zone() == resource.key().zone()
+            && resource.key().resource_ref().resource_type().as_str() == self.kind.resource_type()
+            && serde_json::from_slice::<Value>(resource.canonical_json())
+                .ok()
+                .is_some_and(|value| {
+                    if matches!(
+                        self.kind,
+                        SharedProviderResourceKind::DisplayWaylandPolicy
+                            | SharedProviderResourceKind::DisplayWaylandSession
+                    ) {
+                        ResourceEnvelope::from_json(resource.canonical_json()).is_ok()
+                    } else {
+                        value
+                            .pointer("/spec/providerRef")
+                            .and_then(Value::as_str)
+                            == Some(self.kind.provider_ref())
+                    }
+                });
+        std::future::ready(Ok(if valid {
+            ValidationResult::Valid
+        } else {
+            ValidationResult::Invalid {
+                reason: ReconcileReason::InvalidSpec,
+            }
+        }))
+    }
+
+    async fn plan(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> Result<ReconcilePlan, Self::Error> {
+        let _ = self.has_finalizer(resource)?;
+        ReconcilePlan::new(vec![self.kind.effect_id().to_owned()], false)
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)
+    }
+
+    fn reconcile(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let result = (|| {
+            context
+                .authorize_effect()
+                .map_err(|_| SharedProviderReconcileError::Effect(
+                    SharedProviderEffectError::Unavailable,
+                ))?;
+            let finalizer = self.descriptor.finalizers().first();
+            if let Some(finalizer) = finalizer
+                && !resource.deleting()
+                && !self.has_finalizer(resource)?
+            {
+                return Ok(ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    Some(Self::finalizer_mutation(resource, finalizer, true)?),
+                    None,
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    StatusPersistence::NotRequested,
+                )
+                .map_err(|_| SharedProviderReconcileError::InvalidResource)?);
+            }
+            if finalizer.is_none() {
+                return ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    None,
+                    None,
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    StatusPersistence::NotRequested,
+                )
+                .map_err(|_| SharedProviderReconcileError::InvalidResource);
+            }
+            if !self.has_finalizer(resource)? {
+                return ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    None,
+                    Some(Self::status_candidate(resource, Some(
+                        SharedProviderEffectPhase::Pending,
+                    ))?),
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    StatusPersistence::Pending,
+                )
+                .map_err(|_| SharedProviderReconcileError::InvalidResource);
+            }
+            Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ))
+        })();
+        std::future::ready(result)
+    }
+
+    async fn execute_effect(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> Result<ReconcileResult, Self::Error> {
+        let _permit = context
+            .authorize_effect()
+            .map_err(|_| SharedProviderReconcileError::Effect(
+                SharedProviderEffectError::Unavailable,
+            ))?;
+        let result = self
+            .effects
+            .reconcile_result(
+                self.kind,
+                &self.effect_context(context),
+                resource,
+                dependencies,
+            )
+            .await
+            .map_err(SharedProviderReconcileError::Effect)?;
+        let status = (!result.child_mutated)
+            .then(|| self.status_candidate_for_result(resource, &result))
+            .transpose()?
+            .flatten();
+        let (disposition, next_tick) = if self.kind.resource_type() == "Guest"
+            && result.phase == SharedProviderEffectPhase::Pending
+        {
+            (
+                ReconcileDisposition::RequeueAt,
+                Some(context.now_tick().saturating_add(
+                    SHARED_PROVIDER_PROGRESS_REQUEUE_TICKS,
+                )),
+            )
+        } else {
+            (ReconcileDisposition::Pending, None)
+        };
+        let status_persistence = if status.is_some() {
+            StatusPersistence::Pending
+        } else {
+            StatusPersistence::NotRequested
+        };
+        Ok(ReconcileResult::new(
+            resource.revision(),
+            resource.generation(),
+            None,
+            status,
+            disposition,
+            next_tick,
+            None,
+            status_persistence,
+        )
+        .map_err(|_| SharedProviderReconcileError::InvalidResource)?)
+    }
+
+    async fn observe(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> Result<ObservationResult, Self::Error> {
+        let _permit = context
+            .authorize_effect()
+            .map_err(|_| SharedProviderReconcileError::Effect(
+                SharedProviderEffectError::Unavailable,
+            ))?;
+        if !self.has_finalizer(resource)? {
+            return Ok(ObservationResult::new(
+                ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    None,
+                    Some(Self::status_candidate(
+                        resource,
+                        Some(SharedProviderEffectPhase::Pending),
+                    )?),
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    StatusPersistence::Pending,
+                )
+                .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
+            ));
+        }
+        let result = self
+            .effects
+            .observe_result(
+                self.kind,
+                &self.effect_context(context),
+                resource,
+            )
+            .await
+            .map_err(SharedProviderReconcileError::Effect)?;
+        let status = (!result.child_mutated)
+            .then(|| self.status_candidate_for_result(resource, &result))
+            .transpose()?
+            .flatten();
+        let (disposition, next_tick) = if self.kind.resource_type() == "Guest"
+            && result.phase == SharedProviderEffectPhase::Pending
+        {
+            (
+                ReconcileDisposition::RequeueAt,
+                Some(context.now_tick().saturating_add(
+                    SHARED_PROVIDER_PROGRESS_REQUEUE_TICKS,
+                )),
+            )
+        } else {
+            (ReconcileDisposition::Pending, None)
+        };
+        let status_persistence = if status.is_some() {
+            StatusPersistence::Pending
+        } else {
+            StatusPersistence::NotRequested
+        };
+        Ok(ObservationResult::new(
+            ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                None,
+                status,
+                disposition,
+                next_tick,
+                None,
+                status_persistence,
+            )
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
+        ))
+    }
+
+    fn finalize(
+        &self,
+        _context: &ReconcileContext,
+        deleting_resource: &ResourceSnapshot,
+    ) -> impl std::future::Future<Output = Result<FinalizeResult, Self::Error>> + Send {
+        std::future::ready(Ok(FinalizeResult::new(ReconcileResult::converged(
+            deleting_resource.revision(),
+            deleting_resource.generation(),
+        ))))
+    }
+
+    fn prepare_finalize(
+        &self,
+        context: &ReconcileContext,
+        deleting_resource: &ResourceSnapshot,
+    ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let result = context
+            .authorize_effect()
+            .map(|_| ReconcileResult::converged(
+                deleting_resource.revision(),
+                deleting_resource.generation(),
+            ))
+            .map_err(|_| SharedProviderReconcileError::Effect(
+                SharedProviderEffectError::Unavailable,
+            ));
+        std::future::ready(result)
+    }
+
+    async fn execute_finalize(
+        &self,
+        context: &ReconcileContext,
+        deleting_resource: &ResourceSnapshot,
+    ) -> Result<ReconcileResult, Self::Error> {
+        let _permit = context
+            .authorize_effect()
+            .map_err(|_| SharedProviderReconcileError::Effect(
+                SharedProviderEffectError::Unavailable,
+            ))?;
+        if !self.has_finalizer(deleting_resource)? {
+            return Ok(ReconcileResult::converged(
+                deleting_resource.revision(),
+                deleting_resource.generation(),
+            ));
+        }
+        let finalizer = self.descriptor.finalizers().first().cloned();
+        self.effects
+            .finalize(
+                self.kind,
+                &self.effect_context(context),
+                deleting_resource,
+            )
+            .await
+            .map_err(SharedProviderReconcileError::Effect)?;
+        let Some(finalizer) = finalizer else {
+            return Ok(ReconcileResult::converged(
+                deleting_resource.revision(),
+                deleting_resource.generation(),
+            ));
+        };
+        Ok(
+            ReconcileResult::new(
+                deleting_resource.revision(),
+                deleting_resource.generation(),
+                Some(Self::finalizer_mutation(
+                    deleting_resource,
+                    &finalizer,
+                    false,
+                )?),
+                None,
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::NotRequested,
+            )
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
+        )
+    }
+
+    fn health(
+        &self,
+    ) -> impl std::future::Future<Output = Result<d2b_core_controller::ControllerHealth, Self::Error>>
+        + Send {
+        std::future::ready(Ok(d2b_core_controller::ControllerHealth::Healthy))
+    }
+
+    fn drain(
+        &self,
+        _deadline_tick: u64,
+    ) -> impl std::future::Future<Output = Result<DrainResult, Self::Error>> + Send {
+        std::future::ready(Ok(DrainResult::Drained))
+    }
+
+    fn assess_update(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl std::future::Future<Output = Result<UpdateAssessment, Self::Error>> + Send {
+        let state = serde_json::from_slice::<Value>(resource.canonical_json())
+            .ok()
+            .map(|value| {
+                let observed_generation = value
+                    .pointer("/status/observedGeneration")
+                    .and_then(Value::as_u64);
+                let initial_pending = observed_generation == Some(0)
+                    && value.pointer("/status/phase").and_then(Value::as_str)
+                        == Some("Pending");
+                if observed_generation == Some(resource.generation().get()) || initial_pending {
+                    UpdateAssessmentState::Current
+                } else {
+                    UpdateAssessmentState::UpgradeRequired
+                }
+            })
+            .unwrap_or(UpdateAssessmentState::UpgradeRequired);
+        std::future::ready(
+            UpdateAssessment::new(state, Vec::new(), true)
+                .map_err(|_| SharedProviderReconcileError::InvalidResource),
+        )
+    }
+
+    fn plan_upgrade(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl std::future::Future<Output = Result<UpgradePlan, Self::Error>> + Send {
+        std::future::ready(
+            UpgradePlan::new(
+                DisruptionClass::Restart,
+                true,
+                vec![UpgradeStage::Restart(resource.key().resource_ref().clone())],
+            )
+            .map_err(|_| SharedProviderReconcileError::InvalidResource),
+        )
+    }
+
+    async fn execute_upgrade(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        dependencies: &[DependencySnapshot],
+        _plan: &UpgradePlan,
+    ) -> Result<ReconcileResult, Self::Error> {
+        let _permit = context
+            .authorize_effect()
+            .map_err(|_| SharedProviderReconcileError::Effect(
+                SharedProviderEffectError::Unavailable,
+            ))?;
+        if !self.has_finalizer(resource)? {
+            return Ok(
+                ReconcileResult::new(
+                    resource.revision(),
+                    resource.generation(),
+                    None,
+                    Some(Self::status_candidate(
+                        resource,
+                        Some(SharedProviderEffectPhase::Pending),
+                    )?),
+                    ReconcileDisposition::Pending,
+                    None,
+                    None,
+                    StatusPersistence::Pending,
+                )
+                .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
+            );
+        }
+        let result = self
+            .effects
+            .upgrade_result(
+                self.kind,
+                &self.effect_context(context),
+                resource,
+                dependencies,
+            )
+            .await
+            .map_err(SharedProviderReconcileError::Effect)?;
+        let status = (!result.child_mutated)
+            .then(|| self.status_candidate_for_result(resource, &result))
+            .transpose()?
+            .flatten();
+        let (disposition, next_tick) = if self.kind.resource_type() == "Guest"
+            && result.phase == SharedProviderEffectPhase::Pending
+        {
+            (
+                ReconcileDisposition::RequeueAt,
+                Some(context.now_tick().saturating_add(
+                    SHARED_PROVIDER_PROGRESS_REQUEUE_TICKS,
+                )),
+            )
+        } else {
+            (ReconcileDisposition::Pending, None)
+        };
+        let status_persistence = if status.is_some() {
+            StatusPersistence::Pending
+        } else {
+            StatusPersistence::NotRequested
+        };
+        Ok(
+            ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                None,
+                status,
+                disposition,
+                next_tick,
+                None,
+                status_persistence,
+            )
+            .map_err(|_| SharedProviderReconcileError::InvalidResource)?,
+        )
+    }
+}
+
+/// Compose exact Provider descriptors used by the production shared Runner.
+/// The provider-generation map is supplied by authoritative Provider rows; no
+/// generation or assignment epoch is guessed.
+pub fn compose_shared_provider_runner_descriptors(
+    registrations: impl IntoIterator<Item = SharedProviderRunnerRegistration>,
+    zone: ZoneId,
+    controller_generation: ControllerGeneration,
+    provider_generations: &BTreeMap<ResourceRef, ResourceGeneration>,
+    _session_generation: ReconnectGeneration,
+) -> Result<
+    Vec<(SharedProviderRunnerRegistration, ControllerDescriptor)>,
+    ResourceRuntimeError,
+> {
+    registrations
+        .into_iter()
+        .map(|registration| {
+            if !registration.watched_configuration_is_dependency
+                || !(30_000..=300_000).contains(&registration.repair_interval_ticks)
+            {
+                return Err(ResourceRuntimeError::HandlerNotReady);
+            }
+            let provider_ref = ResourceRef::parse(registration.provider_ref)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let provider_generation = provider_generations
+                .get(&provider_ref)
+                .copied()
+                .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+            let resource_type = ResourceTypeName::parse(registration.resource_type.to_owned())
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let controller_ref = ResourceRef::parse(registration.controller_ref)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let identity = ControllerIdentity::new(
+                zone.clone(),
+                controller_ref.clone(),
+                controller_generation,
+                provider_ref,
+                provider_generation,
+                controller_ref,
+                ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                None,
+            )
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let resource = ResourceRegistration::new(
+                resource_type.clone(),
+                vec![1],
+                5_000,
+                3,
+            )
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let provider_selector = if registration.resource_type.starts_with("display-wayland.")
+            {
+                None
+            } else {
+                Some(registration.provider_ref.to_owned())
+            };
+            let mut selectors = vec![
+                ControllerSelector::new(
+                    resource_type.clone(),
+                    SelectorField::Spec,
+                    provider_selector,
+                )
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+            ];
+            for field in [
+                SelectorField::Status,
+                SelectorField::Metadata,
+                SelectorField::Finalizers,
+                SelectorField::Deletion,
+            ] {
+                selectors.push(
+                    ControllerSelector::new(resource_type.clone(), field, None)
+                        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                );
+            }
+            let dependency_types: &[&str] = match registration.resource_type {
+                "Guest" => &[
+                    "Provider",
+                    "Process",
+                    "EphemeralProcess",
+                    "Endpoint",
+                    "Volume",
+                    "Network",
+                    "Device",
+                    "Credential",
+                ],
+                "display-wayland.d2bus.org.WaylandSession" => &[
+                    "Guest",
+                    "Host",
+                    "User",
+                    "display-wayland.d2bus.org.WaylandPolicy",
+                ],
+                "audio.d2bus.org.AudioBinding" => {
+                    &["audio.d2bus.org.AudioService", "Guest"]
+                }
+                "shell-terminal.d2bus.org.ShellSession" => {
+                    &["shell-terminal.d2bus.org.ShellPool"]
+                }
+                _ => &[],
+            };
+            let dependency_selectors = dependency_types
+                .iter()
+                .map(|resource_type| {
+                    ControllerSelector::new(
+                        ResourceTypeName::parse((*resource_type).to_owned())
+                            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                        SelectorField::Metadata,
+                        None,
+                    )
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let execution = ControllerExecutionPolicy::new(
+                8,
+                4,
+                256,
+                8,
+                256,
+                ResyncPolicy::new(
+                    Some(registration.repair_interval_ticks),
+                    registration.repair_interval_ticks,
+                )
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+            )
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let mut verbs = vec![
+                ControllerVerb::ReadSpec,
+                ControllerVerb::ReadStatus,
+                ControllerVerb::WriteStatus,
+                ControllerVerb::AddFinalizer,
+                ControllerVerb::RemoveFinalizer,
+            ];
+            if registration.resource_type == "Guest" {
+                verbs.push(ControllerVerb::WriteSpec);
+            }
+            let descriptor = ControllerDescriptor::new(
+                identity,
+                vec![resource],
+                vec!["resource-api".to_owned()],
+                vec!["system".to_owned()],
+                verbs,
+                selectors,
+                dependency_selectors,
+                true,
+                if registration.finalizer.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![registration.finalizer.to_owned()]
+                },
+                vec!["d2b.resource.v3".to_owned()],
+                vec!["resources.d2bus.org/v3".to_owned()],
+                execution,
+            )
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            Ok((registration, descriptor))
+        })
+        .collect()
+}
+
+#[derive(Clone)]
+pub(super) struct CoreAssignmentAuthority {
+    provider_generation: ResourceGeneration,
+    controller_generation: ControllerGeneration,
+    session_generation: ReconnectGeneration,
+    controller_role: ResourceRef,
+    target: ResourceRef,
+    epoch: u64,
+}
+
+async fn abort_controller_runner_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+    for task in tasks.drain(..) {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+async fn abort_core_runner_tasks(tasks: &mut Vec<CoreRunnerTask>) {
+    for task in tasks.drain(..) {
+        task.handle.abort();
+        let _ = task.handle.await;
+    }
+}
+
+async fn install_core_runner_tasks(
+    task_store: &Mutex<Vec<CoreRunnerTask>>,
+    mut new_tasks: Vec<CoreRunnerTask>,
+) -> Result<(), ResourceRuntimeError> {
+    let mut tasks = match task_store.lock() {
+        Ok(tasks) => tasks,
+        Err(_) => {
+            abort_core_runner_tasks(&mut new_tasks).await;
+            return Err(ResourceRuntimeError::WatchUnavailable);
+        }
+    };
+    tasks.append(&mut new_tasks);
+    Ok(())
+}
+
+async fn reap_finished_core_runner_tasks(
+    task_store: &Mutex<Vec<CoreRunnerTask>>,
+) -> Result<(), ResourceRuntimeError> {
+    let finished = {
+        let mut tasks = task_store
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        let mut finished = Vec::new();
+        let mut live = Vec::with_capacity(tasks.len());
+        for task in tasks.drain(..) {
+            if task.is_finished() {
+                finished.push(task);
+            } else {
+                live.push(task);
+            }
+        }
+        *tasks = live;
+        finished
+    };
+    for task in finished {
+        let _ = task.handle.await;
+    }
+    Ok(())
+}
+
+async fn abort_u9_runner_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
+    for task in tasks.drain(..) {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+fn u9_runner_tasks_are_live(tasks: &[tokio::task::JoinHandle<()>]) -> bool {
+    !tasks.is_empty() && tasks.iter().all(|task| !task.is_finished())
+}
+
+async fn u9_provider_generations(
+    runtime: &ZoneResourceRuntime,
+) -> Result<
+    (
+        Vec<SharedProviderRunnerRegistration>,
+        BTreeMap<ResourceRef, ResourceGeneration>,
+    ),
+    ResourceRuntimeError,
+> {
+    let mut generations = BTreeMap::new();
+    let mut active = Vec::new();
+    let mut seen = BTreeSet::new();
+    for registration in U9_SHARED_PROVIDER_RUNNERS {
+        if !seen.insert(registration.provider_ref) {
+            continue;
+        }
+        let provider_ref = ResourceRef::parse(registration.provider_ref)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let request = StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "u9-provider-generation".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "u9-provider-generation".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: runtime.zone.clone(),
+                target: provider_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::MetadataOnly,
+            };
+        match retry_transient_store_read(
+            &runtime.zone,
+            "u9-provider-generation",
+            || runtime.store.get(request.clone()),
+        )
+        .await
+        {
+            Ok(provider) if provider.zone == runtime.zone && provider.generation.get() > 0 => {
+                generations.insert(provider_ref, provider.generation);
+                active.extend(
+                    U9_SHARED_PROVIDER_RUNNERS
+                        .iter()
+                        .copied()
+                        .filter(|candidate| candidate.provider_ref == registration.provider_ref),
+                );
+            }
+            Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                let owned_resource = runtime
+                    .provider_resources_present(
+                        registration.provider_ref,
+                        &[registration.resource_type],
+                    )
+                    .await?
+                    || (registration.resource_type.starts_with("display-wayland.")
+                        && !runtime
+                            .committed_resources_of_type(registration.resource_type)
+                            .await?
+                            .is_empty());
+                if owned_resource {
+                    return Err(ResourceRuntimeError::ProviderPathUnavailable);
+                }
+            }
+            Err(_) => return Err(ResourceRuntimeError::StoreReadFailed),
+            _ => return Err(ResourceRuntimeError::HandlerNotReady),
+        }
+    }
+    active.sort_by_key(|registration| {
+        (
+            registration.provider_ref,
+            registration.resource_type,
+            registration.controller_ref,
+        )
+    });
+    active.dedup_by_key(|registration| {
+        (
+            registration.provider_ref,
+            registration.resource_type,
+            registration.controller_ref,
+        )
+    });
+    Ok((active, generations))
+}
+
+fn validate_observability_environment() -> Result<(), ResourceRuntimeError> {
+    d2b_provider_observability_otel::reject_process_environment_credential_chain()
+        .map_err(|_| ResourceRuntimeError::ProviderPathUnavailable)
+}
+
+#[cfg(test)]
+fn validate_observability_environment_keys(
+    keys: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<(), ResourceRuntimeError> {
+    d2b_provider_observability_otel::reject_ambient_credential_chain(keys)
+        .map_err(|_| ResourceRuntimeError::ProviderPathUnavailable)
+}
+
+fn u12_runner_readiness(required: bool, task_count: usize, any_finished: bool) -> bool {
+    !required || (task_count != 0 && !any_finished)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InteractionState {
+    Absent,
+    Ready,
+    Refused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ControllerRunnerFailure {
+    controller: ResourceRef,
+    resource_types: Vec<ResourceTypeName>,
+    error: RunnerError,
+}
+
+impl ControllerRunnerFailure {
+    fn new(
+        controller: ResourceRef,
+        resource_types: impl IntoIterator<Item = ResourceTypeName>,
+        error: RunnerError,
+    ) -> Self {
+        Self {
+            controller,
+            resource_types: resource_types.into_iter().collect(),
+            error,
+        }
+    }
+
+    pub(crate) fn controller(&self) -> &ResourceRef {
+        &self.controller
+    }
+
+    pub(crate) fn resource_types(&self) -> &[ResourceTypeName] {
+        &self.resource_types
+    }
+
+    pub(crate) const fn error(&self) -> RunnerError {
+        self.error
+    }
+}
+
+fn store_runner_failure(
+    slot: &Mutex<Option<ControllerRunnerFailure>>,
+    failure: ControllerRunnerFailure,
+) {
+    if let Ok(mut slot) = slot.lock() {
+        *slot = Some(failure);
+    }
+}
+
+fn push_runner_failure(
+    slot: &Mutex<Vec<ControllerRunnerFailure>>,
+    failure: ControllerRunnerFailure,
+) {
+    if let Ok(mut slot) = slot.lock() {
+        slot.push(failure);
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct CommittedInteractionProviderConfiguration {
@@ -654,10 +9030,22 @@ struct ControllerSession {
     binding: ControllerSessionBinding,
     ingress: BusIngress,
     driver: SessionDriverHandle,
-    resource_client: Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+    _backend_lease: Option<Arc<dyn crate::process_provider_runtime::GuestCredentialBackendLease>>,
+    resource_client: Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>>,
     service_task: tokio::task::JoinHandle<Result<(), SessionServerError>>,
     assignments: BTreeMap<ResourceUid, ResourceClientLease>,
     assignment_stream_open: bool,
+    assignments_revoked: bool,
+    transport_closed: bool,
+    ingress_revoked: bool,
+}
+
+impl ControllerSession {
+    fn cancel_backend_lease(&mut self) {
+        if let Some(lease) = self._backend_lease.take() {
+            lease.cancel();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -682,23 +9070,173 @@ struct ControllerSessionCoordinator {
     zone: ZoneId,
     bundle_resource_types: Vec<ResourceTypeName>,
     store: Arc<RedbResourceStore>,
+    assigned_process_api: Arc<Mutex<Option<Arc<RedbRegisteredControllerApi>>>>,
     api: Arc<ResourceService<RedbBackend>>,
     authorizer: Arc<NativeAuthorizer>,
     authorization_state: Arc<Mutex<Option<AuthorizationState>>>,
+    policy_projection: Arc<PolicyProjection>,
     registrar: Arc<Mutex<Option<ZoneRegistrar>>>,
     assignments: AssignmentRegistry,
     controller_sessions: Arc<Mutex<BTreeMap<ResourceRef, ControllerSession>>>,
+    pending_controller_session_clears:
+        Arc<Mutex<BTreeMap<ResourceRef, crate::process_provider_runtime::ControllerBootstrapContext>>>,
+    credential_sessions: CredentialSessionRegistry,
     controller_session_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    reconcile_attempts: Arc<AtomicUsize>,
+    #[cfg(test)]
+    admission_test_seam: Arc<Mutex<Option<ControllerSessionAdmissionTestSeam>>>,
+    #[cfg(test)]
+    controller_session_evidence_test_errors: Arc<Mutex<Vec<ResourceRuntimeError>>>,
 }
 
 type CloudHypervisorResourceClient = ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>;
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ControllerSessionAdmissionTestSeam {
+    after_snapshot:
+        Arc<dyn Fn(&crate::process_provider_runtime::ProductionProcessProviders) + Send + Sync>,
+    after_policy_install: Arc<dyn Fn(&BTreeSet<BoundSubject>) + Send + Sync>,
+    admit_without_transport: bool,
+}
+
+#[cfg(test)]
+struct ControllerSessionAdmissionTestUnwindGuard {
+    first_policy_release: Arc<AtomicBool>,
+    second_snapshot_release: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl Drop for ControllerSessionAdmissionTestUnwindGuard {
+    fn drop(&mut self) {
+        self.first_policy_release.store(true, Ordering::Release);
+        self.second_snapshot_release
+            .store(true, Ordering::Release);
+        self.shutdown.store(true, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+}
+
+#[derive(Clone)]
+struct PolicyProjection {
+    authorizer: Arc<NativeAuthorizer>,
+    bus: Option<Arc<ZoneBus>>,
+    authorization_state: Arc<Mutex<Option<AuthorizationState>>>,
+    policy_refresh: Arc<Mutex<()>>,
+    policy_loaded: Arc<Mutex<bool>>,
+    installed_controller_subjects: Arc<Mutex<BTreeSet<BoundSubject>>>,
+}
+
+impl PolicyProjection {
+    /// Serialize the installed native policy with its matching trusted
+    /// authorization state. This mutex is the projection's linearization
+    /// point; callers that need to pair the authorizer with state must use
+    /// this snapshot instead of reading the shadow state independently.
+    fn installed_state(&self) -> Result<AuthorizationState, ResourceRuntimeError> {
+        let _install = self
+            .policy_refresh
+            .lock()
+            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
+        let loaded = *self
+            .policy_loaded
+            .lock()
+            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
+        if !loaded {
+            return Err(ResourceRuntimeError::PolicyUnavailable);
+        }
+        self.authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::PolicyUnavailable)
+    }
+
+    fn installed_controller_subjects(
+        &self,
+    ) -> Result<BTreeSet<BoundSubject>, ResourceRuntimeError> {
+        let _install = self
+            .policy_refresh
+            .lock()
+            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
+        self.installed_controller_subjects
+            .lock()
+            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)
+            .map(|subjects| subjects.clone())
+    }
+
+    fn install(
+        &self,
+        policy: PolicySet,
+        state: AuthorizationState,
+        controller_subjects: BTreeSet<BoundSubject>,
+    ) -> Result<(), ResourceRuntimeError> {
+        let _install = self
+            .policy_refresh
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+        // The policy refresh mutex linearizes the complete projection:
+        // authorizer/ZoneBus replacement and the shadow state are published
+        // under one guard. Validation failures happen before mutation and
+        // therefore leave the last-known-good projection installed.
+        let install_result = if let Some(bus) = &self.bus {
+            bus.replace_policy(policy, state.clone())
+                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)
+        } else {
+            self.authorizer
+                .replace_policy(policy, &state)
+                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)
+        };
+        if let Err(error) = install_result {
+            return Err(error);
+        }
+        if let Ok(mut installed) = self.authorization_state.lock() {
+            *installed = Some(state);
+        } else {
+            self.mark_unavailable();
+            return Err(ResourceRuntimeError::AuthorizationUnavailable);
+        }
+        if let Ok(mut installed) = self.installed_controller_subjects.lock() {
+            *installed = controller_subjects;
+        } else {
+            self.mark_unavailable();
+            return Err(ResourceRuntimeError::AuthorizationUnavailable);
+        }
+        if let Ok(mut loaded) = self.policy_loaded.lock() {
+            *loaded = true;
+        } else {
+            self.mark_unavailable();
+            return Err(ResourceRuntimeError::AuthorizationUnavailable);
+        }
+        Ok(())
+    }
+
+    fn mark_unavailable(&self) {
+        if let Some(bus) = &self.bus {
+            bus.mark_policy_unavailable();
+        } else {
+            self.authorizer.mark_policy_unavailable();
+        }
+        if let Ok(mut installed) = self.authorization_state.lock() {
+            *installed = None;
+        }
+        if let Ok(mut subjects) = self.installed_controller_subjects.lock() {
+            subjects.clear();
+        }
+        if let Ok(mut loaded) = self.policy_loaded.lock() {
+            *loaded = false;
+        }
+    }
+}
 
 /// Authenticated daemon-side Resource API adapter for the Cloud Hypervisor
 /// controller. The adapter owns no store or broker capability in the
 /// controller crate; those remain behind this d2bd composition seam.
 struct CloudHypervisorResourceSession {
     client: Arc<CloudHypervisorResourceClient>,
-    mutation_client: Arc<CloudHypervisorResourceClient>,
+    assigned_mutation_api: Arc<RedbRegisteredControllerApi>,
     providers: Arc<crate::process_provider_runtime::ProductionProcessProviders>,
     guest_sessions: Arc<
         tokio::sync::Mutex<
@@ -718,6 +9256,8 @@ struct CloudHypervisorResourceSession {
     controller_generation: ControllerGeneration,
     session_target: Option<crate::CommittedGuestSessionTarget>,
     session_evidence: Option<GuestSessionEvidence>,
+    suppress_finalizer_clear: bool,
+    finalizer_clear_requested: Arc<AtomicBool>,
 }
 
 pub(crate) struct CatalogDescriptorVerifier {
@@ -740,6 +9280,7 @@ fn guest_session_evidence(
     session: &d2bd_runtime::guest_component_session::GuestComponentSessionClient,
     descriptor: &VerifiedGuestSetupDescriptor,
     target: &crate::CommittedGuestSessionTarget,
+    vmm_ready: bool,
 ) -> Option<GuestSessionEvidence> {
     let identity = session.identity();
     if identity.zone() != target.zone()
@@ -775,7 +9316,7 @@ fn guest_session_evidence(
         guest_ref.clone(),
         format!("sha256:{boot_digest}"),
         ["resource-commit".to_owned(), "resource-watch".to_owned()],
-        true,
+        vmm_ready,
         true,
         true,
         binding,
@@ -786,6 +9327,20 @@ fn guest_session_evidence(
 impl std::fmt::Debug for CloudHypervisorResourceSession {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("CloudHypervisorResourceSession(<redacted>)")
+    }
+}
+
+fn cloud_hypervisor_assigned_mutation_error(
+    error: SourceError,
+) -> CloudHypervisorResourceApiError {
+    match error {
+        SourceError::Conflict(_) | SourceError::Integrity => {
+            CloudHypervisorResourceApiError::Conflict
+        }
+        SourceError::Unavailable
+        | SourceError::Backpressure
+        | SourceError::Cancelled
+        | SourceError::Timeout => CloudHypervisorResourceApiError::Transport,
     }
 }
 
@@ -1309,57 +9864,52 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 Ok(CloudHypervisorResourceResponse::Dependencies(dependencies))
             }
             CloudHypervisorResourceRequest::CommitBatch { batch } => {
-                let mut request = wire::CommitBatchRequest::new();
-                request.meta = MessageField::some(public_request_meta(&format!(
+                let owner = self
+                    .get_stored(batch.owner_ref(), "cloud-hypervisor-commit-owner")
+                    .await?;
+                if owner.uid != *batch.owner_uid() || owner.revision != batch.owner_revision() {
+                    return Err(CloudHypervisorResourceApiError::Conflict);
+                }
+                let operation_id = format!(
                     "cloud-hypervisor-commit-children-{}-{}",
                     batch.owner_uid().as_str(),
                     batch.owner_revision().get(),
-                )));
+                );
+                let mut mutations = Vec::with_capacity(batch.mutations().len());
                 for mutation in batch.mutations() {
                     let canonical = batch
                         .canonical_payload(mutation.target())
                         .map_err(|_| CloudHypervisorResourceApiError::InvalidResponse)?;
-                    let mut wire_mutation = wire::Mutation::new();
-                    wire_mutation.kind =
-                        EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_CREATE);
-                    wire_mutation.target = MessageField::some(ch_identity(
-                        batch.zone(),
-                        mutation.target(),
-                        None,
-                        None,
-                        None,
-                    ));
-                    wire_mutation.precondition = MessageField::some(ch_create_precondition());
-                    wire_mutation.resource = MessageField::some(ch_resource_body(
-                        batch.zone(),
-                        mutation.target(),
-                        None,
-                        &canonical,
-                    )?);
-                    wire_mutation.owner = MessageField::some(ch_identity(
-                        batch.zone(),
-                        batch.owner_ref(),
-                        Some(batch.owner_uid()),
-                        None,
-                        Some(batch.owner_revision().get()),
-                    ));
-                    request.mutations.push(wire_mutation);
+                    mutations.push(StoreMutation {
+                        kind: ResourceMutationKind::Create,
+                        zone: batch.zone().clone(),
+                        target: mutation.target().clone(),
+                        expected: ExpectedRevision::CreateAbsent,
+                        expected_uid: None,
+                        owner: Some(batch.owner_ref().clone()),
+                        canonical_resource: Some(canonical),
+                        add_finalizers: Vec::new(),
+                        remove_finalizers: Vec::new(),
+                        wait_for_reconcile: false,
+                        reconcile_deadline_ms: None,
+                        configuration_generation: None,
+                        assignment: None,
+                    });
                 }
-                let response = self.mutation_client.commit_batch(request).await;
-                if response.error.is_some() {
-                    return Err(CloudHypervisorResourceApiError::Conflict);
-                }
-                let mut committed = Vec::new();
-                for resource in &response.resources {
-                    let stored = stored_resource_from_wire(resource)
-                        .ok_or(CloudHypervisorResourceApiError::InvalidResponse)?;
+                let stored = self
+                    .assigned_mutation_api
+                    .commit_assigned_child_mutations(&owner, mutations, &operation_id)
+                    .await
+                    .map_err(cloud_hypervisor_assigned_mutation_error)?;
+                let mut committed = Vec::with_capacity(stored.len());
+                for resource in stored {
                     committed.push(
                         d2b_provider_runtime_cloud_hypervisor::CommittedChild::new(
-                            stored.resource_ref,
+                            resource.resource_ref,
                             batch.owner_ref().clone(),
-                            stored.zone,
-                            stored.uid,
-                            stored.revision,
+                            resource.zone,
+                            resource.uid,
+                            resource.revision,
                         )
                         .map_err(|_| CloudHypervisorResourceApiError::InvalidResponse)?,
                     );
@@ -1386,7 +9936,6 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 )?;
                 let payload = replace_public_field(&current_value, "spec", merged_spec)
                     .map_err(|_| CloudHypervisorResourceApiError::InvalidResponse)?;
-                let mut request = wire::UpdateSpecRequest::new();
                 let mut operation_payload = format!(
                     "{}:{}:",
                     update.expected_uid().as_str(),
@@ -1399,39 +9948,53 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                         d2b_contracts_resource::v3::resource_schema::RESOURCE_ENVELOPE_DOMAIN_TAG,
                         &operation_payload,
                     );
-                request.meta = MessageField::some(public_request_meta(&format!(
+                let operation_id = format!(
                     "ch-update-child-{}",
-                    payload_operation_digest.trim_start_matches("sha256:"),
-                )));
-                let identity = ch_identity(
-                    &current.zone,
-                    update.target(),
-                    Some(update.expected_uid()),
-                    Some(current.generation.get()),
-                    Some(update.expected_revision().get()),
+                    payload_operation_digest.trim_start_matches("sha256:")
                 );
-                let mut mutation = wire::Mutation::new();
-                mutation.kind = EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_SPEC);
-                mutation.target = MessageField::some(identity);
-                mutation.precondition = MessageField::some(ch_exact_precondition(
-                    update.expected_uid(),
-                    update.expected_revision(),
-                ));
-                mutation.resource = MessageField::some(ch_resource_body(
-                    &current.zone,
-                    update.target(),
-                    Some(update.expected_uid()),
-                    &payload,
-                )?);
-                request.mutation = MessageField::some(mutation);
-                let response = self.mutation_client.update_spec(request).await;
-                if response.error.is_some() {
+                let envelope = ResourceEnvelope::from_json(&current.canonical_json)
+                    .map_err(|_| CloudHypervisorResourceApiError::InvalidResponse)?;
+                let owner_ref = envelope
+                    .metadata()
+                    .owner_ref()
+                    .cloned()
+                    .ok_or(CloudHypervisorResourceApiError::Conflict)?;
+                if owner_ref.resource_type().as_str() != "Guest"
+                    || current.owner_uid.is_none()
+                {
                     return Err(CloudHypervisorResourceApiError::Conflict);
                 }
-                let stored = response
-                    .resource
-                    .as_ref()
-                    .and_then(stored_resource_from_wire)
+                let owner = self
+                    .get_stored(&owner_ref, "cloud-hypervisor-update-child-owner")
+                    .await?;
+                if current.owner_uid.as_ref() != Some(&owner.uid) {
+                    return Err(CloudHypervisorResourceApiError::Conflict);
+                }
+                let stored = self
+                    .assigned_mutation_api
+                    .commit_assigned_child_mutations(
+                        &owner,
+                        vec![StoreMutation {
+                            kind: ResourceMutationKind::UpdateSpec,
+                            zone: current.zone.clone(),
+                            target: update.target().clone(),
+                            expected: ExpectedRevision::Exact(update.expected_revision()),
+                            expected_uid: Some(update.expected_uid().clone()),
+                            owner: Some(owner_ref),
+                            canonical_resource: Some(payload),
+                            add_finalizers: Vec::new(),
+                            remove_finalizers: Vec::new(),
+                            wait_for_reconcile: false,
+                            reconcile_deadline_ms: None,
+                            configuration_generation: None,
+                            assignment: None,
+                        }],
+                        &operation_id,
+                    )
+                    .await
+                    .map_err(cloud_hypervisor_assigned_mutation_error)?
+                    .into_iter()
+                    .next()
                     .ok_or(CloudHypervisorResourceApiError::InvalidResponse)?;
                 Ok(CloudHypervisorResourceResponse::Updated(
                     d2b_provider_runtime_cloud_hypervisor::CommittedChild::new(
@@ -1512,7 +10075,6 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 let payload = CanonicalJsonValue::parse(&payload_bytes)
                     .map_err(|_| CloudHypervisorResourceApiError::InvalidResponse)?
                     .to_canonical_bytes();
-                let mut request = wire::UpdateStatusRequest::new();
                 let mut operation_payload =
                     format!("{}:{}:", current.uid.as_str(), current.revision.get()).into_bytes();
                 operation_payload.extend_from_slice(&payload);
@@ -1521,42 +10083,14 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                         d2b_contracts_resource::v3::resource_schema::RESOURCE_ENVELOPE_DOMAIN_TAG,
                         &operation_payload,
                     );
-                request.meta = MessageField::some(public_request_meta(&format!(
+                let operation_id = format!(
                     "ch-update-status-{}",
-                    payload_operation_digest.trim_start_matches("sha256:"),
-                )));
-                let mut mutation = wire::Mutation::new();
-                mutation.kind = EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_STATUS);
-                mutation.target = MessageField::some(ch_identity(
-                    &current.zone,
-                    &current.resource_ref,
-                    Some(&current.uid),
-                    Some(current.generation.get()),
-                    Some(current.revision.get()),
-                ));
-                mutation.precondition =
-                    MessageField::some(ch_exact_precondition(&current.uid, current.revision));
-                mutation.resource = MessageField::some(
-                    ch_resource_body(
-                        &current.zone,
-                        &current.resource_ref,
-                        Some(&current.uid),
-                        &payload,
-                    )
-                    .inspect_err(|_| {
-                        tracing::warn!("Cloud Hypervisor status update failed: resource-body");
-                    })?,
+                    payload_operation_digest.trim_start_matches("sha256:")
                 );
-                request.mutation = MessageField::some(mutation);
-                let response = self.mutation_client.update_status(request).await;
-                if let Some(error) = response.error.as_ref() {
-                    tracing::warn!(
-                        error_kind = ?error.kind,
-                        reason = %error.reason,
-                        "Cloud Hypervisor status update was rejected",
-                    );
-                    return Err(CloudHypervisorResourceApiError::Conflict);
-                }
+                self.assigned_mutation_api
+                    .persist_assigned_status(&current, payload, &operation_id)
+                    .await
+                    .map_err(cloud_hypervisor_assigned_mutation_error)?;
                 Ok(CloudHypervisorResourceResponse::StatusUpdated)
             }
             CloudHypervisorResourceRequest::ObserveProcessAdoption {
@@ -1870,12 +10404,13 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 guest_uid,
                 child,
             } => {
-                self.guest_for_fenced_operation(
-                    &guest_ref,
-                    &guest_uid,
-                    "cloud-hypervisor-delete-child",
-                )
-                .await?;
+                let owner = self
+                    .guest_for_fenced_operation(
+                        &guest_ref,
+                        &guest_uid,
+                        "cloud-hypervisor-delete-child",
+                    )
+                    .await?;
                 let current = self
                     .get_stored(child.target(), "cloud-hypervisor-delete-child-fence")
                     .await?;
@@ -1887,34 +10422,33 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 if envelope.metadata().owner_ref() != Some(&guest_ref) {
                     return Err(CloudHypervisorResourceApiError::Conflict);
                 }
-                let mut request = wire::DeleteRequest::new();
-                request.meta = MessageField::some(public_request_meta(&format!(
+                let operation_id = format!(
                     "cloud-hypervisor-delete-child-{}-{}",
                     child.uid().as_str(),
                     child.revision().get(),
-                )));
-                let mut mutation = wire::Mutation::new();
-                mutation.kind = EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_DELETE);
-                mutation.target = MessageField::some(ch_identity(
-                    &self.zone,
-                    child.target(),
-                    Some(child.uid()),
-                    None,
-                    Some(child.revision().get()),
-                ));
-                mutation.precondition =
-                    MessageField::some(ch_exact_precondition(child.uid(), child.revision()));
-                request.mutation = MessageField::some(mutation);
-                let response = self.mutation_client.delete(request).await;
-                if let Some(error) = response.error.as_ref() {
-                    tracing::warn!(
-                        error_kind = ?error.kind,
-                        reason = %error.reason,
-                        child_revision = child.revision().get(),
-                        "Cloud Hypervisor child deletion was rejected",
-                    );
-                    return Err(CloudHypervisorResourceApiError::Conflict);
-                }
+                );
+                self.assigned_mutation_api
+                    .commit_assigned_child_mutations(
+                        &owner,
+                        vec![StoreMutation {
+                            kind: ResourceMutationKind::Delete,
+                            zone: current.zone.clone(),
+                            target: child.target().clone(),
+                            expected: ExpectedRevision::Exact(child.revision()),
+                            expected_uid: Some(child.uid().clone()),
+                            owner: Some(guest_ref),
+                            canonical_resource: None,
+                            add_finalizers: Vec::new(),
+                            remove_finalizers: Vec::new(),
+                            wait_for_reconcile: false,
+                            reconcile_deadline_ms: None,
+                            configuration_generation: None,
+                            assignment: None,
+                        }],
+                        &operation_id,
+                    )
+                    .await
+                    .map_err(cloud_hypervisor_assigned_mutation_error)?;
                 Ok(CloudHypervisorResourceResponse::LifecycleApplied)
             }
             CloudHypervisorResourceRequest::ClearGuestFinalizer {
@@ -1926,38 +10460,37 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 if !finalizer_present {
                     return Ok(CloudHypervisorResourceResponse::LifecycleApplied);
                 }
-                let mut request = wire::UpdateFinalizersRequest::new();
-                request.meta = MessageField::some(public_request_meta(&format!(
+                if self.suppress_finalizer_clear {
+                    self.finalizer_clear_requested.store(true, Ordering::Release);
+                    return Ok(CloudHypervisorResourceResponse::LifecycleApplied);
+                }
+                let current = self
+                    .guest_for_fenced_operation(
+                        &guest_ref,
+                        &guest_uid,
+                        "cloud-hypervisor-clear-finalizer",
+                    )
+                    .await?;
+                if current.revision != guest_revision {
+                    return Err(CloudHypervisorResourceApiError::Conflict);
+                }
+                let operation_id = format!(
                     "cloud-hypervisor-clear-finalizer-{}-{}",
                     guest_uid.as_str(),
                     guest_revision.get(),
-                )));
-                let mut mutation = wire::Mutation::new();
-                mutation.kind =
-                    EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_FINALIZERS);
-                mutation.target = MessageField::some(ch_identity(
-                    &self.zone,
-                    &guest_ref,
-                    Some(&guest_uid),
-                    None,
-                    Some(guest_revision.get()),
-                ));
-                mutation.precondition =
-                    MessageField::some(ch_exact_precondition(&guest_uid, guest_revision));
-                mutation.remove_finalizers.push(
-                    d2b_provider_runtime_cloud_hypervisor::GUEST_CONTROLLER_FINALIZER.to_owned(),
                 );
-                request.mutation = MessageField::some(mutation);
-                let response = self.mutation_client.update_finalizers(request).await;
-                if let Some(error) = response.error.as_ref() {
-                    tracing::warn!(
-                        error_kind = ?error.kind,
-                        reason = %error.reason,
-                        guest_revision = guest_revision.get(),
-                        "Cloud Hypervisor Guest finalizer removal was rejected",
-                    );
-                    return Err(CloudHypervisorResourceApiError::Conflict);
-                }
+                self.assigned_mutation_api
+                    .persist_assigned_finalizers(
+                        &current,
+                        Vec::new(),
+                        vec![
+                            d2b_provider_runtime_cloud_hypervisor::GUEST_CONTROLLER_FINALIZER
+                                .to_owned(),
+                        ],
+                        &operation_id,
+                    )
+                    .await
+                    .map_err(cloud_hypervisor_assigned_mutation_error)?;
                 Ok(CloudHypervisorResourceResponse::LifecycleApplied)
             }
             CloudHypervisorResourceRequest::EnsureGuestFinalizer {
@@ -1965,32 +10498,41 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 guest_uid,
                 guest_revision,
             } => {
-                let mut request = wire::UpdateFinalizersRequest::new();
-                request.meta = MessageField::some(public_request_meta(&format!(
+                let current = self
+                    .guest_for_fenced_operation(
+                        &guest_ref,
+                        &guest_uid,
+                        "cloud-hypervisor-ensure-finalizer",
+                    )
+                    .await?;
+                if current.revision != guest_revision {
+                    return Err(CloudHypervisorResourceApiError::Conflict);
+                }
+                let envelope = ResourceEnvelope::from_json(&current.canonical_json)
+                    .map_err(|_| CloudHypervisorResourceApiError::InvalidResponse)?;
+                if envelope.metadata().finalizers().iter().any(|finalizer| {
+                    finalizer.as_str()
+                        == d2b_provider_runtime_cloud_hypervisor::GUEST_CONTROLLER_FINALIZER
+                }) {
+                    return Ok(CloudHypervisorResourceResponse::LifecycleApplied);
+                }
+                let operation_id = format!(
                     "cloud-hypervisor-ensure-finalizer-{}-{}",
                     guest_uid.as_str(),
                     guest_revision.get(),
-                )));
-                let mut mutation = wire::Mutation::new();
-                mutation.kind =
-                    EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_FINALIZERS);
-                mutation.target = MessageField::some(ch_identity(
-                    &self.zone,
-                    &guest_ref,
-                    Some(&guest_uid),
-                    None,
-                    Some(guest_revision.get()),
-                ));
-                mutation.precondition =
-                    MessageField::some(ch_exact_precondition(&guest_uid, guest_revision));
-                mutation.add_finalizers.push(
-                    d2b_provider_runtime_cloud_hypervisor::GUEST_CONTROLLER_FINALIZER.to_owned(),
                 );
-                request.mutation = MessageField::some(mutation);
-                let response = self.mutation_client.update_finalizers(request).await;
-                if response.error.is_some() {
-                    return Err(CloudHypervisorResourceApiError::Conflict);
-                }
+                self.assigned_mutation_api
+                    .persist_assigned_finalizers(
+                        &current,
+                        vec![
+                            d2b_provider_runtime_cloud_hypervisor::GUEST_CONTROLLER_FINALIZER
+                                .to_owned(),
+                        ],
+                        Vec::new(),
+                        &operation_id,
+                    )
+                    .await
+                    .map_err(cloud_hypervisor_assigned_mutation_error)?;
                 Ok(CloudHypervisorResourceResponse::LifecycleApplied)
             }
         }
@@ -2012,12 +10554,6 @@ fn ch_identity(
     identity.generation = generation;
     identity.revision = revision;
     identity
-}
-
-fn ch_create_precondition() -> wire::Precondition {
-    let mut precondition = wire::Precondition::new();
-    precondition.kind = EnumOrUnknown::new(wire::PreconditionKind::PRECONDITION_KIND_CREATE_ABSENT);
-    precondition
 }
 
 fn ch_exact_precondition(uid: &ResourceUid, revision: ZoneRevision) -> wire::Precondition {
@@ -2087,47 +10623,79 @@ pub struct ZoneResourceRuntime {
     api: Arc<ResourceService<RedbBackend>>,
     authorizer: Arc<NativeAuthorizer>,
     authorization_state: Arc<Mutex<Option<AuthorizationState>>>,
-    policy_refresh: Mutex<()>,
+    policy_projection: Arc<PolicyProjection>,
     bundle_resource_types: Vec<ResourceTypeName>,
     policy_subject_fingerprints:
         Mutex<BTreeMap<(ResourceRef, ResourceRef), PolicySubjectFingerprint>>,
-    policy_loaded: Mutex<bool>,
-    bus: Option<ZoneBus>,
+    bus: Option<Arc<ZoneBus>>,
     registrar: Arc<Mutex<Option<ZoneRegistrar>>>,
     ingress: Mutex<Option<BusIngress>>,
     service_task: Mutex<Option<tokio::task::JoinHandle<Result<(), SessionServerError>>>>,
     process_status_client:
-        Mutex<Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>>>,
+        Arc<Mutex<Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>>>>,
+    core_controller_subject: Mutex<Option<AuthenticatedSubjectContext>>,
+    system_core_rebind_pending: AtomicBool,
+    core_runner_tasks: Mutex<Vec<CoreRunnerTask>>,
+    core_runner_required_identities: Mutex<BTreeSet<CoreRunnerIdentity>>,
+    core_runner_lock: Arc<tokio::sync::Mutex<()>>,
+    u12_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    u12_runner_lock: Arc<tokio::sync::Mutex<()>>,
+    u12_state: Mutex<Option<Arc<crate::ServerState>>>,
+    u12_required: AtomicBool,
+    u7_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    u7_runner_lock: Arc<tokio::sync::Mutex<()>>,
+    u7_state: Mutex<Option<Arc<crate::ServerState>>>,
+    u7_required: AtomicBool,
+    u6_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    u6_runner_lock: Arc<tokio::sync::Mutex<()>>,
+    u6_state: Mutex<Option<Arc<crate::ServerState>>>,
+    u6_required: AtomicBool,
+    u9_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    u9_runner_lock: Arc<tokio::sync::Mutex<()>>,
+    u9_state: Mutex<Option<Arc<crate::ServerState>>>,
+    u9_required: AtomicBool,
+    u10_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    u10_runner_lock: Arc<tokio::sync::Mutex<()>>,
+    u10_required: AtomicBool,
+    credential_sessions: CredentialSessionRegistry,
+    process_controller_required: AtomicBool,
+    process_runner_failure: Arc<Mutex<Option<ControllerRunnerFailure>>>,
+    u9_runner_failures: Arc<Mutex<Vec<ControllerRunnerFailure>>>,
+    #[cfg(test)]
+    core_runner_events: Arc<Mutex<Vec<&'static str>>>,
     core: Mutex<CoreProcess>,
     readiness: ZoneRuntimeReadiness,
     policy_installed: bool,
     controller_endpoint_registered: bool,
     watch_admitted: bool,
     assignments: AssignmentRegistry,
+    core_assignment_epoch: Arc<AtomicU64>,
     authority_index: Arc<tokio::sync::Mutex<HostGlobalAuthorityIndex>>,
     authority_persistence: Arc<RedbAuthorityPersistence>,
     authority_recovery: Arc<AuthorityRecoveryCoordinator>,
-    device_tpm_controller: crate::tpm_effect_port::DeviceTpmControllerRegistration,
     zone_status: Mutex<ZoneStatusResource>,
     audio_runtime: Arc<Mutex<Option<AudioResourceRuntime>>>,
-    audio_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    semantic_binding_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    process_runtime: Arc<Mutex<Option<ProcessResourceRuntime>>>,
-    process_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    process_runner_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    process_runner_generation: Mutex<Option<ControllerGeneration>>,
     guest_setup_descriptors: BTreeMap<String, Vec<u8>>,
     guest_setup_descriptor_catalog_keys: BTreeMap<String, String>,
     closed_guest_sessions: Arc<tokio::sync::Mutex<BTreeSet<crate::GuestComponentSessionKey>>>,
     controller_deployment: ProviderDeployment,
+    controller_session_providers:
+        Mutex<Option<Arc<crate::process_provider_runtime::ProductionProcessProviders>>>,
     controller_sessions: Arc<Mutex<BTreeMap<ResourceRef, ControllerSession>>>,
     controller_session_reconcile_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    controller_session_reconcile_wake: Arc<tokio::sync::Notify>,
+    controller_session_reconcile_shutdown: Arc<AtomicBool>,
+    controller_session_coordinator:
+        Arc<Mutex<Option<Arc<ControllerSessionCoordinator>>>>,
     controller_session_lock: Arc<tokio::sync::Mutex<()>>,
     controller_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
     cloud_hypervisor_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
-    activation_runtime: Arc<Mutex<Option<ActivationResourceRuntime>>>,
-    activation_watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    shared_provider_effects: Arc<dyn SharedProviderEffectExecutor>,
     interaction_provider_configuration: Option<CommittedInteractionProviderConfiguration>,
     interaction_identity: Option<CommittedInteractionIdentity>,
-    interaction_provider_configuration_refused: bool,
+    interaction_state: InteractionState,
 }
 
 /// Store-derived admission evidence for one security-key Device effect.
@@ -2135,6 +10703,8 @@ pub struct ZoneResourceRuntime {
 /// This contains only the exact values validated against the authoritative
 /// resource record. It is consumed by the Device effect adapter before it can
 /// request a broker-opened descriptor.
+#[allow(dead_code)]
+#[allow(dead_code)]
 pub(crate) struct SecurityKeyDeviceAdmission {
     pub(crate) zone_ref: ResourceRef,
     pub(crate) device_uid: ResourceUid,
@@ -2143,6 +10713,8 @@ pub(crate) struct SecurityKeyDeviceAdmission {
 }
 
 /// Request fields that select the Device admission record to validate.
+#[allow(dead_code)]
+#[allow(dead_code)]
 pub(crate) struct SecurityKeyDeviceAdmissionRequest<'a> {
     pub(crate) device_uid: &'a ResourceUid,
     pub(crate) device_ref: &'a ResourceRef,
@@ -2167,6 +10739,15 @@ impl core::fmt::Debug for ZoneResourceRuntime {
 }
 
 impl ZoneResourceRuntime {
+    /// Install the daemon-owned typed effect executor used by U8 Provider
+    /// runners. The binding is replaced only during trusted composition.
+    pub(crate) fn set_shared_provider_effects(
+        &mut self,
+        effects: Arc<dyn SharedProviderEffectExecutor>,
+    ) {
+        self.shared_provider_effects = effects;
+    }
+
     /// Open one Zone from a broker-owned descriptor.
     pub async fn open(zone: ZoneId, opened: OpenedZoneStore) -> Result<Self, ResourceRuntimeError> {
         Self::open_internal(
@@ -2398,6 +10979,7 @@ impl ZoneResourceRuntime {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let bundle_resource_types = trusted_catalog_resource_types(bundle_resource_types)?;
         let authorizer = Arc::new(runtime_authorizer(&bundle_resource_types)?);
         let assignments = new_assignment_registry();
         let acceptor = authorizer
@@ -2488,9 +11070,12 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::AuthorityUnavailable)?,
         );
         let authority_index = authority_recovery.index();
-        let store_metadata = store
-            .runtime_metadata()
-            .await
+        let store_metadata = retry_transient_store_read(
+            &zone,
+            "runtime-open-metadata",
+            || store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         if let Some(authority) = authority_identity.as_ref() {
             if store_metadata.zone_uid != *authority.zone_uid()
@@ -2544,7 +11129,7 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?,
         );
         let mut interaction_provider_configuration = None;
-        let mut interaction_provider_configuration_refused = false;
+        let mut interaction_provider_configuration_refused;
         let mut interaction_identity = None;
 
         let mut core = CoreProcess::new();
@@ -2553,7 +11138,10 @@ impl ZoneResourceRuntime {
         let mut ingress = None;
         let mut service_task = None;
         let mut process_status_client = None;
+        let mut core_controller_subject = None;
         let defer_activation = authority_identity.is_some();
+        let mut final_store_metadata = store_metadata.clone();
+        let mut interaction_state = InteractionState::Absent;
         let (
             resource_api_ready,
             local_session_ready,
@@ -2620,17 +11208,19 @@ impl ZoneResourceRuntime {
                         tracing::error!(zone = %zone.as_str(), error = ?error, "resource runtime Zone bus setup failed");
                         ResourceRuntimeError::AuthenticationUnavailable
                     })?;
-            let (zone_ingress, zone_service_task, status_client) = register_system_core_session(
-                &mut zone_registrar,
-                Arc::clone(&api),
-                Arc::clone(&authorizer),
-                state.clone(),
-            )
-            .await
-            .inspect_err(|error| {
-                tracing::error!(zone = %zone.as_str(), error = ?error, "resource runtime system-core session registration failed");
-            })?;
+            let (zone_ingress, zone_service_task, status_client, subject_context) =
+                register_system_core_session(
+                    &mut zone_registrar,
+                    Arc::clone(&api),
+                    Arc::clone(&authorizer),
+                    state.clone(),
+                )
+                .await
+                .inspect_err(|error| {
+                    tracing::error!(zone = %zone.as_str(), error = ?error, "resource runtime system-core session registration failed");
+                })?;
             process_status_client = Some(Arc::clone(&status_client));
+            core_controller_subject = Some(subject_context);
             if defer_activation {
                 bus = Some(zone_bus);
                 registrar = Some(zone_registrar);
@@ -2671,17 +11261,21 @@ impl ZoneResourceRuntime {
                             tracing::error!(zone = %zone.as_str(), error = ?error, "resource runtime Zone bundle materialization failed");
                         })?;
                 }
-                let store_metadata = store
-                    .runtime_metadata()
-                    .await
+                let current_store_metadata = retry_transient_store_read(
+                    &zone,
+                    "runtime-open-metadata-after-materialization",
+                    || store.runtime_metadata(),
+                )
+                .await
                     .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+                final_store_metadata = current_store_metadata.clone();
                 (
                     interaction_provider_configuration,
                     interaction_provider_configuration_refused,
                 ) = match load_interaction_provider_configuration(
                     &zone,
                     &store,
-                    store_metadata.current_revision,
+                    current_store_metadata.current_revision,
                 )
                 .await
                 {
@@ -2708,7 +11302,7 @@ impl ZoneResourceRuntime {
                 interaction_identity = match load_committed_interaction_identity(
                     &zone,
                     &store,
-                    store_metadata.current_revision,
+                    current_store_metadata.current_revision,
                     interaction_provider_configuration.as_ref(),
                 )
                 .await
@@ -2724,18 +11318,29 @@ impl ZoneResourceRuntime {
                         None
                     }
                 };
-                let system_core =
-                reconcile_system_core_resources(&zone, &store, Arc::clone(&status_client))
+                let interaction_present =
+                    interaction_resources_present(&zone, &store).await?;
+                interaction_state = derive_interaction_state(
+                    interaction_present,
+                    interaction_provider_configuration.as_ref(),
+                    interaction_identity.as_ref(),
+                    interaction_provider_configuration_refused,
+                );
+                let system_core = system_core_startup_result(&zone, &store)
                     .await
                     .inspect_err(|error| {
-                        tracing::error!(zone = %zone.as_str(), error = ?error, "resource runtime system-core reconciliation failed");
+                        tracing::error!(
+                            zone = %zone.as_str(),
+                            error = ?error,
+                            "resource runtime system-core startup summary failed"
+                        );
                     })?;
                 tracing::warn!(
                     zone = %zone.as_str(),
                     host_phase = ?system_core.host_phase,
                     user_phase = ?system_core.user_phase,
                     total_resources = system_core.total_resource_count,
-                    "system-core bootstrap reconciliation completed",
+                    "system-core shared runner startup summary completed",
                 );
                 let aggregate_handler_phase = if system_core.host_phase == HandlerPhase::Ready
                     && system_core.user_phase == HandlerPhase::Ready
@@ -2764,8 +11369,8 @@ impl ZoneResourceRuntime {
                     },
                     RecoverySnapshot {
                         startup_epoch: 0,
-                        checkpoint_revision: store_metadata.current_revision.get(),
-                        active_configuration_revision: store_metadata
+                        checkpoint_revision: current_store_metadata.current_revision.get(),
+                        active_configuration_revision: current_store_metadata
                             .policy_snapshot
                             .active_configuration_revision
                             .get(),
@@ -2784,7 +11389,7 @@ impl ZoneResourceRuntime {
                     d2bd_runtime::resource_runtime_support::mark_core_handlers(
                     &mut core,
                     aggregate_handler_phase,
-                    store_metadata.current_revision.get(),
+                    current_store_metadata.current_revision.get(),
                 )
                 .inspect_err(|error| {
                     tracing::error!(zone = %zone.as_str(), error = ?error, "resource runtime handler marking failed");
@@ -2814,7 +11419,7 @@ impl ZoneResourceRuntime {
                                     handler_phase_to_zone_phase(system_core.user_phase),
                                 )
                                 .with_runtime_metadata(zone_runtime_metadata(
-                                    &store_metadata,
+                                    &current_store_metadata,
                                     system_core.total_resource_count,
                                     system_core.generation_cleanup_pending,
                                     system_core.cleanup_pending_count,
@@ -2826,11 +11431,23 @@ impl ZoneResourceRuntime {
                 )
             }
         };
-        let store_metadata = store
-            .runtime_metadata()
-            .await
-            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        Ok(Self {
+        let store_metadata = final_store_metadata;
+        let defer_core_start = authority_identity.is_some();
+        let bus = bus.map(Arc::new);
+        let authorization_state = Arc::new(Mutex::new(authorization_state));
+        let policy_loaded = authorization_state
+            .lock()
+            .ok()
+            .is_some_and(|state| state.is_some());
+        let policy_projection = Arc::new(PolicyProjection {
+            authorizer: Arc::clone(&authorizer),
+            bus: bus.clone(),
+            authorization_state: Arc::clone(&authorization_state),
+            policy_refresh: Arc::new(Mutex::new(())),
+            policy_loaded: Arc::new(Mutex::new(policy_loaded)),
+            installed_controller_subjects: Arc::new(Mutex::new(BTreeSet::new())),
+        });
+        let runtime = Self {
             zone,
             authority_identity,
             bootstrap_provisioned_store: bootstrap_provisioned_store
@@ -2841,16 +11458,45 @@ impl ZoneResourceRuntime {
             backend,
             api,
             authorizer,
-            authorization_state: Arc::new(Mutex::new(authorization_state)),
-            policy_refresh: Mutex::new(()),
+            authorization_state,
+            policy_projection,
             bundle_resource_types,
             policy_subject_fingerprints: Mutex::new(BTreeMap::new()),
-            policy_loaded: Mutex::new(false),
             bus,
             registrar: Arc::new(Mutex::new(registrar)),
             ingress: Mutex::new(ingress),
             service_task: Mutex::new(service_task),
-            process_status_client: Mutex::new(process_status_client),
+            process_status_client: Arc::new(Mutex::new(process_status_client)),
+            core_controller_subject: Mutex::new(core_controller_subject),
+            system_core_rebind_pending: AtomicBool::new(false),
+            core_runner_tasks: Mutex::new(Vec::new()),
+            core_runner_required_identities: Mutex::new(BTreeSet::new()),
+            core_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
+            u12_runner_tasks: Mutex::new(Vec::new()),
+            u12_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
+            u12_state: Mutex::new(None),
+            u12_required: AtomicBool::new(false),
+            u7_runner_tasks: Mutex::new(Vec::new()),
+            u7_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
+            u7_state: Mutex::new(None),
+            u7_required: AtomicBool::new(false),
+            u6_runner_tasks: Mutex::new(Vec::new()),
+            u6_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
+            u6_state: Mutex::new(None),
+            u6_required: AtomicBool::new(false),
+            u9_runner_tasks: Mutex::new(Vec::new()),
+            u9_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
+            u9_state: Mutex::new(None),
+            u9_required: AtomicBool::new(false),
+            u10_runner_tasks: Mutex::new(Vec::new()),
+            u10_runner_lock: Arc::new(tokio::sync::Mutex::new(())),
+            u10_required: AtomicBool::new(false),
+            credential_sessions: CredentialSessionRegistry::default(),
+            process_controller_required: AtomicBool::new(false),
+            process_runner_failure: Arc::new(Mutex::new(None)),
+            u9_runner_failures: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            core_runner_events: Arc::new(Mutex::new(Vec::new())),
             core: Mutex::new(core),
             readiness: ZoneRuntimeReadiness {
                 store_ready: true,
@@ -2864,16 +11510,14 @@ impl ZoneResourceRuntime {
             controller_endpoint_registered,
             watch_admitted,
             assignments,
+            core_assignment_epoch: Arc::new(AtomicU64::new(0)),
             authority_index,
             authority_persistence,
             authority_recovery,
-            device_tpm_controller: crate::tpm_effect_port::register_device_tpm_controller(),
             zone_status: Mutex::new(zone_status),
             audio_runtime: Arc::new(Mutex::new(None)),
-            audio_watch_task: Mutex::new(None),
-            semantic_binding_watch_task: Mutex::new(None),
-            process_runtime: Arc::new(Mutex::new(None)),
-            process_watch_task: Mutex::new(None),
+            process_runner_task: Mutex::new(None),
+            process_runner_generation: Mutex::new(None),
             guest_setup_descriptors: BTreeMap::new(),
             guest_setup_descriptor_catalog_keys: BTreeMap::new(),
             closed_guest_sessions: Arc::new(tokio::sync::Mutex::new(BTreeSet::new())),
@@ -2882,17 +11526,36 @@ impl ZoneResourceRuntime {
                 d2bd_runtime::target_runtime::AdmissionLimits::host_default(),
             )
             .map_err(|_| ResourceRuntimeError::CoreStartupFailed)?,
+            controller_session_providers: Mutex::new(None),
             controller_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             controller_session_reconcile_task: Arc::new(Mutex::new(None)),
+            controller_session_reconcile_wake: Arc::new(tokio::sync::Notify::new()),
+            controller_session_reconcile_shutdown: Arc::new(AtomicBool::new(false)),
+            controller_session_coordinator: Arc::new(Mutex::new(None)),
             controller_session_lock: Arc::new(tokio::sync::Mutex::new(())),
             controller_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             cloud_hypervisor_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
-            activation_runtime: Arc::new(Mutex::new(None)),
-            activation_watch_task: Mutex::new(None),
+            shared_provider_effects: Arc::new(UnavailableSharedProviderEffects),
             interaction_provider_configuration,
             interaction_identity,
-            interaction_provider_configuration_refused,
-        })
+            interaction_state,
+        };
+        let coordinator = Arc::new(runtime.build_controller_session_coordinator()?);
+        *runtime
+            .controller_session_coordinator
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = Some(coordinator);
+        if !defer_core_start && runtime.readiness.resource_api_ready {
+            if let Err(error) = runtime.start_core_controller_runners().await {
+                #[cfg(not(test))]
+                return Err(error);
+                #[cfg(test)]
+                if error != ResourceRuntimeError::ProviderPathUnavailable {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(runtime)
     }
 
     /// Materialize the verified bundle after the complete local generation
@@ -3108,28 +11771,27 @@ impl ZoneResourceRuntime {
         Ok(())
     }
 
-    /// Finish the deferred startup path after the complete bundle is visible
-    /// in the store.  Every system-core read, status write, and readiness
-    /// transition below therefore observes the published desired resources.
+    /// Finish deferred startup after the complete bundle is visible in the
+    /// store. The shared Core runners own all Host/User observation and status
+    /// writes after this point.
     pub(crate) async fn activate_published_bundle(&mut self) -> Result<(), ResourceRuntimeError> {
         self.refresh_authorization_policy().await?;
-        let store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
-            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let status_client = self.status_client()?;
-
-        (
-            self.interaction_provider_configuration,
-            self.interaction_provider_configuration_refused,
-        ) = match load_interaction_provider_configuration(
+        let store_metadata = retry_transient_store_read(
             &self.zone,
-            &self.store,
-            store_metadata.current_revision,
+            "runtime-activate-metadata",
+            || self.store.runtime_metadata(),
         )
         .await
-        {
+            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+
+        let (interaction_provider_configuration, mut interaction_provider_configuration_refused) =
+            match load_interaction_provider_configuration(
+                &self.zone,
+                &self.store,
+                store_metadata.current_revision,
+            )
+            .await
+            {
             Ok(None) => (None, false),
             Ok(Some(configuration)) if configuration.is_complete() => (Some(configuration), false),
             Ok(Some(_)) => {
@@ -3148,6 +11810,7 @@ impl ZoneResourceRuntime {
                 (None, true)
             }
         };
+        self.interaction_provider_configuration = interaction_provider_configuration;
         self.interaction_identity = match load_committed_interaction_identity(
             &self.zone,
             &self.store,
@@ -3163,18 +11826,26 @@ impl ZoneResourceRuntime {
                     error = %error,
                     "resource runtime committed interaction identity load failed",
                 );
-                self.interaction_provider_configuration_refused = true;
+                interaction_provider_configuration_refused = true;
                 None
             }
         };
+        let interaction_present =
+            interaction_resources_present(&self.zone, &self.store).await?;
+        self.interaction_state = derive_interaction_state(
+            interaction_present,
+            self.interaction_provider_configuration.as_ref(),
+            self.interaction_identity.as_ref(),
+            interaction_provider_configuration_refused,
+        );
         let system_core =
-            reconcile_system_core_resources(&self.zone, &self.store, status_client.clone())
+            system_core_startup_result(&self.zone, &self.store)
                 .await
                 .inspect_err(|error| {
                     tracing::error!(
                         zone = %self.zone.as_str(),
                         error = ?error,
-                        "resource runtime system-core reconciliation failed",
+                        "resource runtime system-core startup summary failed",
                     );
                 })?;
         let aggregate_handler_phase = if system_core.host_phase == HandlerPhase::Ready
@@ -3184,12 +11855,15 @@ impl ZoneResourceRuntime {
         } else {
             HandlerPhase::Degraded
         };
-        let store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        self.start_core_controller_runners().await?;
+        let store_metadata = retry_transient_store_read(
+            &self.zone,
+            "runtime-activate-metadata-after-core-runners",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let stage = {
+        {
             let recovered_authority = self.authority_index.lock().await;
             let mut core = self
                 .core
@@ -3223,13 +11897,8 @@ impl ZoneResourceRuntime {
                 aggregate_handler_phase,
                 store_metadata.current_revision.get(),
             )?;
-            core.publish_readiness().map_err(map_startup_error)?
         };
-        self.store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
-            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        self.store_metadata = store_metadata;
         self.zone_status = Mutex::new(
             SystemCoreStatusEmitter::new()
                 .emit(
@@ -3248,6 +11917,13 @@ impl ZoneResourceRuntime {
                 )
                 .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
         );
+        let stage = {
+            let mut core = self
+                .core
+                .lock()
+                .map_err(|_| ResourceRuntimeError::CoreStartupFailed)?;
+            core.publish_readiness().map_err(map_startup_error)?
+        };
         self.readiness = ZoneRuntimeReadiness {
             store_ready: true,
             resource_api_ready: true,
@@ -3467,36 +12143,50 @@ impl ZoneResourceRuntime {
     }
 
     /// Refresh the native authorization projection from the current committed
-    /// Role, RoleBinding, and local subject rows before admitting public work.
+    /// Role, RoleBinding, and local subject rows before admitting mutations or
+    /// session transitions. Read-only public requests use the installed
+    /// projection directly and never call this method.
     pub(crate) async fn refresh_authorization_policy(&self) -> Result<(), ResourceRuntimeError> {
-        let _refresh = self
-            .policy_refresh
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
-        let metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        // All policy projections and controller-session transitions use this
+        // lock order: controller session, then policy install.
+        let _session_guard = self.controller_session_lock.lock().await;
+        self.refresh_authorization_policy_locked().await
+    }
+
+    async fn refresh_authorization_policy_locked(&self) -> Result<(), ResourceRuntimeError> {
+        let metadata = retry_transient_store_read(
+            &self.zone,
+            "authorization-policy-refresh-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
         let current = self
-            .authorization_state
-            .lock()
-            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?
-            .clone();
-        let policy_loaded = *self
-            .policy_loaded
-            .lock()
-            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
+            .policy_projection
+            .installed_state()
+            .ok();
+        let policy_loaded = current.is_some();
+        if metadata.policy_snapshot.policy_revision == 0 {
+            return Err(ResourceRuntimeError::PolicyUnavailable);
+        }
+        let controller_subjects = match self.current_controller_policy_subjects().await {
+            Ok(subjects) => subjects,
+            Err(error) => {
+                return Err(error);
+            }
+        };
+        let installed_controller_subjects = self
+            .policy_projection
+            .installed_controller_subjects()?;
         if policy_loaded
+            && !self.system_core_rebind_pending.load(Ordering::Acquire)
             && current.as_ref().is_some_and(|state| {
                 state.snapshot == metadata.policy_snapshot
                     && state.zone_policy_revision == metadata.current_revision
             })
+            && installed_controller_subjects == controller_subjects
         {
             return Ok(());
-        }
-        if metadata.policy_snapshot.policy_revision == 0 {
-            return Err(ResourceRuntimeError::PolicyUnavailable);
         }
         let resources = d2bd_runtime::resource_runtime_support::load_committed_policy_resources(
             &self.store,
@@ -3507,10 +12197,12 @@ impl ZoneResourceRuntime {
             ),
         )
         .await?;
-        let current_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let current_metadata = retry_transient_store_read(
+            &self.zone,
+            "authorization-policy-refresh-verify",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
         if current_metadata != metadata {
             return Err(ResourceRuntimeError::PolicyUnavailable);
@@ -3521,60 +12213,238 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::IdentityUnbound)?
             .clone();
         let fingerprints = refreshed_policy_subject_fingerprints(&resources, &previous)?;
-        let (policy, state) = d2bd_runtime::resource_runtime_support::compile_committed_policy(
-            &self.zone,
-            metadata.policy_snapshot,
-            metadata.current_revision,
-            &self.bundle_resource_types,
-            &resources,
-        )?;
-        self.authorizer
-            .replace_policy(policy.clone(), &state)
-            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
-        if let Some(bus) = &self.bus {
-            bus.replace_policy(policy, state.clone())
-                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+        let (policy, state) =
+            d2bd_runtime::resource_runtime_support::compile_committed_policy_with_subjects(
+                &self.zone,
+                metadata.policy_snapshot,
+                metadata.current_revision,
+                &self.bundle_resource_types,
+                &resources,
+                controller_subjects.iter().cloned(),
+            )?;
+        let rebind_core = self
+            .system_core_rebind_pending
+            .load(Ordering::Acquire)
+            || self
+                .core_controller_subject
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .is_some();
+        if rebind_core {
+            self.system_core_rebind_pending.store(true, Ordering::Release);
         }
-        if let Err(error) = self.refresh_system_core_session(state.clone()).await {
-            self.authorizer.mark_policy_unavailable();
-            if let Some(bus) = &self.bus {
-                bus.mark_policy_unavailable();
-            }
-            if let Ok(mut installed) = self.authorization_state.lock() {
-                *installed = None;
-            }
-            if let Ok(mut loaded) = self.policy_loaded.lock() {
-                *loaded = false;
-            }
+        let _runner_guard = if rebind_core {
+            Some(self.core_runner_lock.lock().await)
+        } else {
+            None
+        };
+        let _u12_runner_guard = if rebind_core {
+            Some(self.u12_runner_lock.lock().await)
+        } else {
+            None
+        };
+        let _u7_runner_guard = if rebind_core {
+            Some(self.u7_runner_lock.lock().await)
+        } else {
+            None
+        };
+        let _u6_runner_guard = if rebind_core {
+            Some(self.u6_runner_lock.lock().await)
+        } else {
+            None
+        };
+        let _u9_runner_guard = if rebind_core {
+            Some(self.u9_runner_lock.lock().await)
+        } else {
+            None
+        };
+        let _u10_runner_guard = if rebind_core {
+            Some(self.u10_runner_lock.lock().await)
+        } else {
+            None
+        };
+        if rebind_core {
+            self.stop_core_controller_runners_locked().await?;
+            self.stop_u12_controller_runners_locked().await?;
+            self.stop_u7_controller_runners_locked().await?;
+            self.stop_u6_controller_runners_locked().await?;
+            self.stop_u9_controller_runners_locked().await?;
+            self.stop_u10_controller_runners_locked().await?;
+        }
+        self.install_policy_projection(policy, state.clone(), controller_subjects)?;
+        if let Err(error) = self.refresh_system_core_session_locked(state.clone()).await {
+            // The policy projection was installed atomically before the
+            // session rebind. Keep that complete projection available while
+            // the retryable session failure is surfaced to the caller.
+            self.system_core_rebind_pending.store(true, Ordering::Release);
             return Err(error);
         }
-        *self
-            .authorization_state
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)? = Some(state);
         *self
             .policy_subject_fingerprints
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)? = fingerprints;
-        *self
-            .policy_loaded
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)? = true;
+        if rebind_core {
+            if let Err(error) = self.start_core_controller_runners_locked(true).await {
+                #[cfg(not(test))]
+                return Err(error);
+                #[cfg(test)]
+                if error != ResourceRuntimeError::ProviderPathUnavailable {
+                    return Err(error);
+                }
+            }
+            if let Some(providers) = self
+                .controller_session_providers
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .clone()
+            {
+                self.rebuild_assigned_process_api_locked(&providers).await?;
+            }
+            let state = self
+                .u12_state
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .clone();
+            if let Some(state) = state {
+                self.start_u12_controller_runners_locked(state).await?;
+            }
+            let state = self
+                .u7_state
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .clone();
+            if let Some(state) = state {
+                self.start_u7_controller_runners_locked(state).await?;
+            }
+            let state = self
+                .u6_state
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .clone();
+            if let Some(state) = state {
+                self.start_u6_controller_runners_locked(state).await?;
+            }
+            let state = self
+                .u9_state
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .clone();
+            if let Some(state) = state {
+                self.start_u9_controller_runners_locked(state).await?;
+            }
+            self.start_u10_controller_runners_locked().await?;
+            self.system_core_rebind_pending
+                .store(false, Ordering::Release);
+        }
         Ok(())
+    }
+
+    async fn current_controller_policy_subjects(
+        &self,
+    ) -> Result<BTreeSet<BoundSubject>, ResourceRuntimeError> {
+        let providers = self
+            .controller_session_providers
+            .lock()
+            .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?
+            .clone();
+        let subjects = self
+            .current_controller_policy_subjects_from(providers.as_deref())
+            .await?;
+        if subjects.is_empty() && providers.is_none() {
+            // Before Process Providers attach, preserve the last validated
+            // external projection rather than replacing it with no subjects.
+            return self.policy_projection.installed_controller_subjects();
+        }
+        Ok(subjects)
+    }
+
+    async fn current_controller_policy_subjects_from(
+        &self,
+        providers: Option<
+            &crate::process_provider_runtime::ProductionProcessProviders,
+        >,
+    ) -> Result<BTreeSet<BoundSubject>, ResourceRuntimeError> {
+        load_controller_policy_subjects(
+            &self.zone,
+            &self.store,
+            providers,
+            &self.controller_sessions,
+        )
+        .await
+    }
+
+    fn install_policy_projection(
+        &self,
+        policy: PolicySet,
+        state: AuthorizationState,
+        controller_subjects: BTreeSet<BoundSubject>,
+    ) -> Result<(), ResourceRuntimeError> {
+        self.policy_projection
+            .install(policy, state, controller_subjects)
     }
 
     /// Re-enroll the fixed internal system-core session after a policy
     /// revision change so its old lease cannot continue past the fence.
+    #[allow(dead_code)]
     async fn refresh_system_core_session(
         &self,
         state: AuthorizationState,
     ) -> Result<(), ResourceRuntimeError> {
+        let _session_guard = self.controller_session_lock.lock().await;
+        self.refresh_system_core_session_locked(state).await
+    }
+
+    async fn refresh_system_core_session_locked(
+        &self,
+        state: AuthorizationState,
+    ) -> Result<(), ResourceRuntimeError> {
+        let existing_session = self
+            .system_core_rebind_pending
+            .load(Ordering::Acquire)
+            || self
+                .core_controller_subject
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .is_some();
+        let session_state = (
+            self.registrar
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .is_some(),
+            self.ingress
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .is_some(),
+            self.service_task
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .is_some(),
+        );
+        if session_state == (false, false, false) && !existing_session {
+            return Ok(());
+        }
+        if !existing_session && session_state != (false, false, false) {
+            return Err(ResourceRuntimeError::AuthenticationUnavailable);
+        }
+        if let Some(coordinator) = self
+            .controller_session_coordinator
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+        {
+            coordinator.clear_assigned_process_api()?;
+        }
+        *self
+            .process_status_client
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = None;
         let mut registrar = self
             .registrar
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-            .take();
-        let mut ingress = self
+            .take()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let ingress = self
             .ingress
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
@@ -3584,26 +12454,39 @@ impl ZoneResourceRuntime {
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .take();
-        if let (Some(registrar), Some(mut ingress)) = (registrar.as_mut(), ingress.as_mut()) {
-            registrar
-                .revoke_in_place(&mut ingress)
-                .await
-                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
-        }
         if let Some(task) = task {
             task.abort();
             let _ = task.await;
         }
-        let Some(mut registrar) = registrar else {
-            return Ok(());
-        };
-        let (new_ingress, new_task, status_client) = register_system_core_session(
-            &mut registrar,
-            Arc::clone(&self.api),
-            Arc::clone(&self.authorizer),
-            state,
-        )
-        .await?;
+        if let Some(mut ingress) = ingress {
+            if registrar.revoke_in_place(&mut ingress).await.is_err() {
+                *self
+                    .registrar
+                    .lock()
+                    .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
+                    Some(registrar);
+                return Err(ResourceRuntimeError::AuthenticationUnavailable);
+            }
+        }
+        let (new_ingress, new_task, status_client, subject_context) =
+            match register_system_core_session(
+                &mut registrar,
+                Arc::clone(&self.api),
+                Arc::clone(&self.authorizer),
+                state,
+            )
+            .await
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    *self
+                        .registrar
+                        .lock()
+                        .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
+                        Some(registrar);
+                    return Err(error);
+                }
+            };
         *self
             .registrar
             .lock()
@@ -3620,6 +12503,10 @@ impl ZoneResourceRuntime {
             .process_status_client
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = Some(status_client);
+        *self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = Some(subject_context);
         Ok(())
     }
 
@@ -3644,12 +12531,7 @@ impl ZoneResourceRuntime {
             &resolved_user,
             operation_id,
         )?;
-        let state = self
-            .authorization_state
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-            .clone()
-            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let state = self.policy_projection.installed_state()?;
         let subject = self
             .authorizer
             .issue_authenticated_subject(context, state)
@@ -3864,10 +12746,36 @@ impl ZoneResourceRuntime {
     pub(crate) fn process_resource_client(
         &self,
     ) -> Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>> {
+        if self.system_core_rebind_pending.load(Ordering::Acquire) {
+            return None;
+        }
         self.process_status_client
             .lock()
             .ok()
             .and_then(|client| client.clone())
+    }
+
+    /// Gate a Guest-local typed Credential session through this Zone's
+    /// authenticated ResourceService before it can read a lease.
+    #[allow(dead_code)]
+    pub(crate) fn scoped_credential_client(
+        &self,
+        session: Option<&d2bd_runtime::guest_component_session::GuestComponentSessionClient>,
+        delegate: Arc<dyn d2b_provider_transport_azure_relay::ScopedCredentialClient>,
+    ) -> Result<
+        Arc<crate::credential_resource_runtime::SameZoneScopedCredentialClient>,
+        ResourceRuntimeError,
+    > {
+        let Some(session) = session else {
+            return Err(ResourceRuntimeError::ResourceApiBindFailed);
+        };
+        crate::credential_resource_runtime::SameZoneScopedCredentialClient::with_component_session(
+            self.zone.clone(),
+            session,
+            delegate,
+        )
+        .map(Arc::new)
+        .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)
     }
 
     fn status_client(
@@ -3883,17 +12791,2136 @@ impl ZoneResourceRuntime {
             .ok_or(ResourceRuntimeError::AuthenticationUnavailable)
     }
 
-    /// Persist a provider reconcile phase through the authenticated Resource
-    /// API so restart admission can rely on durable observed generation.
-    pub(crate) async fn persist_public_reconcile_phase(
+    async fn cloud_hypervisor_assigned_mutation_api(
         &self,
-        resource_ref: &ResourceRef,
-        resource_uid: &ResourceUid,
-        operation_id: &str,
-        phase: &str,
-    ) -> Result<(), ResourceRuntimeError> {
-        self.persist_public_reconcile_status(resource_ref, resource_uid, operation_id, phase, None)
+        provider_ref: &ResourceRef,
+    ) -> Result<Arc<RedbRegisteredControllerApi>, ResourceRuntimeError> {
+        let provider = retry_transient_store_read(
+            &self.zone,
+            "cloud-hypervisor-assignment-provider",
+            || {
+                self.store.get(StoreGetRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "cloud-hypervisor-assignment-provider".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "cloud-hypervisor-assignment-provider".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: self.zone.clone(),
+                    target: provider_ref.clone(),
+                    expected_uid: None,
+                    projection: StoreProjection::MetadataOnly,
+                })
+            },
+        )
+        .await
+        .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        if provider.zone != self.zone
+            || provider.resource_ref != *provider_ref
+            || provider.generation.get() == 0
+        {
+            return Err(ResourceRuntimeError::HandlerNotReady);
+        }
+        let provider_ref_text = provider_ref.to_canonical_string();
+        let registration = U6_SHARED_PROVIDER_RUNNERS
+            .iter()
+            .copied()
+            .find(|registration| registration.provider_ref == provider_ref_text)
+            .ok_or(ResourceRuntimeError::CapabilityUnavailable)?;
+        let subject_context = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let authorization_state = self
+            .authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let controller_generation = self
+            .store_metadata
+            .policy_snapshot
+            .controller_generation
+            .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+        let session_generation = subject_context.reconnect_generation();
+        let provider_generations = BTreeMap::from([(provider_ref.clone(), provider.generation)]);
+        let descriptor = compose_shared_guest_runner_descriptors(
+            [registration],
+            self.zone.clone(),
+            controller_generation,
+            &provider_generations,
+            session_generation,
+        )?
+        .into_iter()
+        .next()
+        .map(|(_, descriptor)| descriptor)
+        .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+        let controller_ref = ResourceRef::parse(registration.controller_ref)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let (assignments, authority) = self
+            .u12_controller_assignments(
+                &descriptor,
+                controller_ref,
+                provider.generation,
+                controller_generation,
+                session_generation,
+            )
+            .await?;
+        let subject = self
+            .authorizer
+            .issue_authenticated_subject(subject_context, authorization_state.clone())
+            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+        let api = self
+            .api
+            .registered_controller_api(subject, authorization_state, assignments)
+            .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
+        let allowed_types = descriptor.resource_types().cloned().collect::<BTreeSet<_>>();
+        Ok(Arc::new(api.with_assignment_fence_resolver(
+            shared_provider_assignment_fence_resolver(
+                Arc::clone(&self.store),
+                allowed_types,
+                authority,
+            ),
+        )))
+    }
+
+    fn process_controller_api(
+        &self,
+        mode: DaemonMode,
+        authority: Arc<CoreAssignmentAuthority>,
+        authorization_state: AuthorizationState,
+    ) -> Result<RedbRegisteredControllerApi, ResourceRuntimeError> {
+        let subject_context = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let subject = self
+            .authorizer
+            .issue_authenticated_subject(subject_context, authorization_state.clone())
+            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+        Ok(self
+            .api
+            .registered_controller_api(subject, authorization_state, Vec::new())
+            .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?
+            .with_assignment_fence_resolver(process_assignment_fence_resolver(
+                Arc::clone(&self.store),
+                mode,
+                authority,
+            )))
+    }
+
+    // Callers hold controller_session_lock so the authority and API publish
+    // cannot race controller-session evidence writes.
+    async fn rebuild_assigned_process_api_locked(
+        &self,
+        providers: &crate::process_provider_runtime::ProductionProcessProviders,
+    ) -> Result<(Arc<CoreAssignmentAuthority>, AuthorizationState), ResourceRuntimeError> {
+        let core_authority = self.core_assignment_fences(false).await?.4;
+        let authorization_state = self
+            .authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let process_api = Arc::new(self.process_controller_api(
+            providers.mode(),
+            Arc::clone(&core_authority),
+            authorization_state.clone(),
+        )?);
+        self.controller_session_coordinator()
+            .set_assigned_process_api(process_api)?;
+        Ok((core_authority, authorization_state))
+    }
+
+    // Assignment-fence reads are one owner-scoped relist. The redb adapter
+    // waits asynchronously for bounded read capacity; retrying here would
+    // give every resource a fresh retry budget and serialize startup.
+    async fn durable_assignment_epoch<F, Fut>(
+        resource_refs: &[ResourceRef],
+        mut read: F,
+    ) -> Result<u64, ResourceRuntimeError>
+    where
+        F: FnMut(&ResourceRef) -> Fut,
+        Fut: std::future::Future<
+            Output = Result<Option<ResourceAssignmentFence>, d2b_resource_store::StoreError>,
+        >,
+    {
+        if resource_refs.len() > d2b_core_controller::controller_assignment::MAX_ASSIGNMENTS {
+            return Err(ResourceRuntimeError::AuthorizationUnavailable);
+        }
+        let mut maximum = 0;
+        for resource_ref in resource_refs {
+            if let Some(fence) = read(resource_ref)
+                .await
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?
+            {
+                maximum = maximum.max(fence.epoch);
+            }
+        }
+        Ok(maximum)
+    }
+
+    async fn core_assignment_fences(
+        &self,
+        rotate_epoch: bool,
+    ) -> Result<
+        (
+            Vec<(ResourceRef, ResourceAssignmentFence)>,
+            ResourceGeneration,
+            ControllerGeneration,
+            ReconnectGeneration,
+            Arc<CoreAssignmentAuthority>,
+        ),
+        ResourceRuntimeError,
+    > {
+        let subject = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let metadata = retry_transient_store_read(
+            &self.zone,
+            "core-controller-assignment-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
+            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        let controller_generation = metadata
+            .policy_snapshot
+            .controller_generation
+            .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+        let resource_types = CORE_RESOURCE_CONTROLLER_REGISTRATIONS
+            .iter()
+            .map(|registration| {
+                ResourceTypeName::parse(registration.resource_type().to_owned())
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut resources = Vec::new();
+        let mut cursor = None;
+        loop {
+            let request = StoreListRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "core-controller-assignment-relist".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "core-controller-assignment-relist".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: self.zone.clone(),
+                    resource_types: resource_types.clone(),
+                    resource_names: Vec::new(),
+                    filters: Vec::new(),
+                    page_size: 256,
+                    cursor: cursor.clone(),
+                    projection: StoreProjection::MetadataOnly,
+                };
+            let page = retry_transient_store_list(
+                &self.zone,
+                "core-controller-assignment-relist",
+                || self.store.list(request.clone()),
+            )
             .await
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+            resources.extend(page.resources);
+            if resources.len() > d2b_core_controller::controller_assignment::MAX_ASSIGNMENTS {
+                return Err(ResourceRuntimeError::AuthorizationUnavailable);
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let provider_ref = ResourceRef::parse(CORE_CONTROLLER_PROVIDER_REF)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let provider_generation = resources
+            .iter()
+            .find(|resource| resource.resource_ref == provider_ref)
+            .map(|resource| resource.generation)
+            .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+        let controller_ref = ResourceRef::parse(CORE_CONTROLLER_PROCESS_REF)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let target = ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let session_generation = subject.reconnect_generation();
+        let resource_refs = resources
+            .iter()
+            .map(|resource| resource.resource_ref.clone())
+            .collect::<Vec<_>>();
+        let durable_epoch = Self::durable_assignment_epoch(&resource_refs, |resource_ref| {
+            self.store
+                .assignment_fence(self.zone.clone(), resource_ref.clone())
+        })
+        .await?;
+        let current_epoch = self.core_assignment_epoch.load(Ordering::Acquire);
+        let floor = current_epoch.max(durable_epoch);
+        let epoch = if rotate_epoch || current_epoch == 0 || durable_epoch > current_epoch {
+            self.assignments
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .reserve_epoch_after(floor)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?
+        } else {
+            current_epoch
+        };
+        self.core_assignment_epoch.store(epoch, Ordering::Release);
+        let authority = Arc::new(CoreAssignmentAuthority {
+            provider_generation,
+            controller_generation,
+            session_generation,
+            controller_role: controller_ref.clone(),
+            target: target.clone(),
+            epoch,
+        });
+        let assignments = resources
+            .into_iter()
+            .map(|resource| {
+                let fence = ResourceAssignmentFence {
+                    resource_uid: resource.uid.clone(),
+                    resource_revision: resource.revision,
+                    provider_generation,
+                    controller_generation,
+                    controller_role: controller_ref.clone(),
+                    target: target.clone(),
+                    session_generation,
+                    epoch,
+                    scope: ResourceAssignmentScope::Primary,
+                };
+                (resource.resource_ref, fence)
+            })
+            .collect();
+        Ok((
+            assignments,
+            provider_generation,
+            controller_generation,
+            session_generation,
+            authority,
+        ))
+    }
+
+    async fn stop_core_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        #[cfg(test)]
+        self.core_runner_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push("stop-enter");
+        let tasks = {
+            let mut tasks = self
+                .core_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            task.handle.abort();
+            let _ = task.handle.await;
+        }
+        #[cfg(test)]
+        self.core_runner_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push("stop-exit");
+        Ok(())
+    }
+
+    async fn provider_generation_for_runner(
+        &self,
+        provider_ref: &ResourceRef,
+    ) -> Result<ResourceGeneration, ResourceRuntimeError> {
+        let request = StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "shared-provider-runner-provider".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "shared-provider-runner-provider".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: provider_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::MetadataOnly,
+            };
+        let resource = retry_transient_store_read(
+            &self.zone,
+            "shared-provider-runner-provider",
+            || self.store.get(request.clone()),
+        )
+        .await
+            .map_err(|error| {
+                if error.kind() == StoreErrorKind::ResourceNotFound {
+                    ResourceRuntimeError::HandlerNotReady
+                } else {
+                    ResourceRuntimeError::StoreReadFailed
+                }
+            })?;
+        if resource.resource_ref != *provider_ref
+            || resource.resource_ref.resource_type().as_str() != "Provider"
+            || resource.generation.get() == 0
+            || resource.revision.get() == 0
+        {
+            return Err(ResourceRuntimeError::HandlerNotReady);
+        }
+        Ok(resource.generation)
+    }
+
+    async fn provider_resources_present(
+        &self,
+        provider_ref: &str,
+        resource_types: &[&str],
+    ) -> Result<bool, ResourceRuntimeError> {
+        for resource_type in resource_types {
+            if self
+                .committed_resources_of_type(resource_type)
+                .await?
+                .iter()
+                .any(|resource| {
+                    resource
+                        .pointer("/spec/providerRef")
+                        .and_then(Value::as_str)
+                        == Some(provider_ref)
+                })
+            {
+                return Ok(true);
+            }
+        }
+        Ok(self
+            .committed_resources_of_type("Process")
+            .await?
+            .iter()
+            .any(|resource| {
+                resource
+                    .pointer("/spec/providerRef")
+                    .and_then(Value::as_str)
+                    == Some(provider_ref)
+                    || resource
+                        .pointer("/metadata/ownerRef")
+                        .and_then(Value::as_str)
+                        == Some(provider_ref)
+            }))
+    }
+
+    async fn start_core_controller_runners(&self) -> Result<(), ResourceRuntimeError> {
+        let _runner_guard = self.core_runner_lock.lock().await;
+        #[cfg(test)]
+        self.core_runner_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push("start-enter");
+        let result = self.start_core_controller_runners_locked(false).await;
+        #[cfg(test)]
+        self.core_runner_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push("start-exit");
+        result
+    }
+
+    async fn start_core_controller_runners_locked(
+        &self,
+        rotate_epoch: bool,
+    ) -> Result<(), ResourceRuntimeError> {
+        if !self.readiness.resource_api_ready {
+            return Ok(());
+        }
+        let mut provider_generations = BTreeMap::new();
+        for registration in U8_SHARED_PROVIDER_RUNNERS {
+            let provider_ref = ResourceRef::parse(registration.provider_ref)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            if provider_generations.contains_key(&provider_ref) {
+                continue;
+            }
+            match self.provider_generation_for_runner(&provider_ref).await {
+                Ok(generation) => {
+                    provider_generations.insert(provider_ref, generation);
+                }
+                Err(ResourceRuntimeError::HandlerNotReady) => {
+                    if self
+                        .provider_resources_present(
+                            registration.provider_ref,
+                            &[registration.resource_type],
+                        )
+                        .await?
+                    {
+                        return Err(ResourceRuntimeError::ProviderPathUnavailable);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let had_existing_core_runners = !self
+            .core_runner_tasks
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
+            .is_empty()
+            || !self
+                .core_runner_required_identities
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
+                .is_empty();
+        reap_finished_core_runner_tasks(&self.core_runner_tasks).await?;
+        let subject_context = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let authorization_state = self
+            .authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let (
+            assignments,
+            provider_generation,
+            controller_generation,
+            session_generation,
+            assignment_authority,
+        ) = match self.core_assignment_fences(rotate_epoch).await {
+            Ok(value) => value,
+            Err(ResourceRuntimeError::HandlerNotReady) if had_existing_core_runners => {
+                return Err(ResourceRuntimeError::HandlerNotReady);
+            }
+            Err(ResourceRuntimeError::HandlerNotReady) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let controller_ref = ResourceRef::parse(CORE_CONTROLLER_PROCESS_REF)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let provider_ref = ResourceRef::parse(CORE_CONTROLLER_PROVIDER_REF)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let host_ref = ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let identity = ControllerIdentity::new(
+            self.zone.clone(),
+            controller_ref,
+            controller_generation,
+            provider_ref.clone(),
+            provider_generation,
+            ResourceRef::parse(CORE_CONTROLLER_PROCESS_REF)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+            host_ref,
+            None,
+        )
+        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let descriptors =
+            core_controller_descriptors(identity).map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let mut prepared = Vec::with_capacity(descriptors.len() + U8_SHARED_PROVIDER_RUNNERS.len());
+        for (registration, descriptor) in descriptors {
+            let subject = self
+                .authorizer
+                .issue_authenticated_subject(subject_context.clone(), authorization_state.clone())
+                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+            let registered_resource_type = registration.resource_type().to_owned();
+            let resource_assignments = assignments
+                .iter()
+                .filter(|(target, _)| {
+                    target.resource_type().as_str() == registration.resource_type()
+                })
+                .cloned()
+                .collect();
+            let resolver_store = Arc::clone(&self.store);
+            let resolver_zone = self.zone.clone();
+            let resolver_authority = Arc::clone(&assignment_authority);
+            let resolver: AssignmentFenceResolver = Arc::new(move |target, uid, revision| {
+                let store = Arc::clone(&resolver_store);
+                let zone = resolver_zone.clone();
+                let authority = Arc::clone(&resolver_authority);
+                let resource_type = registered_resource_type.clone();
+                Box::pin(async move {
+                    if target.resource_type().as_str() != resource_type {
+                        return Err(SourceError::Integrity);
+                    }
+                    if let Some(stored) = store
+                        .assignment_fence(zone, target.clone())
+                        .await
+                        .map_err(|error| match error.kind() {
+                            StoreErrorKind::Backpressure
+                            | StoreErrorKind::StoreBackpressure => SourceError::Backpressure,
+                            StoreErrorKind::Timeout => SourceError::Timeout,
+                            _ => SourceError::Unavailable,
+                        })?
+                    {
+                        if stored.resource_uid != uid
+                            || stored.epoch > authority.epoch
+                            || (stored.epoch == authority.epoch
+                                && (stored.provider_generation != authority.provider_generation
+                                    || stored.controller_generation
+                                        != authority.controller_generation
+                                    || stored.controller_role != authority.controller_role
+                                    || stored.target != authority.target
+                                    || stored.session_generation != authority.session_generation))
+                        {
+                            return Err(SourceError::Integrity);
+                        }
+                        if stored.epoch == authority.epoch
+                            && stored.resource_revision != revision
+                        {
+                            return Err(SourceError::Conflict(stored.resource_revision));
+                        }
+                    }
+                    Ok(ResourceAssignmentFence {
+                        resource_uid: uid,
+                        resource_revision: revision,
+                        provider_generation: authority.provider_generation,
+                        controller_generation: authority.controller_generation,
+                        controller_role: authority.controller_role.clone(),
+                        target: authority.target.clone(),
+                        session_generation: authority.session_generation,
+                        epoch: authority.epoch,
+                        scope: ResourceAssignmentScope::Primary,
+                    })
+                })
+            });
+            let api = self
+                .api
+                .registered_controller_api(subject, authorization_state.clone(), resource_assignments)
+                .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
+            let api = api.with_assignment_fence_resolver(resolver);
+            let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+            let runner_identity = CoreRunnerIdentity::new(
+                descriptor.identity().controller_ref().clone(),
+                registration.resource_type(),
+            );
+            prepared.push(PreparedCoreRunner::Core {
+                identity: runner_identity,
+                reconciler: CoreResourceReconciler::for_handler(
+                    descriptor,
+                    registration.handler(),
+                ),
+                source,
+                config: RunnerConfig {
+                    policy_revision: authorization_state.snapshot.policy_revision,
+                    api_revision: authorization_state.snapshot.api_catalog_revision,
+                    configuration_revision: authorization_state.snapshot.active_configuration_revision,
+                    deadline_tick: 5_000,
+                    max_attempts: 3,
+                },
+                handler: registration.handler().label(),
+                resource_type: registration.resource_type(),
+            });
+        }
+        let system_core_controller_ref =
+            ResourceRef::parse("Process/system-core-resource-controller")
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let system_core_provider_ref = ResourceRef::parse(CORE_CONTROLLER_PROVIDER_REF)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let system_core_host_ref = ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let system_core_identity = ControllerIdentity::new(
+            self.zone.clone(),
+            system_core_controller_ref.clone(),
+            controller_generation,
+            system_core_provider_ref,
+            provider_generation,
+            system_core_controller_ref,
+            system_core_host_ref,
+            None,
+        )
+        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let system_core_descriptor = system_core_resource_descriptor(system_core_identity)?;
+        let system_core_subject = self
+            .authorizer
+            .issue_authenticated_subject(subject_context.clone(), authorization_state.clone())
+            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+        let system_core_api = self
+            .api
+            .registered_controller_api(system_core_subject, authorization_state.clone(), Vec::new())
+            .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?
+            .with_assignment_fence_resolver(system_core_assignment_fence_resolver(
+                Arc::clone(&self.store),
+                ResourceRef::parse("Process/system-core-resource-controller")
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                session_generation,
+                Arc::clone(&self.core_assignment_epoch),
+            ));
+        let system_core_source =
+            CoreControllerSource::new(system_core_descriptor.clone(), Arc::new(system_core_api));
+        let system_core_runner = Runner::new(
+            SystemCoreResourceReconciler::new(system_core_descriptor.clone()),
+            system_core_source,
+            RunnerConfig {
+                policy_revision: authorization_state.snapshot.policy_revision,
+                api_revision: authorization_state.snapshot.api_catalog_revision,
+                configuration_revision: authorization_state.snapshot.active_configuration_revision,
+                deadline_tick: 5_000,
+                max_attempts: 3,
+            },
+        );
+        let provider_descriptors = if provider_generations.is_empty() {
+            Vec::new()
+        } else {
+            compose_shared_provider_runner_descriptors(
+                U8_SHARED_PROVIDER_RUNNERS
+                    .into_iter()
+                    .filter(|registration| {
+                        ResourceRef::parse(registration.provider_ref)
+                            .ok()
+                            .is_some_and(|provider_ref| {
+                                provider_generations.contains_key(&provider_ref)
+                            })
+                    }),
+                self.zone.clone(),
+                controller_generation,
+                &provider_generations,
+                subject_context.reconnect_generation(),
+            )?
+        };
+        for (registration, descriptor) in provider_descriptors {
+            let subject = self
+                .authorizer
+                .issue_authenticated_subject(subject_context.clone(), authorization_state.clone())
+                .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+            let resource_type = registration.resource_type.to_owned();
+            let authority = CoreAssignmentAuthority {
+                provider_generation: *provider_generations
+                    .get(
+                        &ResourceRef::parse(registration.provider_ref)
+                            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                    )
+                    .ok_or(ResourceRuntimeError::HandlerNotReady)?,
+                controller_generation,
+                session_generation: subject_context.reconnect_generation(),
+                controller_role: descriptor.identity().controller_ref().clone(),
+                target: ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                epoch: self.core_assignment_epoch.load(Ordering::Acquire),
+            };
+            if authority.epoch == 0 {
+                return Err(ResourceRuntimeError::HandlerNotReady);
+            }
+            let resolver_store = Arc::clone(&self.store);
+            let resolver_zone = self.zone.clone();
+            let resolver_authority = Arc::new(authority);
+            let resolver_resource_type = resource_type.clone();
+            let resolver: AssignmentFenceResolver = Arc::new(move |target, uid, revision| {
+                let store = Arc::clone(&resolver_store);
+                let zone = resolver_zone.clone();
+                let authority = Arc::clone(&resolver_authority);
+                let resource_type = resolver_resource_type.clone();
+                Box::pin(async move {
+                    if target.resource_type().as_str() != resource_type {
+                        return Err(SourceError::Integrity);
+                    }
+                    if let Some(stored) = store
+                        .assignment_fence(zone, target.clone())
+                        .await
+                        .map_err(|error| match error.kind() {
+                            StoreErrorKind::Backpressure
+                            | StoreErrorKind::StoreBackpressure => SourceError::Backpressure,
+                            StoreErrorKind::Timeout => SourceError::Timeout,
+                            _ => SourceError::Unavailable,
+                        })?
+                    {
+                        if stored.resource_uid != uid
+                            || stored.epoch > authority.epoch
+                            || (stored.epoch == authority.epoch
+                                && (stored.provider_generation != authority.provider_generation
+                                    || stored.controller_generation
+                                        != authority.controller_generation
+                                    || stored.controller_role != authority.controller_role
+                                    || stored.target != authority.target
+                                    || stored.session_generation != authority.session_generation))
+                        {
+                            return Err(SourceError::Integrity);
+                        }
+                        if stored.epoch == authority.epoch
+                            && stored.resource_revision != revision
+                        {
+                            return Err(SourceError::Conflict(stored.resource_revision));
+                        }
+                    }
+                    Ok(ResourceAssignmentFence {
+                        resource_uid: uid,
+                        resource_revision: revision,
+                        provider_generation: authority.provider_generation,
+                        controller_generation: authority.controller_generation,
+                        controller_role: authority.controller_role.clone(),
+                        target: authority.target.clone(),
+                        session_generation: authority.session_generation,
+                        epoch: authority.epoch,
+                        scope: ResourceAssignmentScope::Primary,
+                    })
+                })
+            });
+            let runner_descriptor = descriptor.clone();
+            let api = self
+                .api
+                .registered_controller_api(subject, authorization_state.clone(), Vec::new())
+                .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?
+                .with_assignment_fence_resolver(resolver);
+            let kind = SharedProviderResourceKind::from_registration(registration)?;
+            let source = CoreControllerSource::new(
+                    runner_descriptor.clone(),
+                    Arc::new(api),
+                );
+            let runner_identity = CoreRunnerIdentity::new(
+                runner_descriptor.identity().controller_ref().clone(),
+                resource_type.clone(),
+            );
+            prepared.push(PreparedCoreRunner::Provider {
+                identity: runner_identity,
+                reconciler: SharedProviderResourceReconciler::new(
+                    descriptor,
+                    kind,
+                    Arc::clone(&self.shared_provider_effects),
+                ),
+                source,
+                config: RunnerConfig {
+                    policy_revision: authorization_state.snapshot.policy_revision,
+                    api_revision: authorization_state.snapshot.api_catalog_revision,
+                    configuration_revision: authorization_state.snapshot.active_configuration_revision,
+                    deadline_tick: 5_000,
+                    max_attempts: 3,
+                },
+                controller_ref: runner_descriptor.identity().controller_ref().clone(),
+                resource_type,
+            });
+        }
+        if prepared.is_empty() {
+            return Err(ResourceRuntimeError::HandlerNotReady);
+        }
+        let system_core_runner_identity = CoreRunnerIdentity::new(
+            system_core_descriptor.identity().controller_ref().clone(),
+            "Host/User",
+        );
+        let mut required_identities = prepared
+            .iter()
+            .map(|runner| runner.identity().clone())
+            .collect::<BTreeSet<_>>();
+        required_identities.insert(system_core_runner_identity.clone());
+
+        reap_finished_core_runner_tasks(&self.core_runner_tasks).await?;
+        let mut present_identities = self
+            .core_runner_tasks
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
+            .iter()
+            .filter(|task| !task.is_finished())
+            .map(|task| task.identity.clone())
+            .collect::<Vec<_>>();
+        let mut new_tasks = Vec::new();
+        for runner in prepared {
+            let identity = runner.identity().clone();
+            if present_identities
+                .iter()
+                .any(|present| present == &identity)
+            {
+                continue;
+            }
+            present_identities.push(identity);
+            new_tasks.push(spawn_prepared_core_runner(runner));
+        }
+        if !present_identities
+            .iter()
+            .any(|present| present == &system_core_runner_identity)
+        {
+            let handle = tokio::spawn(async move {
+                match system_core_runner.run().await {
+                    Ok(report) => tracing::debug!(
+                        dispatched = report.dispatched,
+                        relists = report.relists,
+                        "system-core Host/User shared runner stopped",
+                    ),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "system-core Host/User shared runner failed",
+                    ),
+                }
+            });
+            new_tasks.push(CoreRunnerTask {
+                identity: system_core_runner_identity,
+                handle,
+            });
+        }
+        install_core_runner_tasks(&self.core_runner_tasks, new_tasks).await?;
+        let tasks = self
+            .core_runner_tasks
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        if !core_runner_tasks_are_ready(&tasks, &required_identities) {
+            return Err(ResourceRuntimeError::HandlerNotReady);
+        }
+        drop(tasks);
+        *self
+            .core_runner_required_identities
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)? = required_identities;
+        Ok(())
+    }
+
+    async fn stop_u10_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        let tasks = {
+            let mut tasks = self
+                .u10_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        self.u10_required.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Attach all Credential Provider controllers to the shared Core source
+    /// and Runner path. Empty initial lists still retain their exact
+    /// Provider-filtered watches for later Credential creates.
+    pub(crate) async fn start_u10_controller_runners(
+        &self,
+    ) -> Result<(), ResourceRuntimeError> {
+        let _runner_guard = self.u10_runner_lock.lock().await;
+        self.start_u10_controller_runners_locked().await
+    }
+
+    async fn start_u10_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        if !self.readiness.resource_api_ready {
+            return Ok(());
+        }
+        let subject_context = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let authorization_state = self
+            .authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let controller_generation = self
+            .store_metadata
+            .policy_snapshot
+            .controller_generation
+            .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+        let session_generation = subject_context.reconnect_generation();
+        let status_client = self.status_client()?;
+        let mut provider_inputs = Vec::with_capacity(U10_PROVIDER_CONTROLLERS.len());
+        for (provider_name, controller_ref_text, provider_ref_text) in U10_PROVIDER_CONTROLLERS {
+            let controller_ref = ResourceRef::parse(controller_ref_text)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let provider_kind = match provider_name {
+                "credential-secret-service" => {
+                    d2b_contracts_provider::v3::credential_controller::CredentialProviderKind::SecretService
+                }
+                "credential-entra" => {
+                    d2b_contracts_provider::v3::credential_controller::CredentialProviderKind::Entra
+                }
+                "credential-managed-identity" => {
+                    d2b_contracts_provider::v3::credential_controller::CredentialProviderKind::ManagedIdentity
+                }
+                _ => return Err(ResourceRuntimeError::HandlerNotReady),
+            };
+            let provider_ref = ResourceRef::parse(provider_ref_text)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let request = StoreGetRequest {
+                    operation: StoreOperationContext {
+                        operation_id: format!("u10-provider-{provider_name}"),
+                        idempotency_key: None,
+                        correlation_id: format!("u10-provider-{provider_name}"),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: self.zone.clone(),
+                    target: provider_ref.clone(),
+                    expected_uid: None,
+                    projection: StoreProjection::MetadataOnly,
+                };
+            let provider = match retry_transient_store_read(
+                &self.zone,
+                &request.operation.operation_id,
+                || self.store.get(request.clone()),
+            )
+            .await
+            {
+                Ok(provider) => provider,
+                Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                    if self
+                        .provider_resources_present(provider_ref_text, &["Credential"])
+                        .await?
+                    {
+                        return Err(ResourceRuntimeError::ProviderPathUnavailable);
+                    }
+                    continue;
+                }
+                Err(_) => return Err(ResourceRuntimeError::StoreReadFailed),
+            };
+            if provider.zone != self.zone
+                || provider.resource_ref != provider_ref
+                || provider.generation.get() == 0
+            {
+                return Err(ResourceRuntimeError::HandlerNotReady);
+            }
+            provider_inputs.push((
+                provider_name,
+                controller_ref,
+                provider_kind,
+                provider_ref.clone(),
+                provider.generation,
+            ));
+        }
+        let expected_task_count = provider_inputs.len();
+        let (task_count, live_count) = {
+            let tasks = self
+                .u10_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            (
+                tasks.len(),
+                tasks.iter().filter(|task| !task.is_finished()).count(),
+            )
+        };
+        if task_count == expected_task_count && live_count == expected_task_count {
+            self.u10_required
+                .store(expected_task_count != 0, Ordering::Release);
+            return Ok(());
+        }
+        if live_count != 0 {
+            self.stop_u10_controller_runners_locked().await?;
+        } else {
+            let stale = {
+                let mut tasks = self
+                    .u10_runner_tasks
+                    .lock()
+                    .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+                std::mem::take(&mut *tasks)
+            };
+            for task in stale {
+                let _ = task.await;
+            }
+        }
+        if expected_task_count == 0 {
+            self.u10_required.store(false, Ordering::Release);
+            return Ok(());
+        }
+        let mut new_tasks = Vec::new();
+        let build_result: Result<(), ResourceRuntimeError> = async {
+            for (
+                _provider_name,
+                controller_ref,
+                provider_kind,
+                provider_ref,
+                provider_generation,
+            ) in provider_inputs
+            {
+                let identity = ControllerIdentity::new(
+                    self.zone.clone(),
+                    controller_ref.clone(),
+                    controller_generation,
+                    provider_ref.clone(),
+                    provider_generation,
+                    controller_ref.clone(),
+                    ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                    None,
+                )
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+                let descriptor = credential_controller_descriptor(identity.clone())
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+                let (assignments, authority) = self
+                    .u12_controller_assignments(
+                        &descriptor,
+                        controller_ref.clone(),
+                        provider_generation,
+                        controller_generation,
+                        session_generation,
+                    )
+                    .await?;
+                let subject = self
+                    .authorizer
+                    .issue_authenticated_subject(subject_context.clone(), authorization_state.clone())
+                    .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+                let api = self
+                    .api
+                    .registered_controller_api(
+                        subject,
+                        authorization_state.clone(),
+                        assignments,
+                    )
+                    .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
+                let allowed_types = descriptor.resource_types().cloned().collect::<BTreeSet<_>>();
+                let resolver_store = Arc::clone(&self.store);
+                let resolver_zone = self.zone.clone();
+                let resolver_authority = Arc::clone(&authority);
+                let resolver: AssignmentFenceResolver = Arc::new(move |target, uid, revision| {
+                    let store = Arc::clone(&resolver_store);
+                    let zone = resolver_zone.clone();
+                    let authority = Arc::clone(&resolver_authority);
+                    let allowed_types = allowed_types.clone();
+                    Box::pin(async move {
+                        if !allowed_types.contains(target.resource_type()) {
+                            return Err(SourceError::Integrity);
+                        }
+                        if let Some(stored) = store
+                            .assignment_fence(zone.clone(), target.clone())
+                            .await
+                            .map_err(|error| match error.kind() {
+                                StoreErrorKind::Backpressure
+                                | StoreErrorKind::StoreBackpressure => SourceError::Backpressure,
+                                StoreErrorKind::Timeout => SourceError::Timeout,
+                                _ => SourceError::Unavailable,
+                            })?
+                        {
+                            if stored.resource_uid != uid
+                                || stored.epoch > authority.epoch
+                                || (stored.epoch == authority.epoch
+                                    && (stored.provider_generation != authority.provider_generation
+                                        || stored.controller_generation
+                                            != authority.controller_generation
+                                        || stored.controller_role != authority.controller_role
+                                        || stored.target != authority.target
+                                        || stored.session_generation != authority.session_generation))
+                            {
+                                return Err(SourceError::Integrity);
+                            }
+                            if stored.epoch == authority.epoch
+                                && stored.resource_revision != revision
+                            {
+                                return Err(SourceError::Conflict(stored.resource_revision));
+                            }
+                        }
+                        Ok(ResourceAssignmentFence {
+                            resource_uid: uid,
+                            resource_revision: revision,
+                            provider_generation: authority.provider_generation,
+                            controller_generation: authority.controller_generation,
+                            controller_role: authority.controller_role.clone(),
+                            target: authority.target.clone(),
+                            session_generation: authority.session_generation,
+                            epoch: authority.epoch,
+                            scope: ResourceAssignmentScope::Primary,
+                        })
+                    })
+                });
+                let api = api.with_assignment_fence_resolver(resolver);
+                let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+                let reconciler = Arc::new(
+                    CredentialResourceReconciler::new(
+                        Arc::clone(&self.store),
+                        Arc::clone(&status_client),
+                        identity,
+                        provider_ref.clone(),
+                        self.credential_sessions
+                            .for_provider(provider_ref.clone()),
+                    )
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                );
+                let runner = Runner::new(
+                    reconciler,
+                    source,
+                    RunnerConfig {
+                        policy_revision: authorization_state.snapshot.policy_revision,
+                        api_revision: authorization_state.snapshot.api_catalog_revision,
+                        configuration_revision: authorization_state
+                            .snapshot
+                            .active_configuration_revision,
+                        deadline_tick: 5_000,
+                        max_attempts: 3,
+                    },
+                );
+                new_tasks.push(tokio::spawn(async move {
+                    match runner.run().await {
+                        Ok(report) => {
+                            tracing::debug!(
+                                provider = provider_kind.as_str(),
+                                dispatched = report.dispatched,
+                                relists = report.relists,
+                                "Credential resource runner stopped",
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                provider = provider_kind.as_str(),
+                                error = %error,
+                                "Credential resource runner isolated failure",
+                            );
+                        }
+                    }
+                }));
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = build_result {
+            abort_controller_runner_tasks(&mut new_tasks).await;
+            self.u10_required.store(false, Ordering::Release);
+            return Err(error);
+        }
+        let required = new_tasks.len() == expected_task_count;
+        match self.u10_runner_tasks.lock() {
+            Ok(mut tasks) => tasks.extend(new_tasks),
+            Err(_) => {
+                abort_controller_runner_tasks(&mut new_tasks).await;
+                self.u10_required.store(false, Ordering::Release);
+                return Err(ResourceRuntimeError::WatchUnavailable);
+            }
+        }
+        self.u10_required.store(required, Ordering::Release);
+        Ok(())
+    }
+
+    async fn stop_u12_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        let tasks = {
+            let mut tasks = self
+                .u12_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        Ok(())
+    }
+
+    async fn stop_u7_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        let tasks = {
+            let mut tasks = self
+                .u7_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        self.u7_required.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Attach the storage Providers to the production shared Runner.
+    pub(crate) async fn start_u7_controller_runners(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        let _runner_guard = self.u7_runner_lock.lock().await;
+        let result = self
+            .start_u7_controller_runners_locked(Arc::clone(&state))
+            .await;
+        if result.is_ok() {
+            match self.u7_state.lock() {
+                Ok(mut current) => *current = Some(state),
+                Err(_) => {
+                    self.stop_u7_controller_runners_locked().await?;
+                    return Err(ResourceRuntimeError::AuthenticationUnavailable);
+                }
+            }
+        }
+        result
+    }
+
+    async fn start_u7_controller_runners_locked(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        if !self.readiness.resource_api_ready {
+            return Ok(());
+        }
+        {
+            let tasks = self
+                .u7_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            if tasks.iter().any(|task| !task.is_finished()) {
+                return Ok(());
+            }
+        }
+        let stale = {
+            let mut tasks = self
+                .u7_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in stale {
+            let _ = task.await;
+        }
+        let required = volume_provider_runtime::start(self, state).await?;
+        self.u7_required.store(required, Ordering::Release);
+        Ok(())
+    }
+
+    async fn stop_u6_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        let tasks = {
+            let mut tasks = self
+                .u6_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        self.u6_required.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Attach the selected Guest runtime Providers to the production shared
+    /// Runner. Provider selection remains an exact `Guest.spec.providerRef`
+    /// admission rule.
+    pub(crate) async fn start_u6_controller_runners(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        let _runner_guard = self.u6_runner_lock.lock().await;
+        let result = self
+            .start_u6_controller_runners_locked(Arc::clone(&state))
+            .await;
+        if result.is_ok() {
+            match self.u6_state.lock() {
+                Ok(mut current) => *current = Some(state),
+                Err(_) => {
+                    self.stop_u6_controller_runners_locked().await?;
+                    return Err(ResourceRuntimeError::AuthenticationUnavailable);
+                }
+            }
+        }
+        result
+    }
+
+    async fn start_u6_controller_runners_locked(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        if !self.readiness.resource_api_ready {
+            return Ok(());
+        }
+        {
+            let tasks = self
+                .u6_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            if tasks.iter().any(|task| !task.is_finished()) {
+                return Ok(());
+            }
+        }
+        let stale = {
+            let mut tasks = self
+                .u6_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in stale {
+            let _ = task.await;
+        }
+        let required = guest_provider_runtime::start(self, state).await?;
+        self.u6_required.store(required, Ordering::Release);
+        Ok(())
+    }
+
+    async fn stop_u9_controller_runners_locked(&self) -> Result<(), ResourceRuntimeError> {
+        let tasks = {
+            let mut tasks = self
+                .u9_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Ok(mut failures) = self.u9_runner_failures.lock() {
+            failures.clear();
+        }
+        self.u9_required.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Attach interaction and shell resource owners to the production shared
+    /// Runner. Clipboard and notification streams remain ComponentSession
+    /// services and are intentionally not registered as ResourceTypes.
+    pub(crate) async fn start_u9_controller_runners(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        let _runner_guard = self.u9_runner_lock.lock().await;
+        let result = self
+            .start_u9_controller_runners_locked(Arc::clone(&state))
+            .await;
+        if result.is_ok() {
+            match self.u9_state.lock() {
+                Ok(mut current) => *current = Some(state),
+                Err(_) => {
+                    self.stop_u9_controller_runners_locked().await?;
+                    return Err(ResourceRuntimeError::AuthenticationUnavailable);
+                }
+            }
+        }
+        result
+    }
+
+    async fn start_u9_controller_runners_locked(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        if !self.readiness.resource_api_ready {
+            return Ok(());
+        }
+        {
+            let tasks = self
+                .u9_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            if u9_runner_tasks_are_live(&tasks) {
+                return Ok(());
+            }
+        }
+        let stale = {
+            let mut tasks = self
+                .u9_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        let mut stale = stale;
+        abort_u9_runner_tasks(&mut stale).await;
+        let subject_context = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let authorization_state = self
+            .authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let controller_generation = self
+            .store_metadata
+            .policy_snapshot
+            .controller_generation
+            .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+        let session_generation = subject_context.reconnect_generation();
+        let (active_registrations, provider_generations) =
+            u9_provider_generations(self).await?;
+        if active_registrations.is_empty() {
+            if let Ok(mut failures) = self.u9_runner_failures.lock() {
+                failures.clear();
+            }
+            self.u9_required.store(false, Ordering::Release);
+            return Ok(());
+        }
+        self.u9_required.store(true, Ordering::Release);
+        if let Ok(mut failures) = self.u9_runner_failures.lock() {
+            failures.clear();
+        }
+        let descriptors = compose_shared_provider_runner_descriptors(
+            active_registrations,
+            self.zone.clone(),
+            controller_generation,
+            &provider_generations,
+            session_generation,
+        )?;
+        let effects: Arc<dyn SharedProviderEffectExecutor> = Arc::new(
+            DaemonSharedProviderEffects::new(Arc::clone(&state), self.zone.clone()),
+        );
+        let mut new_tasks = Vec::with_capacity(descriptors.len());
+        let mut startup_receivers = Vec::with_capacity(descriptors.len());
+        for (registration, descriptor) in descriptors {
+            let task = async {
+                let kind = SharedProviderResourceKind::from_registration(registration)?;
+                let provider_ref = ResourceRef::parse(registration.provider_ref)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+                let controller_ref = ResourceRef::parse(registration.controller_ref)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+                let provider_generation = *provider_generations
+                    .get(&provider_ref)
+                    .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+                let (assignments, authority) = self
+                    .u12_controller_assignments(
+                        &descriptor,
+                        controller_ref.clone(),
+                        provider_generation,
+                        controller_generation,
+                        session_generation,
+                    )
+                    .await?;
+                let subject = self
+                    .authorizer
+                    .issue_authenticated_subject(
+                        subject_context.clone(),
+                        authorization_state.clone(),
+                    )
+                    .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+                let api = self
+                    .api
+                    .registered_controller_api(
+                        subject,
+                        authorization_state.clone(),
+                        assignments,
+                    )
+                    .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
+                let allowed_types = descriptor
+                    .resource_types()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let resolver_store = Arc::clone(&self.store);
+                let resolver_zone = self.zone.clone();
+                let resolver_authority = Arc::clone(&authority);
+                let resolver: AssignmentFenceResolver =
+                    Arc::new(move |target, uid, revision| {
+                        let store = Arc::clone(&resolver_store);
+                        let zone = resolver_zone.clone();
+                        let authority = Arc::clone(&resolver_authority);
+                        let allowed_types = allowed_types.clone();
+                        Box::pin(async move {
+                            if !allowed_types.contains(target.resource_type()) {
+                                return Err(SourceError::Integrity);
+                            }
+                            if let Some(stored) = store
+                                .assignment_fence(zone, target.clone())
+                                .await
+                                .map_err(|error| match error.kind() {
+                                    StoreErrorKind::Backpressure
+                                    | StoreErrorKind::StoreBackpressure => {
+                                        SourceError::Backpressure
+                                    }
+                                    StoreErrorKind::Timeout => SourceError::Timeout,
+                                    _ => SourceError::Unavailable,
+                                })?
+                            {
+                                if stored.resource_uid != uid
+                                    || stored.epoch > authority.epoch
+                                    || (stored.epoch == authority.epoch
+                                        && (stored.provider_generation
+                                            != authority.provider_generation
+                                            || stored.controller_generation
+                                                != authority.controller_generation
+                                            || stored.controller_role
+                                                != authority.controller_role
+                                            || stored.target != authority.target
+                                            || stored.session_generation
+                                                != authority.session_generation))
+                                {
+                                    return Err(SourceError::Integrity);
+                                }
+                                if stored.epoch == authority.epoch
+                                    && stored.resource_revision != revision
+                                {
+                                    return Err(SourceError::Conflict(stored.resource_revision));
+                                }
+                            }
+                            Ok(ResourceAssignmentFence {
+                                resource_uid: uid,
+                                resource_revision: revision,
+                                provider_generation: authority.provider_generation,
+                                controller_generation: authority.controller_generation,
+                                controller_role: authority.controller_role.clone(),
+                                target: authority.target.clone(),
+                                session_generation: authority.session_generation,
+                                epoch: authority.epoch,
+                                scope: ResourceAssignmentScope::Primary,
+                            })
+                        })
+                    });
+                let api = api.with_assignment_fence_resolver(resolver);
+                let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+                let reconciler = SharedProviderResourceReconciler::new(
+                    descriptor.clone(),
+                    kind,
+                    Arc::clone(&effects),
+                );
+                let runner = Runner::new(
+                    reconciler,
+                    source,
+                    RunnerConfig {
+                        policy_revision: authorization_state.snapshot.policy_revision,
+                        api_revision: authorization_state.snapshot.api_catalog_revision,
+                        configuration_revision: authorization_state
+                            .snapshot
+                            .active_configuration_revision,
+                        deadline_tick: 5_000,
+                        max_attempts: 3,
+                    },
+                );
+                let resource_type = registration.resource_type;
+                let controller = registration.controller_ref;
+                let diagnostic_controller = controller_ref.clone();
+                let diagnostic_resource_type = ResourceTypeName::parse(resource_type)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+                let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+                let failure_slot = Arc::clone(&self.u9_runner_failures);
+                let startup_failure_slot = Arc::clone(&failure_slot);
+                let callback_controller = diagnostic_controller.clone();
+                let callback_resource_type = diagnostic_resource_type.clone();
+                let task = tokio::spawn(async move {
+                    let result = runner
+                        .run_with_startup(move |startup| {
+                            if let Err(error) = startup {
+                                push_runner_failure(
+                                    &startup_failure_slot,
+                                    ControllerRunnerFailure::new(
+                                        callback_controller,
+                                        [callback_resource_type],
+                                        error,
+                                    ),
+                                );
+                            }
+                            let _ = startup_tx.send(startup);
+                        })
+                        .await;
+                    match result {
+                        Ok(report) => tracing::debug!(
+                            controller,
+                            resource_type,
+                            dispatched = report.dispatched,
+                            relists = report.relists,
+                            "U9 interaction shared Runner stopped",
+                        ),
+                        Err(error) => {
+                            let diagnostic = ControllerRunnerFailure::new(
+                                diagnostic_controller,
+                                [diagnostic_resource_type],
+                                error.error(),
+                            );
+                            push_runner_failure(&failure_slot, diagnostic.clone());
+                            let report = error.report();
+                            tracing::warn!(
+                                controller = %diagnostic.controller().to_canonical_string(),
+                                resource_types = ?diagnostic
+                                    .resource_types()
+                                    .iter()
+                                    .map(ResourceTypeName::as_str)
+                                    .collect::<Vec<_>>(),
+                                error_kind = ?diagnostic.error(),
+                                error = %diagnostic.error(),
+                                dispatched = report.dispatched,
+                                relists = report.relists,
+                                checkpointed = report.checkpointed,
+                                failed_resource = ?error
+                                    .failed_key()
+                                    .map(|key| key.resource_ref().to_canonical_string()),
+                                failed_operation = ?error.failed_operation(),
+                                "U9 interaction shared Runner failed",
+                            );
+                        }
+                    }
+                });
+                Ok::<_, ResourceRuntimeError>((task, startup_rx))
+            }
+            .await;
+            match task {
+                Ok((task, startup_rx)) => {
+                    new_tasks.push(task);
+                    startup_receivers.push(startup_rx);
+                }
+                Err(error) => {
+                    abort_u9_runner_tasks(&mut new_tasks).await;
+                    return Err(error);
+                }
+            }
+        }
+        for startup in startup_receivers {
+            match startup.await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => {
+                    abort_u9_runner_tasks(&mut new_tasks).await;
+                    return Err(ResourceRuntimeError::HandlerNotReady);
+                }
+            }
+        }
+        let mut tasks = match self.u9_runner_tasks.lock() {
+            Ok(tasks) => tasks,
+            Err(_) => {
+                abort_u9_runner_tasks(&mut new_tasks).await;
+                return Err(ResourceRuntimeError::WatchUnavailable);
+            }
+        };
+        tasks.extend(new_tasks);
+        self.u9_required.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Attach the observability and activation handlers to the same Core
+    /// source/Runner path used by every resource owner.
+    pub(crate) async fn start_u12_controller_runners(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        let _runner_guard = self.u12_runner_lock.lock().await;
+        let result = self
+            .start_u12_controller_runners_locked(Arc::clone(&state))
+            .await;
+        if result.is_ok() {
+            match self.u12_state.lock() {
+                Ok(mut current) => *current = Some(state),
+                Err(_) => {
+                    self.stop_u12_controller_runners_locked().await?;
+                    return Err(ResourceRuntimeError::AuthenticationUnavailable);
+                }
+            }
+        }
+        result
+    }
+
+    async fn start_u12_controller_runners_locked(
+        &self,
+        state: Arc<crate::ServerState>,
+    ) -> Result<(), ResourceRuntimeError> {
+        if !self.readiness.resource_api_ready {
+            return Ok(());
+        }
+        {
+            let tasks = self
+                .u12_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            if tasks.iter().any(|task| !task.is_finished()) {
+                return Ok(());
+            }
+        }
+        let stale = {
+            let mut tasks = self
+                .u12_runner_tasks
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            std::mem::take(&mut *tasks)
+        };
+        for task in stale {
+            let _ = task.await;
+        }
+
+        let subject_context = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let authorization_state = self
+            .authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let controller_generation = self
+            .store_metadata
+            .policy_snapshot
+            .controller_generation
+            .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+        let session_generation = subject_context.reconnect_generation();
+        let status_client = self.status_client()?;
+        let mut new_tasks = Vec::new();
+
+        enum U12ControllerKind {
+            Telemetry,
+            Activation,
+        }
+        let build_result: Result<bool, ResourceRuntimeError> = async {
+            let mut required = false;
+            for (provider_name, controller_ref_text, provider_ref_text) in U12_PROVIDER_CONTROLLERS
+            {
+                let controller_ref = ResourceRef::parse(controller_ref_text)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+                let kind = match provider_name {
+                    "observability-otel" => U12ControllerKind::Telemetry,
+                    "activation-nixos" => U12ControllerKind::Activation,
+                    _ => return Err(ResourceRuntimeError::HandlerNotReady),
+                };
+                let provider_ref = ResourceRef::parse(provider_ref_text)
+                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+                let request = StoreGetRequest {
+                        operation: StoreOperationContext {
+                            operation_id: format!("u12-provider-{provider_name}"),
+                            idempotency_key: None,
+                            correlation_id: format!("u12-provider-{provider_name}"),
+                            trace_id: None,
+                            deadline_ms: 10_000,
+                        },
+                        zone: self.zone.clone(),
+                        target: provider_ref.clone(),
+                        expected_uid: None,
+                        projection: StoreProjection::MetadataOnly,
+                    };
+                let provider = match retry_transient_store_read(
+                    &self.zone,
+                    &request.operation.operation_id,
+                    || self.store.get(request.clone()),
+                )
+                .await
+                {
+                    Ok(provider) => provider,
+                    Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                        let resource_types = match kind {
+                            U12ControllerKind::Telemetry => [
+                                "telemetry.d2bus.org.TelemetryService",
+                                "telemetry.d2bus.org.TelemetryBinding",
+                            ],
+                            U12ControllerKind::Activation => {
+                                ["activation-nixos.d2bus.org.NixosGeneration", ""]
+                            }
+                        };
+                        let resource_types = resource_types
+                            .into_iter()
+                            .filter(|resource_type| !resource_type.is_empty())
+                            .collect::<Vec<_>>();
+                        if self
+                            .provider_resources_present(provider_ref_text, &resource_types)
+                            .await?
+                        {
+                            return Err(ResourceRuntimeError::ProviderPathUnavailable);
+                        }
+                        continue;
+                    }
+                    Err(_) => return Err(ResourceRuntimeError::StoreReadFailed),
+                };
+                required = true;
+                if provider.zone != self.zone
+                    || provider.resource_ref != provider_ref
+                    || provider.generation.get() == 0
+                {
+                    return Err(ResourceRuntimeError::HandlerNotReady);
+                }
+                if provider_name == "observability-otel" {
+                    validate_observability_environment()?;
+                }
+                let identity = ControllerIdentity::new(
+                    self.zone.clone(),
+                    controller_ref.clone(),
+                    controller_generation,
+                    provider_ref.clone(),
+                    provider.generation,
+                    controller_ref.clone(),
+                    ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+                    None,
+                )
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+                let descriptor = match kind {
+                    U12ControllerKind::Telemetry => {
+                        telemetry_controller_descriptor(identity.clone())
+                            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?
+                    }
+                    U12ControllerKind::Activation => {
+                        activation_controller_descriptor(identity.clone())
+                            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?
+                    }
+                };
+                let (assignments, authority) = self
+                    .u12_controller_assignments(
+                        &descriptor,
+                        controller_ref.clone(),
+                        provider.generation,
+                        controller_generation,
+                        session_generation,
+                    )
+                    .await?;
+                let subject = self
+                    .authorizer
+                    .issue_authenticated_subject(
+                        subject_context.clone(),
+                        authorization_state.clone(),
+                    )
+                    .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+                let api = self
+                    .api
+                    .registered_controller_api(
+                        subject,
+                        authorization_state.clone(),
+                        assignments,
+                    )
+                    .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
+                let allowed_types =
+                    descriptor.resource_types().cloned().collect::<BTreeSet<_>>();
+                let resolver_store = Arc::clone(&self.store);
+                let resolver_zone = self.zone.clone();
+                let resolver_authority = Arc::clone(&authority);
+                let resolver: AssignmentFenceResolver =
+                    Arc::new(move |target, uid, revision| {
+                        let store = Arc::clone(&resolver_store);
+                        let zone = resolver_zone.clone();
+                        let authority = Arc::clone(&resolver_authority);
+                        let allowed_types = allowed_types.clone();
+                        Box::pin(async move {
+                            if !allowed_types.contains(target.resource_type()) {
+                                return Err(SourceError::Integrity);
+                            }
+                            if let Some(stored) = store
+                                .assignment_fence(zone.clone(), target.clone())
+                                .await
+                                .map_err(|error| match error.kind() {
+                                    StoreErrorKind::Backpressure
+                                    | StoreErrorKind::StoreBackpressure => {
+                                        SourceError::Backpressure
+                                    }
+                                    StoreErrorKind::Timeout => SourceError::Timeout,
+                                    _ => SourceError::Unavailable,
+                                })?
+                            {
+                                if stored.resource_uid != uid
+                                    || stored.epoch > authority.epoch
+                                    || (stored.epoch == authority.epoch
+                                        && (stored.provider_generation
+                                            != authority.provider_generation
+                                            || stored.controller_generation
+                                                != authority.controller_generation
+                                            || stored.controller_role != authority.controller_role
+                                            || stored.target != authority.target
+                                            || stored.session_generation
+                                                != authority.session_generation))
+                                {
+                                    return Err(SourceError::Integrity);
+                                }
+                                if stored.epoch == authority.epoch
+                                    && stored.resource_revision != revision
+                                {
+                                    return Err(SourceError::Conflict(stored.resource_revision));
+                                }
+                            }
+                            Ok(ResourceAssignmentFence {
+                                resource_uid: uid,
+                                resource_revision: revision,
+                                provider_generation: authority.provider_generation,
+                                controller_generation: authority.controller_generation,
+                                controller_role: authority.controller_role.clone(),
+                                target: authority.target.clone(),
+                                session_generation: authority.session_generation,
+                                epoch: authority.epoch,
+                                scope: ResourceAssignmentScope::Primary,
+                            })
+                        })
+                    });
+                let api = api.with_assignment_fence_resolver(resolver);
+                let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+                let task = if matches!(kind, U12ControllerKind::Telemetry) {
+                    let reconciler = Arc::new(TelemetryResourceReconciler::new(
+                        Arc::clone(&self.store),
+                        Arc::clone(&status_client),
+                        identity,
+                    ));
+                    let runner = Runner::new(
+                        reconciler,
+                        source,
+                        RunnerConfig {
+                            policy_revision: authorization_state.snapshot.policy_revision,
+                            api_revision: authorization_state.snapshot.api_catalog_revision,
+                            configuration_revision: authorization_state
+                                .snapshot
+                                .active_configuration_revision,
+                            deadline_tick: 5_000,
+                            max_attempts: 3,
+                        },
+                    );
+                    tokio::spawn(async move {
+                        let _ = runner.run().await;
+                    })
+                } else {
+                    let reconciler = Arc::new(ActivationResourceReconciler::new(
+                        Arc::clone(&self.store),
+                        Arc::clone(&status_client),
+                        Arc::clone(&state),
+                        identity,
+                    ));
+                    let runner = Runner::new(
+                        reconciler,
+                        source,
+                        RunnerConfig {
+                            policy_revision: authorization_state.snapshot.policy_revision,
+                            api_revision: authorization_state.snapshot.api_catalog_revision,
+                            configuration_revision: authorization_state
+                                .snapshot
+                                .active_configuration_revision,
+                            deadline_tick: 5_000,
+                            max_attempts: 3,
+                        },
+                    );
+                    tokio::spawn(async move {
+                        let _ = runner.run().await;
+                    })
+                };
+                new_tasks.push(task);
+            }
+            Ok(required)
+        }
+        .await;
+        let required = match build_result {
+            Ok(required) => required,
+            Err(error) => {
+                abort_controller_runner_tasks(&mut new_tasks).await;
+                return Err(error);
+            }
+        };
+        match self.u12_runner_tasks.lock() {
+            Ok(mut tasks) => tasks.extend(new_tasks),
+            Err(_) => {
+                abort_controller_runner_tasks(&mut new_tasks).await;
+                return Err(ResourceRuntimeError::WatchUnavailable);
+            }
+        }
+        self.u12_required.store(required, Ordering::Release);
+        Ok(())
+    }
+
+    async fn u12_controller_assignments(
+        &self,
+        descriptor: &d2b_core_controller::ControllerDescriptor,
+        controller_ref: ResourceRef,
+        provider_generation: ResourceGeneration,
+        controller_generation: ControllerGeneration,
+        session_generation: ReconnectGeneration,
+    ) -> Result<
+        (
+            Vec<(ResourceRef, ResourceAssignmentFence)>,
+            Arc<CoreAssignmentAuthority>,
+        ),
+        ResourceRuntimeError,
+    > {
+        let resource_types = descriptor.resource_types().cloned().collect::<Vec<_>>();
+        let provider_selector = descriptor
+            .watch_selectors()
+            .iter()
+            .find(|selector| selector.field() == SelectorField::Spec)
+            .and_then(|selector| selector.exact_value())
+            .map(str::to_owned);
+        let assignment_projection = if provider_selector.is_some() {
+            StoreProjection::BaseOnly
+        } else {
+            StoreProjection::MetadataOnly
+        };
+        let mut resources = Vec::new();
+        let mut cursor = None;
+        loop {
+            let request = StoreListRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "u12-controller-assignment-relist".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "u12-controller-assignment-relist".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: self.zone.clone(),
+                    resource_types: resource_types.clone(),
+                    resource_names: Vec::new(),
+                    filters: Vec::new(),
+                    page_size: 256,
+                    cursor: cursor.clone(),
+                    projection: assignment_projection,
+                };
+            let page = retry_transient_store_list(
+                &self.zone,
+                "u12-controller-assignment-relist",
+                || self.store.list(request.clone()),
+            )
+            .await
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+            resources.extend(page.resources);
+            if resources.len() > d2b_core_controller::controller_assignment::MAX_ASSIGNMENTS {
+                return Err(ResourceRuntimeError::AuthorizationUnavailable);
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let target = ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let resources = resources
+            .into_iter()
+            .filter(|resource| {
+                let Some(expected_provider) = provider_selector.as_deref() else {
+                    return true;
+                };
+                serde_json::from_slice::<Value>(&resource.canonical_json)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .pointer("/spec/providerRef")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .is_some_and(|provider| provider == expected_provider)
+            })
+            .collect::<Vec<_>>();
+        let mut durable_epoch = 0;
+        let mut authority_mismatch = false;
+        for resource in &resources {
+            let Some(stored) = self
+                .store
+                .assignment_fence(self.zone.clone(), resource.resource_ref.clone())
+                .await
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?
+            else {
+                continue;
+            };
+            durable_epoch = durable_epoch.max(stored.epoch);
+            if stored.provider_generation != provider_generation
+                || stored.controller_generation != controller_generation
+                || stored.controller_role != controller_ref
+                || stored.target != target
+                || stored.session_generation != session_generation
+            {
+                authority_mismatch = true;
+            }
+        }
+        let floor = durable_epoch.max(1);
+        let epoch = if authority_mismatch {
+            let epoch = self
+                .assignments
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .reserve_epoch_after(floor)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            epoch
+        } else {
+            floor
+        };
+        let authority = Arc::new(CoreAssignmentAuthority {
+            provider_generation,
+            controller_generation,
+            session_generation,
+            controller_role: controller_ref.clone(),
+            target: target.clone(),
+            epoch,
+        });
+        let assignments = resources
+            .into_iter()
+            .filter(|resource| {
+                resource
+                    .resource_ref
+                    .resource_type()
+                    .to_canonical_string()
+                    != "Provider"
+            })
+            .map(|resource| {
+                (
+                    resource.resource_ref,
+                    ResourceAssignmentFence {
+                        resource_uid: resource.uid,
+                        resource_revision: resource.revision,
+                        provider_generation,
+                        controller_generation,
+                        controller_role: controller_ref.clone(),
+                        target: target.clone(),
+                        session_generation,
+                        epoch,
+                        scope: ResourceAssignmentScope::Primary,
+                    },
+                )
+            })
+            .collect();
+        Ok((assignments, authority))
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn core_controller_runner_count(&self) -> usize {
+        self.core_runner_tasks
+            .lock()
+            .map(|tasks| tasks.len())
+            .unwrap_or_default()
     }
 
     /// Persist a provider phase together with its typed durable projection.
@@ -4096,6 +15123,10 @@ impl ZoneResourceRuntime {
         self.interaction_identity.as_ref()
     }
 
+    pub(crate) const fn interaction_state(&self) -> InteractionState {
+        self.interaction_state
+    }
+
     /// Resolve the one committed WaylandSession that owns a VM's display
     /// lifecycle. A missing row is reported separately so VM start can fail
     /// closed without inventing a display process or session identity.
@@ -4114,16 +15145,16 @@ impl ZoneResourceRuntime {
         if identity.subject_ref() != &expected_guest {
             return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
         }
-        let resource = committed_resource(
+        let (resource, snapshot_revision) = current_committed_resource(
             &self.zone,
             &self.store,
-            self.store_metadata.current_revision,
             identity.wayland_session_ref(),
+            "interaction-wayland-session-current",
         )
         .await?;
         let spec = committed_wayland_session_spec(
             &self.zone,
-            self.store_metadata.current_revision,
+            snapshot_revision,
             &resource,
         )?;
         if spec.guest_ref() != &expected_guest || !spec.cross_domain_trusted() {
@@ -4159,28 +15190,12 @@ impl ZoneResourceRuntime {
         Ok(Some((resource.resource_ref, resource.uid, spec)))
     }
 
-    pub(crate) const fn interaction_provider_configuration_refused(&self) -> bool {
-        self.interaction_provider_configuration_refused
-    }
-
     /// Return the current core-controller stage.
     pub fn core_stage(&self) -> Result<StartupStage, ResourceRuntimeError> {
         self.core
             .lock()
             .map(|core| core.stage())
             .map_err(|_| ResourceRuntimeError::CoreStartupFailed)
-    }
-
-    /// Whether the production Device TPM reconcile entry point is registered.
-    pub(crate) const fn device_tpm_controller_registered(&self) -> bool {
-        self.device_tpm_controller.is_registered()
-    }
-
-    /// Borrow the registered Device TPM reconcile entry point.
-    pub(crate) const fn device_tpm_controller(
-        &self,
-    ) -> crate::tpm_effect_port::DeviceTpmControllerRegistration {
-        self.device_tpm_controller
     }
 
     /// Borrow the production Zone status projection.
@@ -4205,9 +15220,7 @@ impl ZoneResourceRuntime {
         let mut cursor = None;
         let mut out = Vec::new();
         loop {
-            let page = self
-                .store
-                .list(StoreListRequest {
+            let request = StoreListRequest {
                     operation: StoreOperationContext {
                         operation_id: "network-admission-scan".to_owned(),
                         idempotency_key: None,
@@ -4220,10 +15233,15 @@ impl ZoneResourceRuntime {
                     resource_names: Vec::new(),
                     filters: Vec::new(),
                     page_size: 512,
-                    cursor,
+                    cursor: cursor.clone(),
                     projection: StoreProjection::Full,
-                })
-                .await
+                };
+            let page = retry_transient_store_list(
+                &self.zone,
+                "network-admission-scan",
+                || self.store.list(request.clone()),
+            )
+            .await
                 .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
             for resource in page.resources {
                 out.push(
@@ -4244,9 +15262,7 @@ impl ZoneResourceRuntime {
         target: &ResourceRef,
         operation_id: &str,
     ) -> Result<Value, ResourceRuntimeError> {
-        let resource = self
-            .store
-            .get(StoreGetRequest {
+        let request = StoreGetRequest {
                 operation: StoreOperationContext {
                     operation_id: operation_id.to_owned(),
                     idempotency_key: None,
@@ -4258,8 +15274,11 @@ impl ZoneResourceRuntime {
                 target: target.clone(),
                 expected_uid: None,
                 projection: StoreProjection::Full,
-            })
-            .await
+            };
+        let resource = retry_transient_store_read(&self.zone, operation_id, || {
+            self.store.get(request.clone())
+        })
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         if resource.zone != self.zone || resource.resource_ref != *target {
             return Err(ResourceRuntimeError::StoreReadFailed);
@@ -4346,6 +15365,27 @@ impl ZoneResourceRuntime {
         &self,
         state: Arc<crate::ServerState>,
     ) -> Result<(), ResourceRuntimeError> {
+        self.reconcile_cloud_hypervisor_guests_inner(state, None).await
+    }
+
+    /// Reconcile one Cloud Hypervisor Guest selected by the shared Runner.
+    ///
+    /// The legacy relist helper remains available to explicit lifecycle
+    /// commands, but the shared Runner always supplies one exact Guest key.
+    pub(crate) async fn reconcile_cloud_hypervisor_guest(
+        &self,
+        state: Arc<crate::ServerState>,
+        guest_ref: &ResourceRef,
+    ) -> Result<(), ResourceRuntimeError> {
+        self.reconcile_cloud_hypervisor_guests_inner(state, Some(guest_ref))
+            .await
+    }
+
+    async fn reconcile_cloud_hypervisor_guests_inner(
+        &self,
+        state: Arc<crate::ServerState>,
+        selected_guest: Option<&ResourceRef>,
+    ) -> Result<(), ResourceRuntimeError> {
         if !self.readiness.resource_api_ready {
             return Ok(());
         }
@@ -4353,11 +15393,17 @@ impl ZoneResourceRuntime {
         let client = self.cloud_hypervisor_resource_client().inspect_err(|error| {
             tracing::warn!(error = ?error, "Cloud Hypervisor reconcile stage failed: controller-client");
         })?;
-        let guests = self
-            .list_cloud_hypervisor_guests()
-            .await
-            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        let guests = match selected_guest {
+            Some(guest_ref) => vec![guest_ref.clone()],
+            None => self
+                .list_cloud_hypervisor_guests()
+                .await
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?,
+        };
         for guest_ref in guests {
+            if selected_guest.is_some_and(|selected| selected != &guest_ref) {
+                continue;
+            }
             let Some(descriptor_bytes) =
                 self.guest_setup_descriptors.get(guest_ref.name().as_str())
             else {
@@ -4434,34 +15480,10 @@ impl ZoneResourceRuntime {
                 crate::resolve_committed_guest_session_target(self, &guest_ref)
                     .await
                     .ok();
-            let guest_deleting = self
-                .committed_resource_value(&guest_ref, "cloud-hypervisor-delete-session")
-                .await
-                .ok()
-                .and_then(|value| {
-                    value
-                        .pointer("/metadata/deletionRequestedAt")
-                        .map(|value| !value.is_null())
-                })
-                .unwrap_or(false);
-            if guest_deleting && let Some(target) = guest_session_target.as_ref() {
-                let session_closed = self
-                    .closed_guest_sessions
-                    .lock()
-                    .await
-                    .contains(&target.key());
-                if !session_closed
-                    && let Err(error) =
-                        crate::connect_guest_component_session_for_guest(&state, target).await
-                {
-                    tracing::warn!(
-                        zone = %self.zone.as_str(),
-                        guest = %guest_ref.name().as_str(),
-                        error = %error,
-                        "Cloud Hypervisor deletion session reconnect failed",
-                    );
-                }
-            }
+            // Deletion may reuse the already authenticated live session below,
+            // but it never creates a new session solely to clear a finalizer.
+            // A durable Closed marker therefore remains terminal for session
+            // custody during finalization.
             let guest_session = match guest_session_target.as_ref() {
                 Some(target) => state
                     .guest_component_sessions
@@ -4471,11 +15493,32 @@ impl ZoneResourceRuntime {
                     .cloned(),
                 None => None,
             };
+            let session_vmm_ready = match (
+                guest_session_target.as_ref(),
+                guest_session.as_ref(),
+                crate::load_bundle_resolver(&state),
+            ) {
+                (Some(target), Some(_), Ok(resolver)) => {
+                    crate::resolve_component_session_endpoint_for_guest(
+                        &state, &resolver, self, target,
+                    )
+                    .await
+                    .is_ok()
+                }
+                _ => false,
+            };
             let session_evidence = guest_session.as_ref().and_then(|session| {
                 guest_session_target.as_ref().and_then(|target| {
-                    guest_session_evidence(&guest_ref, session.as_ref(), &descriptor, target)
+                    guest_session_evidence(
+                        &guest_ref,
+                        session.as_ref(),
+                        &descriptor,
+                        target,
+                        session_vmm_ready,
+                    )
                 })
             });
+            let finalizer_clear_requested = Arc::new(AtomicBool::new(false));
             self.ensure_cloud_hypervisor_controller_deployment(
                 &provider_ref,
                 &config,
@@ -4484,9 +15527,18 @@ impl ZoneResourceRuntime {
             .inspect_err(|error| {
                 tracing::warn!(error = ?error, "Cloud Hypervisor reconcile stage failed: deployment");
             })?;
+            let assigned_mutation_api = self
+                .cloud_hypervisor_assigned_mutation_api(&provider_ref)
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        error = ?error,
+                        "Cloud Hypervisor reconcile stage failed: assignment-api",
+                    );
+                })?;
             let session = CloudHypervisorResourceSession {
                 client: Arc::clone(&client),
-                mutation_client: self.status_client()?,
+                assigned_mutation_api,
                 providers: state
                     .provider_runtime
                     .process_providers()
@@ -4506,6 +15558,8 @@ impl ZoneResourceRuntime {
                     .unwrap_or_else(|| ControllerGeneration::new(1).expect("generation one")),
                 session_target: guest_session_target,
                 session_evidence,
+                suppress_finalizer_clear: selected_guest.is_some(),
+                finalizer_clear_requested: Arc::clone(&finalizer_clear_requested),
             };
             let adapter = AuthenticatedResourceApiAdapter::new(Arc::new(session));
             let mut controller = CloudHypervisorController::from_verified_descriptor(
@@ -4542,6 +15596,11 @@ impl ZoneResourceRuntime {
                 })
                 .unwrap_or(true);
             if deleting_or_gone {
+                if selected_guest.is_some()
+                    && !finalizer_clear_requested.load(Ordering::Acquire)
+                {
+                    return Err(ResourceRuntimeError::CapabilityUnavailable);
+                }
                 continue;
             }
             self.reconcile_cloud_hypervisor_setup_volume(&state, &guest_ref)
@@ -4769,19 +15828,7 @@ impl ZoneResourceRuntime {
                 return Err(ResourceRuntimeError::CapabilityUnavailable);
             }
         }
-        let operation_id = format!(
-            "cloud-hypervisor-setup-volume-ready-{}-{}",
-            volume.uid.as_str(),
-            volume.revision.get(),
-        );
-        self.persist_public_reconcile_phase(&volume_ref, &volume.uid, &operation_id, "Ready")
-            .await
-            .inspect_err(|error| {
-                tracing::warn!(
-                    error = ?error,
-                    "Cloud Hypervisor setup Volume status commit failed",
-                );
-            })
+        Ok(())
     }
 
     async fn ensure_cloud_hypervisor_controller_deployment(
@@ -4855,7 +15902,9 @@ impl ZoneResourceRuntime {
                 ) && !session.service_task.is_finished()
             })
         {
-            return Ok(Arc::clone(&session.resource_client));
+            if let Some(client) = session.resource_client.as_ref() {
+                return Ok(Arc::clone(client));
+            }
         }
         self.status_client()
     }
@@ -5278,19 +16327,19 @@ impl ZoneResourceRuntime {
             .cloned()
             .filter(|reference| d2b_provider_runtime_cloud_hypervisor::is_provider_ref(reference))
             .ok_or(ResourceRuntimeError::CapabilityUnavailable)?;
+        let (provider, snapshot_revision) = current_committed_resource(
+            &self.zone,
+            &self.store,
+            &provider_ref,
+            "cloud-hypervisor-guest-inputs",
+        )
+        .await?;
         let guest_spec =
             serde_json::from_slice::<GuestSpec>(&envelope.spec().base().to_canonical_bytes())
                 .map_err(|_| ResourceRuntimeError::CapabilityUnavailable)?;
-        let provider = committed_resource(
-            &self.zone,
-            &self.store,
-            self.store_metadata.current_revision,
-            &provider_ref,
-        )
-        .await?;
         let (provider_spec, _, _, _, _) = committed_provider_spec(
             &self.zone,
-            self.store_metadata.current_revision,
+            snapshot_revision,
             &provider,
             &provider_ref,
         )?;
@@ -5332,277 +16381,366 @@ impl ZoneResourceRuntime {
         ))
     }
 
-    /// Relist and reconcile the durable PipeWire resources owned by this
-    /// Zone. The registry is initialized once and survives ordinary
-    /// watch/reconcile cycles; a daemon restart reconstructs it from store
-    /// rows before any public readiness is published.
-    pub(crate) async fn reconcile_audio_resources(
+    fn build_controller_session_coordinator(
         &self,
-        state: Arc<crate::ServerState>,
-    ) -> Result<(), ResourceRuntimeError> {
-        if !self.readiness.resource_api_ready {
-            return Ok(());
-        }
-        let snapshot = list_audio_snapshot(&self.store, &self.zone)
-            .await
-            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let binding_resources = snapshot.bindings.clone();
-        let statuses;
-        let pending_finalizers;
-        let child_owners;
-        {
-            let mut runtime = self
-                .audio_runtime
-                .lock()
-                .map_err(|_| ResourceRuntimeError::CapabilityUnavailable)?;
-            let registry =
-                runtime.get_or_insert_with(|| AudioResourceRuntime::new(self.zone.clone(), state));
-            registry
-                .reconcile(snapshot)
-                .map_err(map_audio_runtime_error)?;
-            statuses = registry.statuses();
-            pending_finalizers = registry.take_pending_finalizers();
-            child_owners = registry
-                .child_owners(&binding_resources)
-                .map_err(map_audio_runtime_error)?;
-        }
-        let client = self.status_client()?;
-        for owner in &child_owners {
-            if owner.desired.is_some() && !has_audio_finalizer(&owner.resource) {
-                update_audio_finalizer(&client, &owner.resource, true)
-                    .await
-                    .map_err(map_audio_runtime_error)?;
-            }
-        }
-        let converged_children =
-            reconcile_binding_children(&self.store, &client, &self.zone, &child_owners)
-                .await
-                .map_err(|_| ResourceRuntimeError::CapabilityUnavailable)?;
-        for resource in pending_finalizers {
-            if !converged_children.contains(&resource.resource_ref) {
-                continue;
-            }
-            remove_audio_finalizer(&client, &resource)
-                .await
-                .map_err(map_audio_runtime_error)?;
-        }
-        // Finalizer mutations advance the parent revision. Relist the
-        // authoritative Binding rows before status writes so their exact
-        // UID/revision preconditions remain current on startup.
-        let binding_resources = list_audio_resources(
-            &self.store,
-            &self.zone,
-            ResourceTypeName::parse(AUDIO_BINDING_TYPE).expect("static audio binding type"),
-            "binding-status",
-        )
-        .await
-        .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let children =
-            crate::binding_child_resource_runtime::list_binding_children(&self.store, &self.zone)
-                .await
-                .map_err(|_| ResourceRuntimeError::CapabilityUnavailable)?;
-        for status in statuses {
-            let Some(resource) = binding_resources
-                .iter()
-                .find(|resource| resource.resource_ref == status.resource)
-            else {
-                return Err(ResourceRuntimeError::StoreReadFailed);
-            };
-            let projection =
-                audio_binding_status_projection_with_status(resource, &children, &status.status)
-                    .map_err(map_audio_runtime_error)?;
-            persist_resource_status_with_projection(
-                &client,
-                resource,
-                &audio_binding_status_value(status.status),
-                Some(&projection),
-            )
-            .await?;
-        }
-        let start_watch = {
-            let mut watch_task = self
-                .audio_watch_task
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            watch_needs_restart(&mut watch_task)
-        };
-        if start_watch {
-            let watch = d2b_resource_api::watch::WatchService::new(Arc::clone(&self.store))
-                .open(audio_watch_request(&self.zone))
-                .await
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            let store = Arc::clone(&self.store);
-            let zone = self.zone.clone();
-            let registry = Arc::clone(&self.audio_runtime);
-            let status_client = self.status_client()?;
-            let task = tokio::spawn(run_audio_watch(watch, store, zone, registry, status_client));
-            let mut watch_task = self
-                .audio_watch_task
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            if watch_task.is_none() {
-                *watch_task = Some(task);
-            } else {
-                task.abort();
-            }
-        }
-        Ok(())
-    }
-
-    /// Relist and reconcile USB, security-key, and telemetry Bindings.
-    ///
-    /// These Providers retain semantic authority in their own crates; the
-    /// daemon only admits their explicit child intents through Core.
-    pub(crate) async fn reconcile_semantic_binding_resources(
-        &self,
-    ) -> Result<(), ResourceRuntimeError> {
-        if !self.readiness.resource_api_ready {
-            return Ok(());
-        }
-        let client = self.status_client()?;
-        reconcile_semantic_binding_resources(&self.store, &client, &self.zone)
-            .await
-            .map_err(|error| match error {
-                crate::semantic_binding_resource_runtime::SemanticBindingRuntimeError::Store => {
-                    ResourceRuntimeError::StoreReadFailed
-                }
-                crate::semantic_binding_resource_runtime::SemanticBindingRuntimeError::InvalidResource
-                | crate::semantic_binding_resource_runtime::SemanticBindingRuntimeError::InvalidRelationship
-                | crate::semantic_binding_resource_runtime::SemanticBindingRuntimeError::Reconcile => {
-                    ResourceRuntimeError::CapabilityUnavailable
-                }
-            })?;
-        let start_watch = {
-            let mut watch_task = self
-                .semantic_binding_watch_task
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            watch_needs_restart(&mut watch_task)
-        };
-        if start_watch {
-            let watch = d2b_resource_api::watch::WatchService::new(Arc::clone(&self.store))
-                .open(semantic_binding_watch_request(&self.zone))
-                .await
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            let store = Arc::clone(&self.store);
-            let zone = self.zone.clone();
-            let client = client.clone();
-            let task = tokio::spawn(run_semantic_binding_watch(watch, store, zone, client));
-            let mut watch_task = self
-                .semantic_binding_watch_task
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            if watch_task.is_none() {
-                *watch_task = Some(task);
-            } else {
-                task.abort();
-            }
-        }
-        Ok(())
-    }
-
-    fn controller_session_coordinator(&self) -> ControllerSessionCoordinator {
-        ControllerSessionCoordinator {
+    ) -> Result<ControllerSessionCoordinator, ResourceRuntimeError> {
+        Ok(ControllerSessionCoordinator {
             zone: self.zone.clone(),
             bundle_resource_types: self.bundle_resource_types.clone(),
             store: Arc::clone(&self.store),
+            assigned_process_api: Arc::new(Mutex::new(None)),
             api: Arc::clone(&self.api),
             authorizer: Arc::clone(&self.authorizer),
             authorization_state: self.authorization_state.clone(),
+            policy_projection: Arc::clone(&self.policy_projection),
             registrar: Arc::clone(&self.registrar),
             assignments: Arc::clone(&self.assignments),
             controller_sessions: Arc::clone(&self.controller_sessions),
+            pending_controller_session_clears: Arc::new(Mutex::new(BTreeMap::new())),
+            credential_sessions: self.credential_sessions.clone(),
             controller_session_lock: Arc::clone(&self.controller_session_lock),
-        }
-    }
-
-    fn controller_session_hook(
-        &self,
-        providers: Arc<crate::process_provider_runtime::ProductionProcessProviders>,
-    ) -> crate::process_resource_runtime::ProcessWatchHook {
-        let coordinator = self.controller_session_coordinator();
-        let task_slot = Arc::clone(&self.controller_session_reconcile_task);
-        Arc::new(move || {
-            let coordinator = coordinator.clone();
-            let providers = Arc::clone(&providers);
-            let task_slot = Arc::clone(&task_slot);
-            Box::pin(async move {
-                schedule_controller_session_reconcile(task_slot, coordinator, providers)
-                    .map_err(|_| ())
-            })
+            #[cfg(test)]
+            reconcile_attempts: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            admission_test_seam: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            controller_session_evidence_test_errors: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
-    fn controller_session_fence_hook(
-        &self,
-        providers: Arc<crate::process_provider_runtime::ProductionProcessProviders>,
-    ) -> crate::process_resource_runtime::ProcessWatchHook {
-        let coordinator = self.controller_session_coordinator();
-        Arc::new(move || {
-            let coordinator = coordinator.clone();
-            let providers = Arc::clone(&providers);
-            Box::pin(async move {
-                tokio::spawn(async move {
-                    if let Err(error) = coordinator
-                        .reconcile_controller_sessions(Arc::clone(&providers), false)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %error,
-                            "external Provider controller session fencing degraded",
-                        );
-                        return;
-                    }
-                    let Ok(snapshot) = crate::process_resource_runtime::list_process_snapshot(
-                        &coordinator.store,
-                        &coordinator.zone,
-                    )
-                    .await
-                    else {
-                        return;
-                    };
-                    if let Err(error) = coordinator
-                        .fence_process_snapshot(&providers, &snapshot)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %error,
-                            "external Provider controller process fencing degraded",
-                        );
-                    }
-                });
-                Ok(())
-            })
-        })
+    fn controller_session_coordinator(&self) -> Arc<ControllerSessionCoordinator> {
+        self.controller_session_coordinator
+            .lock()
+            .ok()
+            .and_then(|coordinator| coordinator.clone())
+            .expect("controller session coordinator initialized")
     }
 }
 
 fn schedule_controller_session_reconcile(
     task_slot: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    coordinator: ControllerSessionCoordinator,
+    wake: Arc<tokio::sync::Notify>,
+    shutdown: Arc<AtomicBool>,
+    coordinator: Arc<ControllerSessionCoordinator>,
     providers: Arc<crate::process_provider_runtime::ProductionProcessProviders>,
 ) -> Result<(), ResourceRuntimeError> {
+    if shutdown.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let mut slot = task_slot
         .lock()
         .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
-    if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+    if shutdown.load(Ordering::Acquire) {
         return Ok(());
     }
+    if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+        wake.notify_one();
+        return Ok(());
+    }
+    let wake_for_task = Arc::clone(&wake);
     *slot = Some(tokio::spawn(async move {
-        if let Err(error) = coordinator
-            .reconcile_controller_sessions(providers, true)
-            .await
-        {
-            tracing::warn!(
-                error = %error,
-                "external Provider controller session reconciliation degraded",
-            );
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let notified = wake_for_task.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            if let Err(error) = coordinator
+                .reconcile_controller_sessions(Arc::clone(&providers), true)
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    "external Provider controller session reconciliation degraded",
+                );
+                tokio::time::sleep(COMPONENT_SESSION_RETRY_BACKOFF).await;
+                continue;
+            }
+            notified.await;
         }
     }));
     Ok(())
 }
 
 impl ControllerSessionCoordinator {
+    fn set_assigned_process_api(
+        &self,
+        api: Arc<RedbRegisteredControllerApi>,
+    ) -> Result<(), ResourceRuntimeError> {
+        *self
+            .assigned_process_api
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = Some(api);
+        Ok(())
+    }
+
+    fn clear_assigned_process_api(&self) -> Result<(), ResourceRuntimeError> {
+        *self
+            .assigned_process_api
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = None;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_controller_session_admission_test_seam(
+        &self,
+        seam: ControllerSessionAdmissionTestSeam,
+    ) {
+        *self
+            .admission_test_seam
+            .lock()
+            .expect("controller-session test seam lock") = Some(seam);
+    }
+
+    #[cfg(test)]
+    fn set_controller_session_evidence_test_errors(
+        &self,
+        errors: Vec<ResourceRuntimeError>,
+    ) {
+        *self
+            .controller_session_evidence_test_errors
+            .lock()
+            .expect("controller-session evidence test seam lock") = errors;
+    }
+
+    fn controller_provider_identity_error_is_global(error: &ResourceRuntimeError) -> bool {
+        matches!(
+            error,
+            ResourceRuntimeError::StoreReadFailed
+                | ResourceRuntimeError::AuthenticationUnavailable
+                | ResourceRuntimeError::AuthorizationUnavailable
+                | ResourceRuntimeError::PolicyUnavailable
+        )
+    }
+
+    fn controller_session_evidence_error_is_context_local(
+        error: &ResourceRuntimeError,
+    ) -> bool {
+        let kind = match error {
+            ResourceRuntimeError::ResourceGetFailed(kind)
+            | ResourceRuntimeError::ResourceStatusUpdateFailed(kind) => *kind,
+            _ => return false,
+        };
+        matches!(
+            kind,
+            ResourceErrorKind::ResourceConflict
+                | ResourceErrorKind::RevisionExpired
+                | ResourceErrorKind::Backpressure
+                | ResourceErrorKind::Timeout
+                | ResourceErrorKind::Cancelled
+                | ResourceErrorKind::ResourcePlaneUnavailable
+        )
+    }
+
+    fn controller_session_evidence_read_error(kind: StoreErrorKind) -> ResourceRuntimeError {
+        match kind {
+            StoreErrorKind::ResourceConflict => {
+                ResourceRuntimeError::ResourceGetFailed(ResourceErrorKind::ResourceConflict)
+            }
+            StoreErrorKind::RevisionExpired => {
+                ResourceRuntimeError::ResourceGetFailed(ResourceErrorKind::RevisionExpired)
+            }
+            StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure => {
+                ResourceRuntimeError::ResourceGetFailed(ResourceErrorKind::Backpressure)
+            }
+            StoreErrorKind::Timeout => {
+                ResourceRuntimeError::ResourceGetFailed(ResourceErrorKind::Timeout)
+            }
+            StoreErrorKind::Cancelled => {
+                ResourceRuntimeError::ResourceGetFailed(ResourceErrorKind::Cancelled)
+            }
+            StoreErrorKind::ResourcePlaneUnavailable => {
+                ResourceRuntimeError::ResourceGetFailed(ResourceErrorKind::ResourcePlaneUnavailable)
+            }
+            _ => ResourceRuntimeError::StoreReadFailed,
+        }
+    }
+
+    async fn persist_controller_session_evidence_with_retry(
+        &self,
+        context: &crate::process_provider_runtime::ControllerBootstrapContext,
+        session_generation: Option<ReconnectGeneration>,
+    ) -> Result<(), ResourceRuntimeError> {
+        for attempt in 0..2 {
+            match self
+                .persist_controller_session_evidence(context, session_generation)
+                .await
+            {
+                Err(error)
+                    if attempt == 0
+                        && Self::controller_session_evidence_error_is_context_local(&error) =>
+                {
+                    tracing::debug!(
+                        process = %context.process_ref(),
+                        "controller-session evidence conflicted; rereading before retry",
+                    );
+                }
+                result => return result,
+            }
+        }
+        unreachable!("controller-session evidence retry must return a result");
+    }
+
+    async fn persist_controller_session_evidence(
+        &self,
+        context: &crate::process_provider_runtime::ControllerBootstrapContext,
+        session_generation: Option<ReconnectGeneration>,
+    ) -> Result<(), ResourceRuntimeError> {
+        #[cfg(test)]
+        if session_generation.is_none()
+            && let Some(error) = self
+                .controller_session_evidence_test_errors
+                .lock()
+                .ok()
+                .and_then(|mut errors| errors.pop())
+        {
+            return Err(error);
+        }
+        let process = match self
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "controller-session-evidence-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "controller-session-evidence-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: context.process_ref().clone(),
+                expected_uid: Some(context.process_uid().clone()),
+                projection: StoreProjection::Full,
+            })
+            .await
+        {
+            Ok(process) => process,
+            Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                if session_generation.is_none() {
+                    return Ok(());
+                }
+                return Err(ResourceRuntimeError::IdentityUnbound);
+            }
+            Err(error) => {
+                return Err(Self::controller_session_evidence_read_error(error.kind()));
+            }
+        };
+        if let Err(error) = controller_session_evidence_identity_check(
+            controller_resource_matches(context, &process),
+            session_generation.is_none(),
+        ) {
+            return Err(error);
+        }
+        let controller_session = session_generation.map(|session_generation| {
+            json!({
+                "ready": true,
+                "providerRef": context.provider_owner_ref().to_canonical_string(),
+                "providerUid": context.provider_uid().as_str(),
+                "providerGeneration": context.provider_generation().get(),
+                "processRef": context.process_ref().to_canonical_string(),
+                "processUid": context.process_uid().as_str(),
+                "processGeneration": context.generation().get(),
+                "controllerGeneration": context.controller_generation().get(),
+                "sessionGeneration": session_generation.get(),
+                "artifactReady": true,
+                "descriptorReady": true,
+                "registrationReady": true,
+            })
+        });
+        let api = self
+            .assigned_process_api
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        persist_resource_controller_session_evidence(
+            &api,
+            &process,
+            controller_session.as_ref(),
+        )
+        .await
+    }
+
+    fn queue_controller_session_clear(
+        &self,
+        context: &crate::process_provider_runtime::ControllerBootstrapContext,
+    ) -> Result<(), ResourceRuntimeError> {
+        self.pending_controller_session_clears
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .insert(context.process_ref().clone(), context.clone());
+        Ok(())
+    }
+
+    fn remove_queued_controller_session_clear(
+        &self,
+        process_ref: &ResourceRef,
+        context: &crate::process_provider_runtime::ControllerBootstrapContext,
+    ) -> Result<(), ResourceRuntimeError> {
+        let mut pending = self
+            .pending_controller_session_clears
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
+        if pending
+            .get(process_ref)
+            .is_some_and(|queued| queued == context)
+        {
+            pending.remove(process_ref);
+        }
+        Ok(())
+    }
+
+    async fn retry_queued_controller_session_clears(
+        &self,
+    ) -> Result<(), ResourceRuntimeError> {
+        let pending = self
+            .pending_controller_session_clears
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .iter()
+            .map(|(process_ref, context)| (process_ref.clone(), context.clone()))
+            .collect::<Vec<_>>();
+        for (process_ref, context) in pending {
+            let session_state = self
+                .controller_sessions
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+                .get(&process_ref)
+                .map(|session| session.service_task.is_finished());
+            match session_state {
+                Some(false) => {
+                    self.remove_queued_controller_session_clear(&process_ref, &context)?;
+                    continue;
+                }
+                Some(true) => continue,
+                None => {}
+            }
+            match self
+                .persist_controller_session_evidence_with_retry(&context, None)
+                .await
+            {
+                Ok(()) => {
+                    self.remove_queued_controller_session_clear(&process_ref, &context)?;
+                }
+                Err(error) if Self::controller_session_clear_error_is_stale_identity(&error) => {
+                    self.remove_queued_controller_session_clear(&process_ref, &context)?;
+                }
+                Err(error)
+                    if Self::controller_session_evidence_error_is_context_local(&error) =>
+                {
+                    tracing::warn!(
+                        process = %process_ref,
+                        error = %error,
+                        "controller-session evidence clear remains deferred after transport teardown",
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     fn revoke_controller_assignments(&self, binding: &ControllerSessionBinding) {
         if d2b_provider_runtime_cloud_hypervisor::is_provider_ref(binding.provider_ref()) {
             self.assignments
@@ -5612,20 +16750,61 @@ impl ControllerSessionCoordinator {
         }
     }
 
+    fn controller_session_clear_error_is_stale_identity(error: &ResourceRuntimeError) -> bool {
+        matches!(
+            error,
+            ResourceRuntimeError::IdentityUnbound
+                | ResourceRuntimeError::ResourceGetFailed(ResourceErrorKind::ResourceNotFound)
+                | ResourceRuntimeError::ResourceStatusUpdateFailed(
+                    ResourceErrorKind::ResourceNotFound
+                )
+        )
+    }
+
+    fn isolate_controller_session_clear_error(
+        result: Result<(), ResourceRuntimeError>,
+    ) -> Result<(), ResourceRuntimeError> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(error)
+                if Self::controller_session_clear_error_is_stale_identity(&error)
+                    || Self::controller_session_evidence_error_is_context_local(&error) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn clear_controller_session_for_reconcile(
+        &self,
+        process_ref: &ResourceRef,
+        expected: Option<&crate::process_provider_runtime::ControllerBootstrapContext>,
+    ) -> Result<(), ResourceRuntimeError> {
+        Self::isolate_controller_session_clear_error(
+            self.remove_controller_session(process_ref, expected).await,
+        )
+    }
+
     async fn fence(
         &self,
         providers: &crate::process_provider_runtime::ProductionProcessProviders,
     ) -> Result<(), ResourceRuntimeError> {
-        let bootstrap_refs = providers.controller_bootstrap_refs(&self.zone);
-        let bootstrap_ref_set = bootstrap_refs.iter().cloned().collect::<BTreeSet<_>>();
+        self.retry_queued_controller_session_clears().await?;
+        let bootstrap_contexts = providers.controller_bootstrap_contexts(&self.zone);
+        let bootstrap_contexts = bootstrap_contexts
+            .into_iter()
+            .map(|context| (context.process_ref().clone(), context))
+            .collect::<BTreeMap<_, _>>();
         let stale_sessions = self
             .controller_sessions
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .iter()
             .filter(|(process_ref, session)| {
-                controller_session_needs_fence(
-                    bootstrap_ref_set.contains(*process_ref),
+                crate::process_provider_runtime::controller_session_needs_fence(
+                    bootstrap_contexts.get(*process_ref),
+                    &session.context,
                     session.service_task.is_finished(),
                 )
             })
@@ -5633,7 +16812,7 @@ impl ControllerSessionCoordinator {
             .collect::<Vec<_>>();
         for (process_ref, context) in stale_sessions {
             providers.fail_controller_bootstrap(&context);
-            self.remove_controller_session(&process_ref, Some(&context))
+            self.clear_controller_session_for_reconcile(&process_ref, Some(&context))
                 .await?;
         }
 
@@ -5656,12 +16835,13 @@ impl ControllerSessionCoordinator {
         if contexts.is_empty() {
             return Ok(());
         }
-        let store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let store_metadata = retry_transient_store_read(
+            &self.zone,
+            "controller-session-fence-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let current_revision = store_metadata.current_revision;
         let current_controller_generation = store_metadata.policy_snapshot.controller_generation;
         let provider_refs = contexts
             .iter()
@@ -5671,7 +16851,6 @@ impl ControllerSessionCoordinator {
             match load_committed_controller_provider_identities(
                 &self.zone,
                 &self.store,
-                current_revision,
                 BTreeSet::from([provider_ref.clone()]),
             )
             .await
@@ -5687,8 +16866,11 @@ impl ControllerSessionCoordinator {
                             )
                     }) {
                         providers.fail_controller_bootstrap(context);
-                        self.remove_controller_session(context.process_ref(), Some(context))
-                            .await?;
+                        self.clear_controller_session_for_reconcile(
+                            context.process_ref(),
+                            Some(context),
+                        )
+                        .await?;
                     }
                 }
                 Err(error) => {
@@ -5697,13 +16879,20 @@ impl ControllerSessionCoordinator {
                         .filter(|context| context.provider_owner_ref() == &provider_ref)
                     {
                         providers.fail_controller_bootstrap(context);
-                        self.remove_controller_session(context.process_ref(), Some(context))
-                            .await?;
+                        self.clear_controller_session_for_reconcile(
+                            context.process_ref(),
+                            Some(context),
+                        )
+                        .await?;
                     }
                     tracing::warn!(
+                        provider = %provider_ref,
                         error = %error,
                         "external Provider controller identity projection failed",
                     );
+                    if Self::controller_provider_identity_error_is_global(&error) {
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -5714,18 +16903,22 @@ impl ControllerSessionCoordinator {
                 context.controller_generation(),
             ) {
                 providers.fail_controller_bootstrap(&context);
-                self.remove_controller_session(context.process_ref(), Some(&context))
-                    .await?;
+                self.clear_controller_session_for_reconcile(
+                    context.process_ref(),
+                    Some(&context),
+                )
+                .await?;
             }
         }
         Ok(())
     }
 
-    async fn fence_process_snapshot(
+    async fn fence_process_resources(
         &self,
         providers: &crate::process_provider_runtime::ProductionProcessProviders,
-        snapshot: &[StoredResource],
+        resources: &[StoredResource],
     ) -> Result<(), ResourceRuntimeError> {
+        let _session_guard = self.controller_session_lock.lock().await;
         let sessions = {
             let sessions = self
                 .controller_sessions
@@ -5736,10 +16929,10 @@ impl ControllerSessionCoordinator {
                 .map(|(process_ref, session)| (process_ref.clone(), session.context.clone()))
                 .collect::<Vec<_>>()
         };
-        let stale_sessions = controller_session_snapshot_fences(sessions, snapshot);
+        let stale_sessions = controller_session_resource_fences(sessions, resources);
         for (process_ref, context) in stale_sessions {
             providers.fail_controller_bootstrap(&context);
-            self.remove_controller_session(&process_ref, Some(&context))
+            self.clear_controller_session_for_reconcile(&process_ref, Some(&context))
                 .await?;
         }
         Ok(())
@@ -5750,21 +16943,74 @@ impl ControllerSessionCoordinator {
         providers: Arc<crate::process_provider_runtime::ProductionProcessProviders>,
         establish: bool,
     ) -> Result<(), ResourceRuntimeError> {
-        let Ok(_session_guard) = self.controller_session_lock.try_lock() else {
-            return Ok(());
-        };
+        let _session_guard = self.controller_session_lock.lock().await;
+        self.reconcile_controller_sessions_locked(providers, establish)
+            .await
+    }
+
+    async fn reconcile_controller_sessions_locked(
+        &self,
+        providers: Arc<crate::process_provider_runtime::ProductionProcessProviders>,
+        establish: bool,
+    ) -> Result<(), ResourceRuntimeError> {
+        #[cfg(test)]
+        self.reconcile_attempts.fetch_add(1, Ordering::SeqCst);
         self.fence(&providers).await?;
         if !establish {
             self.refresh_controller_policy(&providers).await?;
             self.reconcile_controller_assignments(&providers).await?;
             return Ok(());
         }
-        let store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let store_metadata = retry_transient_store_read(
+            &self.zone,
+            "controller-session-reconcile-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         let bootstrap_contexts = providers.controller_bootstrap_contexts(&self.zone);
+        let active_processes = self
+            .controller_sessions
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for context in &bootstrap_contexts {
+            if !active_processes.contains(context.process_ref()) {
+                match self
+                    .persist_controller_session_evidence_with_retry(context, None)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error)
+                        if Self::controller_session_clear_error_is_stale_identity(&error) =>
+                    {
+                        providers.fail_controller_bootstrap(context);
+                        continue;
+                    }
+                    Err(error)
+                        if Self::controller_session_evidence_error_is_context_local(&error) =>
+                    {
+                        tracing::warn!(
+                            process = %context.process_ref(),
+                            "controller-session evidence clear conflicted; retaining context for retry",
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        #[cfg(test)]
+        if let Some(seam) = self
+            .admission_test_seam
+            .lock()
+            .ok()
+            .and_then(|seam| seam.clone())
+        {
+            (seam.after_snapshot)(providers.as_ref());
+        }
         let provider_refs = bootstrap_contexts
             .iter()
             .map(|context| context.provider_owner_ref().clone())
@@ -5774,7 +17020,6 @@ impl ControllerSessionCoordinator {
             match load_committed_controller_provider_identities(
                 &self.zone,
                 &self.store,
-                store_metadata.current_revision,
                 BTreeSet::from([provider_ref.clone()]),
             )
             .await
@@ -5795,8 +17040,11 @@ impl ControllerSessionCoordinator {
                         .collect::<Vec<_>>();
                     for context in mismatched {
                         providers.fail_controller_bootstrap(&context);
-                        self.remove_controller_session(context.process_ref(), Some(&context))
-                            .await?;
+                        self.clear_controller_session_for_reconcile(
+                            context.process_ref(),
+                            Some(&context),
+                        )
+                        .await?;
                     }
                     provider_identities.extend(identities);
                 }
@@ -5806,17 +17054,27 @@ impl ControllerSessionCoordinator {
                         .filter(|context| context.provider_owner_ref() == &provider_ref)
                     {
                         providers.fail_controller_bootstrap(context);
-                        self.remove_controller_session(context.process_ref(), Some(context))
-                            .await?;
+                        self.clear_controller_session_for_reconcile(
+                            context.process_ref(),
+                            Some(context),
+                        )
+                        .await?;
                     }
                     tracing::warn!(
+                        provider = %provider_ref,
                         error = %error,
                         "external Provider controller identity projection failed",
                     );
+                    if Self::controller_provider_identity_error_is_global(&error) {
+                        return Err(error);
+                    }
                 }
             }
         }
-        let surviving_contexts = providers.controller_bootstrap_contexts(&self.zone);
+        let surviving_contexts = bootstrap_contexts
+            .into_iter()
+            .filter(|context| providers.has_controller_bootstrap(context.process_ref(), context))
+            .collect::<Vec<_>>();
         let provider_subjects = surviving_contexts
             .iter()
             .filter_map(|context| {
@@ -5827,9 +17085,7 @@ impl ControllerSessionCoordinator {
                         subject_uid: provider_uid.clone(),
                     })
             })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
         let policy_resources =
             d2bd_runtime::resource_runtime_support::load_committed_policy_resources(
                 &self.store,
@@ -5844,78 +17100,184 @@ impl ControllerSessionCoordinator {
                 store_metadata.current_revision,
                 &self.bundle_resource_types,
                 &policy_resources,
-                provider_subjects,
+                provider_subjects.iter().cloned(),
             ) {
                 Ok(policy) => policy,
                 Err(error) => {
                     for context in surviving_contexts {
                         providers.fail_controller_bootstrap(&context);
-                        self.remove_controller_session(context.process_ref(), Some(&context))
-                            .await?;
+                        self.clear_controller_session_for_reconcile(
+                            context.process_ref(),
+                            Some(&context),
+                        )
+                        .await?;
                     }
                     tracing::warn!(
                         error = %error,
                         "external Provider controller policy projection failed",
                     );
-                    return Ok(());
+                    return Err(error);
                 }
             };
-        if self.authorizer.replace_policy(policy, &state).is_err() {
+        #[cfg(test)]
+        let installed_subjects = provider_subjects.clone();
+        if let Err(error) = self
+            .policy_projection
+            .install(policy, state, provider_subjects)
+        {
             for context in surviving_contexts {
                 providers.fail_controller_bootstrap(&context);
-                self.remove_controller_session(context.process_ref(), Some(&context))
-                    .await?;
+                self.clear_controller_session_for_reconcile(
+                    context.process_ref(),
+                    Some(&context),
+                )
+                .await?;
             }
-            return Ok(());
+            return Err(error);
         }
-        *self
-            .authorization_state
+        #[cfg(test)]
+        if let Some(seam) = self
+            .admission_test_seam
             .lock()
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = Some(state);
+            .ok()
+            .and_then(|seam| seam.clone())
+        {
+            (seam.after_policy_install)(&installed_subjects);
+        }
 
-        let bootstrap_refs = providers.controller_bootstrap_refs(&self.zone);
-        for process_ref in bootstrap_refs {
+        for context in surviving_contexts {
+            let process_ref = context.process_ref().clone();
             let existing = self
                 .controller_sessions
                 .lock()
                 .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
                 .get(&process_ref)
-                .map(|session| (session.context.clone(), session.service_task.is_finished()));
-            if let Some((context, finished)) = existing {
+                .map(|session| {
+                    (
+                        session.context.clone(),
+                        session.service_task.is_finished(),
+                        session.binding.session_generation(),
+                    )
+                });
+            if let Some((context, finished, session_generation)) = existing {
                 if finished {
                     providers.fail_controller_bootstrap(&context);
-                    self.remove_controller_session(&process_ref, Some(&context))
-                        .await?;
+                    self.clear_controller_session_for_reconcile(
+                        &process_ref,
+                        Some(&context),
+                    )
+                    .await?;
                     continue;
+                }
+                match self
+                    .persist_controller_session_evidence_with_retry(
+                        &context,
+                        Some(session_generation),
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error)
+                        if Self::controller_session_evidence_error_is_context_local(&error) =>
+                    {
+                        tracing::warn!(
+                            process = %process_ref,
+                            "controller-session evidence conflicted; retaining session for retry",
+                        );
+                        continue;
+                    }
+                    Err(error)
+                        if Self::controller_session_clear_error_is_stale_identity(&error) =>
+                    {
+                        providers.fail_controller_bootstrap(&context);
+                        self.clear_controller_session_for_reconcile(
+                            &process_ref,
+                            Some(&context),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 }
                 if providers.has_controller_bootstrap(&process_ref, &context) {
                     continue;
                 }
-                self.remove_controller_session(&process_ref, Some(&context))
-                    .await?;
+                self.clear_controller_session_for_reconcile(
+                    &process_ref,
+                    Some(&context),
+                )
+                .await?;
             }
 
+            if !providers.has_controller_bootstrap(&process_ref, &context) {
+                continue;
+            }
             if !providers.controller_bootstrap_ready(&self.zone, &process_ref) {
                 continue;
             }
-            let Some(endpoint) = providers.begin_controller_bootstrap(&self.zone, &process_ref)
-            else {
-                continue;
-            };
-            let context = endpoint.context().clone();
             let mut registrar = match self.registrar.lock() {
                 Ok(mut registrar) => match registrar.take() {
                     Some(registrar) => registrar,
-                    None => {
-                        providers.fail_controller_bootstrap(&context);
-                        continue;
-                    }
+                    None => continue,
                 },
                 Err(_) => {
-                    providers.fail_controller_bootstrap(&context);
                     return Err(ResourceRuntimeError::AuthenticationUnavailable);
                 }
             };
+            let Some(endpoint) =
+                providers.begin_controller_bootstrap_if_matches(&self.zone, &context)
+            else {
+                *self
+                    .registrar
+                    .lock()
+                    .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
+                    Some(registrar);
+                continue;
+            };
+            let context = endpoint.context().clone();
+            #[cfg(test)]
+            if let Some(_seam) = self
+                .admission_test_seam
+                .lock()
+                .ok()
+                .and_then(|seam| seam.clone())
+                .filter(|seam| seam.admit_without_transport)
+            {
+                let current = match self
+                    .controller_context_is_current(&providers, &context)
+                    .await
+                {
+                    Ok(current) => current,
+                    Err(ResourceRuntimeError::IdentityUnbound) => false,
+                    Err(error) => return Err(error),
+                };
+                let expected_subject = BoundSubject {
+                    subject_ref: context.provider_owner_ref().clone(),
+                    subject_uid: context.provider_uid().clone(),
+                };
+                let policy_has_subject = self
+                    .policy_projection
+                    .installed_controller_subjects()
+                    .is_ok_and(|subjects| subjects.contains(&expected_subject));
+                *self
+                    .registrar
+                    .lock()
+                    .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
+                    Some(registrar);
+                assert!(
+                    policy_has_subject,
+                    "controller admission must use a policy compiled with its Provider subject"
+                );
+                if current {
+                    assert!(
+                        providers.activate_controller_bootstrap(&context),
+                        "matching controller bootstrap must activate exactly once"
+                    );
+                } else {
+                    providers.fail_controller_bootstrap(&context);
+                }
+                continue;
+            }
             let setup = self
                 .establish_controller_session(&providers, endpoint, &mut registrar)
                 .await;
@@ -5935,8 +17297,13 @@ impl ControllerSessionCoordinator {
                     _resource_client,
                     service_task,
                     _session_generation,
+                    _route,
+                    backend_lease,
                 ))) = setup.take()
                 {
+                    if let Some(backend_lease) = backend_lease {
+                        backend_lease.cancel();
+                    }
                     let _ = driver
                         .close(
                             d2b_contracts_zone_session::v3::component_session::CloseReason::RoleMismatch,
@@ -5951,11 +17318,35 @@ impl ControllerSessionCoordinator {
                 return Err(ResourceRuntimeError::AuthenticationUnavailable);
             }
             match setup.expect("controller setup result present") {
-                Ok((ingress, driver, resource_client, service_task, session_generation)) => {
-                    let current = self
+                Ok((
+                    ingress,
+                    driver,
+                    resource_client,
+                    service_task,
+                    session_generation,
+                    route,
+                    backend_lease,
+                )) => {
+                    let current = match self
                         .controller_context_is_current(&providers, &context)
                         .await
-                        .unwrap_or(false);
+                    {
+                        Ok(current) => current,
+                        Err(ResourceRuntimeError::IdentityUnbound) => false,
+                        Err(error) => {
+                            let _ = driver
+                                .close(
+                                    d2b_contracts_zone_session::v3::component_session::CloseReason::RoleMismatch,
+                                    d2b_contracts_zone_session::v3::component_session::Remediation::ReplaceGeneration,
+                                )
+                                .await;
+                            service_task.abort();
+                            let _ = service_task.await;
+                            providers.fail_controller_bootstrap(&context);
+                            self.revoke_controller_ingress(ingress).await?;
+                            return Err(error);
+                        }
+                    };
                     if !current || !providers.activate_controller_bootstrap(&context) {
                         let _ = driver
                             .close(
@@ -5970,15 +17361,36 @@ impl ControllerSessionCoordinator {
                         continue;
                     }
                     let context_for_cleanup = context.clone();
+                    let binding = controller_session_binding(&context, session_generation)?;
+                    let credential_session = if is_credential_provider_ref(context.provider_owner_ref()) {
+                        Some(Arc::new(
+                            ComponentCredentialSession::new(route.clone(), Arc::new(driver.clone()))
+                                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?,
+                        ) as Arc<dyn CredentialSession>)
+                    } else {
+                        None
+                    };
+                    if let Some(session) = credential_session.as_ref() {
+                        self.credential_sessions.register(
+                            context.provider_owner_ref().clone(),
+                            session_generation,
+                            Arc::clone(session),
+                        )
+                        .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
+                    }
                     let mut session = Some(ControllerSession {
                         context: context.clone(),
-                        binding: controller_session_binding(&context, session_generation)?,
+                        binding,
                         ingress,
                         driver: driver.clone(),
+                        _backend_lease: backend_lease,
                         resource_client,
                         service_task,
                         assignments: BTreeMap::new(),
                         assignment_stream_open: false,
+                        assignments_revoked: false,
+                        transport_closed: false,
+                        ingress_revoked: false,
                     });
                     let inserted = match self.controller_sessions.lock() {
                         Ok(mut sessions) => {
@@ -5994,9 +17406,63 @@ impl ControllerSessionCoordinator {
                         }
                         Err(_) => false,
                     };
+                    if inserted {
+                        if let Err(error) = self
+                            .persist_controller_session_evidence_with_retry(
+                                &context,
+                                Some(session_generation),
+                            )
+                            .await
+                        {
+                            if Self::controller_session_evidence_error_is_context_local(&error) {
+                                tracing::warn!(
+                                    process = %process_ref,
+                                    "controller-session evidence conflicted; retaining admitted session for retry",
+                                );
+                                continue;
+                            }
+                            providers.fail_controller_bootstrap(&context);
+                            match error {
+                                error
+                                    if Self::controller_session_clear_error_is_stale_identity(
+                                        &error,
+                                    ) =>
+                                {
+                                    self.clear_controller_session_for_reconcile(
+                                        &process_ref,
+                                        Some(&context),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                                error => {
+                                    self.clear_controller_session_for_reconcile(
+                                        &process_ref,
+                                        Some(&context),
+                                    )
+                                    .await?;
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        tracing::info!(
+                            zone = %self.zone.as_str(),
+                            provider = %context.provider_owner_ref(),
+                            process = %context.process_ref(),
+                            session_generation = session_generation.get(),
+                            "external Provider controller ResourceV3 session live",
+                        );
+                    }
                     if !inserted {
+                        if credential_session.is_some() {
+                            self.credential_sessions.remove(
+                                context.provider_owner_ref(),
+                                session_generation,
+                            );
+                        }
                         providers.fail_controller_bootstrap(&context_for_cleanup);
-                        if let Some(session) = session {
+                        if let Some(mut session) = session {
+                            session.cancel_backend_lease();
                             let _ = session
                                 .driver
                                 .close(
@@ -6061,10 +17527,12 @@ impl ControllerSessionCoordinator {
         if !providers.has_controller_bootstrap(context.process_ref(), context) {
             return Ok(false);
         }
-        let metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let metadata = retry_transient_store_read(
+            &self.zone,
+            "controller-session-context-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         if controller_generation_is_stale(
             metadata.policy_snapshot.controller_generation,
@@ -6072,13 +17540,24 @@ impl ControllerSessionCoordinator {
         ) {
             return Ok(false);
         }
-        let identities = load_committed_controller_provider_identities(
+        let identities = match load_committed_controller_provider_identities(
             &self.zone,
             &self.store,
-            metadata.current_revision,
             BTreeSet::from([context.provider_owner_ref().clone()]),
         )
-        .await?;
+        .await
+        {
+            Ok(identities) => identities,
+            Err(error) if !Self::controller_provider_identity_error_is_global(&error) => {
+                tracing::warn!(
+                    provider = %context.provider_owner_ref(),
+                    error = %error,
+                    "external Provider controller identity is not admissible",
+                );
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
         let Some((provider_uid, provider_generation)) =
             identities.get(context.provider_owner_ref())
         else {
@@ -6089,11 +17568,11 @@ impl ControllerSessionCoordinator {
         {
             return Ok(false);
         }
-        let snapshot =
-            crate::process_resource_runtime::list_process_snapshot(&self.store, &self.zone)
+        let resources =
+            crate::process_resource_runtime::list_process_resources(&self.store, &self.zone)
                 .await
                 .map_err(map_process_runtime_error)?;
-        Ok(snapshot
+        Ok(resources
             .iter()
             .find(|resource| resource.resource_ref == *context.process_ref())
             .is_some_and(|resource| controller_resource_matches(context, resource)))
@@ -6112,8 +17591,11 @@ impl ControllerSessionCoordinator {
             }
             ControllerAssignmentRefreshAction::Failed { context, error } => {
                 providers.fail_controller_bootstrap(context);
-                self.remove_controller_session(context.process_ref(), Some(context))
-                    .await?;
+                self.clear_controller_session_for_reconcile(
+                    context.process_ref(),
+                    Some(context),
+                )
+                .await?;
                 Err(error)
             }
         }
@@ -6498,9 +17980,7 @@ impl ControllerSessionCoordinator {
         let mut resources = Vec::new();
         let mut resource_uids = BTreeSet::new();
         loop {
-            let page = self
-                .store
-                .list(StoreListRequest {
+            let request = StoreListRequest {
                     operation: StoreOperationContext {
                         operation_id: "controller-assignment-list".to_owned(),
                         idempotency_key: None,
@@ -6513,10 +17993,15 @@ impl ControllerSessionCoordinator {
                     resource_names: Vec::new(),
                     filters: Vec::new(),
                     page_size: 128,
-                    cursor,
+                    cursor: cursor.clone(),
                     projection: StoreProjection::Full,
-                })
-                .await
+                };
+            let page = retry_transient_store_list(
+                &self.zone,
+                "controller-assignment-list",
+                || self.store.list(request.clone()),
+            )
+            .await
                 .map_err(|error| {
                     if matches!(
                         error.kind(),
@@ -6565,19 +18050,53 @@ impl ControllerSessionCoordinator {
         process_ref: &ResourceRef,
         expected: Option<&crate::process_provider_runtime::ControllerBootstrapContext>,
     ) -> Result<(), ResourceRuntimeError> {
-        let session = {
+        let (context, mut session) = {
             let mut sessions = self
                 .controller_sessions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let matches = sessions.get(process_ref).is_some_and(|session| {
+            let Some(session) = sessions.get(process_ref).filter(|session| {
                 expected.is_none_or(|expected| &session.context == expected)
-            });
-            matches.then(|| sessions.remove(process_ref)).flatten()
+            }) else {
+                return Ok(());
+            };
+            let context = session.context.clone();
+            let session = sessions
+                .remove(process_ref)
+                .expect("matching controller session remains in the map");
+            (context, session)
         };
-        if let Some(session) = session {
+
+        if !session.ingress_revoked {
+            if let Err(error) = self
+                .revoke_controller_ingress_in_place(&mut session.ingress)
+                .await
+            {
+                let mut sessions = self
+                    .controller_sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if sessions.get(process_ref).is_none() {
+                    sessions.insert(process_ref.clone(), session);
+                }
+                return Err(error);
+            }
+            session.ingress_revoked = true;
+        }
+
+        self.credential_sessions.remove(
+            session.binding.provider_ref(),
+            session.binding.session_generation(),
+        );
+
+        if !session.assignments_revoked {
             self.revoke_controller_assignments(&session.binding);
             send_controller_assignment_revocations(&session.driver, &session.assignments).await;
+            session.assignments_revoked = true;
+        }
+
+        if !session.transport_closed {
+            session.cancel_backend_lease();
             let _ = session
                 .driver
                 .close(
@@ -6586,8 +18105,34 @@ impl ControllerSessionCoordinator {
                 )
                 .await;
             session.service_task.abort();
-            let _ = session.service_task.await;
-            self.revoke_controller_ingress(session.ingress).await?;
+            let _ = (&mut session.service_task).await;
+            session.transport_closed = true;
+        }
+
+        if let Err(error) = self
+            .persist_controller_session_evidence_with_retry(&context, None)
+            .await
+        {
+            if Self::controller_session_clear_error_is_stale_identity(&error) {
+                return Ok(());
+            }
+            if Self::controller_session_evidence_error_is_context_local(&error) {
+                self.queue_controller_session_clear(&context)?;
+                tracing::warn!(
+                    process = %process_ref,
+                    error = %error,
+                    "controller-session transport teardown completed; durable evidence clear deferred",
+                );
+                return Ok(());
+            }
+            let mut sessions = self
+                .controller_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if sessions.get(process_ref).is_none() {
+                sessions.insert(process_ref.clone(), session);
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -6596,13 +18141,20 @@ impl ControllerSessionCoordinator {
         &self,
         mut ingress: BusIngress,
     ) -> Result<(), ResourceRuntimeError> {
+        self.revoke_controller_ingress_in_place(&mut ingress).await
+    }
+
+    async fn revoke_controller_ingress_in_place(
+        &self,
+        ingress: &mut BusIngress,
+    ) -> Result<(), ResourceRuntimeError> {
         let mut registrar = self
             .registrar
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .take()
             .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
-        let result = registrar.revoke_in_place(&mut ingress).await;
+        let result = registrar.revoke_in_place(ingress).await;
         let restored = self
             .registrar
             .lock()
@@ -6612,7 +18164,6 @@ impl ControllerSessionCoordinator {
             })
             .is_ok();
         if !restored {
-            drop(ingress);
             return Err(ResourceRuntimeError::AuthenticationUnavailable);
         }
         result.map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)
@@ -6627,13 +18178,15 @@ impl ControllerSessionCoordinator {
         (
             BusIngress,
             SessionDriverHandle,
-            Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
+            Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>>,
             tokio::task::JoinHandle<Result<(), SessionServerError>>,
             ReconnectGeneration,
+            d2b_session::AuthenticatedSessionRouteBinding,
+            Option<Arc<dyn crate::process_provider_runtime::GuestCredentialBackendLease>>,
         ),
         ResourceRuntimeError,
     > {
-        let (daemon_endpoint, context) = endpoint.into_parts();
+        let (daemon_endpoint, delivery_key_handoff, backend_lease, context) = endpoint.into_parts();
         let authentication_error = |stage: &'static str| {
             tracing::warn!(
                 zone = %self.zone.as_str(),
@@ -6660,10 +18213,12 @@ impl ControllerSessionCoordinator {
             return Err(authentication_error("resource-peer-mismatch"));
         }
 
-        let store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let store_metadata = retry_transient_store_read(
+            &self.zone,
+            "controller-process-bootstrap-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         let provider_resource = committed_resource(
             &self.zone,
@@ -6687,22 +18242,35 @@ impl ControllerSessionCoordinator {
         }
         let zone_ref = ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
             .map_err(|_| authentication_error("zone-reference"))?;
-        registrar
-            .install_committed_controller_process_subject(
+        let credential_session = is_credential_provider_ref(context.provider_owner_ref());
+        let committed_subject = CommittedControllerProcessSubjectInput {
+            provider_ref: context.provider_owner_ref().clone(),
+            provider_uid,
+            process_ref: context.process_ref().clone(),
+            zone_ref,
+            execution_ref: context.execution_ref().clone(),
+            provider_generation,
+            controller_generation: context.controller_generation(),
+        };
+        if credential_session {
+            registrar
+                .install_committed_controller_process_subject_for_service(
+                    &verified_peer,
+                    committed_subject,
+                    d2b_contracts_zone_session::v3::component_session::ServicePackage::CredentialV3,
+                )
+        } else {
+            registrar.install_committed_controller_process_subject(
                 &verified_peer,
-                CommittedControllerProcessSubjectInput {
-                    provider_ref: context.provider_owner_ref().clone(),
-                    provider_uid,
-                    process_ref: context.process_ref().clone(),
-                    zone_ref,
-                    execution_ref: context.execution_ref().clone(),
-                    provider_generation,
-                    controller_generation: context.controller_generation(),
-                },
+                committed_subject,
             )
-            .map_err(|_| authentication_error("controller-subject-install"))?;
-
-        let policy = controller_resource_endpoint_policy();
+        }
+        .map_err(|_| authentication_error("controller-subject-install"))?;
+        let policy = if credential_session {
+            credential_provider_endpoint_policy()
+        } else {
+            controller_resource_endpoint_policy()
+        };
         let acceptor = registrar
             .component_session_acceptor(policy.clone(), verified_peer)
             .map_err(|_| authentication_error("session-acceptor"))?;
@@ -6735,24 +18303,124 @@ impl ControllerSessionCoordinator {
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .clone()
             .ok_or_else(|| authentication_error("authorization-state"))?;
-        let subject = self
-            .authorizer
-            .issue_authenticated_subject(route.context().clone(), authorization_state)
-            .map_err(|_| authentication_error("authenticated-subject"))?;
-        let service = Arc::new(
-            ResourceBusAdapter::bind_component_session(Arc::clone(&self.api), subject)
-                .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?,
-        );
-        let resource_client = Arc::new(service.client());
-        let services = Arc::clone(&service).ttrpc_services();
         let (ingress, driver) = registrar
             .register_component_service_session(candidate)
             .await
             .map_err(|_| authentication_error("service-registration"))?;
-        let service_task = tokio::spawn(d2b_session::serve_ttrpc_services(
-            Arc::new(driver.clone()),
-            services,
-        ));
+        let (resource_client, service_task) = if credential_session {
+            let metadata = ProviderSessionMetadata::from_route(&route)
+                .and_then(|metadata| metadata.encode())
+                .map_err(|_| authentication_error("provider-session-bootstrap"))?;
+            let stream = StreamId::new(PROVIDER_BOOTSTRAP_STREAM_ID)
+                .map_err(|_| authentication_error("provider-session-stream"))?;
+            driver
+                .open_named_stream(
+                    stream,
+                    PROVIDER_BOOTSTRAP_STREAM_CREDIT,
+                    PROVIDER_BOOTSTRAP_STREAM_CREDIT,
+                )
+                .await
+                .map_err(|_| authentication_error("provider-session-stream-open"))?;
+            driver
+                .send_named_stream(stream, metadata)
+                .await
+                .map_err(|_| authentication_error("provider-session-bootstrap-send"))?;
+            driver
+                .close_named_stream(stream)
+                .await
+                .map_err(|_| authentication_error("provider-session-bootstrap-close"))?;
+            let delivery_key_handoff = delivery_key_handoff
+                .ok_or_else(|| authentication_error("provider-delivery-key-handoff"))?;
+            if let Some(backend_lease) = backend_lease.as_ref() {
+                if backend_lease
+                    .bind_route(&route, None, Some(credentials))
+                    .is_err()
+                {
+                    let _ = registrar.revoke(ingress).await;
+                    let _ = driver
+                        .close(
+                            d2b_contracts_zone_session::v3::component_session::CloseReason::RoleMismatch,
+                            d2b_contracts_zone_session::v3::component_session::Remediation::ReplaceGeneration,
+                        )
+                        .await;
+                    return Err(authentication_error("provider-backend-route-bind"));
+                }
+            } else {
+                let _ = registrar.revoke(ingress).await;
+                let _ = driver
+                    .close(
+                        d2b_contracts_zone_session::v3::component_session::CloseReason::RoleMismatch,
+                        d2b_contracts_zone_session::v3::component_session::Remediation::ReplaceGeneration,
+                    )
+                    .await;
+                return Err(authentication_error("provider-backend-responder-missing"));
+            }
+            let key_stream = StreamId::new(PROVIDER_DELIVERY_KEY_STREAM_ID)
+                .map_err(|_| authentication_error("provider-delivery-key-stream"))?;
+            driver
+                .open_named_stream(
+                    key_stream,
+                    PROVIDER_DELIVERY_KEY_STREAM_CREDIT,
+                    PROVIDER_DELIVERY_KEY_STREAM_CREDIT,
+                )
+                .await
+                .map_err(|_| authentication_error("provider-delivery-key-stream-open"))?;
+            driver
+                .send_named_stream(
+                    key_stream,
+                    delivery_key_handoff
+                        .encode_for_route(&route)
+                        .map_err(|_| authentication_error("provider-delivery-key-handoff-encode"))?
+                        .to_vec(),
+                )
+                .await
+                .map_err(|_| authentication_error("provider-delivery-key-handoff-send"))?;
+            driver
+                .close_named_stream(key_stream)
+                .await
+                .map_err(|_| authentication_error("provider-delivery-key-stream-close"))?;
+            let ready_stream = StreamId::new(PROVIDER_READY_STREAM_ID)
+                .map_err(|_| authentication_error("provider-session-ready-stream"))?;
+            driver
+                .open_named_stream(
+                    ready_stream,
+                    PROVIDER_READY_STREAM_CREDIT,
+                    PROVIDER_READY_STREAM_CREDIT,
+                )
+                .await
+                .map_err(|_| authentication_error("provider-session-ready-open"))?;
+            receive_provider_ready(&driver)
+                .await
+                .map_err(|_| authentication_error("provider-session-ready"))?;
+            let monitor = driver.clone();
+            (
+                None,
+                tokio::spawn(async move {
+                    loop {
+                        match monitor.receive_control().await {
+                            Ok(d2b_session::SessionEvent::Close(_)) | Err(_) => return Ok(()),
+                            Ok(_) => {}
+                        }
+                    }
+                }),
+            )
+        } else {
+            let subject = self
+                .authorizer
+                .issue_authenticated_subject(route.context().clone(), authorization_state)
+                .map_err(|_| authentication_error("authenticated-subject"))?;
+            let service = Arc::new(
+                ResourceBusAdapter::bind_component_session(Arc::clone(&self.api), subject)
+                    .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?,
+            );
+            let resource_client = Some(Arc::new(service.client()));
+            let services = Arc::clone(&service).ttrpc_services();
+            let service_task = tokio::spawn(d2b_session::serve_ttrpc_services(
+                Arc::new(driver.clone()),
+                services,
+            ));
+            (resource_client, service_task)
+        };
         tokio::task::yield_now().await;
         if service_task.is_finished() {
             service_task.abort();
@@ -6766,6 +18434,8 @@ impl ControllerSessionCoordinator {
             resource_client,
             service_task,
             session_generation,
+            route,
+            backend_lease,
         ))
     }
 
@@ -6773,19 +18443,26 @@ impl ControllerSessionCoordinator {
         &self,
         providers: &crate::process_provider_runtime::ProductionProcessProviders,
     ) -> Result<(), ResourceRuntimeError> {
-        let store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let store_metadata = retry_transient_store_read(
+            &self.zone,
+            "controller-policy-refresh-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let contexts = providers.controller_bootstrap_contexts(&self.zone);
-        let provider_subjects = contexts
-            .iter()
-            .map(|context| d2b_resource_api::authz::BoundSubject {
-                subject_ref: context.provider_owner_ref().clone(),
-                subject_uid: context.provider_uid().clone(),
-            })
-            .collect::<BTreeSet<_>>();
+        let provider_subjects = match load_controller_policy_subjects(
+            &self.zone,
+            &self.store,
+            Some(providers),
+            &self.controller_sessions,
+        )
+        .await
+        {
+            Ok(subjects) => subjects,
+            Err(error) => {
+                return Err(error);
+            }
+        };
         let policy_resources =
             d2bd_runtime::resource_runtime_support::load_committed_policy_resources(
                 &self.store,
@@ -6800,24 +18477,19 @@ impl ControllerSessionCoordinator {
                 store_metadata.current_revision,
                 &self.bundle_resource_types,
                 &policy_resources,
-                provider_subjects,
+                provider_subjects.iter().cloned(),
             )
             .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
-        self.authorizer
-            .replace_policy(policy, &state)
-            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
-        *self
-            .authorization_state
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? = Some(state);
+        self.policy_projection
+            .install(policy, state, provider_subjects)?;
         Ok(())
     }
 }
 
 impl ZoneResourceRuntime {
-    /// Relist and reconcile generic Process and EphemeralProcess resources
-    /// owned by this Zone. Their lifecycle effects remain inside the fixed
-    /// daemon-composed process Provider supervisors.
+    /// Ensure the shared Runner for generic Process and EphemeralProcess
+    /// resources owned by this Zone and refresh controller-session fences.
+    /// Lifecycle effects remain inside the fixed daemon-composed Providers.
     pub(crate) async fn reconcile_process_resources(
         &self,
         state: Arc<crate::ServerState>,
@@ -6825,51 +18497,178 @@ impl ZoneResourceRuntime {
         if !self.readiness.resource_api_ready {
             return Ok(());
         }
+        self.process_controller_required.store(true, Ordering::Release);
         let providers = state
             .provider_runtime
             .process_providers()
             .ok_or(ResourceRuntimeError::ProviderPathUnavailable)?;
         let coordinator = self.controller_session_coordinator();
-        coordinator
-            .reconcile_controller_sessions(Arc::clone(&providers), false)
-            .await?;
-        {
-            let _guard = self.controller_reconcile_lock.lock().await;
-            let snapshot = list_process_snapshot(&self.store, &self.zone)
-                .await
-                .map_err(map_process_runtime_error)?;
-            coordinator
-                .fence_process_snapshot(&providers, &snapshot)
+        let wake_task_slot = Arc::clone(&self.controller_session_reconcile_task);
+        let wake = Arc::clone(&self.controller_session_reconcile_wake);
+        let wake_shutdown = Arc::clone(&self.controller_session_reconcile_shutdown);
+        let wake_coordinator = Arc::downgrade(&coordinator);
+        let wake_providers = Arc::downgrade(&providers);
+        let (core_authority, authorization_state) = {
+            let _session_guard = self.controller_session_lock.lock().await;
+            if self.system_core_rebind_pending.load(Ordering::Acquire) {
+                return Err(ResourceRuntimeError::AuthenticationUnavailable);
+            }
+            *self
+                .controller_session_providers
+                .lock()
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)? =
+                Some(Arc::clone(&providers));
+            let (core_authority, authorization_state) = self
+                .rebuild_assigned_process_api_locked(&providers)
                 .await?;
-            let store_metadata = self
-                .store
-                .runtime_metadata()
-                .await
-                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+            providers
+                .set_controller_session_waker(
+                    self.zone.clone(),
+                    Arc::new(move || {
+                        let coordinator = wake_coordinator
+                            .upgrade()
+                            .ok_or_else(|| "controller-session-coordinator-dropped".to_owned())?;
+                        let providers = wake_providers
+                            .upgrade()
+                            .ok_or_else(|| "process-providers-dropped".to_owned())?;
+                        schedule_controller_session_reconcile(
+                            Arc::clone(&wake_task_slot),
+                            Arc::clone(&wake),
+                            Arc::clone(&wake_shutdown),
+                            coordinator,
+                            providers,
+                        )
+                        .map_err(|error| format!("{error:?}"))
+                    }),
+                )
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
+            coordinator
+                .reconcile_controller_sessions_locked(Arc::clone(&providers), false)
+                .await?;
+            (core_authority, authorization_state)
+        };
+        let _guard = self.controller_reconcile_lock.lock().await;
+        let resources = list_process_resources(&self.store, &self.zone)
+            .await
+            .map_err(map_process_runtime_error)?;
+        coordinator
+            .fence_process_resources(&providers, &resources)
+            .await?;
+        let store_metadata = retry_transient_store_read(
+            &self.zone,
+            "process-reconcile-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
+            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        let controller_generation = core_authority.controller_generation;
+        let stale_task = {
+            let mut task = self
+                .process_runner_task
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+            let current_generation = self
+                .process_runner_generation
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
+                .to_owned();
+            if task.as_ref().is_some_and(|task| !task.is_finished())
+                && current_generation == Some(controller_generation)
+            {
+                None
+            } else {
+                let stale = task.take();
+                *self
+                    .process_runner_generation
+                    .lock()
+                    .map_err(|_| ResourceRuntimeError::WatchUnavailable)? = None;
+                stale
+            }
+        };
+        if let Some(task) = stale_task {
+            task.abort();
+            let _ = task.await;
+        }
+        let runner_exists = self
+            .process_runner_task
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
+            .as_ref()
+            .is_some_and(|task| !task.is_finished());
+        if !runner_exists {
+            let controller_ref = ResourceRef::parse(CORE_CONTROLLER_PROCESS_REF)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let provider_ref = ResourceRef::parse(CORE_CONTROLLER_PROVIDER_REF)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let host_ref = ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let identity = ControllerIdentity::new(
+                self.zone.clone(),
+                controller_ref.clone(),
+                controller_generation,
+                provider_ref,
+                core_authority.provider_generation,
+                controller_ref.clone(),
+                host_ref,
+                None,
+            )
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let descriptor = process_controller_descriptor(identity)
+                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+            let api = self.process_controller_api(
+                providers.mode(),
+                Arc::clone(&core_authority),
+                authorization_state.clone(),
+            )?;
+            let watch_task_slot = Arc::clone(&self.controller_session_reconcile_task);
+            let watch_wake = Arc::clone(&self.controller_session_reconcile_wake);
+            let watch_shutdown = Arc::clone(&self.controller_session_reconcile_shutdown);
+            let watch_coordinator =
+                Arc::downgrade(&self.controller_session_coordinator());
+            let watch_providers = Arc::clone(&providers);
+            let api = api.with_watch_change_observer(Arc::new(move |change: &ChangeRecord| {
+                if matches!(
+                    change.target.resource_ref().resource_type().as_str(),
+                    "Process" | "EphemeralProcess"
+                ) {
+                    if let Some(coordinator) = watch_coordinator.upgrade() {
+                        let _ = schedule_controller_session_reconcile(
+                            Arc::clone(&watch_task_slot),
+                            Arc::clone(&watch_wake),
+                            Arc::clone(&watch_shutdown),
+                            coordinator,
+                            Arc::clone(&watch_providers),
+                        );
+                    }
+                }
+            }));
+            let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
             let controller_provider_identities = load_committed_controller_provider_identities(
                 &self.zone,
                 &self.store,
-                store_metadata.current_revision,
-                controller_provider_refs(&snapshot),
+                controller_provider_refs(&resources),
             )
             .await
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
-            let runtime = match self.process_runtime.lock() {
-                Ok(mut guard) => guard.take(),
-                Err(_) => return Err(ResourceRuntimeError::CapabilityUnavailable),
-            };
-            let mut runtime = runtime.unwrap_or_else(|| {
-                ProcessResourceRuntime::new(self.zone.clone(), Arc::clone(&providers))
-            });
-            if let Some(controller_generation) =
-                store_metadata.policy_snapshot.controller_generation
-            {
-                runtime.set_controller_generation(controller_generation);
-            }
-            runtime.set_controller_provider_identities(controller_provider_identities);
+            let mut runtime =
+                ProcessResourceRuntime::new(self.zone.clone(), Arc::clone(&providers));
+            runtime.set_controller_generation(controller_generation);
+            runtime
+                .set_controller_provider_identities(controller_provider_identities)
+                .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
+            runtime.set_provider_identity_loader(Arc::new(
+                CommittedProcessProviderIdentityLoader {
+                    zone: self.zone.clone(),
+                    store: Arc::clone(&self.store),
+                },
+            ));
+            runtime.set_owner_identity_loader(Arc::new(CommittedProcessOwnerIdentityLoader {
+                zone: self.zone.clone(),
+                store: Arc::clone(&self.store),
+            }));
             runtime.set_lifecycle_identity(
                 self.store_metadata.zone_uid.clone(),
-                self.store_metadata.policy_snapshot.policy_revision,
+                store_metadata.policy_snapshot.policy_revision,
             );
             let guest_descriptor_digests = self
                 .guest_setup_descriptors
@@ -6882,23 +18681,23 @@ impl ZoneResourceRuntime {
                 .collect();
             runtime.set_guest_descriptor_digests(guest_descriptor_digests);
             let mut owner_uids = BTreeMap::new();
-            for owner_ref in snapshot.iter().filter_map(|resource| {
+            for owner_ref in resources.iter().filter_map(|resource| {
                 ResourceEnvelope::from_json(&resource.canonical_json)
                     .ok()
                     .and_then(|envelope| envelope.metadata().owner_ref().cloned())
             }) {
-                if owner_uids.contains_key(&owner_ref) {
-                    continue;
-                }
-                let owner = self
+                let Ok(owner) = self
                     .committed_resource_value(&owner_ref, "process-owner-identity")
                     .await
-                    .map_err(|_| ResourceRuntimeError::IdentityUnbound)?;
-                let owner = ResourceEnvelope::from_json(
-                    &serde_json::to_vec(&owner)
-                        .map_err(|_| ResourceRuntimeError::IdentityUnbound)?,
-                )
-                .map_err(|_| ResourceRuntimeError::IdentityUnbound)?;
+                else {
+                    continue;
+                };
+                let Ok(owner_bytes) = serde_json::to_vec(&owner) else {
+                    continue;
+                };
+                let Ok(owner) = ResourceEnvelope::from_json(&owner_bytes) else {
+                    continue;
+                };
                 owner_uids.insert(owner_ref, owner.metadata().uid().clone());
             }
             runtime.set_owner_uids(owner_uids);
@@ -6910,206 +18709,127 @@ impl ZoneResourceRuntime {
             } else {
                 runtime.set_target_scope(None, None);
             }
-            if let Some(status_client) = self.process_resource_client() {
-                runtime.set_status_client(status_client);
+            let wake_source = Arc::downgrade(&source);
+            let liveness_task_slot = Arc::clone(&self.controller_session_reconcile_task);
+            let liveness_wake = Arc::clone(&self.controller_session_reconcile_wake);
+            let liveness_shutdown = Arc::clone(&self.controller_session_reconcile_shutdown);
+            let liveness_coordinator =
+                Arc::downgrade(&self.controller_session_coordinator());
+            let liveness_providers = Arc::clone(&providers);
+            runtime.set_liveness_waker(Arc::new(move |key, revision| {
+                if let Some(source) = wake_source.upgrade() {
+                    let _ = source.dispatch_observation(key, revision);
+                }
+                if let Some(coordinator) = liveness_coordinator.upgrade() {
+                    let _ = schedule_controller_session_reconcile(
+                        Arc::clone(&liveness_task_slot),
+                        Arc::clone(&liveness_wake),
+                        Arc::clone(&liveness_shutdown),
+                        coordinator,
+                        Arc::clone(&liveness_providers),
+                    );
+                }
+            }));
+            runtime.set_status_client(self.status_client()?);
+            let diagnostic_controller = descriptor.identity().controller_ref().clone();
+            let diagnostic_resource_types =
+                descriptor.resource_types().cloned().collect::<Vec<_>>();
+            let handler = ProcessResourceReconciler::new(descriptor, runtime);
+            let runner = Runner::new(
+                handler,
+                source,
+                RunnerConfig {
+                    policy_revision: authorization_state.snapshot.policy_revision,
+                    api_revision: authorization_state.snapshot.api_catalog_revision,
+                    configuration_revision: authorization_state
+                        .snapshot
+                        .active_configuration_revision,
+                    deadline_tick: 5_000,
+                    max_attempts: 3,
+                },
+            );
+            let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+            let failure_slot = Arc::clone(&self.process_runner_failure);
+            let startup_failure_slot = Arc::clone(&failure_slot);
+            let callback_controller = diagnostic_controller.clone();
+            let callback_resource_types = diagnostic_resource_types.clone();
+            let task = tokio::spawn(async move {
+                let result = runner
+                    .run_with_startup(move |startup| {
+                        if let Err(error) = startup {
+                            store_runner_failure(
+                                &startup_failure_slot,
+                                ControllerRunnerFailure::new(
+                                    callback_controller,
+                                    callback_resource_types,
+                                    error,
+                                ),
+                            );
+                        }
+                        let _ = startup_tx.send(startup);
+                    })
+                    .await;
+                match result {
+                    Ok(report) => tracing::debug!(
+                        dispatched = report.dispatched,
+                        relists = report.relists,
+                        "Process Provider shared runner stopped",
+                    ),
+                    Err(error) => {
+                        let diagnostic = ControllerRunnerFailure::new(
+                            diagnostic_controller,
+                            diagnostic_resource_types,
+                            error.error(),
+                        );
+                        store_runner_failure(&failure_slot, diagnostic.clone());
+                        let report = error.report();
+                        tracing::warn!(
+                            controller = %diagnostic.controller().to_canonical_string(),
+                            resource_types = ?diagnostic
+                                .resource_types()
+                                .iter()
+                                .map(ResourceTypeName::as_str)
+                                .collect::<Vec<_>>(),
+                            error_kind = ?diagnostic.error(),
+                            error = %diagnostic.error(),
+                            dispatched = report.dispatched,
+                            relists = report.relists,
+                            checkpointed = report.checkpointed,
+                            failed_resource = ?error
+                                .failed_key()
+                                .map(|key| key.resource_ref().to_canonical_string()),
+                            failed_operation = ?error.failed_operation(),
+                            "Process Provider shared runner failed",
+                        );
+                    }
+                }
+            });
+            match startup_rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => {
+                    let _ = task.await;
+                    return Err(ResourceRuntimeError::HandlerNotReady);
+                }
             }
-            let result = runtime.reconcile(snapshot).await;
-            match self.process_runtime.lock() {
-                Ok(mut guard) => *guard = Some(runtime),
-                Err(_) => return Err(ResourceRuntimeError::CapabilityUnavailable),
+            if let Ok(mut failure) = self.process_runner_failure.lock() {
+                *failure = None;
             }
-            result.map_err(map_process_runtime_error)?;
+            *self
+                .process_runner_task
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)? = Some(task);
+            *self
+                .process_runner_generation
+                .lock()
+                .map_err(|_| ResourceRuntimeError::WatchUnavailable)? = Some(controller_generation);
         }
         schedule_controller_session_reconcile(
             Arc::clone(&self.controller_session_reconcile_task),
+            Arc::clone(&self.controller_session_reconcile_wake),
+            Arc::clone(&self.controller_session_reconcile_shutdown),
             coordinator.clone(),
             Arc::clone(&providers),
         )?;
-        if let (Some(client), Some(identity)) = (
-            self.process_resource_client(),
-            self.interaction_identity.as_ref(),
-        ) {
-            crate::process_resource_runtime::reconcile_wayland_session_deletion(
-                &client,
-                &self.store,
-                &self.zone,
-                identity.wayland_session_ref(),
-            )
-            .await
-            .map_err(map_process_runtime_error)?;
-        }
-
-        let start_watch = {
-            let mut watch_task = self
-                .process_watch_task
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            watch_needs_restart(&mut watch_task)
-        };
-        if start_watch {
-            let watch = d2b_resource_api::watch::WatchService::new(Arc::clone(&self.store))
-                .open(process_watch_request(&self.zone))
-                .await
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            let store = Arc::clone(&self.store);
-            let zone = self.zone.clone();
-            let registry = Arc::clone(&self.process_runtime);
-            let provider_identity_hook = {
-                let store = Arc::clone(&self.store);
-                let zone = self.zone.clone();
-                Some(
-                    Arc::new(move |provider_refs| {
-                        let store = Arc::clone(&store);
-                        let zone = zone.clone();
-                        Box::pin(async move {
-                            let current_revision = store
-                                .runtime_metadata()
-                                .await
-                                .map_err(|_| ())?
-                                .current_revision;
-                            load_committed_controller_provider_identities(
-                                &zone,
-                                &store,
-                                current_revision,
-                                provider_refs,
-                            )
-                            .await
-                            .map_err(|_| ())
-                        })
-                            as std::pin::Pin<
-                                Box<
-                                    dyn std::future::Future<
-                                            Output = Result<
-                                                BTreeMap<
-                                                    ResourceRef,
-                                                    (ResourceUid, ResourceGeneration),
-                                                >,
-                                                (),
-                                            >,
-                                        > + Send,
-                                >,
-                            >
-                    })
-                        as crate::process_resource_runtime::ProcessProviderIdentityHook,
-                )
-            };
-            let controller_fence_hook =
-                Some(self.controller_session_fence_hook(Arc::clone(&providers)));
-            let controller_hook = Some(self.controller_session_hook(Arc::clone(&providers)));
-            let task = tokio::spawn(run_process_watch(
-                watch,
-                store,
-                zone,
-                registry,
-                self.process_resource_client(),
-                self.interaction_identity
-                    .as_ref()
-                    .map(|identity| identity.wayland_session_ref().clone()),
-                provider_identity_hook,
-                controller_fence_hook,
-                controller_hook,
-                Arc::clone(&self.controller_reconcile_lock),
-            ));
-            let mut watch_task = self
-                .process_watch_task
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            if watch_task.is_none() {
-                *watch_task = Some(task);
-            } else {
-                task.abort();
-            }
-        }
-        Ok(())
-    }
-
-    /// Relist and reconcile durable NixOS generation resources owned by this
-    /// Zone. Activation effects remain behind the typed broker or the
-    /// authenticated Guest ComponentSession route.
-    pub(crate) async fn reconcile_activation_resources(
-        &self,
-        state: Arc<crate::ServerState>,
-    ) -> Result<(), ResourceRuntimeError> {
-        if !self.readiness.resource_api_ready {
-            return Ok(());
-        }
-        let snapshot = list_activation_snapshot(&self.store, &self.zone)
-            .await
-            .map_err(map_activation_runtime_error)?;
-        let process_snapshot =
-            crate::process_resource_runtime::list_process_snapshot(&self.store, &self.zone)
-                .await
-                .map_err(map_process_runtime_error)?;
-        let runtime = match self.activation_runtime.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => return Err(ResourceRuntimeError::CapabilityUnavailable),
-        };
-        let mut runtime =
-            runtime.unwrap_or_else(|| ActivationResourceRuntime::new(self.zone.clone()));
-        runtime.clear_guest_clients();
-        if let Some(status_client) = self.process_resource_client() {
-            runtime.set_status_client(status_client);
-        }
-        let guest_targets = guest_activation_targets(&snapshot);
-        let mut process_snapshot = process_snapshot;
-        for guest in guest_targets {
-            let Ok(target) = crate::resolve_committed_guest_session_target(self, &guest).await
-            else {
-                continue;
-            };
-            let Ok(session) =
-                crate::connect_guest_component_session_for_guest(&state, &target).await
-            else {
-                continue;
-            };
-            match list_guest_process_snapshot(&session, &self.zone, &guest).await {
-                Ok(resources) => {
-                    runtime.set_guest_client(
-                        guest.clone(),
-                        Arc::new(GuestActivationResourceClient::new(Arc::clone(&session))),
-                    );
-                    process_snapshot.extend(resources);
-                }
-                Err(()) => {
-                    crate::invalidate_guest_component_session_for_guest(&state, &target).await;
-                }
-            }
-        }
-        let result = runtime
-            .reconcile(Arc::clone(&state), snapshot, process_snapshot)
-            .await;
-        match self.activation_runtime.lock() {
-            Ok(mut guard) => *guard = Some(runtime),
-            Err(_) => return Err(ResourceRuntimeError::CapabilityUnavailable),
-        }
-        result.map_err(map_activation_runtime_error)?;
-        let start_watch = {
-            let mut watch_task = self
-                .activation_watch_task
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            watch_needs_restart(&mut watch_task)
-        };
-        if start_watch {
-            let watch = d2b_resource_api::watch::WatchService::new(Arc::clone(&self.store))
-                .open(activation_watch_request(&self.zone))
-                .await
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            let store = Arc::clone(&self.store);
-            let zone = self.zone.clone();
-            let state = state.clone();
-            let registry = Arc::clone(&self.activation_runtime);
-            let task = tokio::spawn(run_activation_watch(watch, store, zone, state, registry));
-            let mut watch_task = self
-                .activation_watch_task
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            if watch_task.is_none() {
-                *watch_task = Some(task);
-            } else {
-                task.abort();
-            }
-        }
         Ok(())
     }
 
@@ -7243,6 +18963,108 @@ impl ZoneResourceRuntime {
         if !self.readiness.provider_path_ready {
             return Some(ResourceRuntimeError::ProviderPathUnavailable);
         }
+        let core_runners_ready = match (
+            self.core_runner_required_identities.try_lock(),
+            self.core_runner_tasks.try_lock(),
+        ) {
+            (Ok(required_identities), Ok(tasks)) => {
+                core_runner_tasks_are_ready(&tasks, &required_identities)
+            }
+            _ => false,
+        };
+        if !core_runners_ready {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
+        if self
+            .process_runner_failure
+            .lock()
+            .map(|failure| failure.is_some())
+            .unwrap_or(true)
+        {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
+        if self.process_controller_required.load(Ordering::Acquire)
+            && !self
+                .process_runner_task
+                .try_lock()
+                .map(|task| task.as_ref().is_some_and(|task| !task.is_finished()))
+                .unwrap_or(false)
+        {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
+        if matches!(self.interaction_state, InteractionState::Refused) {
+            return Some(ResourceRuntimeError::InteractionConfigurationUnavailable);
+        }
+        if self
+            .u9_runner_failures
+            .lock()
+            .map(|failures| !failures.is_empty())
+            .unwrap_or(true)
+        {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
+        let u12_ready = if self.u12_required.load(Ordering::Acquire) {
+            self.u12_runner_tasks
+                .try_lock()
+                .map(|tasks| {
+                    u12_runner_readiness(
+                        true,
+                        tasks.len(),
+                        tasks.iter().any(|task| task.is_finished()),
+                    )
+                })
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        if !u12_ready {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
+        let u7_ready = if self.u7_required.load(Ordering::Acquire) {
+            self.u7_runner_tasks
+                .try_lock()
+                .map(|tasks| {
+                    !tasks.is_empty() && !tasks.iter().any(|task| task.is_finished())
+                })
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        if !u7_ready {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
+        // Guest runtime readiness is status-first: a live Runner task is only
+        // internal scheduling capacity. Guest controllers publish readiness
+        // after their authenticated session, VMM identity, and API socket
+        // have all been observed.
+        let u9_ready = if self.u9_required.load(Ordering::Acquire) {
+            self.u9_runner_tasks
+                .try_lock()
+                .map(|tasks| u9_runner_tasks_are_live(&tasks))
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        if !u9_ready {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
+        let u10_ready = if self.u10_required.load(Ordering::Acquire) {
+            self.u10_runner_tasks
+                .try_lock()
+                .map(|tasks| {
+                    u12_runner_readiness(
+                        true,
+                        tasks.len(),
+                        tasks.iter().any(|task| task.is_finished()),
+                    )
+                })
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        if !u10_ready {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
         if !matches!(self.core_stage().ok(), Some(StartupStage::Ready)) {
             return Some(ResourceRuntimeError::HandlerNotReady);
         }
@@ -7351,7 +19173,6 @@ impl ZoneResourceRuntime {
             return Err(ResourceRuntimeError::RequestInvalid);
         }
         let operation_id = public_operation_id(request, peer_uid, method);
-        self.refresh_authorization_policy().await?;
         let resolved_user = d2bd_runtime::resource_runtime_support::resolve_zone_user(
             &self.store,
             &self.zone,
@@ -7359,17 +19180,16 @@ impl ZoneResourceRuntime {
             &format!("{}:user", operation_id),
         )
         .await?;
+        let read_only = matches!(method, "Get" | "List");
+        if !read_only {
+            self.refresh_authorization_policy().await?;
+        }
         let context = d2bd_runtime::resource_runtime_support::local_user_subject_context(
             &self.zone,
             &resolved_user,
             &operation_id,
         )?;
-        let state = self
-            .authorization_state
-            .lock()
-            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
-            .clone()
-            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let state = self.policy_projection.installed_state()?;
         let subject = self
             .authorizer
             .issue_authenticated_subject(context, state)
@@ -7590,6 +19410,8 @@ impl ZoneResourceRuntime {
     /// is read from the authenticated Device record, while the legacy-state
     /// decision comes from the trusted Core bundle resolver; request fields
     /// cannot select either independently.
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     pub(crate) async fn tpm_device_is_admitted(
         &self,
         device_uid: &ResourceUid,
@@ -7663,6 +19485,8 @@ impl ZoneResourceRuntime {
     /// Load and validate the persisted Device record before a security-key
     /// provider constructs its one-use admission. Request fields select a
     /// candidate only; the returned values all originate from the store.
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     pub(crate) async fn security_key_device_is_admitted(
         &self,
         request: SecurityKeyDeviceAdmissionRequest<'_>,
@@ -7764,6 +19588,8 @@ impl ZoneResourceRuntime {
         }
     }
 
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     fn tpm_device_targets_vm(resource: &Value, vm_id: &str) -> bool {
         resource
             .get("metadata")
@@ -7774,6 +19600,8 @@ impl ZoneResourceRuntime {
             == Some(vm_id)
     }
 
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     fn security_key_device_matches(
         resource: &Value,
         zone: &ZoneId,
@@ -7815,6 +19643,8 @@ impl ZoneResourceRuntime {
             == Some(selector_id)
     }
 
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     fn tpm_migration_decision(
         vm_id: &str,
         intent: &str,
@@ -7840,18 +19670,23 @@ impl ZoneResourceRuntime {
             authority_persistence,
             authority_recovery,
             process_status_client,
-            audio_watch_task,
+            core_runner_tasks,
+            u12_runner_tasks,
+            u7_runner_tasks,
+            u6_runner_tasks,
+            u9_runner_tasks,
+            u10_runner_tasks,
             audio_runtime,
-            semantic_binding_watch_task,
-            process_watch_task,
-            process_runtime,
+            process_runner_task,
+            process_runner_generation,
             controller_sessions,
             controller_session_reconcile_task,
-            activation_watch_task,
-            activation_runtime,
+            controller_session_reconcile_shutdown,
+            controller_session_coordinator,
             assignments,
             ..
         } = self;
+        controller_session_reconcile_shutdown.store(true, Ordering::Release);
         if let Some(task) = service_task
             .into_inner()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
@@ -7859,29 +19694,57 @@ impl ZoneResourceRuntime {
             task.abort();
             let _ = task.await;
         }
-        if let Some(task) = audio_watch_task
+        let core_runner_tasks = core_runner_tasks
             .into_inner()
-            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
-        {
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        for task in core_runner_tasks {
+            task.handle.abort();
+            let _ = task.handle.await;
+        }
+        let u12_runner_tasks = u12_runner_tasks
+            .into_inner()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        for task in u12_runner_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        let u7_runner_tasks = u7_runner_tasks
+            .into_inner()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        for task in u7_runner_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        let u6_runner_tasks = u6_runner_tasks
+            .into_inner()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        for task in u6_runner_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        let u9_runner_tasks = u9_runner_tasks
+            .into_inner()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        for task in u9_runner_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        let u10_runner_tasks = u10_runner_tasks
+            .into_inner()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        for task in u10_runner_tasks {
             task.abort();
             let _ = task.await;
         }
         drop(audio_runtime);
-        if let Some(task) = semantic_binding_watch_task
+        if let Some(task) = process_runner_task
             .into_inner()
             .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
         {
             task.abort();
             let _ = task.await;
         }
-        if let Some(task) = process_watch_task
-            .into_inner()
-            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
-        {
-            task.abort();
-            let _ = task.await;
-        }
-        drop(process_runtime);
+        drop(process_runner_generation);
         let controller_session_task = controller_session_reconcile_task
             .lock()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
@@ -7890,11 +19753,16 @@ impl ZoneResourceRuntime {
             task.abort();
             let _ = task.await;
         }
+        controller_session_coordinator
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .take();
         let sessions = Arc::try_unwrap(controller_sessions)
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .into_inner()
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
-        for (_, session) in sessions {
+        for (_, mut session) in sessions {
+            session.cancel_backend_lease();
             if d2b_provider_runtime_cloud_hypervisor::is_provider_ref(
                 session.binding.provider_ref(),
             ) {
@@ -7921,14 +19789,6 @@ impl ZoneResourceRuntime {
                 let _ = registrar.revoke_in_place(&mut ingress).await;
             }
         }
-        if let Some(task) = activation_watch_task
-            .into_inner()
-            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
-        {
-            task.abort();
-            let _ = task.await;
-        }
-        drop(activation_runtime);
         drop(process_status_client);
         drop(
             ingress
@@ -8109,6 +19969,14 @@ impl UserDiscoveryEffectPort for SystemCoreUserDiscovery {
     }
 }
 
+fn resource_status_observed_generation(resource: &ResourceSnapshot) -> Option<ResourceGeneration> {
+    let value = serde_json::from_slice::<Value>(resource.canonical_json()).ok()?;
+    let generation = value
+        .pointer("/status/observedGeneration")
+        .and_then(Value::as_u64)?;
+    ResourceGeneration::new(generation).ok()
+}
+
 async fn discover_local_user(
     user_ref: &ResourceRef,
     spec: &UserSpec,
@@ -8164,6 +20032,129 @@ async fn discover_local_user(
     }))
 }
 
+fn is_u9_provider_ref(value: &str) -> bool {
+    U9_PROVIDER_REFS.contains(&value)
+}
+
+fn contains_u9_provider_ref(value: &Value) -> bool {
+    match value {
+        Value::String(value) => is_u9_provider_ref(value),
+        Value::Array(values) => values.iter().any(contains_u9_provider_ref),
+        Value::Object(values) => values.values().any(contains_u9_provider_ref),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn is_u9_resource_type(resource_type: &ResourceTypeName) -> bool {
+    let resource_type = resource_type.as_str();
+    resource_type.starts_with("display-wayland.")
+        || resource_type.starts_with("audio.d2bus.org.")
+        || resource_type.starts_with("shell-terminal.d2bus.org.")
+}
+
+async fn interaction_resources_present(
+    zone: &ZoneId,
+    store: &RedbResourceStore,
+) -> Result<bool, ResourceRuntimeError> {
+    let provider_type =
+        ResourceTypeName::parse("Provider").map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+    let provider_names = U9_PROVIDER_REFS
+        .iter()
+        .map(|provider| {
+            provider
+                .strip_prefix("Provider/")
+                .and_then(|name| ResourceName::parse(name).ok())
+                .ok_or(ResourceRuntimeError::HandlerNotReady)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut cursor = None;
+    loop {
+        let request = StoreListRequest {
+                operation: StoreOperationContext {
+                    operation_id: "interaction-presence-providers".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "interaction-presence-providers".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                resource_types: vec![provider_type.clone()],
+                resource_names: provider_names.clone(),
+                filters: Vec::new(),
+                page_size: 16,
+                cursor: cursor.clone(),
+                projection: StoreProjection::Full,
+            };
+        let page = retry_transient_store_list(zone, "interaction-presence-providers", || {
+            store.list(request.clone())
+        })
+        .await
+            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        if !page.resources.is_empty() {
+            return Ok(true);
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    let mut cursor = None;
+    loop {
+        let request = StoreListRequest {
+                operation: StoreOperationContext {
+                    operation_id: "interaction-presence-resources".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "interaction-presence-resources".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                resource_types: Vec::new(),
+                resource_names: Vec::new(),
+                filters: Vec::new(),
+                page_size: 512,
+                cursor: cursor.clone(),
+                projection: StoreProjection::Full,
+            };
+        let page = retry_transient_store_list(zone, "interaction-presence-resources", || {
+            store.list(request.clone())
+        })
+        .await
+            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        for resource in page.resources {
+            if is_u9_resource_type(&resource.resource_ref.resource_type()) {
+                return Ok(true);
+            }
+            let value: Value = serde_json::from_slice(&resource.canonical_json)
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+            if contains_u9_provider_ref(&value) {
+                return Ok(true);
+            }
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(false)
+}
+
+fn derive_interaction_state(
+    interaction_present: bool,
+    configuration: Option<&CommittedInteractionProviderConfiguration>,
+    identity: Option<&CommittedInteractionIdentity>,
+    refused: bool,
+) -> InteractionState {
+    if !interaction_present && configuration.is_none() && identity.is_none() && !refused {
+        InteractionState::Absent
+    } else if !refused && configuration.is_some() && identity.is_some() {
+        InteractionState::Ready
+    } else {
+        InteractionState::Refused
+    }
+}
+
 async fn load_interaction_provider_configuration(
     zone: &ZoneId,
     store: &RedbResourceStore,
@@ -8182,8 +20173,7 @@ async fn load_interaction_provider_configuration(
         .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
     let notification_ref = ResourceRef::parse("Provider/notification-desktop")
         .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
-    let page = store
-        .list(StoreListRequest {
+    let request = StoreListRequest {
             operation,
             zone: zone.clone(),
             resource_types: vec![provider_type],
@@ -8197,10 +20187,19 @@ async fn load_interaction_provider_configuration(
             page_size: 2,
             cursor: None,
             projection: StoreProjection::Full,
-        })
-        .await
+        };
+    let page = retry_transient_store_list(zone, "interaction-provider-config", || {
+        store.list(request.clone())
+    })
+    .await
         .map_err(|error| {
-            tracing::error!(zone = %zone.as_str(), error = ?error, "bootstrap Host list failed");
+            tracing::error!(
+                zone = %zone.as_str(),
+                operation = "interaction-provider-config",
+                store_error_kind = ?error.kind(),
+                reason_code = error.reason_code(),
+                "interaction Provider configuration list failed",
+            );
             ResourceRuntimeError::StoreReadFailed
         })?;
     if page.next_cursor.is_some() {
@@ -8254,8 +20253,7 @@ async fn load_committed_interaction_identity(
         trace_id: None,
         deadline_ms: 10_000,
     };
-    let page = store
-        .list(StoreListRequest {
+    let request = StoreListRequest {
             operation,
             zone: zone.clone(),
             resource_types: vec![session_resource_type],
@@ -8264,8 +20262,11 @@ async fn load_committed_interaction_identity(
             page_size: 2,
             cursor: None,
             projection: StoreProjection::Full,
-        })
-        .await
+        };
+    let page = retry_transient_store_list(zone, "interaction-wayland-session", || {
+        store.list(request.clone())
+    })
+    .await
         .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
     if page.next_cursor.is_some() {
         return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
@@ -8548,33 +20549,69 @@ async fn receive_controller_bootstrap(
     Ok((resource_socket, credentials))
 }
 
+async fn receive_provider_ready(
+    driver: &SessionDriverHandle,
+) -> Result<(), ResourceRuntimeError> {
+    let stream = StreamId::new(PROVIDER_READY_STREAM_ID)
+        .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
+    let mut received = Vec::new();
+    loop {
+        match driver
+            .receive_named_stream_for(stream)
+            .await
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+        {
+            StreamEvent::Data {
+                stream: received_stream,
+                bytes,
+            } if received_stream == stream => {
+                received.extend_from_slice(&bytes);
+                if received.len() > PROVIDER_READY_MARKER.len() {
+                    return Err(ResourceRuntimeError::AuthenticationUnavailable);
+                }
+                driver
+                    .grant_named_stream_credit(
+                        stream,
+                        u32::try_from(bytes.len())
+                            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?,
+                    )
+                    .await
+                    .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?;
+            }
+            StreamEvent::RemoteClosed {
+                stream: closed_stream,
+            } if closed_stream == stream => {
+                if received == PROVIDER_READY_MARKER {
+                    return Ok(());
+                }
+                return Err(ResourceRuntimeError::AuthenticationUnavailable);
+            }
+            StreamEvent::Reset { .. } => {
+                return Err(ResourceRuntimeError::AuthenticationUnavailable);
+            }
+            _ => return Err(ResourceRuntimeError::AuthenticationUnavailable),
+        }
+    }
+}
+
 async fn committed_resource(
     zone: &ZoneId,
     store: &RedbResourceStore,
     current_revision: ZoneRevision,
     resource_ref: &ResourceRef,
 ) -> Result<StoredResource, ResourceRuntimeError> {
-    if !matches!(
-        resource_ref.resource_type().as_str(),
-        "Guest"
-            | "Host"
-            | "Provider"
-            | "User"
-            | "display-wayland.d2bus.org.WaylandPolicy"
-            | "display-wayland.d2bus.org.WaylandSession"
-    ) {
+    if !is_supported_committed_resource_ref(resource_ref) {
         return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
     }
     let operation_id = format!(
         "interaction-identity:{}",
         resource_ref.to_canonical_string()
     );
-    let resource = store
-        .get(StoreGetRequest {
+    let request = StoreGetRequest {
             operation: StoreOperationContext {
                 operation_id: operation_id.clone(),
                 idempotency_key: None,
-                correlation_id: operation_id,
+                correlation_id: operation_id.clone(),
                 trace_id: None,
                 deadline_ms: 10_000,
             },
@@ -8582,9 +20619,76 @@ async fn committed_resource(
             target: resource_ref.clone(),
             expected_uid: None,
             projection: StoreProjection::Full,
-        })
-        .await
+        };
+    let resource = retry_transient_store_read(zone, &operation_id, || {
+        store.get(request.clone())
+    })
+    .await
         .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
+    validate_committed_resource(zone, current_revision, resource_ref, resource)
+}
+
+async fn current_committed_resource(
+    zone: &ZoneId,
+    store: &RedbResourceStore,
+    resource_ref: &ResourceRef,
+    operation_id: &str,
+) -> Result<(StoredResource, ZoneRevision), ResourceRuntimeError> {
+    if !is_supported_committed_resource_ref(resource_ref) {
+        return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
+    }
+    let request = StoreListRequest {
+            operation: StoreOperationContext {
+                operation_id: operation_id.to_owned(),
+                idempotency_key: None,
+                correlation_id: operation_id.to_owned(),
+                trace_id: None,
+                deadline_ms: 10_000,
+            },
+            zone: zone.clone(),
+            resource_types: vec![resource_ref.resource_type().clone()],
+            resource_names: vec![resource_ref.name().clone()],
+            filters: Vec::new(),
+            page_size: 1,
+            cursor: None,
+            projection: StoreProjection::Full,
+        };
+    let snapshot = retry_transient_store_list(zone, operation_id, || {
+        store.list(request.clone())
+    })
+    .await
+        .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
+    if snapshot.truncated || snapshot.next_cursor.is_some() || snapshot.resources.len() != 1 {
+        return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
+    }
+    let snapshot_revision = snapshot.snapshot_revision;
+    let resource = snapshot
+        .resources
+        .into_iter()
+        .next()
+        .ok_or(ResourceRuntimeError::InteractionConfigurationUnavailable)?;
+    let resource = validate_committed_resource(zone, snapshot_revision, resource_ref, resource)?;
+    Ok((resource, snapshot_revision))
+}
+
+fn is_supported_committed_resource_ref(resource_ref: &ResourceRef) -> bool {
+    matches!(
+        resource_ref.resource_type().as_str(),
+        "Guest"
+            | "Host"
+            | "Provider"
+            | "User"
+            | "display-wayland.d2bus.org.WaylandPolicy"
+            | "display-wayland.d2bus.org.WaylandSession"
+    )
+}
+
+fn validate_committed_resource(
+    zone: &ZoneId,
+    current_revision: ZoneRevision,
+    resource_ref: &ResourceRef,
+    resource: StoredResource,
+) -> Result<StoredResource, ResourceRuntimeError> {
     if resource.zone != *zone
         || resource.resource_ref != *resource_ref
         || resource.generation.get() == 0
@@ -8614,21 +20718,185 @@ async fn committed_resource(
 async fn load_committed_controller_provider_identities(
     zone: &ZoneId,
     store: &RedbResourceStore,
-    current_revision: ZoneRevision,
     provider_refs: BTreeSet<ResourceRef>,
 ) -> Result<BTreeMap<ResourceRef, (ResourceUid, ResourceGeneration)>, ResourceRuntimeError> {
+    if provider_refs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let provider_type = ResourceTypeName::parse("Provider")
+        .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
+    let resource_names = provider_refs
+        .iter()
+        .map(|provider_ref| {
+            if provider_ref.resource_type() != &provider_type {
+                return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
+            }
+            Ok(provider_ref.name().clone())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let page_size = u32::try_from(provider_refs.len())
+        .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
+    let request = StoreListRequest {
+            operation: StoreOperationContext {
+                operation_id: "controller-provider-identity-snapshot".to_owned(),
+                idempotency_key: None,
+                correlation_id: "controller-provider-identity-snapshot".to_owned(),
+                trace_id: None,
+                deadline_ms: 10_000,
+            },
+            zone: zone.clone(),
+            resource_types: vec![provider_type],
+            resource_names,
+            filters: Vec::new(),
+            page_size,
+            cursor: None,
+            projection: StoreProjection::Full,
+        };
+    let snapshot = retry_transient_store_list(
+        zone,
+        "controller-provider-identity-snapshot",
+        || store.list(request.clone()),
+    )
+    .await
+        .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+    if snapshot.truncated || snapshot.next_cursor.is_some() {
+        return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
+    }
+
     let mut identities = BTreeMap::new();
-    for provider_ref in provider_refs {
-        let resource = committed_resource(zone, store, current_revision, &provider_ref).await?;
+    for resource in snapshot.resources {
+        let provider_ref = resource.resource_ref.clone();
+        if !provider_refs.contains(&provider_ref) || identities.contains_key(&provider_ref) {
+            return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
+        }
         let (_, uid, generation, _, _) =
-            committed_provider_spec(zone, current_revision, &resource, &provider_ref)?;
+            committed_provider_spec(zone, snapshot.snapshot_revision, &resource, &provider_ref)?;
         identities.insert(provider_ref, (uid, generation));
+    }
+    if identities.len() != provider_refs.len() {
+        return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
     }
     Ok(identities)
 }
 
-fn controller_session_needs_fence(bootstrap_present: bool, service_task_finished: bool) -> bool {
-    !bootstrap_present || service_task_finished
+async fn load_controller_policy_subjects(
+    zone: &ZoneId,
+    store: &RedbResourceStore,
+    providers: Option<&crate::process_provider_runtime::ProductionProcessProviders>,
+    controller_sessions: &Mutex<BTreeMap<ResourceRef, ControllerSession>>,
+) -> Result<BTreeSet<BoundSubject>, ResourceRuntimeError> {
+    let mut contexts = BTreeMap::new();
+    if let Some(providers) = providers {
+        for context in providers.controller_bootstrap_contexts(zone) {
+            contexts.insert(context.process_ref().clone(), context);
+        }
+    }
+    for session in controller_sessions
+        .lock()
+        .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?
+        .values()
+    {
+        let context = session.context.clone();
+        if let Some(existing) = contexts.get(context.process_ref())
+            && existing != &context
+        {
+            return Err(ResourceRuntimeError::PolicyUnavailable);
+        }
+        contexts.insert(context.process_ref().clone(), context);
+    }
+    let provider_refs = contexts
+        .values()
+        .map(|context| context.provider_owner_ref().clone())
+        .collect::<BTreeSet<_>>();
+    let identities = load_committed_controller_provider_identities(
+        zone,
+        store,
+        provider_refs,
+    )
+    .await
+    .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
+    let mut subjects = BTreeSet::new();
+    for context in contexts.values() {
+        let Some((provider_uid, provider_generation)) =
+            identities.get(context.provider_owner_ref())
+        else {
+            return Err(ResourceRuntimeError::PolicyUnavailable);
+        };
+        if provider_uid != context.provider_uid()
+            || *provider_generation != context.provider_generation()
+        {
+            return Err(ResourceRuntimeError::PolicyUnavailable);
+        }
+        subjects.insert(BoundSubject {
+            subject_ref: context.provider_owner_ref().clone(),
+            subject_uid: provider_uid.clone(),
+        });
+    }
+    Ok(subjects)
+}
+
+struct CommittedProcessProviderIdentityLoader {
+    zone: ZoneId,
+    store: Arc<RedbResourceStore>,
+}
+
+#[async_trait]
+impl ProcessProviderIdentityLoader for CommittedProcessProviderIdentityLoader {
+    async fn load(
+        &self,
+        provider_ref: &ResourceRef,
+    ) -> Result<(ResourceUid, ResourceGeneration), ProcessResourceRuntimeError> {
+        let mut identities = load_committed_controller_provider_identities(
+            &self.zone,
+            &self.store,
+            BTreeSet::from([provider_ref.clone()]),
+        )
+        .await
+        .map_err(|_| ProcessResourceRuntimeError::ProviderIdentityUnavailable)?;
+        identities
+            .remove(provider_ref)
+            .ok_or(ProcessResourceRuntimeError::ProviderIdentityUnavailable)
+    }
+}
+
+struct CommittedProcessOwnerIdentityLoader {
+    zone: ZoneId,
+    store: Arc<RedbResourceStore>,
+}
+
+#[async_trait]
+impl ProcessOwnerIdentityLoader for CommittedProcessOwnerIdentityLoader {
+    async fn load(
+        &self,
+        owner_ref: &ResourceRef,
+    ) -> Result<ResourceUid, ProcessResourceRuntimeError> {
+        let operation_id = format!(
+            "process-owner-identity-retry:{}",
+            owner_ref.to_canonical_string()
+        );
+        let request = StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: operation_id.clone(),
+                    idempotency_key: None,
+                    correlation_id: "process-owner-identity-retry".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: self.zone.clone(),
+                target: owner_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            };
+        let resource = retry_transient_store_read(&self.zone, &operation_id, || {
+            self.store.get(request.clone())
+        })
+        .await
+            .map_err(|_| ProcessResourceRuntimeError::OwnerIdentityUnavailable)?;
+        if resource.zone != self.zone || resource.resource_ref != *owner_ref {
+            return Err(ProcessResourceRuntimeError::OwnerIdentityUnavailable);
+        }
+        Ok(resource.uid)
+    }
 }
 
 fn controller_assignment_refresh_action<'a>(
@@ -8826,14 +21094,14 @@ fn controller_session_binding(
     .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)
 }
 
-pub(crate) fn controller_session_snapshot_fences(
+pub(crate) fn controller_session_resource_fences(
     sessions: impl IntoIterator<
         Item = (
             ResourceRef,
             crate::process_provider_runtime::ControllerBootstrapContext,
         ),
     >,
-    snapshot: &[StoredResource],
+    resources: &[StoredResource],
 ) -> Vec<(
     ResourceRef,
     crate::process_provider_runtime::ControllerBootstrapContext,
@@ -8841,7 +21109,7 @@ pub(crate) fn controller_session_snapshot_fences(
     sessions
         .into_iter()
         .filter(|(_, context)| {
-            !snapshot
+            !resources
                 .iter()
                 .find(|resource| resource.resource_ref == *context.process_ref())
                 .is_some_and(|resource| controller_resource_matches(context, resource))
@@ -8871,6 +21139,10 @@ fn controller_resource_matches(
         || envelope.metadata().revision() != resource.revision
         || envelope.digest().ok().as_deref() != Some(resource.payload_digest.as_str())
         || envelope.metadata().owner_ref() != Some(context.provider_owner_ref())
+        || resource.owner_uid.as_ref() != Some(context.provider_uid())
+        || resource
+            .owner_generation
+            .is_some_and(|generation| generation != context.provider_generation())
         || envelope.spec().provider_ref() != Some(context.process_provider_ref())
     {
         return false;
@@ -8883,6 +21155,16 @@ fn controller_resource_matches(
     process.execution().process_class()
         == d2b_contracts_resource::v3::process::ProcessClass::Controller
         && process.execution().execution_ref() == context.execution_ref()
+}
+
+fn controller_session_evidence_identity_check(
+    resource_matches: bool,
+    clearing: bool,
+) -> Result<(), ResourceRuntimeError> {
+    if !resource_matches && !clearing {
+        return Err(ResourceRuntimeError::IdentityUnbound);
+    }
+    Ok(())
 }
 
 fn committed_provider_spec(
@@ -9052,37 +21334,413 @@ fn parse_committed_notification_configuration(
     })
 }
 
-async fn reconcile_system_core_resources(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SystemCoreResourceReconcileError;
+
+impl core::fmt::Display for SystemCoreResourceReconcileError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("system-core-resource-reconcile-failed")
+    }
+}
+
+impl std::error::Error for SystemCoreResourceReconcileError {}
+
+/// Typed Host/User handler executed by the shared Core Runner.
+struct SystemCoreResourceReconciler {
+    descriptor: ControllerDescriptor,
+}
+
+impl std::fmt::Debug for SystemCoreResourceReconciler {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("SystemCoreResourceReconciler")
+            .field("descriptor", &self.descriptor)
+            .finish()
+    }
+}
+
+impl SystemCoreResourceReconciler {
+    fn new(descriptor: ControllerDescriptor) -> Arc<Self> {
+        Arc::new(Self { descriptor })
+    }
+
+    fn valid_spec(resource: &ResourceSnapshot) -> bool {
+        let resource_type = (|| {
+            let envelope = ResourceEnvelope::from_json(resource.canonical_json())
+                .map_err(|_| SystemCoreResourceReconcileError)?;
+            let resource_type = envelope.resource_type().as_str();
+            match resource_type {
+                "Host" => {
+                    if envelope.spec().provider_ref().map(|provider| {
+                        provider.to_canonical_string() == HOST_PROVIDER_REF
+                    }) != Some(true)
+                    {
+                        return Err(SystemCoreResourceReconcileError);
+                    }
+                    serde_json::from_slice::<HostSpec>(
+                        &envelope.spec().base().to_canonical_bytes(),
+                    )
+                    .map_err(|_| SystemCoreResourceReconcileError)?;
+                }
+                "User" => {
+                    serde_json::from_slice::<UserSpec>(
+                        &envelope.spec().base().to_canonical_bytes(),
+                    )
+                    .map_err(|_| SystemCoreResourceReconcileError)?;
+                }
+                _ => return Err(SystemCoreResourceReconcileError),
+            }
+            Ok::<_, SystemCoreResourceReconcileError>(())
+        })();
+        resource_type.is_ok()
+    }
+
+    fn resource_type(
+        resource: &ResourceSnapshot,
+    ) -> Result<&str, SystemCoreResourceReconcileError> {
+        match resource.key().resource_ref().resource_type().as_str() {
+            "Host" | "User" => Ok(resource.key().resource_ref().resource_type().as_str()),
+            _ => Err(SystemCoreResourceReconcileError),
+        }
+    }
+
+    async fn status_candidate(
+        resource: &ResourceSnapshot,
+    ) -> Result<Vec<u8>, SystemCoreResourceReconcileError> {
+        let envelope = ResourceEnvelope::from_json(resource.canonical_json())
+            .map_err(|_| SystemCoreResourceReconcileError)?;
+        let resource_ref = ResourceRef::new(
+            envelope.resource_type().clone(),
+            envelope.metadata().name().clone(),
+        );
+        let status = match resource_ref.resource_type().as_str() {
+            "Host" => {
+                let spec: HostSpec =
+                    serde_json::from_slice(&envelope.spec().base().to_canonical_bytes())
+                        .map_err(|_| SystemCoreResourceReconcileError)?;
+                let provider_ref = envelope
+                    .spec()
+                    .provider_ref()
+                    .cloned()
+                    .ok_or(SystemCoreResourceReconcileError)?;
+                let report = match HostReconciler::new()
+                    .reconcile_with_probe(
+                        &resource_ref,
+                        &provider_ref,
+                        &spec,
+                        &SystemCoreHostProbe::current(),
+                        &BTreeSet::new(),
+                        false,
+                    )
+                    .await
+                {
+                    Ok(report) => report,
+                    Err(_) => {
+                        let mut status = HostReconciler::new()
+                            .reconcile(&resource_ref, &provider_ref, &spec)
+                            .map_err(|_| SystemCoreResourceReconcileError)?;
+                        status.phase = ResourcePhase::Degraded;
+                        HostObservationReport {
+                            status,
+                            capabilities: Vec::new(),
+                            kernel_release: "unknown".to_owned(),
+                            os_name: "unknown".to_owned(),
+                            user_manager_available: false,
+                            active_process_count: 0,
+                            minijail_ready: false,
+                        }
+                    }
+                };
+                host_status_value(&report).map_err(|_| SystemCoreResourceReconcileError)?
+            }
+            "User" => {
+                let spec: UserSpec =
+                    serde_json::from_slice(&envelope.spec().base().to_canonical_bytes())
+                        .map_err(|_| SystemCoreResourceReconcileError)?;
+                let status = UserReconciler::new(SystemCoreUserDiscovery)
+                    .reconcile(&resource_ref, &spec)
+                    .await
+                    .map_err(|_| SystemCoreResourceReconcileError)?;
+                serde_json::to_value(status).map_err(|_| SystemCoreResourceReconcileError)?
+            }
+            _ => return Err(SystemCoreResourceReconcileError),
+        };
+        let mut current = serde_json::from_slice::<Value>(resource.canonical_json())
+            .map_err(|_| SystemCoreResourceReconcileError)?;
+        let current_status = current
+            .get_mut("status")
+            .and_then(Value::as_object_mut)
+            .ok_or(SystemCoreResourceReconcileError)?;
+        let domain_status = status.as_object().ok_or(SystemCoreResourceReconcileError)?;
+        let mut resource_projection = current_status
+            .get("resource")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (key, value) in domain_status {
+            if key != "phase" {
+                resource_projection.insert(key.clone(), value.clone());
+            }
+        }
+        let object = current_status;
+        if let Some(phase) = domain_status.get("phase") {
+            object.insert("phase".to_owned(), phase.clone());
+        }
+        object.insert("resource".to_owned(), Value::Object(resource_projection));
+        object.insert(
+            "observedGeneration".to_owned(),
+            Value::Number(resource.generation().get().into()),
+        );
+        object.insert(
+            "lastReconciledAt".to_owned(),
+            Value::String(current_status_timestamp().as_str().to_owned()),
+        );
+        serde_json::to_vec(&Value::Object(object.clone()))
+            .map_err(|_| SystemCoreResourceReconcileError)
+    }
+}
+
+impl ResourceReconciler for SystemCoreResourceReconciler {
+    type Error = SystemCoreResourceReconcileError;
+
+    fn classify_error(&self, _error: &Self::Error) -> d2b_core_controller::HandlerFailure {
+        d2b_core_controller::HandlerFailure::retryable()
+    }
+
+    fn describe(&self) -> impl Future<Output = Result<ControllerDescriptor, Self::Error>> + Send {
+        std::future::ready(Ok(self.descriptor.clone()))
+    }
+
+    fn validate_spec(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ValidationResult, Self::Error>> + Send {
+        let valid = Self::resource_type(resource).is_ok() && Self::valid_spec(resource);
+        std::future::ready(Ok(if valid {
+            ValidationResult::Valid
+        } else {
+            ValidationResult::Invalid {
+                reason: ReconcileReason::InvalidSpec,
+            }
+        }))
+    }
+
+    fn plan(
+        &self,
+        context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl Future<Output = Result<ReconcilePlan, Self::Error>> + Send {
+        let plan = if resource_status_observed_generation(resource) == Some(resource.generation())
+            && !context.reasons().contains(TriggerReason::StartupRelist)
+        {
+            ReconcilePlan::new(Vec::new(), true)
+        } else {
+            ReconcilePlan::new(vec!["system-core-observe".to_owned()], false)
+        };
+        std::future::ready(plan.map_err(|_| SystemCoreResourceReconcileError))
+    }
+
+    fn reconcile(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        std::future::ready(Ok(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        )))
+    }
+
+    fn execute_effect(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &ReconcilePlan,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        let result = async move {
+            let status = Self::status_candidate(resource).await?;
+            ReconcileResult::new(
+                resource.revision(),
+                resource.generation(),
+                None,
+                Some(status),
+                ReconcileDisposition::Pending,
+                None,
+                None,
+                StatusPersistence::Pending,
+            )
+            .map_err(|_| SystemCoreResourceReconcileError)
+        };
+        result
+    }
+
+    fn observe(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<ObservationResult, Self::Error>> + Send {
+        std::future::ready(Ok(ObservationResult::new(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        ))))
+    }
+
+    fn finalize(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+    ) -> impl Future<Output = Result<FinalizeResult, Self::Error>> + Send {
+        std::future::ready(Ok(FinalizeResult::new(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        ))))
+    }
+
+    fn health(
+        &self,
+    ) -> impl Future<Output = Result<d2b_core_controller::ControllerHealth, Self::Error>> + Send
+    {
+        std::future::ready(Ok(d2b_core_controller::ControllerHealth::Healthy))
+    }
+
+    fn drain(
+        &self,
+        _deadline_tick: u64,
+    ) -> impl Future<Output = Result<DrainResult, Self::Error>> + Send {
+        std::future::ready(Ok(DrainResult::Drained))
+    }
+
+    fn assess_update(
+        &self,
+        _context: &ReconcileContext,
+        _resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl Future<Output = Result<UpdateAssessment, Self::Error>> + Send {
+        std::future::ready(
+            UpdateAssessment::new(UpdateAssessmentState::Current, Vec::new(), true)
+                .map_err(|_| SystemCoreResourceReconcileError),
+        )
+    }
+
+    fn plan_upgrade(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+    ) -> impl Future<Output = Result<UpgradePlan, Self::Error>> + Send {
+        std::future::ready(
+            UpgradePlan::new(
+                d2b_core_controller::DisruptionClass::None,
+                true,
+                vec![UpgradeStage::Recycle(resource.key().resource_ref().clone())],
+            )
+            .map_err(|_| SystemCoreResourceReconcileError),
+        )
+    }
+
+    fn execute_upgrade(
+        &self,
+        _context: &ReconcileContext,
+        resource: &ResourceSnapshot,
+        _dependencies: &[DependencySnapshot],
+        _plan: &UpgradePlan,
+    ) -> impl Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+        std::future::ready(Ok(ReconcileResult::converged(
+            resource.revision(),
+            resource.generation(),
+        )))
+    }
+}
+
+fn system_core_resource_descriptor(
+    identity: ControllerIdentity,
+) -> Result<ControllerDescriptor, ResourceRuntimeError> {
+    let host =
+        ResourceTypeName::parse("Host").map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+    let user =
+        ResourceTypeName::parse("User").map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+    let resources = vec![
+        ResourceRegistration::new(host.clone(), vec![1], 5_000, 3)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+        ResourceRegistration::new(user.clone(), vec![1], 5_000, 3)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+    ];
+    let selectors = [host, user]
+        .into_iter()
+        .flat_map(|resource_type| {
+            [
+                ChangeField::Spec,
+                ChangeField::Status,
+                ChangeField::Metadata,
+                ChangeField::Finalizers,
+                ChangeField::Deletion,
+            ]
+            .into_iter()
+            .map(move |field| ControllerSelector::new(resource_type.clone(), field, None))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+    ControllerDescriptor::new(
+        identity,
+        resources,
+        vec!["host".to_owned(), "user".to_owned()],
+        vec!["system".to_owned()],
+        vec![
+            ControllerVerb::ReadSpec,
+            ControllerVerb::ReadStatus,
+            ControllerVerb::WriteStatus,
+        ],
+        selectors,
+        Vec::new(),
+        false,
+        Vec::new(),
+        vec!["d2b.system-core.v3".to_owned()],
+        vec!["resources.d2bus.org/v3".to_owned()],
+        ControllerExecutionPolicy::new(
+            8,
+            8,
+            256,
+            8,
+            256,
+            ResyncPolicy::new(None, 5_000).map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+        )
+        .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
+    )
+    .map_err(|_| ResourceRuntimeError::HandlerNotReady)
+}
+
+async fn system_core_startup_result(
     zone: &ZoneId,
     store: &RedbResourceStore,
-    status_client: Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
 ) -> Result<SystemCoreReconcileResult, ResourceRuntimeError> {
-    let host_type =
-        ResourceTypeName::parse("Host").map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-    let user_type =
-        ResourceTypeName::parse("User").map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-    let operation = |suffix: &str| StoreOperationContext {
-        operation_id: format!("system-core-reconcile:{suffix}"),
-        idempotency_key: None,
-        correlation_id: format!("system-core-reconcile:{suffix}"),
-        trace_id: None,
-        deadline_ms: 10_000,
-    };
     let mut resources = Vec::new();
     let mut cursor = None;
     loop {
-        let page = store
-            .list(StoreListRequest {
-                operation: operation("all"),
+        let request = StoreListRequest {
+                operation: StoreOperationContext {
+                    operation_id: "system-core-startup-summary".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "system-core-startup-summary".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
                 zone: zone.clone(),
                 resource_types: Vec::new(),
                 resource_names: Vec::new(),
                 filters: Vec::new(),
                 page_size: 128,
-                cursor,
+                cursor: cursor.clone(),
                 projection: StoreProjection::Full,
-            })
-            .await
+            };
+        let page = retry_transient_store_list(zone, "system-core-startup-summary", || {
+            store.list(request.clone())
+        })
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         resources.extend(page.resources);
         cursor = page.next_cursor;
@@ -9090,20 +21748,13 @@ async fn reconcile_system_core_resources(
             break;
         }
     }
-    let hosts = resources
-        .iter()
-        .filter(|resource| resource.resource_ref.resource_type() == &host_type)
-        .cloned()
-        .collect::<Vec<_>>();
-    let users = resources
-        .iter()
-        .filter(|resource| resource.resource_ref.resource_type() == &user_type)
-        .cloned()
-        .collect::<Vec<_>>();
     let total_resource_count = resources.len().min(u32::MAX as usize) as u32;
-    let active_configuration_generation = store
-        .runtime_metadata()
-        .await
+    let active_configuration_generation = retry_transient_store_read(
+        zone,
+        "system-core-startup-metadata",
+        || store.runtime_metadata(),
+    )
+    .await
         .map_err(|_| ResourceRuntimeError::StoreReadFailed)?
         .policy_snapshot
         .active_configuration_revision
@@ -9113,100 +21764,15 @@ async fn reconcile_system_core_resources(
         .filter(|resource| configuration_cleanup_pending(resource, active_configuration_generation))
         .count()
         .min(u32::MAX as usize) as u32;
-
-    let mut host_phase = host_phase_for_resource_count(hosts.len());
-    for resource in hosts {
-        let envelope =
-            d2b_contracts_resource::v3::ResourceEnvelope::from_json(&resource.canonical_json)
-                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-        let spec: HostSpec = serde_json::from_slice(&envelope.spec().base().to_canonical_bytes())
-            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-        let host_ref = ResourceRef::new(
-            envelope.resource_type().clone(),
-            envelope.metadata().name().clone(),
-        );
-        let provider_ref = envelope
-            .spec()
-            .provider_ref()
-            .ok_or(ResourceRuntimeError::HandlerNotReady)?;
-        if provider_ref.to_canonical_string() != HOST_PROVIDER_REF {
-            return Err(ResourceRuntimeError::HandlerNotReady);
-        }
-        let report = match HostReconciler::new()
-            .reconcile_with_probe(
-                &host_ref,
-                provider_ref,
-                &spec,
-                &SystemCoreHostProbe::current(),
-                &BTreeSet::new(),
-                false,
-            )
-            .await
-        {
-            Ok(report) => report,
-            Err(_) => {
-                let mut status = HostReconciler::new()
-                    .reconcile(&host_ref, provider_ref, &spec)
-                    .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-                status.phase = ResourcePhase::Degraded;
-                HostObservationReport {
-                    status,
-                    capabilities: Vec::new(),
-                    kernel_release: "unknown".to_owned(),
-                    os_name: "unknown".to_owned(),
-                    user_manager_available: false,
-                    active_process_count: 0,
-                    minijail_ready: false,
-                }
-            }
-        };
-        if report.status.phase != ResourcePhase::Ready {
-            host_phase = HandlerPhase::Degraded;
-        }
-        let status = host_status_value(&report)?;
-        persist_resource_status(&status_client, &resource, &status).await?;
-    }
-
-    let user_reconciler = UserReconciler::new(SystemCoreUserDiscovery);
-    let mut user_phase = HandlerPhase::Ready;
-    for resource in users {
-        let envelope =
-            d2b_contracts_resource::v3::ResourceEnvelope::from_json(&resource.canonical_json)
-                .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-        let spec: UserSpec = serde_json::from_slice(&envelope.spec().base().to_canonical_bytes())
-            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-        let user_ref = ResourceRef::new(
-            envelope.resource_type().clone(),
-            envelope.metadata().name().clone(),
-        );
-        let status = user_reconciler
-            .reconcile(&user_ref, &spec)
-            .await
-            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-        persist_resource_status(
-            &status_client,
-            &resource,
-            &serde_json::to_value(&status).map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
-        )
-        .await?;
-        if status.phase != ResourcePhase::Ready {
-            // A User that is absent or drifted is a live, durable condition,
-            // not a store failure. Keep the handler current but degraded.
-            user_phase = HandlerPhase::Degraded;
-        }
-    }
-    let core_phase =
-        if matches!(host_phase, HandlerPhase::Ready) && matches!(user_phase, HandlerPhase::Ready) {
-            ResourcePhase::Ready
-        } else {
-            ResourcePhase::Degraded
-        };
+    // Startup readiness is established by the already authenticated Core
+    // session; the shared runner immediately replaces this provisional
+    // projection with persisted Host/User observations.
     Ok(SystemCoreReconcileResult {
-        core_phase,
-        host_phase,
-        user_phase,
+        core_phase: ResourcePhase::Ready,
+        host_phase: HandlerPhase::Ready,
+        user_phase: HandlerPhase::Ready,
         total_resource_count,
-        generation_cleanup_pending: cleanup_pending_count != 0,
+        generation_cleanup_pending: cleanup_pending_count > 0,
         cleanup_pending_count,
     })
 }
@@ -9247,16 +21813,6 @@ fn host_status_value(
     Ok(status)
 }
 
-fn map_audio_runtime_error(error: AudioResourceRuntimeError) -> ResourceRuntimeError {
-    match error {
-        AudioResourceRuntimeError::Controller(_) => ResourceRuntimeError::CapabilityUnavailable,
-        AudioResourceRuntimeError::InvalidResource
-        | AudioResourceRuntimeError::InvalidRelationship => {
-            ResourceRuntimeError::CapabilityUnavailable
-        }
-    }
-}
-
 fn map_process_runtime_error(error: ProcessResourceRuntimeError) -> ResourceRuntimeError {
     match error {
         ProcessResourceRuntimeError::Store => ResourceRuntimeError::StoreReadFailed,
@@ -9264,67 +21820,132 @@ fn map_process_runtime_error(error: ProcessResourceRuntimeError) -> ResourceRunt
         | ProcessResourceRuntimeError::TemplateUnavailable
         | ProcessResourceRuntimeError::IdentityAmbiguous
         | ProcessResourceRuntimeError::ProviderEffect
+        | ProcessResourceRuntimeError::ControllerBootstrapUnavailable
         | ProcessResourceRuntimeError::ProviderIdentityUnavailable
+        | ProcessResourceRuntimeError::OwnerIdentityUnavailable
         | ProcessResourceRuntimeError::InvalidResource => {
             ResourceRuntimeError::CapabilityUnavailable
         }
     }
 }
 
-pub(crate) fn guest_activation_targets(resources: &[StoredResource]) -> BTreeSet<ResourceRef> {
-    resources
-        .iter()
-        .filter(|resource| {
-            resource.resource_ref.resource_type().as_str()
-                == d2b_contracts_resource::v3::activation_nixos::NIXOS_GENERATION_RESOURCE_TYPE
-        })
-        .filter_map(|resource| {
-            let envelope = ResourceEnvelope::from_json(&resource.canonical_json).ok()?;
-            let spec = serde_json::from_slice::<NixosGenerationSpec>(
-                &envelope.spec().base().to_canonical_bytes(),
-            )
-            .ok()?;
-            (spec.execution_ref().resource_type().as_str() == "Guest")
-                .then(|| spec.execution_ref().clone())
-        })
-        .collect()
+fn assignment_fence_store_error(error: &StoreError, fallback_revision: ZoneRevision) -> SourceError {
+    match error.kind() {
+        StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure => {
+            SourceError::Backpressure
+        }
+        StoreErrorKind::Timeout => SourceError::Timeout,
+        StoreErrorKind::ResourceConflict => {
+            SourceError::Conflict(error.current_revision().unwrap_or(fallback_revision))
+        }
+        _ => SourceError::Unavailable,
+    }
 }
 
-pub(crate) async fn list_guest_process_snapshot(
-    session: &d2bd_runtime::guest_component_session::GuestComponentSessionClient,
-    zone: &ZoneId,
-    guest: &ResourceRef,
-) -> Result<Vec<StoredResource>, ()> {
-    let mut request = wire::ListRequest::new();
-    let mut meta = wire::RequestMeta::new();
-    meta.operation_id = "activation-guest-process-relist".to_owned();
-    meta.idempotency_key = meta.operation_id.clone();
-    meta.correlation_id = meta.operation_id.clone();
-    meta.trace_id = meta.operation_id.clone();
-    meta.deadline_ms = 10_000;
-    request.meta = protobuf::MessageField::some(meta);
-    request.resource_types = vec!["Process".to_owned(), "EphemeralProcess".to_owned()];
-    request.page_size = 256;
-    let mut projection = wire::Projection::new();
-    projection.kind = protobuf::EnumOrUnknown::new(wire::ProjectionKind::PROJECTION_KIND_FULL);
-    request.projection = protobuf::MessageField::some(projection);
-
-    let client = session.resource_service_client();
-    let mut resources = Vec::new();
-    loop {
-        let response = client
-            .list(ttrpc::context::Context::default(), &request)
-            .await
-            .map_err(|_| ())?;
-        if response.error.is_some() {
-            return Err(());
-        }
-        for resource in &response.resources {
-            let resource = stored_resource_from_wire(resource).ok_or(())?;
-            if resource.zone != *zone {
-                return Err(());
+pub(super) fn shared_provider_assignment_fence_resolver(
+    store: Arc<RedbResourceStore>,
+    allowed_types: BTreeSet<ResourceTypeName>,
+    authority: Arc<CoreAssignmentAuthority>,
+) -> AssignmentFenceResolver {
+    Arc::new(move |target, uid, revision| {
+        let store = Arc::clone(&store);
+        let authority = Arc::clone(&authority);
+        let allowed_types = allowed_types.clone();
+        Box::pin(async move {
+            if !allowed_types.contains(target.resource_type()) {
+                return Err(SourceError::Integrity);
             }
-            let envelope = ResourceEnvelope::from_json(&resource.canonical_json).map_err(|_| ())?;
+            if let Some(stored) = store
+                .assignment_fence(store.identity().zone().clone(), target.clone())
+                .await
+                .map_err(|error| match error.kind() {
+                    StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure => {
+                        SourceError::Backpressure
+                    }
+                    StoreErrorKind::Timeout => SourceError::Timeout,
+                    _ => SourceError::Unavailable,
+                })?
+            {
+                if stored.resource_uid != uid
+                    || stored.epoch > authority.epoch
+                    || (stored.epoch == authority.epoch
+                        && (stored.provider_generation != authority.provider_generation
+                            || stored.controller_generation != authority.controller_generation
+                            || stored.controller_role != authority.controller_role
+                            || stored.target != authority.target
+                            || stored.session_generation != authority.session_generation))
+                {
+                    return Err(SourceError::Integrity);
+                }
+                if stored.epoch == authority.epoch && stored.resource_revision != revision {
+                    return Err(SourceError::Conflict(stored.resource_revision));
+                }
+            }
+            Ok(ResourceAssignmentFence {
+                resource_uid: uid,
+                resource_revision: revision,
+                provider_generation: authority.provider_generation,
+                controller_generation: authority.controller_generation,
+                controller_role: authority.controller_role.clone(),
+                target: authority.target.clone(),
+                session_generation: authority.session_generation,
+                epoch: authority.epoch,
+                scope: ResourceAssignmentScope::Primary,
+            })
+        })
+    })
+}
+
+fn process_assignment_fence_resolver(
+    store: Arc<RedbResourceStore>,
+    mode: DaemonMode,
+    authority: Arc<CoreAssignmentAuthority>,
+) -> AssignmentFenceResolver {
+    fn integrity(target: &ResourceRef, reason: &'static str) -> SourceError {
+        tracing::warn!(
+            resource = %target.to_canonical_string(),
+            reason,
+            "Process assignment source rejected resource identity",
+        );
+        SourceError::Integrity
+    }
+
+    Arc::new(move |target, uid, revision| {
+        let store = Arc::clone(&store);
+        let authority = Arc::clone(&authority);
+        Box::pin(async move {
+            let resource = store
+                .get(StoreGetRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "process-assignment-fence".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "process-assignment-fence".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: store.identity().zone().clone(),
+                    target: target.clone(),
+                    expected_uid: Some(uid.clone()),
+                    projection: StoreProjection::Full,
+                })
+                .await
+                .map_err(|error| assignment_fence_store_error(&error, revision))?;
+            if resource.revision != revision {
+                return Err(SourceError::Conflict(resource.revision));
+            }
+            let envelope = ResourceEnvelope::from_json(&resource.canonical_json)
+                .map_err(|_| integrity(&target, "resource-envelope-invalid"))?;
+            let provider_ref = envelope
+                .spec()
+                .provider_ref()
+                .cloned()
+                .ok_or_else(|| integrity(&target, "process-provider-ref-missing"))?;
+            if !matches!(
+                provider_ref.name().as_str(),
+                "system-minijail" | "system-systemd"
+            ) {
+                return Err(integrity(&target, "process-provider-ref-unsupported"));
+            }
             let execution_ref = envelope
                 .spec()
                 .base()
@@ -9333,26 +21954,170 @@ pub(crate) async fn list_guest_process_snapshot(
                     CanonicalJsonValue::String(value) => ResourceRef::parse(value).ok(),
                     _ => None,
                 })
-                .ok_or(())?;
-            if execution_ref != *guest {
-                return Err(());
+                .ok_or_else(|| integrity(&target, "process-execution-ref-missing"))?;
+            let expected_target = match mode {
+                DaemonMode::Host => "Host",
+                DaemonMode::Guest => "Guest",
+            };
+            if execution_ref.resource_type().as_str() != expected_target {
+                return Err(integrity(&target, "process-execution-ref-wrong-domain"));
             }
-            resources.push(resource);
-        }
-        let Some(cursor) = response.next_cursor.as_ref().cloned() else {
-            break;
-        };
-        request.cursor = protobuf::MessageField::some(cursor);
-    }
-    Ok(resources)
+            let _target_provider = match store
+                .get(StoreGetRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "process-assignment-provider".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "process-assignment-provider".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: store.identity().zone().clone(),
+                    target: provider_ref.clone(),
+                    expected_uid: None,
+                    projection: StoreProjection::MetadataOnly,
+                })
+                .await
+            {
+                Ok(provider) if provider.generation.get() > 0 => provider,
+                Ok(_) => {
+                    return Err(integrity(&target, "target-provider-generation-invalid"));
+                }
+                Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                    let current_revision = store
+                        .runtime_metadata()
+                        .await
+                        .map_err(|error| assignment_fence_store_error(&error, revision))?
+                        .current_revision;
+                    return Err(SourceError::Conflict(current_revision));
+                }
+                Err(error) if error.kind() == StoreErrorKind::ResourceConflict => {
+                    return Err(SourceError::Conflict(
+                        error.current_revision().unwrap_or(revision),
+                    ));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure
+                    ) =>
+                {
+                    return Err(SourceError::Backpressure);
+                }
+                Err(error) if error.kind() == StoreErrorKind::Timeout => {
+                    return Err(SourceError::Timeout);
+                }
+                Err(_) => return Err(SourceError::Integrity),
+            };
+            Ok(ResourceAssignmentFence {
+                resource_uid: uid,
+                resource_revision: revision,
+                provider_generation: authority.provider_generation,
+                controller_generation: authority.controller_generation,
+                controller_role: authority.controller_role.clone(),
+                target: execution_ref,
+                session_generation: authority.session_generation,
+                epoch: authority.epoch,
+                scope: ResourceAssignmentScope::Primary,
+            })
+        })
+    })
 }
 
-fn map_activation_runtime_error(error: ActivationResourceRuntimeError) -> ResourceRuntimeError {
-    match error {
-        ActivationResourceRuntimeError::Store => ResourceRuntimeError::StoreReadFailed,
-        ActivationResourceRuntimeError::InvalidResource
-        | ActivationResourceRuntimeError::Policy => ResourceRuntimeError::CapabilityUnavailable,
-    }
+fn system_core_assignment_fence_resolver(
+    store: Arc<RedbResourceStore>,
+    controller_role: ResourceRef,
+    session_generation: ReconnectGeneration,
+    epoch: Arc<AtomicU64>,
+) -> AssignmentFenceResolver {
+    Arc::new(move |target, uid, revision| {
+        let store = Arc::clone(&store);
+        let controller_role = controller_role.clone();
+        let epoch = Arc::clone(&epoch);
+        Box::pin(async move {
+            let resource = store
+                .get(StoreGetRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "system-core-assignment-fence".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "system-core-assignment-fence".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: store.identity().zone().clone(),
+                    target: target.clone(),
+                    expected_uid: Some(uid.clone()),
+                    projection: StoreProjection::Full,
+                })
+                .await
+                .map_err(|error| assignment_fence_store_error(&error, revision))?;
+            if resource.revision != revision
+                || !matches!(
+                    resource.resource_ref.resource_type().as_str(),
+                    "Host" | "User"
+                )
+            {
+                return Err(SourceError::Conflict(resource.revision));
+            }
+            let envelope = ResourceEnvelope::from_json(&resource.canonical_json)
+                .map_err(|_| SourceError::Integrity)?;
+            if let Some(provider_ref) = envelope.spec().provider_ref()
+                && provider_ref.to_canonical_string() != "Provider/system-core"
+            {
+                return Err(SourceError::Integrity);
+            }
+            let provider_ref =
+                ResourceRef::parse("Provider/system-core").map_err(|_| SourceError::Integrity)?;
+            let provider = store
+                .get(StoreGetRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "system-core-assignment-provider".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "system-core-assignment-provider".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: store.identity().zone().clone(),
+                    target: provider_ref,
+                    expected_uid: None,
+                    projection: StoreProjection::MetadataOnly,
+                })
+                .await
+                .map_err(|error| match error.kind() {
+                    StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure => {
+                        SourceError::Backpressure
+                    }
+                    StoreErrorKind::Timeout => SourceError::Timeout,
+                    StoreErrorKind::ResourceConflict => {
+                        SourceError::Conflict(error.current_revision().unwrap_or(revision))
+                    }
+                    StoreErrorKind::ResourceNotFound => SourceError::Unavailable,
+                    _ => SourceError::Integrity,
+                })?;
+            let controller_generation = store
+                .runtime_metadata()
+                .await
+                .map_err(|error| assignment_fence_store_error(&error, revision))?
+                .policy_snapshot
+                .controller_generation
+                .ok_or(SourceError::Integrity)?;
+            let assignment_epoch = epoch.load(Ordering::Acquire);
+            if assignment_epoch == 0 {
+                return Err(SourceError::Integrity);
+            }
+            Ok(ResourceAssignmentFence {
+                resource_uid: uid,
+                resource_revision: revision,
+                provider_generation: provider.generation,
+                controller_generation,
+                controller_role,
+                target: ResourceRef::parse(CORE_CONTROLLER_HOST_REF)
+                    .map_err(|_| SourceError::Integrity)?,
+                session_generation,
+                epoch: assignment_epoch,
+                scope: ResourceAssignmentScope::Primary,
+            })
+        })
+    })
 }
 
 async fn public_create_request(
@@ -10683,7 +23448,13 @@ impl ResourcePlane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, fs::OpenOptions, os::fd::AsRawFd, sync::Arc};
+    use std::{
+        collections::VecDeque,
+        fs::OpenOptions,
+        os::fd::{AsRawFd, OwnedFd},
+        sync::Arc,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use d2b_contracts_resource::v3::{
         CanonicalJsonObject, Timestamp,
@@ -10691,9 +23462,1494 @@ mod tests {
     };
     use d2b_contracts_zone_session::v3::component_session::LimitProfile;
     use d2b_contracts_zone_session::v3::resource_bundle::{BundleResource, BundleResourceMetadata};
+    use d2b_core::{
+        bundle::{Bundle, BundleGeneration},
+        bundle_resolver::BundleResolver,
+        manifest_v04::ManifestV04,
+        processes::ProcessesJson,
+    };
+    use d2b_provider_volume_local::VolumeLocalError;
     use d2b_resource_store::mutation_seal::mutation_seal_pair;
     use d2b_resource_store_redb::write_provisioning_marker;
     use d2b_session_unix::{CreditPool, CreditScopeSet, OutboundPacket, prearmed_seqpacket_pair};
+
+    const TEST_PROCESS_FINALIZER: &str = "process-system-minijail.d2bus.org/cleanup";
+
+    #[tokio::test]
+    async fn assignment_fence_relist_is_bounded_and_does_not_retry_each_resource() {
+        let resource_refs = [
+            ResourceRef::parse("Host/host-system").unwrap(),
+            ResourceRef::parse("User/alice").unwrap(),
+            ResourceRef::parse("Provider/system-core").unwrap(),
+        ];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_read = Arc::clone(&calls);
+        let epoch = ZoneResourceRuntime::durable_assignment_epoch(&resource_refs, move |_resource_ref| {
+            calls_for_read.fetch_add(1, Ordering::SeqCst);
+            async {
+                Ok(Some(ResourceAssignmentFence {
+                    resource_uid: ResourceUid::parse(
+                        "123e4567-e89b-42d3-a456-426614174000",
+                    )
+                    .unwrap(),
+                    resource_revision: ZoneRevision::new(1),
+                    provider_generation: ResourceGeneration::new(1).unwrap(),
+                    controller_generation: ControllerGeneration::new(1).unwrap(),
+                    controller_role: ResourceRef::parse("Process/system-core").unwrap(),
+                    target: ResourceRef::parse("Zone/work").unwrap(),
+                    session_generation: ReconnectGeneration::new(1).unwrap(),
+                    epoch: 7,
+                    scope: ResourceAssignmentScope::Primary,
+                }))
+            }
+        })
+        .await
+        .expect("bounded assignment-fence relist");
+        assert_eq!(epoch, 7);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            resource_refs.len(),
+            "one relist pass must read each assignment fence once"
+        );
+
+        let oversized = vec![
+            resource_refs[0].clone();
+            d2b_core_controller::controller_assignment::MAX_ASSIGNMENTS + 1
+        ];
+        let result = ZoneResourceRuntime::durable_assignment_epoch(&oversized, |_resource_ref| async {
+            Ok::<Option<ResourceAssignmentFence>, d2b_resource_store::StoreError>(None)
+        })
+        .await;
+        assert_eq!(
+            result,
+            Err(ResourceRuntimeError::AuthorizationUnavailable)
+        );
+    }
+
+    #[test]
+    fn trusted_provider_catalog_includes_declared_export_only() {
+        let resource_types = trusted_provider_resource_types().expect("trusted declarations");
+        assert!(resource_types
+            .iter()
+            .any(|resource_type| resource_type.as_str() == "virtiofs.d2bus.org.Export"));
+        assert!(!resource_types
+            .iter()
+            .any(|resource_type| resource_type.as_str() == "untrusted.d2bus.org.Type"));
+    }
+
+    #[test]
+    fn unknown_qualified_bundle_resource_types_fail_closed() {
+        let trusted = ResourceTypeName::parse("virtiofs.d2bus.org.Export").unwrap();
+        assert!(trusted_catalog_resource_types([trusted]).is_ok());
+        let unknown = ResourceTypeName::parse("untrusted.d2bus.org.Type").unwrap();
+        assert_eq!(
+            trusted_catalog_resource_types([unknown]),
+            Err(ResourceRuntimeError::AuthorizationUnavailable)
+        );
+    }
+
+    #[test]
+    fn guest_dependency_reenters_only_after_provider_status_is_ready() {
+        let guest = serde_json::json!({
+            "spec": { "providerRef": "Provider/runtime" }
+        });
+        let provider_ref = ResourceRef::parse("Provider/runtime").unwrap();
+        let provider_uid =
+            ResourceUid::parse("11111111-1111-4111-8111-111111111111").unwrap();
+        let pending = DependencySnapshot::new(ResourceSnapshot::new(
+            ResourceKey::new(
+                ZoneId::parse("work").unwrap(),
+                provider_ref.clone(),
+                provider_uid.clone(),
+            ),
+            ZoneRevision::new(4),
+            ResourceGeneration::new(2).unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "status": { "phase": "Pending" }
+            }))
+            .unwrap(),
+            false,
+        ));
+        assert!(!DaemonSharedProviderEffects::related_guest_dependency(
+            &guest, &pending
+        )
+        .unwrap());
+        let ready = DependencySnapshot::new(ResourceSnapshot::new(
+            ResourceKey::new(
+                ZoneId::parse("work").unwrap(),
+                provider_ref,
+                provider_uid,
+            ),
+            ZoneRevision::new(5),
+            ResourceGeneration::new(2).unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "status": {
+                    "phase": "Ready",
+                    "observedGeneration": 2
+                }
+            }))
+            .unwrap(),
+            false,
+        ));
+        assert!(DaemonSharedProviderEffects::related_guest_dependency(
+            &guest, &ready
+        )
+        .unwrap());
+    }
+
+    #[derive(Debug)]
+    struct AssignmentTestError;
+
+    impl core::fmt::Display for AssignmentTestError {
+        fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter.write_str("assignment test handler failed")
+        }
+    }
+
+    impl std::error::Error for AssignmentTestError {}
+
+    struct AssignmentTestReconciler {
+        descriptor: ControllerDescriptor,
+    }
+
+    fn has_test_process_finalizer(resource: &ResourceSnapshot) -> bool {
+        serde_json::from_slice::<Value>(resource.canonical_json())
+            .ok()
+            .and_then(|value| value.pointer("/metadata/finalizers").cloned())
+            .and_then(|value| value.as_array().cloned())
+            .is_some_and(|finalizers| {
+                finalizers
+                    .iter()
+                    .any(|value| value.as_str() == Some(TEST_PROCESS_FINALIZER))
+            })
+    }
+
+    impl ResourceReconciler for AssignmentTestReconciler {
+        type Error = AssignmentTestError;
+
+        fn classify_error(
+            &self,
+            _error: &Self::Error,
+        ) -> d2b_core_controller::HandlerFailure {
+            d2b_core_controller::HandlerFailure::terminal()
+        }
+
+        fn describe(
+            &self,
+        ) -> impl std::future::Future<
+            Output = Result<ControllerDescriptor, Self::Error>,
+        > + Send {
+            std::future::ready(Ok(self.descriptor.clone()))
+        }
+
+        fn validate_spec(
+            &self,
+            _context: &ReconcileContext,
+            _resource: &ResourceSnapshot,
+        ) -> impl std::future::Future<Output = Result<ValidationResult, Self::Error>> + Send {
+            std::future::ready(Ok(ValidationResult::Valid))
+        }
+
+        fn plan(
+            &self,
+            _context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+        ) -> impl std::future::Future<Output = Result<ReconcilePlan, Self::Error>> + Send {
+            let steps = if has_test_process_finalizer(resource) {
+                Vec::new()
+            } else {
+                vec!["finalizer".to_owned()]
+            };
+            std::future::ready(
+                ReconcilePlan::new(steps, false).map_err(|_| AssignmentTestError),
+            )
+        }
+
+        fn reconcile(
+            &self,
+            _context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+            _plan: &ReconcilePlan,
+        ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+            if has_test_process_finalizer(resource) {
+                return std::future::ready(Ok(ReconcileResult::converged(
+                    resource.revision(),
+                    resource.generation(),
+                )));
+            }
+            let canonical = finalizer_candidate(
+                resource.canonical_json(),
+                TEST_PROCESS_FINALIZER,
+                true,
+            )
+            .map_err(|_| AssignmentTestError);
+            let result = canonical
+                .and_then(|canonical| {
+                    let mutation = d2b_core_controller::MutationIntent::new(
+                        resource.key().resource_ref().clone(),
+                        Some(resource.key().uid().clone()),
+                        Some(resource.revision()),
+                        d2b_core_controller::MutationIntentKind::UpdateFinalizers,
+                        Some(canonical),
+                    )
+                    .map_err(|_| AssignmentTestError)?;
+                    let batch = ResourceMutationBatch::new(vec![mutation])
+                        .map_err(|_| AssignmentTestError)?;
+                    ReconcileResult::new(
+                        resource.revision(),
+                        resource.generation(),
+                        Some(batch),
+                        None,
+                        ReconcileDisposition::Pending,
+                        None,
+                        None,
+                        StatusPersistence::NotRequested,
+                    )
+                    .map_err(|_| AssignmentTestError)
+                });
+            std::future::ready(result)
+        }
+
+        fn observe(
+            &self,
+            _context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+        ) -> impl std::future::Future<Output = Result<ObservationResult, Self::Error>> + Send {
+            std::future::ready(Ok(ObservationResult::new(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ))))
+        }
+
+        fn finalize(
+            &self,
+            _context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+        ) -> impl std::future::Future<Output = Result<FinalizeResult, Self::Error>> + Send {
+            std::future::ready(Ok(FinalizeResult::new(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            ))))
+        }
+
+        fn health(
+            &self,
+        ) -> impl std::future::Future<
+            Output = Result<d2b_core_controller::ControllerHealth, Self::Error>,
+        > + Send {
+            std::future::ready(Ok(d2b_core_controller::ControllerHealth::Healthy))
+        }
+
+        fn drain(
+            &self,
+            _deadline_tick: u64,
+        ) -> impl std::future::Future<Output = Result<DrainResult, Self::Error>> + Send {
+            std::future::ready(Ok(DrainResult::Drained))
+        }
+
+        fn assess_update(
+            &self,
+            _context: &ReconcileContext,
+            _resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+        ) -> impl std::future::Future<Output = Result<UpdateAssessment, Self::Error>> + Send {
+            std::future::ready(
+                UpdateAssessment::new(UpdateAssessmentState::Current, Vec::new(), true)
+                    .map_err(|_| AssignmentTestError),
+            )
+        }
+
+        fn plan_upgrade(
+            &self,
+            _context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+        ) -> impl std::future::Future<Output = Result<UpgradePlan, Self::Error>> + Send {
+            std::future::ready(
+                UpgradePlan::new(
+                    DisruptionClass::None,
+                    true,
+                    vec![UpgradeStage::Recycle(resource.key().resource_ref().clone())],
+                )
+                .map_err(|_| AssignmentTestError),
+            )
+        }
+
+        fn execute_upgrade(
+            &self,
+            _context: &ReconcileContext,
+            resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+            _plan: &UpgradePlan,
+        ) -> impl std::future::Future<Output = Result<ReconcileResult, Self::Error>> + Send {
+            std::future::ready(Ok(ReconcileResult::converged(
+                resource.revision(),
+                resource.generation(),
+            )))
+        }
+    }
+
+    struct RecordingSharedProviderEffects {
+        reconciles: AtomicUsize,
+        finalizes: AtomicUsize,
+        cleanup_ready: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl SharedProviderEffectExecutor for RecordingSharedProviderEffects {
+        async fn reconcile_network(
+            &self,
+            _context: &SharedProviderEffectContext,
+            _resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+        ) -> Result<SharedProviderEffectPhase, SharedProviderEffectError> {
+            self.reconciles.fetch_add(1, Ordering::SeqCst);
+            Ok(SharedProviderEffectPhase::Ready)
+        }
+
+        async fn reconcile_audio(
+            &self,
+            _kind: SharedProviderResourceKind,
+            _context: &SharedProviderEffectContext,
+            _resource: &ResourceSnapshot,
+            _dependencies: &[DependencySnapshot],
+        ) -> Result<SharedProviderEffectResult, SharedProviderEffectError> {
+            Ok(SharedProviderEffectResult {
+                phase: SharedProviderEffectPhase::Pending,
+                child_mutated: true,
+                resource_projection: None,
+            })
+        }
+
+        async fn finalize(
+            &self,
+            _kind: SharedProviderResourceKind,
+            _context: &SharedProviderEffectContext,
+            _resource: &ResourceSnapshot,
+        ) -> Result<(), SharedProviderEffectError> {
+            if !self.cleanup_ready.load(Ordering::SeqCst) {
+                return Err(SharedProviderEffectError::Unavailable);
+            }
+            self.finalizes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn shared_provider_test_descriptor_for(
+        registration: SharedProviderRunnerRegistration,
+    ) -> (
+        SharedProviderRunnerRegistration,
+        ControllerDescriptor,
+    ) {
+        let provider_ref = ResourceRef::parse(registration.provider_ref).unwrap();
+        let generations = BTreeMap::from([(provider_ref, ResourceGeneration::new(7).unwrap())]);
+        compose_shared_provider_runner_descriptors(
+            [registration],
+            ZoneId::parse("work").unwrap(),
+            ControllerGeneration::new(3).unwrap(),
+            &generations,
+            ReconnectGeneration::new(5).unwrap(),
+        )
+        .unwrap()
+        .pop()
+        .unwrap()
+    }
+
+    fn shared_provider_test_descriptor() -> (
+        SharedProviderRunnerRegistration,
+        ControllerDescriptor,
+    ) {
+        shared_provider_test_descriptor_for(U8_SHARED_PROVIDER_RUNNERS[0])
+    }
+
+    fn shared_provider_test_resource(finalizers: &[&str], deleting: bool) -> ResourceSnapshot {
+        shared_provider_test_resource_for(
+            U8_SHARED_PROVIDER_RUNNERS[0],
+            finalizers,
+            deleting,
+        )
+    }
+
+    fn shared_provider_test_resource_for(
+        registration: SharedProviderRunnerRegistration,
+        finalizers: &[&str],
+        deleting: bool,
+    ) -> ResourceSnapshot {
+        let zone = ZoneId::parse("work").unwrap();
+        let resource_ref =
+            ResourceRef::parse(&format!("{}/work", registration.resource_type)).unwrap();
+        let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let finalizers = finalizers
+            .iter()
+            .map(|value| Value::String((*value).to_owned()))
+            .collect::<Vec<_>>();
+        let spec = if registration.resource_type.starts_with("display-wayland.") {
+            json!({})
+        } else {
+            json!({"providerRef": registration.provider_ref})
+        };
+        let body = json!({
+            "apiVersion": "resources.d2bus.org/v3",
+            "type": registration.resource_type,
+            "metadata": {
+                "name": "work",
+                "zone": "work",
+                "uid": uid.as_str(),
+                "generation": 1,
+                "revision": 1,
+                "finalizers": finalizers,
+            },
+            "spec": spec,
+            "status": {
+                "phase": "Pending",
+                "observedGeneration": 0,
+            },
+        });
+        ResourceSnapshot::new(
+            ResourceKey::new(zone, resource_ref, uid),
+            ZoneRevision::new(1),
+            ResourceGeneration::new(1).unwrap(),
+            serde_json::to_vec(&body).unwrap(),
+            deleting,
+        )
+    }
+
+    #[test]
+    fn production_provider_composition_closes_exactly_27_typed_rows() {
+        const EXPECTED_PROVIDER_IDS: [&str; 27] = [
+            "system-core",
+            "system-systemd",
+            "system-minijail",
+            "runtime-cloud-hypervisor",
+            "runtime-qemu-media",
+            "runtime-azure-container-apps",
+            "runtime-azure-virtual-machine",
+            "volume-local",
+            "volume-virtiofs",
+            "network-local",
+            "device-tpm",
+            "device-usbip",
+            "device-security-key",
+            "device-gpu",
+            "display-wayland",
+            "audio-pipewire",
+            "clipboard-wayland",
+            "notification-desktop",
+            "shell-terminal",
+            "credential-secret-service",
+            "credential-entra",
+            "credential-managed-identity",
+            "transport-unix",
+            "transport-vsock",
+            "transport-azure-relay",
+            "observability-otel",
+            "activation-nixos",
+        ];
+        let expected = EXPECTED_PROVIDER_IDS.into_iter().collect::<BTreeSet<_>>();
+        assert_eq!(expected.len(), 27);
+
+        let mut resource_owners = BTreeSet::from([
+            "system-core",
+            "system-systemd",
+            "system-minijail",
+        ]);
+        let mut registration_keys = BTreeSet::<(String, String, String)>::new();
+        let mut check_shared_registration = |registration: SharedProviderRunnerRegistration| {
+            assert!(
+                registration_keys.insert((
+                    registration.provider_ref.to_owned(),
+                    registration.resource_type.to_owned(),
+                    registration.controller_ref.to_owned(),
+                )),
+                "duplicate Provider/resource/controller registration"
+            );
+            assert!(expected.contains(
+                registration
+                    .provider_ref
+                    .strip_prefix("Provider/")
+                    .expect("Provider registration reference")
+            ));
+            assert!(registration.watched_configuration_is_dependency);
+            assert!((30_000..=300_000).contains(&registration.repair_interval_ticks));
+            resource_owners.insert(
+                registration
+                    .provider_ref
+                    .strip_prefix("Provider/")
+                    .expect("Provider registration reference"),
+            );
+            let (_, descriptor) = shared_provider_test_descriptor_for(registration);
+            assert_eq!(
+                descriptor.identity().provider_ref().to_canonical_string(),
+                registration.provider_ref
+            );
+            assert_eq!(
+                descriptor.identity().controller_ref().to_canonical_string(),
+                registration.controller_ref
+            );
+            assert_eq!(
+                descriptor.resource_types().next().expect("one resource type").as_str(),
+                registration.resource_type
+            );
+            assert_eq!(
+                descriptor.execution().resync().observe_interval_ticks(),
+                Some(registration.repair_interval_ticks)
+            );
+            let provider_selector = descriptor
+                .watch_selectors()
+                .iter()
+                .find(|selector| selector.field() == SelectorField::Spec)
+                .and_then(|selector| selector.exact_value());
+            if registration.resource_type.starts_with("display-wayland.") {
+                assert!(provider_selector.is_none());
+            } else {
+                assert_eq!(provider_selector, Some(registration.provider_ref));
+            }
+            if registration.finalizer.is_empty() {
+                assert!(descriptor.finalizers().is_empty());
+            } else {
+                assert_eq!(descriptor.finalizers(), &[registration.finalizer.to_owned()]);
+            }
+            for finalizer in descriptor
+                .finalizers()
+                .iter()
+                .filter(|finalizer| !finalizer.is_empty())
+            {
+                let parsed = d2b_contracts_resource::v3::FinalizerId::parse(finalizer.clone())
+                    .expect("production finalizer must satisfy the Resource API contract");
+                assert_eq!(parsed.as_str(), finalizer);
+            }
+            match registration.provider_ref {
+                "Provider/volume-local" => {
+                    assert_eq!(registration.finalizer, "volume-local.d2bus.org/layout");
+                }
+                "Provider/volume-virtiofs" => {
+                    assert_eq!(
+                        registration.finalizer,
+                        "volume-virtiofs.d2bus.org/export"
+                    );
+                }
+                _ => {}
+            }
+        };
+
+        for registration in U6_SHARED_PROVIDER_RUNNERS {
+            check_shared_registration(registration);
+        }
+        for registration in U7_SHARED_PROVIDER_RUNNERS.iter().map(|registration| {
+            SharedProviderRunnerRegistration {
+                controller_ref: registration.controller_ref,
+                provider_ref: registration.provider_ref,
+                resource_type: registration.resource_type,
+                finalizer: registration.finalizer,
+                repair_interval_ticks: registration.repair_interval_secs * 1_000,
+                watched_configuration_is_dependency: registration
+                    .watched_configuration_is_dependency,
+            }
+        }) {
+            check_shared_registration(registration);
+        }
+        for registration in U8_SHARED_PROVIDER_RUNNERS {
+            check_shared_registration(registration);
+        }
+        for registration in U9_SHARED_PROVIDER_RUNNERS {
+            check_shared_registration(registration);
+        }
+
+        for (provider_name, controller_ref_text, provider_ref_text) in U10_PROVIDER_CONTROLLERS {
+            let provider_ref = ResourceRef::parse(provider_ref_text).expect("Credential Provider");
+            let controller_ref =
+                ResourceRef::parse(controller_ref_text).expect("Credential controller");
+            let identity = ControllerIdentity::new(
+                ZoneId::parse("work").expect("Zone"),
+                controller_ref.clone(),
+                ControllerGeneration::new(3).expect("controller generation"),
+                provider_ref.clone(),
+                ResourceGeneration::new(7).expect("Provider generation"),
+                controller_ref,
+                ResourceRef::parse(CORE_CONTROLLER_HOST_REF).expect("Host"),
+                None,
+            )
+            .expect("Credential identity");
+            let descriptor =
+                credential_controller_descriptor(identity).expect("Credential descriptor");
+            assert_eq!(
+                descriptor.resource_types().map(ResourceTypeName::as_str).collect::<Vec<_>>(),
+                vec!["Credential"]
+            );
+            assert_eq!(
+                descriptor
+                    .watch_selectors()
+                    .iter()
+                    .find(|selector| selector.field() == SelectorField::Spec)
+                    .and_then(|selector| selector.exact_value()),
+                Some(provider_ref_text)
+            );
+            assert_eq!(
+                descriptor.execution().resync().observe_interval_ticks(),
+                Some(30_000)
+            );
+            assert!(
+                registration_keys.insert((
+                    provider_ref_text.to_owned(),
+                    "Credential".to_owned(),
+                    controller_ref_text.to_owned(),
+                )),
+                "duplicate Credential Provider registration for {provider_name}"
+            );
+            resource_owners.insert(provider_name);
+        }
+
+        for (provider_name, controller_ref_text, provider_ref_text) in U12_PROVIDER_CONTROLLERS {
+            let provider_ref = ResourceRef::parse(provider_ref_text).expect("U12 Provider");
+            let controller_ref =
+                ResourceRef::parse(controller_ref_text).expect("U12 controller");
+            let identity = ControllerIdentity::new(
+                ZoneId::parse("work").expect("Zone"),
+                controller_ref.clone(),
+                ControllerGeneration::new(3).expect("controller generation"),
+                provider_ref,
+                ResourceGeneration::new(7).expect("Provider generation"),
+                controller_ref,
+                ResourceRef::parse(CORE_CONTROLLER_HOST_REF).expect("Host"),
+                None,
+            )
+            .expect("U12 identity");
+            let descriptor = if provider_name == "observability-otel" {
+                telemetry_controller_descriptor(identity).expect("Telemetry descriptor")
+            } else {
+                activation_controller_descriptor(identity).expect("Activation descriptor")
+            };
+            let resource_types = descriptor
+                .resource_types()
+                .map(|resource_type| resource_type.as_str().to_owned())
+                .collect::<Vec<_>>();
+            assert!(!resource_types.is_empty());
+            for resource_type in resource_types {
+                assert!(
+                    registration_keys.insert((
+                        provider_ref_text.to_owned(),
+                        resource_type,
+                        controller_ref_text.to_owned(),
+                    )),
+                    "duplicate U12 Provider registration for {provider_name}"
+                );
+            }
+            assert_eq!(
+                descriptor
+                    .watch_selectors()
+                    .iter()
+                    .find(|selector| selector.field() == SelectorField::Spec)
+                    .and_then(|selector| selector.exact_value()),
+                Some(provider_ref_text)
+            );
+            resource_owners.insert(provider_name);
+        }
+
+        assert_eq!(
+            resource_owners,
+            BTreeSet::from([
+                "system-core",
+                "system-systemd",
+                "system-minijail",
+                "runtime-cloud-hypervisor",
+                "runtime-qemu-media",
+                "runtime-azure-container-apps",
+                "runtime-azure-virtual-machine",
+                "volume-local",
+                "volume-virtiofs",
+                "network-local",
+                "device-tpm",
+                "device-usbip",
+                "device-security-key",
+                "device-gpu",
+                "display-wayland",
+                "audio-pipewire",
+                "shell-terminal",
+                "credential-secret-service",
+                "credential-entra",
+                "credential-managed-identity",
+                "observability-otel",
+                "activation-nixos",
+            ])
+        );
+
+        let session_only = ["clipboard-wayland", "notification-desktop"];
+        let transport_only = ["transport-unix", "transport-vsock", "transport-azure-relay"];
+        assert!(session_only
+            .into_iter()
+            .chain(transport_only)
+            .all(|provider| expected.contains(provider) && !resource_owners.contains(provider)));
+        let mut composed = resource_owners;
+        composed.extend(session_only);
+        composed.extend(transport_only);
+        assert_eq!(composed, expected);
+    }
+
+    #[tokio::test]
+    async fn shared_provider_runner_uses_typed_effect_and_cleanup_after_finalizer_pass() {
+        let (registration, descriptor) = shared_provider_test_descriptor();
+        let effects = Arc::new(RecordingSharedProviderEffects {
+            reconciles: AtomicUsize::new(0),
+            finalizes: AtomicUsize::new(0),
+            cleanup_ready: std::sync::atomic::AtomicBool::new(false),
+        });
+        let reconciler = SharedProviderResourceReconciler::new(
+            descriptor,
+            SharedProviderResourceKind::Network,
+            effects.clone(),
+        );
+        let first = reconciler
+            .first_pass_for_test(&shared_provider_test_resource(&[], false))
+            .unwrap();
+        assert_eq!(first.disposition(), ReconcileDisposition::Pending);
+        assert!(first.mutation_batch().is_some());
+        assert_eq!(
+            first
+                .mutation_batch()
+                .unwrap()
+                .mutations()
+                .first()
+                .unwrap()
+                .kind(),
+            d2b_core_controller::MutationIntentKind::UpdateFinalizers
+        );
+        assert_eq!(effects.reconciles.load(Ordering::SeqCst), 0);
+
+        let current = shared_provider_test_resource(&[registration.finalizer], false);
+        assert_eq!(
+            reconciler
+                .execute_effect_for_test(&current, &[])
+                .await
+                .unwrap(),
+            SharedProviderEffectPhase::Ready
+        );
+        assert_eq!(effects.reconciles.load(Ordering::SeqCst), 1);
+
+        let deleting = shared_provider_test_resource(&[registration.finalizer], true);
+        assert!(reconciler.execute_finalize_for_test(&deleting).await.is_err());
+        assert_eq!(effects.finalizes.load(Ordering::SeqCst), 0);
+        effects.cleanup_ready.store(true, Ordering::SeqCst);
+        let finalized = reconciler.execute_finalize_for_test(&deleting).await.unwrap();
+        assert!(finalized.mutation_batch().is_some());
+        assert_eq!(
+            finalized
+                .mutation_batch()
+                .unwrap()
+                .mutations()
+                .first()
+                .unwrap()
+                .kind(),
+            d2b_core_controller::MutationIntentKind::UpdateFinalizers
+        );
+        assert_eq!(effects.finalizes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn u9_repair_preserves_child_mutation_result() {
+        let registration = U9_SHARED_PROVIDER_RUNNERS[3];
+        let (_, descriptor) = shared_provider_test_descriptor_for(registration);
+        let effects = RecordingSharedProviderEffects {
+            reconciles: AtomicUsize::new(0),
+            finalizes: AtomicUsize::new(0),
+            cleanup_ready: std::sync::atomic::AtomicBool::new(true),
+        };
+        let resource =
+            shared_provider_test_resource_for(registration, &[registration.finalizer], false);
+        let context = SharedProviderEffectContext {
+            identity: descriptor.identity().clone(),
+            target: resource.key().clone(),
+            operation_id: "u9-repair-child-mutation".to_owned(),
+        };
+        let result = effects
+            .observe_result(
+                SharedProviderResourceKind::AudioBinding,
+                &context,
+                &resource,
+            )
+            .await
+            .expect("U9 repair result");
+        assert_eq!(result.phase, SharedProviderEffectPhase::Pending);
+        assert!(result.child_mutated);
+        assert!(result.resource_projection.is_none());
+    }
+
+    #[tokio::test]
+    async fn u9_runner_recovery_reaps_finished_sibling_before_respawn() {
+        let mut tasks = vec![
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+            tokio::spawn(async {
+                panic!("finished U9 runner");
+            }),
+        ];
+        tokio::task::yield_now().await;
+        assert!(!u9_runner_tasks_are_live(&tasks));
+        abort_u9_runner_tasks(&mut tasks).await;
+        assert!(tasks.is_empty());
+
+        let mut replacement = vec![tokio::spawn(async {
+            std::future::pending::<()>().await;
+        })];
+        assert!(u9_runner_tasks_are_live(&replacement));
+        abort_u9_runner_tasks(&mut replacement).await;
+        assert!(replacement.is_empty());
+    }
+
+    #[tokio::test]
+    async fn production_audio_scheduled_observe_rereads_exact_dependencies() {
+        let zone = ZoneId::parse("work").unwrap();
+        let provider_ref = ResourceRef::parse("Provider/audio-pipewire").unwrap();
+        let service_ref =
+            ResourceRef::parse("audio.d2bus.org.AudioService/host-audio").unwrap();
+        let guest_ref = ResourceRef::parse("Guest/audio-vm").unwrap();
+        let binding_ref =
+            ResourceRef::parse("audio.d2bus.org.AudioBinding/guest-audio").unwrap();
+        let bad_binding_ref =
+            ResourceRef::parse("audio.d2bus.org.AudioBinding/bad-audio").unwrap();
+        let missing_service_ref =
+            ResourceRef::parse("audio.d2bus.org.AudioService/missing").unwrap();
+        let service_spec =
+            d2b_provider_audio_pipewire::AudioServiceSpec::projection(zone.as_str()).unwrap();
+        let binding_spec = d2b_provider_audio_pipewire::AudioBindingSpec::new(
+            service_ref.clone(),
+            guest_ref.clone(),
+            zone.as_str(),
+        )
+        .unwrap();
+        let bad_binding_spec = d2b_provider_audio_pipewire::AudioBindingSpec::new(
+            missing_service_ref,
+            guest_ref.clone(),
+            zone.as_str(),
+        )
+        .unwrap();
+        let guest_spec = r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"providerRef":"Provider/audio-pipewire","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#;
+        let (_directory, state, plane, runtime, broker_evidence) =
+            prepare_production_audio_runner_fixture(vec![
+                bundle_resource(
+                    "Provider",
+                    "audio-pipewire",
+                    &zone,
+                    r#"{"artifactId":"audio-pipewire","config":{}}"#,
+                ),
+                bundle_resource("Guest", "audio-vm", &zone, guest_spec),
+                bundle_resource(
+                    "audio.d2bus.org.AudioService",
+                    "host-audio",
+                    &zone,
+                    &serde_json::to_string(&service_spec).unwrap(),
+                ),
+                bundle_resource(
+                    "audio.d2bus.org.AudioBinding",
+                    "guest-audio",
+                    &zone,
+                    &serde_json::to_string(&binding_spec).unwrap(),
+                ),
+                bundle_resource(
+                    "audio.d2bus.org.AudioBinding",
+                    "bad-audio",
+                    &zone,
+                    &serde_json::to_string(&bad_binding_spec).unwrap(),
+                ),
+            ])
+            .await;
+        mark_test_resource_ready(&runtime, &service_ref, &broker_evidence).await;
+        mark_test_resource_ready(&runtime, &guest_ref, &broker_evidence).await;
+
+        let provider = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "u9-audio-provider".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "u9-audio-provider".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: provider_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::MetadataOnly,
+            })
+            .await
+            .unwrap();
+        let binding = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "u9-audio-binding".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "u9-audio-binding".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: binding_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let bad_binding = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "u9-audio-bad-binding".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "u9-audio-bad-binding".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: bad_binding_ref,
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let snapshot = |stored: &StoredResource| {
+            ResourceSnapshot::new(
+                ResourceKey::new(
+                    stored.zone.clone(),
+                    stored.resource_ref.clone(),
+                    stored.uid.clone(),
+                ),
+                stored.revision,
+                stored.generation,
+                stored.canonical_json.clone(),
+                false,
+            )
+        };
+        let controller_ref =
+            ResourceRef::parse("Process/audio-pipewire-controller").unwrap();
+        let identity = ControllerIdentity::new(
+            zone.clone(),
+            controller_ref.clone(),
+            ControllerGeneration::new(1).unwrap(),
+            provider_ref,
+            provider.generation,
+            controller_ref,
+            ResourceRef::parse(CORE_CONTROLLER_HOST_REF).unwrap(),
+            None,
+        )
+        .unwrap();
+        let effects =
+            DaemonSharedProviderEffects::new(Arc::clone(&state), zone.clone());
+        let context = SharedProviderEffectContext {
+            identity: identity.clone(),
+            target: snapshot(&binding).key().clone(),
+            operation_id: "process-observe:u9-audio-binding".to_owned(),
+        };
+
+        let first = effects
+            .observe_result(
+                SharedProviderResourceKind::AudioBinding,
+                &context,
+                &snapshot(&binding),
+            )
+            .await
+            .expect("scheduled observe should read exact dependencies");
+        assert!(first.child_mutated);
+        assert!(first.resource_projection.is_none());
+
+        let stale_uid =
+            ResourceUid::parse("223e4567-e89b-42d3-a456-426614174000").unwrap();
+        let stale_dependency = |stored: &StoredResource| {
+            DependencySnapshot::new(ResourceSnapshot::new(
+                ResourceKey::new(
+                    stored.zone.clone(),
+                    stored.resource_ref.clone(),
+                    stale_uid.clone(),
+                ),
+                stored.revision,
+                stored.generation,
+                stored.canonical_json.clone(),
+                false,
+            ))
+        };
+        let service = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "u9-audio-service".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "u9-audio-service".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: service_ref,
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let guest = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "u9-audio-guest".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "u9-audio-guest".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone,
+                target: guest_ref,
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let repaired = effects
+            .reconcile_audio(
+                SharedProviderResourceKind::AudioBinding,
+                &context,
+                &snapshot(&binding),
+                &[stale_dependency(&service), stale_dependency(&guest)],
+            )
+            .await
+            .expect("stale dependencies should be replaced by authoritative reads");
+        assert!(!repaired.child_mutated);
+        assert!(repaired.resource_projection.is_some());
+
+        let bad_context = SharedProviderEffectContext {
+            identity,
+            target: snapshot(&bad_binding).key().clone(),
+            operation_id: "process-observe:u9-bad-audio-binding".to_owned(),
+        };
+        assert_eq!(
+            effects
+                .observe_result(
+                    SharedProviderResourceKind::AudioBinding,
+                    &bad_context,
+                    &snapshot(&bad_binding),
+                )
+                .await,
+            Err(SharedProviderEffectError::InvalidResource)
+        );
+        let unaffected = effects
+            .observe_result(
+                SharedProviderResourceKind::AudioBinding,
+                &context,
+                &snapshot(&binding),
+            )
+            .await
+            .expect("one invalid binding must not stop its sibling");
+        assert!(!unaffected.child_mutated);
+        assert!(unaffected.resource_projection.is_some());
+
+        drop(effects);
+        drop(runtime);
+        close_production_guest_runtime_fixture(state, plane).await;
+    }
+
+    #[test]
+    fn every_u6_guest_runtime_descriptor_is_provider_ref_scoped() {
+        for registration in U6_SHARED_PROVIDER_RUNNERS {
+            let (_, descriptor) = shared_provider_test_descriptor_for(registration);
+            assert_eq!(
+                descriptor
+                    .resource_types()
+                    .map(|resource_type| resource_type.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["Guest"]
+            );
+            assert!(descriptor
+                .watch_selectors()
+                .iter()
+                .any(|selector| selector.exact_value() == Some(registration.provider_ref)));
+            assert!(descriptor.dependency_selectors().iter().any(|selector| {
+                selector.resource_type().as_str() == "Process"
+            }));
+            assert!(registration.watched_configuration_is_dependency);
+        }
+    }
+
+    #[test]
+    fn u6_guest_runtime_kinds_are_closed_to_the_four_provider_rows() {
+        assert_eq!(
+            SharedProviderResourceKind::from_registration(U6_SHARED_PROVIDER_RUNNERS[0]).unwrap(),
+            SharedProviderResourceKind::CloudHypervisorGuest
+        );
+        assert_eq!(
+            SharedProviderResourceKind::from_registration(U6_SHARED_PROVIDER_RUNNERS[1]).unwrap(),
+            SharedProviderResourceKind::QemuMediaGuest
+        );
+        assert_eq!(
+            SharedProviderResourceKind::from_registration(U6_SHARED_PROVIDER_RUNNERS[2]).unwrap(),
+            SharedProviderResourceKind::AzureContainerAppsGuest
+        );
+        assert_eq!(
+            SharedProviderResourceKind::from_registration(U6_SHARED_PROVIDER_RUNNERS[3]).unwrap(),
+            SharedProviderResourceKind::AzureVirtualMachineGuest
+        );
+    }
+
+    #[test]
+    fn cloud_hypervisor_assigned_mutation_errors_keep_retry_classes() {
+        assert_eq!(
+            cloud_hypervisor_assigned_mutation_error(SourceError::Conflict(ZoneRevision::new(2))),
+            CloudHypervisorResourceApiError::Conflict
+        );
+        assert_eq!(
+            cloud_hypervisor_assigned_mutation_error(SourceError::Integrity),
+            CloudHypervisorResourceApiError::Conflict
+        );
+        assert_eq!(
+            cloud_hypervisor_assigned_mutation_error(SourceError::Backpressure),
+            CloudHypervisorResourceApiError::Transport
+        );
+        assert_eq!(
+            cloud_hypervisor_assigned_mutation_error(SourceError::Timeout),
+            CloudHypervisorResourceApiError::Transport
+        );
+    }
+
+    #[test]
+    fn u6_guest_runner_enrolls_its_exact_finalizer_before_effects() {
+        let registration = U6_SHARED_PROVIDER_RUNNERS[1];
+        let (_, descriptor) = shared_provider_test_descriptor_for(registration);
+        let reconciler = SharedProviderResourceReconciler::new(
+            descriptor,
+            SharedProviderResourceKind::QemuMediaGuest,
+            Arc::new(UnavailableSharedProviderEffects),
+        );
+        let result = reconciler
+            .first_pass_for_test(&shared_provider_test_resource_for(
+                registration,
+                &[],
+                false,
+            ))
+            .expect("finalizer enrollment result");
+        let mutation = result
+            .mutation_batch()
+            .expect("first pass must mutate only finalizers")
+            .mutations()
+            .first()
+            .expect("finalizer mutation");
+        assert_eq!(
+            mutation.kind(),
+            d2b_core_controller::MutationIntentKind::UpdateFinalizers
+        );
+        let payload = mutation
+            .canonical_resource()
+            .expect("full finalizer candidate");
+        let value: Value = serde_json::from_slice(payload).expect("candidate JSON");
+        assert_eq!(
+            value["metadata"]["finalizers"],
+            serde_json::json!([registration.finalizer])
+        );
+    }
+
+    #[tokio::test]
+    async fn every_u8_descriptor_cleans_before_finalizer_removal() {
+        for registration in U8_SHARED_PROVIDER_RUNNERS {
+            let (_, descriptor) = shared_provider_test_descriptor_for(registration);
+            let effects = Arc::new(RecordingSharedProviderEffects {
+                reconciles: AtomicUsize::new(0),
+                finalizes: AtomicUsize::new(0),
+                cleanup_ready: std::sync::atomic::AtomicBool::new(true),
+            });
+            let kind = SharedProviderResourceKind::from_registration(registration).unwrap();
+            let reconciler =
+                SharedProviderResourceReconciler::new(descriptor, kind, effects.clone());
+            let deleting =
+                shared_provider_test_resource_for(registration, &[registration.finalizer], true);
+            let result = reconciler.execute_finalize_for_test(&deleting).await.unwrap();
+            assert!(result.mutation_batch().is_some());
+            assert_eq!(effects.finalizes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn u9_runner_enrolls_exact_finalizers_before_effects() {
+        for registration in U9_SHARED_PROVIDER_RUNNERS {
+            let (_, descriptor) = shared_provider_test_descriptor_for(registration);
+            let kind = SharedProviderResourceKind::from_registration(registration).unwrap();
+            let reconciler = SharedProviderResourceReconciler::new(
+                descriptor,
+                kind,
+                Arc::new(UnavailableSharedProviderEffects),
+            );
+            let result = reconciler
+                .first_pass_for_test(&shared_provider_test_resource_for(
+                    registration,
+                    &[],
+                    false,
+                ))
+                .expect("U9 first pass");
+            if registration.finalizer.is_empty() {
+                assert!(result.mutation_batch().is_none());
+                assert_eq!(result.disposition(), ReconcileDisposition::Pending);
+            } else {
+                let mutation = result
+                    .mutation_batch()
+                    .expect("U9 finalizer mutation")
+                    .mutations()
+                    .first()
+                    .expect("U9 finalizer");
+                assert_eq!(
+                    mutation.kind(),
+                    d2b_core_controller::MutationIntentKind::UpdateFinalizers
+                );
+                let value: Value =
+                    serde_json::from_slice(mutation.canonical_resource().unwrap())
+                        .expect("U9 finalizer candidate");
+                assert_eq!(
+                    value["metadata"]["finalizers"],
+                    serde_json::json!([registration.finalizer])
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn network_runner_uses_durable_child_readiness() {
+        let fixture = PublicationStoreFixture::new().await;
+        let bundle = publication_bundle(&fixture.zone, fixture.identity.zone_uid(), "network");
+        let runtime = Arc::new(fixture.open(&bundle).await);
+        let children = SharedRunnerNetworkResources::new(
+            Arc::clone(&runtime),
+            ResourceRef::parse("Network/work").unwrap(),
+            &ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+        );
+        assert_eq!(
+            children.readiness().await.unwrap(),
+            SharedRunnerNetworkReadiness {
+                volume_ready: false,
+                guest_ready: false,
+                attachment_ready: false,
+            }
+        );
+        drop(children);
+        let runtime = Arc::try_unwrap(runtime).expect("test runtime has one owner");
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn accepted_u12_resources_cannot_run_without_their_provider() {
+        assert!(!u12_runner_readiness(true, 0, false));
+        assert!(!u12_runner_readiness(true, 1, true));
+        assert!(u12_runner_readiness(true, 2, false));
+        assert!(u12_runner_readiness(false, 0, true));
+        assert_eq!(
+            validate_observability_environment_keys(["OTEL_EXPORTER_OTLP_HEADERS"]),
+            Err(ResourceRuntimeError::ProviderPathUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn u12_runner_start_rollback_aborts_every_spawned_task() {
+        let mut tasks = vec![
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+        ];
+        abort_controller_runner_tasks(&mut tasks).await;
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn poisoned_core_runner_task_lock_aborts_and_awaits_new_tasks() {
+        let task_store = Mutex::new(Vec::new());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = task_store.lock().unwrap();
+            panic!("poison Core runner task lock");
+        }));
+
+        struct DropMarker(Arc<AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_started = Arc::clone(&started);
+        let task_dropped = Arc::clone(&dropped);
+        let task = tokio::spawn(async move {
+            let _marker = DropMarker(task_dropped);
+            task_started.store(true, Ordering::Release);
+            std::future::pending::<()>().await;
+        });
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            install_core_runner_tasks(
+                &task_store,
+                vec![CoreRunnerTask {
+                    identity: CoreRunnerIdentity::new(
+                        ResourceRef::parse("Process/test-core-runner").unwrap(),
+                        "test",
+                    ),
+                    handle: task,
+                }],
+            )
+            .await,
+            Err(ResourceRuntimeError::WatchUnavailable)
+        );
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "poisoned task-list cleanup must await every spawned runner"
+        );
+    }
+
+    #[tokio::test]
+    async fn u12_rebind_stop_clears_every_tracked_runner() {
+        let fixture = PublicationStoreFixture::new().await;
+        let bundle = publication_bundle(&fixture.zone, fixture.identity.zone_uid(), "u12-stop");
+        let runtime = fixture.open(&bundle).await;
+        runtime
+            .u12_runner_tasks
+            .lock()
+            .unwrap()
+            .push(tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }));
+        runtime
+            .stop_u12_controller_runners_locked()
+            .await
+            .expect("U12 runner stop");
+        assert!(runtime.u12_runner_tasks.lock().unwrap().is_empty());
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn daemon_shared_provider_effects_network_content_path_round_trips_and_preserves_foreign_marker()
+    {
+        let zone_uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let network_uid = ResourceUid::parse("223e4567-e89b-42d3-a456-426614174000").unwrap();
+        let owner_ref = ResourceRef::parse("Network/work").unwrap();
+        let bundle_generation = ResourceBundleGenerationId::parse(
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let provenance = NetworkProvenance::new(
+            zone_uid,
+            network_uid.clone(),
+            ResourceGeneration::new(2).unwrap(),
+            ResourceGeneration::new(3).unwrap(),
+            bundle_generation,
+        );
+        let network_spec = d2b_contracts_resource::v3::network::NetworkSpec::minimal(
+            d2b_contracts_resource::v3::network::Ipv4Cidr::parse("10.20.0.0/24").unwrap(),
+            d2b_contracts_resource::v3::network::Ipv4Cidr::parse("192.0.2.0/30").unwrap(),
+            d2b_contracts_resource::v3::execution_policy::BoundedToken::parse("net-vm-base")
+                .unwrap(),
+        )
+        .unwrap();
+        let content = d2b_provider_network_local::controller::render_config_with_provenance(
+            &network_spec,
+            &provenance,
+        )
+        .unwrap();
+        let assignment = ResourceAssignmentFence {
+            resource_uid: network_uid,
+            resource_revision: ZoneRevision::new(4),
+            provider_generation: ResourceGeneration::new(7).unwrap(),
+            controller_generation: ControllerGeneration::new(3).unwrap(),
+            controller_role: ResourceRef::parse("Process/network-local-controller").unwrap(),
+            target: ResourceRef::parse(CORE_CONTROLLER_HOST_REF).unwrap(),
+            session_generation: ReconnectGeneration::new(5).unwrap(),
+            epoch: 9,
+            scope: ResourceAssignmentScope::Primary,
+        };
+        let fence = SharedRunnerNetworkContentFence {
+            owner_ref: owner_ref.clone(),
+            provenance,
+            assignment,
+            controller_ref: ResourceRef::parse("Process/network-local-controller").unwrap(),
+            controller_generation: ControllerGeneration::new(3).unwrap(),
+            provider_generation: ResourceGeneration::new(7).unwrap(),
+            session_generation: ReconnectGeneration::new(5).unwrap(),
+        };
+        let volume_spec =
+            d2b_provider_network_local::controller::config_volume_spec("host-system", None)
+                .unwrap();
+        let mut spec = serde_json::to_value(&volume_spec).unwrap();
+        spec.as_object_mut()
+            .unwrap()
+            .insert("providerRef".to_owned(), Value::String("Provider/volume-local".to_owned()));
+        let volume_uid =
+            ResourceUid::parse("323e4567-e89b-42d3-a456-426614174000").unwrap();
+        let projected = DaemonSharedProviderEffects::project_network_volume_spec(
+            spec,
+            &volume_uid,
+            &content,
+            &fence,
+            &owner_ref,
+        )
+        .unwrap();
+        let mut envelope = json!({
+            "metadata": { "uid": volume_uid, "generation": 1 },
+            "spec": projected,
+        });
+        assert!(!network_config_content_projection_ready(&envelope));
+        let projection = d2b_provider_volume_local::NetworkConfigContentProjection::from_settings(
+            &envelope["spec"]["provider"]["settings"]["content"],
+        )
+        .unwrap();
+        let mut tampered = serde_json::to_value(&projection).unwrap();
+        tampered["dnsmasq"][0] = Value::from(b'X');
+        assert_eq!(
+            d2b_provider_volume_local::NetworkConfigContentProjection::from_settings(&tampered),
+            Err(VolumeLocalError::InvalidSpec)
+        );
+        let evidence =
+            d2b_provider_volume_local::NetworkConfigMaterializationEvidence::from_observed_files(
+                &projection,
+                content.dnsmasq.as_slice(),
+                content.nftables.as_slice(),
+                content.routing.as_slice(),
+                content.attachments.as_slice(),
+            )
+            .unwrap();
+        envelope["status"] = json!({
+            "phase": "Ready",
+            "observedGeneration": 1,
+            "resource": {
+                "provider": "volume-local",
+                "content": evidence,
+            },
+        });
+        assert!(network_config_content_projection_ready(&envelope));
+
+        let mut foreign = envelope["spec"].clone();
+        foreign["provider"]["settings"]["content"]["ownershipMarker"] =
+            Value::String("foreign-marker".to_owned());
+        let before = serde_json::to_vec(&foreign).unwrap();
+        let marker = d2b_contracts_resource::v3::derive_network_ownership_marker(
+            &fence.provenance,
+            "network-config",
+        );
+        assert!(!network_config_provider_matches(
+            &foreign["provider"],
+            &volume_uid,
+            &owner_ref,
+            &marker
+        ));
+        assert_eq!(
+            DaemonSharedProviderEffects::project_network_volume_spec(
+                foreign.clone(),
+                &volume_uid,
+                &content,
+                &fence,
+                &owner_ref,
+            ),
+            Err(NetworkEffectError::NetworkAdmissionMismatch)
+        );
+        assert_eq!(serde_json::to_vec(&foreign).unwrap(), before);
+    }
 
     #[test]
     fn cloud_hypervisor_process_update_applies_requested_lifecycle() {
@@ -10823,6 +25079,256 @@ mod tests {
         }
     }
 
+    fn test_controller_session_providers(
+    ) -> Arc<crate::process_provider_runtime::ProductionProcessProviders> {
+        let host = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/deny-unknown/host-valid.json"
+        ))
+        .unwrap();
+        let manifest = ManifestV04::from_slice(
+            include_str!("../../../tests/golden/manifest_v04/baseline-vms.json").as_bytes(),
+        )
+        .unwrap();
+        let resolver = BundleResolver::from_artifacts_with_zone_resource_bundles(
+            Bundle {
+                bundle_version: 11,
+                schema_version: "v2".to_owned(),
+                public_manifest_path: "vms.json".to_owned(),
+                host_path: "host.json".to_owned(),
+                processes_path: "processes.json".to_owned(),
+                privileges_path: "privileges.json".to_owned(),
+                storage_path: None,
+                sync_path: None,
+                allocator_path: None,
+                realm_controllers_path: None,
+                realm_identity_path: None,
+                realm_workloads_launcher_v2_path: None,
+                unsafe_local_workloads_path: None,
+                closures: Vec::new(),
+                minijail_profiles: Vec::new(),
+                managed_keys: Default::default(),
+                generation: BundleGeneration {
+                    generator: "test".to_owned(),
+                    source_revision: None,
+                    generated_at: None,
+                },
+                bundle_hash: Some("sha256:bundle".to_owned()),
+                artifact_hashes: None,
+            },
+            host,
+            ProcessesJson {
+                schema_version: "v2".to_owned(),
+                vms: Vec::new(),
+            },
+            manifest,
+            BTreeMap::new(),
+        );
+        Arc::new(
+            crate::process_provider_runtime::ProductionProcessProviders::new_for_mode(
+                resolver,
+                std::path::PathBuf::from("/nonexistent/d2b-broker.sock"),
+                BrokerCallerRole::AdminUid { uid: 0 },
+                DaemonMode::Host,
+            ),
+        )
+    }
+
+    fn attach_ready_controller(
+        providers: &Arc<crate::process_provider_runtime::ProductionProcessProviders>,
+        zone: &ZoneId,
+        process_ref: &str,
+        process_uid: &str,
+        process_generation: u64,
+        provider_ref: &str,
+        provider_uid: &str,
+        provider_generation: u64,
+        controller_generation: ControllerGeneration,
+    ) -> OwnedFd {
+        let (daemon_endpoint, peer_endpoint) = prearmed_seqpacket_pair().unwrap();
+        nix::sys::socket::send(
+            peer_endpoint.as_raw_fd(),
+            b"controller-ready",
+            nix::sys::socket::MsgFlags::empty(),
+        )
+        .unwrap();
+        providers
+            .attach_pending_controller_provider_context_for_test(
+                daemon_endpoint,
+                zone.clone(),
+                ResourceRef::parse(process_ref).unwrap(),
+                ResourceUid::parse(process_uid).unwrap(),
+                ResourceGeneration::new(process_generation).unwrap(),
+                ResourceRef::parse("Provider/system-minijail").unwrap(),
+                ResourceRef::parse(provider_ref).unwrap(),
+                ResourceUid::parse(provider_uid).unwrap(),
+                ResourceGeneration::new(provider_generation).unwrap(),
+                ResourceRef::parse("Host/host-system").unwrap(),
+                controller_generation,
+            )
+            .unwrap();
+        peer_endpoint
+    }
+
+    async fn insert_test_controller_session(
+        coordinator: &mut ControllerSessionCoordinator,
+        context: &crate::process_provider_runtime::ControllerBootstrapContext,
+    ) {
+        let policy = controller_resource_endpoint_policy();
+        let catalog = d2b_resource_api::authz::ApiCatalog::standard();
+        let role_ref = ResourceRef::parse("Role/test-controller").unwrap();
+        let role = d2b_resource_api::authz::CompiledRole::new(
+            role_ref.clone(),
+            vec![
+                d2b_resource_api::authz::PolicyRule::new(
+                    &catalog,
+                    [],
+                    [],
+                    [d2b_resource_api::authz::SessionVerb::Connect],
+                    [],
+                    [],
+                    [context.zone().clone()],
+                    [],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let metadata = coordinator.store.runtime_metadata().await.unwrap();
+        let state = AuthorizationState {
+            snapshot: metadata.policy_snapshot,
+            zone_policy_revision: metadata.current_revision,
+            bootstrap_phase: d2b_resource_api::authz::BootstrapPhase::Disabled,
+            now_tick: 1,
+        };
+        let binding = d2b_resource_api::authz::CompiledRoleBinding::new(
+            role_ref,
+            [BoundSubject {
+                subject_ref: context.provider_owner_ref().clone(),
+                subject_uid: context.provider_uid().clone(),
+            }],
+            d2b_resource_api::authz::BindingScope {
+                zones: [context.zone().clone()].into_iter().collect(),
+                ..d2b_resource_api::authz::BindingScope::default()
+            },
+            d2b_resource_api::authz::RelayGrantAuthority::None,
+        )
+        .unwrap();
+        let policy_set =
+            PolicySet::new(&catalog, state.snapshot.policy_revision, vec![role], vec![binding])
+                .unwrap();
+        let native = NativeAuthorizer::new(catalog, Some(policy_set)).unwrap();
+        let bus_authorizer = BusAuthorizer::new(native, state).unwrap();
+        let (_bus, registrar) =
+            ZoneBus::new(context.zone().clone(), bus_authorizer, BusConfig::default()).unwrap();
+        coordinator.registrar = Arc::new(Mutex::new(Some(registrar)));
+
+        let (initiator_fd, responder_fd) = prearmed_seqpacket_pair().unwrap();
+        let initiator_socket = SeqpacketSocket::from_parent_prearmed(initiator_fd).unwrap();
+        let responder_socket = SeqpacketSocket::from_parent_prearmed(responder_fd).unwrap();
+        let verified_peer =
+            VerifiedUnixPeer::verify_inherited_seqpacket(&initiator_socket).unwrap();
+        let mut registrar = coordinator.registrar.lock().unwrap().take().unwrap();
+        registrar
+            .install_committed_controller_process_subject(
+                &verified_peer,
+                CommittedControllerProcessSubjectInput {
+                    provider_ref: context.provider_owner_ref().clone(),
+                    provider_uid: context.provider_uid().clone(),
+                    process_ref: context.process_ref().clone(),
+                    zone_ref: ResourceRef::parse("Zone/work").unwrap(),
+                    execution_ref: context.execution_ref().clone(),
+                    provider_generation: context.provider_generation(),
+                    controller_generation: context.controller_generation(),
+                },
+            )
+            .unwrap();
+        let initiator = unix_transport(initiator_socket, &policy).unwrap();
+        let responder = unix_transport(responder_socket, &policy).unwrap();
+        let (initiator, responder) = tokio::join!(
+            SessionEngine::establish_initiator(
+                initiator,
+                policy.clone(),
+                HandshakeCredentials::Nn,
+                std::time::Instant::now(),
+            ),
+            SessionEngine::establish_responder(
+                responder,
+                policy.clone(),
+                HandshakeCredentials::Nn,
+                std::time::Instant::now(),
+            ),
+        );
+        let acceptor = registrar
+            .component_session_acceptor(policy, verified_peer)
+            .unwrap();
+        let candidate = acceptor
+            .admit(
+                initiator.unwrap(),
+                TransportEvidence::new(
+                    EvidenceClass::UnixPeer,
+                    BindingDigest::parse(format!("sha256:{}", "22".repeat(32))).unwrap(),
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+        let (ingress, driver) = registrar
+            .register_component_service_session(candidate)
+            .await
+            .unwrap();
+        *coordinator.registrar.lock().unwrap() = Some(registrar);
+
+        let session_generation = ReconnectGeneration::new(1).unwrap();
+        let binding = controller_session_binding(context, session_generation).unwrap();
+        let service_task = tokio::spawn(async { Ok::<(), SessionServerError>(()) });
+        coordinator
+            .controller_sessions
+            .lock()
+            .unwrap()
+            .insert(
+                context.process_ref().clone(),
+                ControllerSession {
+                    context: context.clone(),
+                    binding,
+                    ingress,
+                    driver,
+                    _backend_lease: None,
+                    resource_client: None,
+                    service_task,
+                    assignments: BTreeMap::new(),
+                    assignment_stream_open: false,
+                    assignments_revoked: false,
+                    transport_closed: false,
+                    ingress_revoked: false,
+                },
+            );
+        drop(responder);
+    }
+
+    async fn read_test_resource(
+        runtime: &ZoneResourceRuntime,
+        target: ResourceRef,
+        operation_id: &str,
+    ) -> StoredResource {
+        runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: operation_id.to_owned(),
+                    idempotency_key: None,
+                    correlation_id: operation_id.to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: runtime.zone.clone(),
+                target,
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap()
+    }
+
     fn publication_storage_row(
         zone: &ZoneId,
         identity: &d2b_resource_store_redb::StoreIdentity,
@@ -10924,6 +25430,1316 @@ mod tests {
             })
             .unwrap()
             .state
+    }
+
+    #[tokio::test]
+    async fn core_runner_start_rotation_is_serialized() {
+        let fixture = PublicationStoreFixture::new().await;
+        let bundle = publication_bundle(&fixture.zone, fixture.identity.zone_uid(), "rotation");
+        let mut runtime = fixture.open(&bundle).await;
+        runtime.readiness.resource_api_ready = false;
+        runtime
+            .core_runner_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(CoreRunnerTask {
+                identity: CoreRunnerIdentity::new(
+                    ResourceRef::parse("Process/test-core-runner").unwrap(),
+                    "test",
+                ),
+                handle: tokio::spawn(async {
+                    loop {
+                        tokio::task::yield_now().await;
+                    }
+                }),
+            });
+        {
+            let _runner_guard = runtime.core_runner_lock.lock().await;
+            runtime.stop_core_controller_runners_locked().await.unwrap();
+        }
+        assert!(
+            runtime
+                .core_runner_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
+
+        let first = runtime.start_core_controller_runners();
+        let second = runtime.start_core_controller_runners();
+        let (first, second) = tokio::join!(first, second);
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(
+            runtime
+                .core_runner_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            [
+                "stop-enter",
+                "stop-exit",
+                "start-enter",
+                "start-exit",
+                "start-enter",
+                "start-exit"
+            ]
+        );
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn system_core_refresh_waits_for_controller_session_guard() {
+        let fixture = PublicationStoreFixture::new().await;
+        let bundle =
+            publication_bundle(&fixture.zone, fixture.identity.zone_uid(), "session-guard");
+        let runtime = fixture.open(&bundle).await;
+        let state = AuthorizationState {
+            snapshot: runtime.store_metadata.policy_snapshot,
+            zone_policy_revision: runtime.store_metadata.current_revision,
+            bootstrap_phase: d2b_resource_api::authz::BootstrapPhase::Disabled,
+            now_tick: 0,
+        };
+
+        let guard = runtime.controller_session_lock.lock().await;
+        {
+            let refresh = runtime.refresh_system_core_session(state);
+            tokio::pin!(refresh);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut refresh)
+                    .await
+                    .is_err(),
+                "system-core refresh must not bypass controller-session establishment"
+            );
+            drop(guard);
+            assert_eq!(refresh.await, Ok(()));
+        }
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_policy_refresh_preserves_installed_controller_subjects() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let provider_ref = ResourceRef::parse("Provider/system-minijail").unwrap();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Provider",
+                "system-minijail",
+                &zone,
+                r#"{"artifactId":"system-minijail","config":{}}"#,
+            )],
+        )
+        .await;
+        let providers = test_controller_session_providers();
+        *runtime.controller_session_providers.lock().unwrap() = Some(Arc::clone(&providers));
+        let provider = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "controller-policy-provider-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "controller-policy-provider-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: provider_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::MetadataOnly,
+            })
+            .await
+            .unwrap();
+        let metadata = runtime.store.runtime_metadata().await.unwrap();
+        let controller_generation = metadata
+            .policy_snapshot
+            .controller_generation
+            .expect("test policy has a controller generation");
+        providers
+            .attach_controller_provider_context_for_test(
+                zone.clone(),
+                ResourceRef::parse("Process/system-minijail-controller").unwrap(),
+                ResourceUid::parse("323e4567-e89b-42d3-a456-426614174000").unwrap(),
+                ResourceGeneration::new(1).unwrap(),
+                ResourceRef::parse("Provider/system-minijail").unwrap(),
+                provider_ref.clone(),
+                provider.uid.clone(),
+                provider.generation,
+                ResourceRef::parse("Host/host-system").unwrap(),
+                controller_generation,
+            )
+            .unwrap();
+        assert!(
+            runtime
+                .policy_projection
+                .installed_controller_subjects()
+                .unwrap()
+                .is_empty()
+        );
+
+        // The Provider materialization advanced the store revision, so this
+        // refresh must recompile instead of returning from its installed-state
+        // fast path.
+        runtime.refresh_authorization_policy().await.unwrap();
+
+        let controller_subject = BoundSubject {
+            subject_ref: provider_ref,
+            subject_uid: provider.uid,
+        };
+        let state = runtime.policy_projection.installed_state().unwrap();
+        let authorization_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(state.snapshot, authorization_state.snapshot);
+        assert_eq!(
+            state.zone_policy_revision,
+            authorization_state.zone_policy_revision
+        );
+        assert_eq!(
+            runtime
+                .policy_projection
+                .installed_controller_subjects()
+                .unwrap(),
+            BTreeSet::from([controller_subject.clone()])
+        );
+        let context = || {
+            AuthenticatedSubjectContext::new(
+                controller_subject.subject_ref.clone(),
+                controller_subject.subject_uid.clone(),
+                ResourceRef::parse("Zone/work").unwrap(),
+                EvidenceClass::UnixPeer,
+                d2b_contracts_resource::v3::identity::SessionPurpose::parse("resource-api")
+                    .unwrap(),
+                d2b_contracts_resource::v3::identity::ServiceName::parse("d2b.resource.v3")
+                    .unwrap(),
+                d2b_contracts_resource::v3::identity::SessionBinding::new(
+                    d2b_contracts_resource::v3::SchemaFingerprint::parse(format!(
+                        "sha256:{}",
+                        "1".repeat(64)
+                    ))
+                    .unwrap(),
+                    d2b_contracts_resource::v3::identity::TransportBinding::new(
+                        d2b_contracts_resource::v3::identity::Locality::Local,
+                        BindingDigest::parse(format!("sha256:{}", "2".repeat(64))).unwrap(),
+                    ),
+                    ReconnectGeneration::new(1).unwrap(),
+                    d2b_contracts_resource::v3::identity::TranscriptHash::from_bytes([3; 32]),
+                ),
+            )
+        };
+        assert!(
+            runtime
+                .authorizer
+                .issue_authenticated_subject(context(), state.clone())
+                .is_ok(),
+            "policy refresh must retain the installed Provider controller grant"
+        );
+        let bus_authorizer = runtime
+            .bus
+            .as_ref()
+            .expect("production runtime has a ZoneBus")
+            .native_authorizer();
+        assert!(
+            bus_authorizer
+                .issue_authenticated_subject(context(), state)
+                .is_ok(),
+            "ZoneBus must retain the installed Provider controller grant"
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn policy_projection_preflight_failure_preserves_last_good_projection() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let before = runtime.policy_projection.installed_state().unwrap();
+        let resources = d2bd_runtime::resource_runtime_support::load_committed_policy_resources(
+            &runtime.store,
+            &runtime.zone,
+            "policy-preflight-regression",
+        )
+        .await
+        .unwrap();
+        let metadata = runtime.store.runtime_metadata().await.unwrap();
+        let (policy, mut rejected_state) =
+            d2bd_runtime::resource_runtime_support::compile_committed_policy_with_subjects(
+                &runtime.zone,
+                metadata.policy_snapshot,
+                metadata.current_revision,
+                &runtime.bundle_resource_types,
+                &resources,
+                std::iter::empty(),
+            )
+            .unwrap();
+        rejected_state.snapshot.policy_revision =
+            rejected_state.snapshot.policy_revision.saturating_add(1);
+
+        assert_eq!(
+            runtime
+                .policy_projection
+                .install(policy, rejected_state, BTreeSet::new()),
+            Err(ResourceRuntimeError::AuthorizationUnavailable)
+        );
+        assert_eq!(runtime.policy_projection.installed_state().unwrap(), before);
+        assert!(*runtime.policy_projection.policy_loaded.lock().unwrap());
+        assert_eq!(
+            runtime
+                .authorization_state
+                .lock()
+                .unwrap()
+                .as_ref(),
+            Some(&before)
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_get_and_list_use_installed_policy_after_rebind_failure() {
+        let (_directory, runtime, broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let process_provider_ref = ResourceRef::parse("Provider/system-minijail").unwrap();
+        let process_ref = ResourceRef::parse("Process/system-minijail-controller").unwrap();
+        let uid = Uid::current();
+        let username = User::from_uid(uid)
+            .unwrap()
+            .expect("test peer uid has an NSS user")
+            .name;
+        let user_ref = ResourceRef::parse(&format!("User/{username}")).unwrap();
+        let role_ref = ResourceRef::parse("Role/public-read").unwrap();
+        let role = d2b_contracts_zone_session::v3::role::RoleSpec::new(vec![
+            d2b_contracts_zone_session::v3::role::RoleRule::new(
+                vec![ResourceTypeName::parse("Host").unwrap()],
+                vec![
+                    d2b_contracts_zone_session::v3::role::RoleResourceVerb::Get,
+                    d2b_contracts_zone_session::v3::role::RoleResourceVerb::List,
+                ],
+                Vec::new(),
+                Vec::new(),
+                vec![zone.clone()],
+                Vec::new(),
+                vec![d2b_contracts_zone_session::v3::role::RoleSessionVerb::Connect],
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let binding =
+            d2b_contracts_zone_session::v3::role_binding::RoleBindingSpec::new(
+                role_ref,
+                vec![user_ref.clone()],
+                None,
+                None,
+            )
+            .unwrap();
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "Provider",
+                    "system-minijail",
+                    &zone,
+                    r#"{"artifactId":"system-minijail","config":{}}"#,
+                ),
+                BundleResource::new(
+                    ResourceTypeName::parse("Process").unwrap(),
+                    BundleResourceMetadata::new(
+                        process_ref.name().clone(),
+                        zone.clone(),
+                        Some(process_provider_ref.clone()),
+                        BTreeMap::new(),
+                        BTreeMap::new(),
+                    ),
+                    CanonicalJsonObject::parse(
+                        br#"{"executionRef":"Host/host-system","processClass":"controller","providerRef":"Provider/system-minijail","template":"test-controller"}"#,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                bundle_resource(
+                    "User",
+                    &username,
+                    &zone,
+                    &serde_json::to_string(&json!({
+                        "displayName": username,
+                        "groups": [],
+                        "osUsername": username,
+                    }))
+                    .unwrap(),
+                ),
+                bundle_resource(
+                    "Role",
+                    "public-read",
+                    &zone,
+                    &serde_json::to_string(&role).unwrap(),
+                ),
+                bundle_resource(
+                    "RoleBinding",
+                    "public-read",
+                    &zone,
+                    &serde_json::to_string(&binding).unwrap(),
+                ),
+            ],
+        )
+        .await;
+        mark_test_resource_ready(&runtime, &user_ref, &broker_evidence).await;
+        let process_provider = read_test_resource(
+            &runtime,
+            process_provider_ref.clone(),
+            "rebind-process-provider",
+        )
+        .await;
+        let process = read_test_resource(&runtime, process_ref.clone(), "rebind-process")
+            .await;
+        let providers = test_controller_session_providers();
+        *runtime.controller_session_providers.lock().unwrap() = Some(Arc::clone(&providers));
+        let controller_generation = runtime
+            .store
+            .runtime_metadata()
+            .await
+            .unwrap()
+            .policy_snapshot
+            .controller_generation
+            .expect("test policy has a controller generation");
+        providers
+            .attach_controller_provider_context_for_test(
+                zone.clone(),
+                process_ref.clone(),
+                process.uid.clone(),
+                process.generation,
+                process_provider_ref.clone(),
+                process_provider_ref.clone(),
+                process_provider.uid.clone(),
+                process_provider.generation,
+                ResourceRef::parse("Host/host-system").unwrap(),
+                controller_generation,
+            )
+            .unwrap();
+        let coordinator = runtime.controller_session_coordinator();
+        let authority = runtime.core_assignment_fences(false).await.unwrap().4;
+        let authorization_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        coordinator
+            .set_assigned_process_api(Arc::new(
+                runtime
+                    .process_controller_api(
+                        DaemonMode::Host,
+                        authority,
+                        authorization_state.clone(),
+                    )
+                    .unwrap(),
+            ))
+            .unwrap();
+        runtime.refresh_authorization_policy().await.unwrap();
+        {
+            let _runner_guard = runtime.core_runner_lock.lock().await;
+            runtime
+                .stop_core_controller_runners_locked()
+                .await
+                .unwrap();
+        }
+        let before_rebind_authority = runtime.core_assignment_fences(false).await.unwrap().4;
+        let before_rebind_authorization_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let before_rebind_process =
+            read_test_resource(&runtime, process_ref.clone(), "rebind-process-before-fence").await;
+        let before_rebind_api = Arc::new(
+            runtime
+                .process_controller_api(
+                    DaemonMode::Host,
+                    Arc::clone(&before_rebind_authority),
+                    before_rebind_authorization_state,
+                )
+                .unwrap(),
+        );
+        let before_rebind_fence = process_assignment_fence_resolver(
+            Arc::clone(&runtime.store),
+            DaemonMode::Host,
+            Arc::clone(&before_rebind_authority),
+        )(
+            process_ref.clone(),
+            before_rebind_process.uid.clone(),
+            before_rebind_process.revision,
+        )
+        .await
+        .expect("pre-rebind Process assignment fence");
+        assert_eq!(
+            before_rebind_fence,
+            ResourceAssignmentFence {
+                resource_uid: before_rebind_process.uid.clone(),
+                resource_revision: before_rebind_process.revision,
+                provider_generation: before_rebind_authority.provider_generation,
+                controller_generation: before_rebind_authority.controller_generation,
+                controller_role: before_rebind_authority.controller_role.clone(),
+                target: ResourceRef::parse("Host/host-system").unwrap(),
+                session_generation: before_rebind_authority.session_generation,
+                epoch: before_rebind_authority.epoch,
+                scope: ResourceAssignmentScope::Primary,
+            }
+        );
+        assert!(before_rebind_authority.epoch > 0);
+        let before_rebind_revision = runtime
+            .store
+            .runtime_metadata()
+            .await
+            .unwrap()
+            .current_revision;
+        let registrar = runtime
+            .registrar
+            .lock()
+            .unwrap()
+            .take()
+            .expect("system-core registrar");
+        let service_task = runtime
+            .service_task
+            .lock()
+            .unwrap()
+            .take()
+            .expect("system-core session task");
+        service_task.abort();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Role",
+                "rebind-trigger",
+                &zone,
+                &serde_json::to_string(&role).unwrap(),
+            )],
+        )
+        .await;
+        assert!(
+            runtime.store.runtime_metadata().await.unwrap().current_revision
+                > before_rebind_revision,
+            "rebind trigger must advance the committed revision"
+        );
+        assert_eq!(
+            runtime.refresh_authorization_policy().await,
+            Err(ResourceRuntimeError::AuthenticationUnavailable)
+        );
+        assert!(
+            runtime.policy_projection.installed_state().is_ok(),
+            "a failed session rebind must preserve the complete installed policy"
+        );
+        let installed_after_failure = runtime.policy_projection.installed_state().unwrap();
+        let metadata_after_failure = runtime.store.runtime_metadata().await.unwrap();
+        assert_eq!(
+            installed_after_failure.zone_policy_revision,
+            metadata_after_failure.current_revision,
+            "the retryable failure must occur after the complete projection is installed"
+        );
+        assert!(
+            coordinator.assigned_process_api.lock().unwrap().is_none(),
+            "failed system-core rebind must invalidate the assigned Process API"
+        );
+        let context = providers
+            .controller_bootstrap_contexts(&zone)
+            .into_iter()
+            .find(|context| context.process_ref() == &process_ref)
+            .expect("rebind Process controller context");
+        assert_eq!(
+            coordinator
+                .persist_controller_session_evidence(
+                    &context,
+                    Some(ReconnectGeneration::new(1).unwrap()),
+                )
+                .await,
+            Err(ResourceRuntimeError::AuthenticationUnavailable),
+            "pending evidence must not write through an invalidated Process API"
+        );
+
+        let guard = runtime.controller_session_lock.lock().await;
+        for request in [
+            json!({
+                "method": "Get",
+                "zoneRef": "Zone/work",
+                "resourceRef": "Host/host-system",
+            }),
+            json!({
+                "method": "List",
+                "zoneRef": "Zone/work",
+                "resourceType": "Host",
+            }),
+        ] {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                runtime.dispatch_public_cli_request(&request, uid.as_raw()),
+            )
+            .await
+            .expect("public read must not wait for controller-session policy refresh")
+            .expect("public read should use the installed authorization projection");
+        }
+        drop(guard);
+        let _ = service_task.await;
+        assert!(
+            runtime.core_runner_tasks.lock().unwrap().is_empty(),
+            "a failed system-core rebind must stop the old runner generation"
+        );
+        *runtime.registrar.lock().unwrap() = Some(registrar);
+        runtime
+            .refresh_authorization_policy()
+            .await
+            .expect("the next refresh must retry system-core rebind recovery");
+        assert!(
+            runtime.service_task.lock().unwrap().is_some(),
+            "recovery must re-enroll the fenced system-core session"
+        );
+        assert!(
+            runtime
+                .core_runner_tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|task| !task.is_finished()),
+            "successful rebind recovery must restore the core runners"
+        );
+        assert!(
+            coordinator.assigned_process_api.lock().unwrap().is_some(),
+            "successful system-core rebind must restore the assigned Process API"
+        );
+        let after_rebind_authority = runtime.core_assignment_fences(false).await.unwrap().4;
+        let after_rebind_process =
+            read_test_resource(&runtime, process_ref.clone(), "rebind-process-after-fence").await;
+        let rebuilt_process_fence = process_assignment_fence_resolver(
+            Arc::clone(&runtime.store),
+            DaemonMode::Host,
+            Arc::clone(&after_rebind_authority),
+        )(
+            process_ref.clone(),
+            after_rebind_process.uid.clone(),
+            after_rebind_process.revision,
+        )
+        .await
+        .expect("rebuilt Process assignment fence");
+        let expected_rebuilt_process_fence = ResourceAssignmentFence {
+            epoch: before_rebind_fence.epoch + 1,
+            ..before_rebind_fence.clone()
+        };
+        assert_eq!(
+            rebuilt_process_fence,
+            expected_rebuilt_process_fence,
+            "rebind must preserve Process identity and advance its assignment epoch exactly once"
+        );
+        assert_eq!(
+            after_rebind_authority.provider_generation,
+            before_rebind_authority.provider_generation
+        );
+        assert_eq!(
+            after_rebind_authority.controller_generation,
+            before_rebind_authority.controller_generation
+        );
+        assert_eq!(
+            after_rebind_authority.controller_role,
+            before_rebind_authority.controller_role
+        );
+        assert_eq!(
+            after_rebind_authority.target,
+            before_rebind_authority.target
+        );
+        assert_eq!(
+            after_rebind_authority.session_generation,
+            before_rebind_authority.session_generation
+        );
+        assert_eq!(
+            after_rebind_authority.epoch,
+            before_rebind_authority.epoch + 1,
+            "the Process API rebuild must reuse the one epoch rotated for rebind"
+        );
+        coordinator
+            .persist_controller_session_evidence(
+                &context,
+                Some(ReconnectGeneration::new(1).unwrap()),
+            )
+            .await
+            .expect("rebind must rebuild the assigned Process API before evidence writes");
+        let current_process =
+            read_test_resource(&runtime, process_ref.clone(), "rebind-process-current-fence")
+                .await;
+        let current_process_fence = process_assignment_fence_resolver(
+            Arc::clone(&runtime.store),
+            DaemonMode::Host,
+            Arc::clone(&after_rebind_authority),
+        )(
+            process_ref.clone(),
+            current_process.uid.clone(),
+            current_process.revision,
+        )
+        .await
+        .expect("current Process assignment fence");
+        let durable_current_fence = runtime
+            .store
+            .assignment_fence(zone.clone(), process_ref.clone())
+            .await
+            .unwrap()
+            .expect("rebuilt Process assignment fence must persist");
+        assert_eq!(durable_current_fence, current_process_fence);
+        assert_eq!(durable_current_fence.epoch, after_rebind_authority.epoch);
+        assert_eq!(
+            persist_resource_controller_session_evidence(
+                &before_rebind_api,
+                &current_process,
+                Some(&json!({"ready": false, "stale": true})),
+            )
+            .await,
+            Err(ResourceRuntimeError::ResourceStatusUpdateFailed(
+                ResourceErrorKind::ResourceConflict
+            )),
+            "the pre-rebind Process fence must be rejected after the epoch advances"
+        );
+        drop(before_rebind_api);
+        drop(coordinator);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn controller_session_reconcile_wake_survives_guard_contention() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let coordinator = runtime.controller_session_coordinator();
+        let providers = test_controller_session_providers();
+        let task_slot = Arc::clone(&runtime.controller_session_reconcile_task);
+        let wake = Arc::clone(&runtime.controller_session_reconcile_wake);
+        let shutdown = Arc::clone(&runtime.controller_session_reconcile_shutdown);
+        *runtime.authorization_state.lock().unwrap() = None;
+
+        let guard = runtime.controller_session_lock.lock().await;
+        schedule_controller_session_reconcile(
+            task_slot,
+            wake,
+            Arc::clone(&shutdown),
+            Arc::clone(&coordinator),
+            providers,
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if coordinator.reconcile_attempts.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("controller-session worker should attempt reconciliation");
+        assert!(runtime.authorization_state.lock().unwrap().is_none());
+        schedule_controller_session_reconcile(
+            Arc::clone(&runtime.controller_session_reconcile_task),
+            Arc::clone(&runtime.controller_session_reconcile_wake),
+            Arc::clone(&shutdown),
+            Arc::clone(&coordinator),
+            test_controller_session_providers(),
+        )
+        .unwrap();
+
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if runtime.authorization_state.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guarded controller-session wake should reconcile after release");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if coordinator.reconcile_attempts.load(Ordering::SeqCst) == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("wake arriving during reconciliation should trigger one later pass");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            coordinator.reconcile_attempts.load(Ordering::SeqCst),
+            2,
+            "one wake arriving during reconciliation must not create a hot loop"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        drop(coordinator);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn readable_pending_controller_bootstrap_wakes_coordinator_to_active() {
+        let zone = ZoneId::parse("work").unwrap();
+        let providers = test_controller_session_providers();
+        let process_ref = ResourceRef::parse("Process/provider-controller").unwrap();
+        let provider_owner_ref =
+            ResourceRef::parse("Provider/runtime-cloud-hypervisor").unwrap();
+        let process_provider_ref = ResourceRef::parse("Provider/system-minijail").unwrap();
+        let (daemon_endpoint, peer_endpoint) = prearmed_seqpacket_pair().unwrap();
+        nix::sys::socket::send(
+            peer_endpoint.as_raw_fd(),
+            b"bootstrap-ready",
+            nix::sys::socket::MsgFlags::empty(),
+        )
+        .unwrap();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let callback_providers = Arc::downgrade(&providers);
+        let callback_zone = zone.clone();
+        let callback_process_ref = process_ref.clone();
+        let callback_wake_count = Arc::clone(&wake_count);
+        providers
+            .set_controller_session_waker(
+                zone.clone(),
+                Arc::new(move || {
+                    let providers = callback_providers
+                        .upgrade()
+                        .expect("providers remain while the wake is delivered");
+                    assert!(providers
+                        .controller_bootstrap_ready(&callback_zone, &callback_process_ref));
+                    let context = providers
+                        .controller_bootstrap_contexts(&callback_zone)
+                        .into_iter()
+                        .find(|context| context.process_ref() == &callback_process_ref)
+                        .expect("readable Pending endpoint context");
+                    let endpoint = providers
+                        .begin_controller_bootstrap_if_matches(&callback_zone, &context)
+                        .expect("readable Pending endpoint must be claimed");
+                    let context = endpoint.context().clone();
+                    assert!(providers.activate_controller_bootstrap(&context));
+                    callback_wake_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        providers
+            .attach_pending_controller_provider_context_for_test(
+                daemon_endpoint,
+                zone.clone(),
+                process_ref.clone(),
+                ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+                ResourceGeneration::new(1).unwrap(),
+                process_provider_ref,
+                provider_owner_ref,
+                ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap(),
+                ResourceGeneration::new(1).unwrap(),
+                ResourceRef::parse("Host/host-system").unwrap(),
+                ControllerGeneration::new(1).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            providers
+                .controller_bootstrap_contexts(&zone)
+                .into_iter()
+                .map(|context| context.process_ref().clone())
+                .collect::<Vec<_>>(),
+            vec![process_ref.clone()]
+        );
+        assert!(!providers.controller_bootstrap_ready(&zone, &process_ref));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controller_session_admission_freezes_pending_snapshot_across_passes() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = ZoneId::parse("work").unwrap();
+        materialize_test_bundle(&runtime, Vec::new()).await;
+        let first_provider_ref =
+            ResourceRef::parse("Provider/runtime-cloud-hypervisor").expect("first provider");
+        let second_provider_ref =
+            ResourceRef::parse("Provider/runtime-qemu-media").expect("second provider");
+        let first_process_ref =
+            ResourceRef::parse("Process/provider-controller-first").expect("first process");
+        let second_process_ref =
+            ResourceRef::parse("Process/provider-controller-second").expect("second process");
+        let controller_process = |name: &str, owner_ref: &ResourceRef, template: &str| {
+            BundleResource::new(
+                ResourceTypeName::parse("Process").unwrap(),
+                BundleResourceMetadata::new(
+                    ResourceName::parse(name).unwrap(),
+                    zone.clone(),
+                    Some(owner_ref.clone()),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                ),
+                CanonicalJsonObject::parse(
+                    format!(
+                        r#"{{"executionRef":"Host/host-system","processClass":"controller","providerRef":"Provider/system-minijail","template":"{template}"}}"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "Provider",
+                    "runtime-cloud-hypervisor",
+                    &zone,
+                    r#"{"artifactId":"runtime-cloud-hypervisor","config":{}}"#,
+                ),
+                bundle_resource(
+                    "Provider",
+                    "runtime-qemu-media",
+                    &zone,
+                    r#"{"artifactId":"runtime-qemu-media","config":{}}"#,
+                ),
+                controller_process(
+                    first_process_ref.name().as_str(),
+                    &first_provider_ref,
+                    "acceptance-controller",
+                ),
+                controller_process(
+                    second_process_ref.name().as_str(),
+                    &second_provider_ref,
+                    "acceptance-controller",
+                ),
+            ],
+        )
+        .await;
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "Provider",
+                    "runtime-qemu-media",
+                    &zone,
+                    r#"{"artifactId":"runtime-qemu-media","config":{"replacement":true}}"#,
+                ),
+                controller_process(
+                    second_process_ref.name().as_str(),
+                    &second_provider_ref,
+                    "acceptance-controller-replacement",
+                ),
+            ],
+        )
+        .await;
+        let first_provider =
+            read_test_resource(&runtime, first_provider_ref.clone(), "admission-first-provider")
+                .await;
+        let second_provider = read_test_resource(
+            &runtime,
+            second_provider_ref.clone(),
+            "admission-second-provider",
+        )
+        .await;
+        let first_process =
+            read_test_resource(&runtime, first_process_ref.clone(), "admission-first-process")
+                .await;
+        let second_process = read_test_resource(
+            &runtime,
+            second_process_ref.clone(),
+            "admission-second-process",
+        )
+        .await;
+        assert_eq!(second_provider.generation.get(), 2);
+        assert_eq!(second_process.generation.get(), 2);
+        let controller_generation = runtime
+            .store
+            .runtime_metadata()
+            .await
+            .unwrap()
+            .policy_snapshot
+            .controller_generation
+            .expect("test policy has a controller generation");
+        let providers = test_controller_session_providers();
+        let coordinator = runtime.controller_session_coordinator();
+        let authority = runtime.core_assignment_fences(false).await.unwrap().4;
+        let authorization_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        coordinator
+            .set_assigned_process_api(Arc::new(
+                runtime
+                    .process_controller_api(DaemonMode::Host, authority, authorization_state)
+                    .unwrap(),
+            ))
+            .unwrap();
+        let wake = Arc::clone(&runtime.controller_session_reconcile_wake);
+        let wake_for_waker = Arc::clone(&wake);
+        let shutdown = Arc::clone(&runtime.controller_session_reconcile_shutdown);
+        let task_slot_for_waker = Arc::clone(&runtime.controller_session_reconcile_task);
+        let shutdown_for_waker = Arc::clone(&shutdown);
+        let coordinator_for_waker = Arc::downgrade(&coordinator);
+        let providers_for_waker = Arc::downgrade(&providers);
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let callback_wake_count = Arc::clone(&wake_count);
+        providers
+            .set_controller_session_waker(
+                zone.clone(),
+                Arc::new(move || {
+                    callback_wake_count.fetch_add(1, Ordering::SeqCst);
+                    let coordinator = coordinator_for_waker
+                        .upgrade()
+                        .ok_or_else(|| "controller-session-coordinator-dropped".to_owned())?;
+                    let providers = providers_for_waker
+                        .upgrade()
+                        .ok_or_else(|| "process-providers-dropped".to_owned())?;
+                    schedule_controller_session_reconcile(
+                        Arc::clone(&task_slot_for_waker),
+                        Arc::clone(&wake_for_waker),
+                        Arc::clone(&shutdown_for_waker),
+                        coordinator,
+                        providers,
+                    )
+                    .map_err(|error| format!("{error:?}"))
+                }),
+            )
+            .unwrap();
+        let peers = Arc::new(Mutex::new(Vec::<OwnedFd>::new()));
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let stale_context = Arc::new(Mutex::new(None));
+        let peers_for_hook = Arc::clone(&peers);
+        let hook_ran_for_hook = Arc::clone(&hook_ran);
+        let stale_context_for_hook = Arc::clone(&stale_context);
+        let providers_for_hook = Arc::clone(&providers);
+        let second_snapshot_seen = Arc::new(AtomicBool::new(false));
+        let second_snapshot_seen_for_hook = Arc::clone(&second_snapshot_seen);
+        let second_snapshot_release = Arc::new(AtomicBool::new(false));
+        let second_snapshot_release_for_hook = Arc::clone(&second_snapshot_release);
+        let zone_for_hook = zone.clone();
+        let replacement_process_uid = second_process.uid.clone();
+        let replacement_process_generation = second_process.generation.get();
+        let replacement_provider_uid = second_provider.uid.clone();
+        let replacement_provider_generation = second_provider.generation.get();
+        let controller_generation_for_hook = controller_generation;
+        let second_process_ref_for_hook = second_process_ref.clone();
+        let second_provider_ref_for_hook = second_provider_ref.clone();
+        let after_snapshot = Arc::new(
+            move |_providers: &crate::process_provider_runtime::ProductionProcessProviders| {
+                if hook_ran_for_hook.swap(true, Ordering::AcqRel) {
+                    second_snapshot_seen_for_hook.store(true, Ordering::Release);
+                    while !second_snapshot_release_for_hook.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    return;
+                }
+                let late_peer = attach_ready_controller(
+                    &providers_for_hook,
+                    &zone_for_hook,
+                    second_process_ref_for_hook.to_canonical_string().as_str(),
+                    "323e4567-e89b-42d3-a456-426614174002",
+                    1,
+                    second_provider_ref_for_hook.to_canonical_string().as_str(),
+                    "423e4567-e89b-42d3-a456-426614174003",
+                    1,
+                    controller_generation_for_hook,
+                );
+                let late_context = providers_for_hook
+                    .controller_bootstrap_contexts(&zone_for_hook)
+                    .into_iter()
+                    .find(|context| context.process_ref() == &second_process_ref_for_hook)
+                    .expect("late Pending controller context");
+                *stale_context_for_hook.lock().unwrap() = Some(late_context);
+                let replacement_peer = attach_ready_controller(
+                    &providers_for_hook,
+                    &zone_for_hook,
+                    second_process_ref_for_hook.to_canonical_string().as_str(),
+                    replacement_process_uid.as_str(),
+                    replacement_process_generation,
+                    second_provider_ref_for_hook.to_canonical_string().as_str(),
+                    replacement_provider_uid.as_str(),
+                    replacement_provider_generation,
+                    controller_generation_for_hook,
+                );
+                peers_for_hook
+                    .lock()
+                    .unwrap()
+                    .extend([late_peer, replacement_peer]);
+            },
+        );
+        let policy_snapshots = Arc::new(Mutex::new(Vec::<BTreeSet<BoundSubject>>::new()));
+        let policy_snapshots_for_hook = Arc::clone(&policy_snapshots);
+        let first_policy_seen = Arc::new(AtomicBool::new(false));
+        let first_policy_seen_for_hook = Arc::clone(&first_policy_seen);
+        let first_policy_release = Arc::new(AtomicBool::new(false));
+        let first_policy_release_for_hook = Arc::clone(&first_policy_release);
+        let _admission_unwind_guard = ControllerSessionAdmissionTestUnwindGuard {
+            first_policy_release: Arc::clone(&first_policy_release),
+            second_snapshot_release: Arc::clone(&second_snapshot_release),
+            shutdown: Arc::clone(&shutdown),
+            wake: Arc::clone(&wake),
+        };
+        coordinator.set_controller_session_admission_test_seam(
+            ControllerSessionAdmissionTestSeam {
+                after_snapshot,
+                after_policy_install: Arc::new(move |subjects| {
+                    policy_snapshots_for_hook
+                        .lock()
+                        .unwrap()
+                        .push(subjects.clone());
+                    if !first_policy_seen_for_hook.swap(true, Ordering::AcqRel) {
+                        while !first_policy_release_for_hook.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                    }
+                }),
+                admit_without_transport: true,
+            },
+        );
+        peers.lock().unwrap().push(attach_ready_controller(
+            &providers,
+            &zone,
+            first_process_ref.to_canonical_string().as_str(),
+            first_process.uid.as_str(),
+            first_process.generation.get(),
+            first_provider_ref.to_canonical_string().as_str(),
+            first_provider.uid.as_str(),
+            first_provider.generation.get(),
+            controller_generation,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if policy_snapshots.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first scheduled pass must install its frozen policy");
+        let stale_context = stale_context
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("test seam captured the replaced context");
+        let replacement_context = providers
+            .controller_bootstrap_contexts(&zone)
+            .into_iter()
+            .find(|context| context.process_ref() == &second_process_ref)
+            .expect("replacement Pending controller context");
+        let first_subject = BoundSubject {
+            subject_ref: first_provider_ref.clone(),
+            subject_uid: first_provider.uid.clone(),
+        };
+        let second_subject = BoundSubject {
+            subject_ref: second_provider_ref.clone(),
+            subject_uid: second_provider.uid.clone(),
+        };
+        assert_eq!(
+            policy_snapshots.lock().unwrap().as_slice(),
+            [BTreeSet::from([first_subject.clone()])]
+        );
+        first_policy_release.store(true, Ordering::Release);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if second_snapshot_seen.load(Ordering::Acquire)
+                    && !providers.controller_bootstrap_ready(&zone, &first_process_ref)
+                    && providers.controller_bootstrap_ready(&zone, replacement_context.process_ref())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the queued wake must reach a second frozen admission pass");
+        assert_ne!(
+            stale_context.process_uid(),
+            replacement_context.process_uid(),
+            "replacement must fence the stale Process UID"
+        );
+        assert_ne!(
+            stale_context.generation(),
+            replacement_context.generation(),
+            "replacement must fence the stale Process generation"
+        );
+        assert_ne!(
+            stale_context.provider_uid(),
+            replacement_context.provider_uid(),
+            "replacement must fence the stale Provider UID"
+        );
+        assert_ne!(
+            stale_context.provider_generation(),
+            replacement_context.provider_generation(),
+            "replacement must fence the stale Provider generation"
+        );
+        assert!(
+            providers
+                .begin_controller_bootstrap_if_matches(&zone, &stale_context)
+                .is_none(),
+            "a replaced Pending marker must not be claimed by a stale snapshot"
+        );
+        assert!(
+            providers.controller_bootstrap_ready(&zone, replacement_context.process_ref()),
+            "the replacement must remain Pending after pass one"
+        );
+        assert!(
+            !providers.controller_bootstrap_ready(&zone, &first_process_ref),
+            "the original context must be Active after pass one"
+        );
+        second_snapshot_release.store(true, Ordering::Release);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if policy_snapshots.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second pass must install the replacement Provider subject");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            coordinator.reconcile_attempts.load(Ordering::SeqCst),
+            2,
+            "the non-lossy wake must not create a duplicate pass"
+        );
+        assert_eq!(
+            policy_snapshots.lock().unwrap().as_slice(),
+            [
+                BTreeSet::from([first_subject.clone()]),
+                BTreeSet::from([first_subject.clone(), second_subject.clone()]),
+            ]
+        );
+        for context in providers.controller_bootstrap_contexts(&zone) {
+            assert!(!providers.controller_bootstrap_ready(&zone, context.process_ref()));
+            assert!(
+                providers
+                    .begin_controller_bootstrap_if_matches(&zone, &context)
+                    .is_none(),
+                "an active controller must not be admitted twice"
+            );
+        }
+        assert_eq!(wake_count.load(Ordering::SeqCst), 3);
+
+        shutdown.store(true, Ordering::Release);
+        wake.notify_one();
+        drop(peers);
+        drop(coordinator);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn controller_session_reconcile_failures_use_bounded_backoff() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let coordinator = runtime.controller_session_coordinator();
+        let providers = test_controller_session_providers();
+        let task_slot = Arc::clone(&runtime.controller_session_reconcile_task);
+        let wake = Arc::clone(&runtime.controller_session_reconcile_wake);
+        let shutdown = Arc::clone(&runtime.controller_session_reconcile_shutdown);
+        let sessions = Arc::clone(&runtime.controller_sessions);
+        std::thread::spawn(move || {
+            let _guard = sessions.lock().unwrap();
+            panic!("poison controller-session test lock");
+        })
+        .join()
+        .expect_err("test thread must poison the controller-session lock");
+
+        schedule_controller_session_reconcile(
+            task_slot,
+            wake,
+            Arc::clone(&shutdown),
+            Arc::clone(&coordinator),
+            providers,
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if coordinator.reconcile_attempts.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed reconciliation should be attempted");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            coordinator.reconcile_attempts.load(Ordering::SeqCst),
+            1,
+            "a failed reconciliation must not self-notify into a hot loop"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            async {
+                loop {
+                    if coordinator.reconcile_attempts.load(Ordering::SeqCst) >= 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .expect("failed reconciliation should retry after bounded backoff");
+
+        runtime.controller_sessions.clear_poison();
+        shutdown.store(true, Ordering::Release);
+        drop(coordinator);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn system_core_refresh_rejects_partial_session_state() {
+        let fixture = PublicationStoreFixture::new().await;
+        let bundle =
+            publication_bundle(&fixture.zone, fixture.identity.zone_uid(), "session-partial");
+        let runtime = fixture.open(&bundle).await;
+        let state = AuthorizationState {
+            snapshot: runtime.store_metadata.policy_snapshot,
+            zone_policy_revision: runtime.store_metadata.current_revision,
+            bootstrap_phase: d2b_resource_api::authz::BootstrapPhase::Disabled,
+            now_tick: 0,
+        };
+        *runtime.service_task.lock().unwrap() = Some(tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        }));
+
+        assert_eq!(
+            runtime.refresh_system_core_session(state).await,
+            Err(ResourceRuntimeError::AuthenticationUnavailable)
+        );
+        assert!(runtime.service_task.lock().unwrap().is_some());
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn system_core_refresh_rejects_empty_existing_session_state() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let state = runtime.policy_projection.installed_state().unwrap();
+        let registrar = runtime
+            .registrar
+            .lock()
+            .unwrap()
+            .take()
+            .expect("system-core registrar");
+        *runtime.ingress.lock().unwrap() = None;
+        let service_task = runtime
+            .service_task
+            .lock()
+            .unwrap()
+            .take()
+            .expect("system-core session task");
+        service_task.abort();
+
+        assert_eq!(
+            runtime.refresh_system_core_session(state).await,
+            Err(ResourceRuntimeError::AuthenticationUnavailable)
+        );
+        *runtime.registrar.lock().unwrap() = Some(registrar);
+        let _ = service_task.await;
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -11121,6 +26937,7 @@ mod tests {
                 "update": {
                     "dependencies": {"count": 0, "refs": []},
                     "disruption": "None",
+                    "observedGeneration": 0,
                     "lastAssessedAt": null,
                     "observedGeneration": 0,
                     "operationId": null,
@@ -11138,6 +26955,8 @@ mod tests {
             resource_ref: ResourceRef::parse(&format!("Provider/{name}")).unwrap(),
             zone,
             uid,
+            owner_uid: None,
+            owner_generation: None,
             generation: ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(1),
             canonical_json,
@@ -11381,6 +27200,664 @@ mod tests {
         assert!(controller_session_matches(&first, &first, false));
         assert!(!controller_session_matches(&first, &second, false));
         assert!(!controller_session_matches(&first, &first, true));
+    }
+
+    #[test]
+    fn stale_controller_session_clear_errors_are_safe_for_teardown_only() {
+        assert!(ControllerSessionCoordinator::controller_session_clear_error_is_stale_identity(
+            &ResourceRuntimeError::IdentityUnbound
+        ));
+        assert!(
+            ControllerSessionCoordinator::controller_session_clear_error_is_stale_identity(
+                &ResourceRuntimeError::ResourceStatusUpdateFailed(ResourceErrorKind::ResourceNotFound)
+            )
+        );
+        assert!(
+            !ControllerSessionCoordinator::controller_session_clear_error_is_stale_identity(
+                &ResourceRuntimeError::AuthenticationUnavailable
+            )
+        );
+    }
+
+    #[test]
+    fn stale_owner_identity_still_allows_fenced_controller_session_clear() {
+        assert_eq!(
+            controller_session_evidence_identity_check(false, true),
+            Ok(())
+        );
+        assert_eq!(
+            controller_session_evidence_identity_check(false, false),
+            Err(ResourceRuntimeError::IdentityUnbound)
+        );
+        assert_eq!(
+            controller_session_evidence_identity_check(true, false),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn controller_session_evidence_conflicts_are_scoped_to_one_context() {
+        for kind in [
+            ResourceErrorKind::ResourceConflict,
+            ResourceErrorKind::RevisionExpired,
+        ] {
+            assert!(
+                ControllerSessionCoordinator::controller_session_evidence_error_is_context_local(
+                    &ResourceRuntimeError::ResourceStatusUpdateFailed(kind)
+                )
+            );
+        }
+        assert!(
+            !ControllerSessionCoordinator::controller_session_evidence_error_is_context_local(
+                &ResourceRuntimeError::ResourceStatusUpdateFailed(
+                    ResourceErrorKind::ResourceStatusOwnerMismatch
+                )
+            )
+        );
+        for kind in [
+            ResourceErrorKind::Backpressure,
+            ResourceErrorKind::Timeout,
+            ResourceErrorKind::Cancelled,
+            ResourceErrorKind::ResourcePlaneUnavailable,
+        ] {
+            assert!(
+                ControllerSessionCoordinator::controller_session_evidence_error_is_context_local(
+                    &ResourceRuntimeError::ResourceGetFailed(kind)
+                )
+            );
+        }
+        assert!(
+            !ControllerSessionCoordinator::controller_session_evidence_error_is_context_local(
+                &ResourceRuntimeError::AuthenticationUnavailable
+            )
+        );
+    }
+
+    #[test]
+    fn transient_controller_session_get_errors_do_not_abort_sibling_sessions() {
+        for kind in [
+            StoreErrorKind::ResourceConflict,
+            StoreErrorKind::RevisionExpired,
+            StoreErrorKind::Backpressure,
+            StoreErrorKind::StoreBackpressure,
+            StoreErrorKind::Timeout,
+            StoreErrorKind::Cancelled,
+            StoreErrorKind::ResourcePlaneUnavailable,
+        ] {
+            let error = ControllerSessionCoordinator::controller_session_evidence_read_error(kind);
+            assert!(
+                ControllerSessionCoordinator::controller_session_evidence_error_is_context_local(
+                    &error
+                ),
+                "target-local {kind:?} must requeue only its own Provider session"
+            );
+        }
+        assert!(
+            !ControllerSessionCoordinator::controller_session_evidence_error_is_context_local(
+                &ResourceRuntimeError::StoreReadFailed
+            ),
+            "global store integrity failures must still propagate"
+        );
+        assert_eq!(
+            ControllerSessionCoordinator::controller_session_evidence_read_error(
+                StoreErrorKind::StoreIntegrityFailure
+            ),
+            ResourceRuntimeError::StoreReadFailed
+        );
+    }
+
+    #[test]
+    fn controller_provider_identity_failures_preserve_global_store_and_auth_fences() {
+        assert!(
+            ControllerSessionCoordinator::controller_provider_identity_error_is_global(
+                &ResourceRuntimeError::StoreReadFailed
+            )
+        );
+        assert!(
+            ControllerSessionCoordinator::controller_provider_identity_error_is_global(
+                &ResourceRuntimeError::AuthenticationUnavailable
+            )
+        );
+        assert!(
+            !ControllerSessionCoordinator::controller_provider_identity_error_is_global(
+                &ResourceRuntimeError::InteractionConfigurationUnavailable
+            )
+        );
+    }
+
+    #[test]
+    fn stale_controller_session_clear_isolated_from_unrelated_contexts() {
+        assert_eq!(
+            ControllerSessionCoordinator::isolate_controller_session_clear_error(Err(
+                ResourceRuntimeError::IdentityUnbound
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            ControllerSessionCoordinator::isolate_controller_session_clear_error(Err(
+                ResourceRuntimeError::ResourceStatusUpdateFailed(
+                    ResourceErrorKind::ResourceNotFound
+                )
+            )),
+            Ok(())
+        );
+        for kind in [
+            ResourceErrorKind::ResourceConflict,
+            ResourceErrorKind::RevisionExpired,
+            ResourceErrorKind::Backpressure,
+            ResourceErrorKind::Timeout,
+            ResourceErrorKind::Cancelled,
+            ResourceErrorKind::ResourcePlaneUnavailable,
+        ] {
+            assert_eq!(
+                ControllerSessionCoordinator::isolate_controller_session_clear_error(Err(
+                    ResourceRuntimeError::ResourceStatusUpdateFailed(kind)
+                )),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            ControllerSessionCoordinator::isolate_controller_session_clear_error(Err(
+                ResourceRuntimeError::AuthenticationUnavailable
+            )),
+            Err(ResourceRuntimeError::AuthenticationUnavailable)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_teardown_controller_session_clear_does_not_fence_siblings() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let provider_ref = ResourceRef::parse("Provider/system-core").unwrap();
+        let process_ref = ResourceRef::parse("Process/d2b-core-controller").unwrap();
+        materialize_test_bundle(&runtime, Vec::new()).await;
+        let process = BundleResource::new(
+            ResourceTypeName::parse("Process").unwrap(),
+            BundleResourceMetadata::new(
+                ResourceName::parse("d2b-core-controller").unwrap(),
+                zone.clone(),
+                Some(provider_ref.clone()),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            CanonicalJsonObject::parse(
+                br#"{"executionRef":"Host/host-system","processClass":"controller","providerRef":"Provider/system-minijail","template":"test-controller"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        materialize_test_bundle(&runtime, vec![process]).await;
+        let provider =
+            read_test_resource(&runtime, provider_ref.clone(), "sibling-fence-provider").await;
+        let process =
+            read_test_resource(&runtime, process_ref.clone(), "sibling-fence-process").await;
+        let controller_generation = runtime
+            .store
+            .runtime_metadata()
+            .await
+            .unwrap()
+            .policy_snapshot
+            .controller_generation
+            .expect("test policy has a controller generation");
+        let providers = test_controller_session_providers();
+        providers
+            .attach_controller_provider_context_for_test(
+                zone.clone(),
+                process_ref.clone(),
+                process.uid.clone(),
+                process.generation,
+                ResourceRef::parse("Provider/system-minijail").unwrap(),
+                provider_ref.clone(),
+                provider.uid.clone(),
+                provider.generation,
+                ResourceRef::parse("Host/host-system").unwrap(),
+                controller_generation,
+            )
+            .unwrap();
+        let first_context = providers
+            .controller_bootstrap_contexts(&zone)
+            .into_iter()
+            .find(|context| context.process_ref() == &process_ref)
+            .expect("fenced controller context");
+        providers
+            .set_controller_session_waker(zone.clone(), Arc::new(|| Ok(())))
+            .unwrap();
+        let sibling_process_ref = ResourceRef::parse("Process/sibling-controller").unwrap();
+        let sibling_peer = attach_ready_controller(
+            &providers,
+            &zone,
+            sibling_process_ref.to_canonical_string().as_str(),
+            "523e4567-e89b-42d3-a456-426614174004",
+            1,
+            provider_ref.to_canonical_string().as_str(),
+            provider.uid.as_str(),
+            provider.generation.get(),
+            controller_generation,
+        );
+        let sibling_context = providers
+            .controller_bootstrap_contexts(&zone)
+            .into_iter()
+            .find(|context| context.process_ref() == &sibling_process_ref)
+            .expect("eligible sibling controller context");
+        let mut coordinator = runtime.build_controller_session_coordinator().unwrap();
+        let authority = runtime.core_assignment_fences(false).await.unwrap().4;
+        let authorization_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        coordinator
+            .set_assigned_process_api(Arc::new(
+                runtime
+                    .process_controller_api(DaemonMode::Host, authority, authorization_state)
+                    .unwrap(),
+            ))
+            .unwrap();
+        insert_test_controller_session(&mut coordinator, &first_context).await;
+        providers.fail_controller_bootstrap(&first_context);
+        coordinator.set_controller_session_evidence_test_errors(vec![
+            ResourceRuntimeError::ResourceGetFailed(ResourceErrorKind::Timeout),
+            ResourceRuntimeError::ResourceStatusUpdateFailed(ResourceErrorKind::ResourceConflict),
+        ]);
+
+        assert_eq!(coordinator.fence(&providers).await, Ok(()));
+        assert!(
+            !coordinator
+                .controller_sessions
+                .lock()
+                .unwrap()
+                .contains_key(&process_ref),
+            "post-teardown evidence failure must not reinsert the dead session"
+        );
+        assert!(
+            coordinator
+                .pending_controller_session_clears
+                .lock()
+                .unwrap()
+                .contains_key(&process_ref),
+            "durable evidence clear must remain queued for retry"
+        );
+        assert!(
+            providers.controller_bootstrap_ready(&zone, sibling_context.process_ref()),
+            "a context-local clear failure must not abort an eligible sibling"
+        );
+
+        assert_eq!(coordinator.fence(&providers).await, Ok(()));
+        assert!(
+            !coordinator
+                .pending_controller_session_clears
+                .lock()
+                .unwrap()
+                .contains_key(&process_ref),
+            "the next fence must retry and retire the queued evidence clear"
+        );
+        let cleared = read_test_resource(
+            &runtime,
+            process_ref.clone(),
+            "sibling-fence-cleared-evidence",
+        )
+        .await;
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&cleared.canonical_json)
+                .unwrap()
+                .pointer("/status/resource/controllerSession")
+                .is_none(),
+            "retry must clear durable evidence without restoring transport authority"
+        );
+        assert!(providers.controller_bootstrap_ready(
+            &zone,
+            sibling_context.process_ref()
+        ));
+
+        drop(sibling_peer);
+        drop(coordinator);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_controller_session_clear_retains_live_authority() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let provider_ref = ResourceRef::parse("Provider/system-core").unwrap();
+        let process_ref = ResourceRef::parse("Process/d2b-core-controller").unwrap();
+        materialize_test_bundle(&runtime, Vec::new()).await;
+        let process = BundleResource::new(
+            ResourceTypeName::parse("Process").unwrap(),
+            BundleResourceMetadata::new(
+                ResourceName::parse("d2b-core-controller").unwrap(),
+                zone.clone(),
+                Some(provider_ref.clone()),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            CanonicalJsonObject::parse(
+                br#"{"executionRef":"Host/host-system","processClass":"controller","providerRef":"Provider/system-minijail","template":"test-controller"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        materialize_test_bundle(&runtime, vec![process]).await;
+        let provider = read_test_resource(
+            &runtime,
+            provider_ref.clone(),
+            "failed-session-clear-provider",
+        )
+        .await;
+        let process = read_test_resource(
+            &runtime,
+            process_ref.clone(),
+            "failed-session-clear-process",
+        )
+        .await;
+        let controller_generation = runtime
+            .store
+            .runtime_metadata()
+            .await
+            .unwrap()
+            .policy_snapshot
+            .controller_generation
+            .expect("test policy has a controller generation");
+        let providers = test_controller_session_providers();
+        providers
+            .attach_controller_provider_context_for_test(
+                zone.clone(),
+                process_ref.clone(),
+                process.uid.clone(),
+                process.generation,
+                ResourceRef::parse("Provider/system-minijail").unwrap(),
+                provider_ref.clone(),
+                provider.uid.clone(),
+                provider.generation,
+                ResourceRef::parse("Host/host-system").unwrap(),
+                controller_generation,
+            )
+            .unwrap();
+        let context = providers
+            .controller_bootstrap_contexts(&zone)
+            .into_iter()
+            .find(|context| context.process_ref() == &process_ref)
+            .expect("test controller context");
+        assert!(controller_resource_matches(&context, &process));
+        let mut legacy_process = process.clone();
+        legacy_process.owner_generation = None;
+        assert!(
+            controller_resource_matches(&context, &legacy_process),
+            "legacy Process rows without owner generation must still accept session evidence"
+        );
+        let mut recreated_owner = process.clone();
+        recreated_owner.owner_uid =
+            Some(ResourceUid::parse("44444444-4444-4444-8444-444444444444").unwrap());
+        assert!(
+            !controller_resource_matches(&context, &recreated_owner),
+            "a Process row recycled under the Provider name must not satisfy the new Provider UID"
+        );
+        assert_eq!(
+            controller_session_resource_fences(
+                vec![(process_ref.clone(), context.clone())],
+                &[recreated_owner.clone()],
+            )
+            .len(),
+            1,
+            "session fencing must reject a same-name Process under an older Provider UID",
+        );
+        let mut recreated_generation = process.clone();
+        recreated_generation.owner_generation = Some(
+            ResourceGeneration::new(context.provider_generation().get().saturating_add(1))
+                .unwrap(),
+        );
+        assert!(
+            !controller_resource_matches(&context, &recreated_generation),
+            "a Process row from an older Provider generation must not satisfy the new owner"
+        );
+
+        let mut coordinator = runtime.build_controller_session_coordinator().unwrap();
+        let authority = runtime.core_assignment_fences(false).await.unwrap().4;
+        let authorization_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let assigned_process_api = Arc::new(
+            runtime
+                .process_controller_api(DaemonMode::Host, authority, authorization_state)
+                .unwrap(),
+        );
+        coordinator
+            .set_assigned_process_api(Arc::clone(&assigned_process_api))
+            .unwrap();
+        persist_resource_controller_session_evidence(
+            &assigned_process_api,
+            &legacy_process,
+            Some(&json!({ "ready": true })),
+        )
+        .await
+        .expect("persist legacy controller-session evidence");
+        let legacy_persisted = read_test_resource(
+            &runtime,
+            process_ref.clone(),
+            "legacy-controller-session-evidence",
+        )
+        .await;
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&legacy_persisted.canonical_json)
+                .unwrap()
+                .pointer("/status/resource/controllerSession")
+                .is_some(),
+            "legacy Process rows must persist controller-session evidence"
+        );
+        coordinator
+            .persist_controller_session_evidence(
+                &context,
+                Some(ReconnectGeneration::new(1).unwrap()),
+            )
+            .await
+            .expect("seed durable controller-session evidence");
+        *coordinator
+            .assigned_process_api
+            .lock()
+            .unwrap() = None;
+        let policy = controller_resource_endpoint_policy();
+        let catalog = d2b_resource_api::authz::ApiCatalog::standard();
+        let role_ref = ResourceRef::parse("Role/test-controller").unwrap();
+        let role = d2b_resource_api::authz::CompiledRole::new(
+            role_ref.clone(),
+            vec![
+                d2b_resource_api::authz::PolicyRule::new(
+                    &catalog,
+                    [],
+                    [],
+                    [d2b_resource_api::authz::SessionVerb::Connect],
+                    [],
+                    [],
+                    [zone.clone()],
+                    [],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let metadata = runtime.store.runtime_metadata().await.unwrap();
+        let state = AuthorizationState {
+            snapshot: metadata.policy_snapshot,
+            zone_policy_revision: metadata.current_revision,
+            bootstrap_phase: d2b_resource_api::authz::BootstrapPhase::Disabled,
+            now_tick: 1,
+        };
+        let binding = d2b_resource_api::authz::CompiledRoleBinding::new(
+            role_ref,
+            [BoundSubject {
+                subject_ref: context.provider_owner_ref().clone(),
+                subject_uid: context.provider_uid().clone(),
+            }],
+            d2b_resource_api::authz::BindingScope {
+                zones: [zone.clone()].into_iter().collect(),
+                ..d2b_resource_api::authz::BindingScope::default()
+            },
+            d2b_resource_api::authz::RelayGrantAuthority::None,
+        )
+        .unwrap();
+        let policy_set =
+            PolicySet::new(&catalog, state.snapshot.policy_revision, vec![role], vec![binding])
+                .unwrap();
+        let native = NativeAuthorizer::new(catalog, Some(policy_set)).unwrap();
+        let bus_authorizer = BusAuthorizer::new(native, state).unwrap();
+        let (_bus, registrar) =
+            ZoneBus::new(zone.clone(), bus_authorizer, BusConfig::default()).unwrap();
+        coordinator.registrar = Arc::new(Mutex::new(Some(registrar)));
+        let (initiator_fd, responder_fd) = prearmed_seqpacket_pair().unwrap();
+        let initiator_socket = SeqpacketSocket::from_parent_prearmed(initiator_fd).unwrap();
+        let responder_socket = SeqpacketSocket::from_parent_prearmed(responder_fd).unwrap();
+        let verified_peer =
+            VerifiedUnixPeer::verify_inherited_seqpacket(&initiator_socket).unwrap();
+        let registrar = coordinator.registrar.clone();
+        let mut registrar = registrar
+            .lock()
+            .unwrap()
+            .take()
+            .expect("test registrar");
+        registrar
+            .install_committed_controller_process_subject(
+                &verified_peer,
+                CommittedControllerProcessSubjectInput {
+                    provider_ref: context.provider_owner_ref().clone(),
+                    provider_uid: context.provider_uid().clone(),
+                    process_ref: context.process_ref().clone(),
+                    zone_ref: ResourceRef::parse("Zone/work").unwrap(),
+                    execution_ref: context.execution_ref().clone(),
+                    provider_generation: context.provider_generation(),
+                    controller_generation: context.controller_generation(),
+                },
+            )
+            .unwrap();
+        let initiator = unix_transport(initiator_socket, &policy).unwrap();
+        let responder = unix_transport(responder_socket, &policy).unwrap();
+        let (initiator, responder) = tokio::join!(
+            SessionEngine::establish_initiator(
+                initiator,
+                policy.clone(),
+                HandshakeCredentials::Nn,
+                std::time::Instant::now(),
+            ),
+            SessionEngine::establish_responder(
+                responder,
+                policy.clone(),
+                HandshakeCredentials::Nn,
+                std::time::Instant::now(),
+            ),
+        );
+        let acceptor = registrar
+            .component_session_acceptor(policy, verified_peer)
+            .unwrap();
+        let candidate = acceptor
+            .admit(
+                initiator.unwrap(),
+                TransportEvidence::new(
+                    EvidenceClass::UnixPeer,
+                    BindingDigest::parse(format!("sha256:{}", "22".repeat(32))).unwrap(),
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+        let (ingress, driver) = registrar
+            .register_component_service_session(candidate)
+            .await
+            .unwrap();
+        coordinator
+            .registrar
+            .lock()
+            .unwrap()
+            .replace(registrar);
+        let binding =
+            controller_session_binding(&context, ReconnectGeneration::new(1).unwrap()).unwrap();
+        let service_task = tokio::spawn(async { Ok::<(), SessionServerError>(()) });
+        let session = ControllerSession {
+            context: context.clone(),
+            binding,
+            ingress,
+            driver,
+            _backend_lease: None,
+            resource_client: None,
+            service_task,
+            assignments: BTreeMap::new(),
+            assignment_stream_open: false,
+            assignments_revoked: false,
+            transport_closed: false,
+            ingress_revoked: false,
+        };
+        coordinator
+            .controller_sessions
+            .lock()
+            .unwrap()
+            .insert(process_ref.clone(), session);
+        let registrar_for_retry = coordinator.registrar.lock().unwrap().take();
+        let result = coordinator
+            .remove_controller_session(&process_ref, Some(&context))
+            .await;
+        assert_eq!(
+            result,
+            Err(ResourceRuntimeError::AuthenticationUnavailable)
+        );
+        assert!(
+            coordinator
+                .controller_sessions
+                .lock()
+                .unwrap()
+                .contains_key(&process_ref),
+                "failed ingress teardown must retain the live session authority"
+        );
+        let retained = read_test_resource(
+                &runtime,
+                process_ref.clone(),
+                "failed-ingress-teardown-retains-evidence",
+        )
+        .await;
+        let retained_value: serde_json::Value =
+                serde_json::from_slice(&retained.canonical_json).unwrap();
+        assert!(
+                retained_value
+                    .pointer("/status/resource/controllerSession")
+                    .is_some(),
+                "failed ingress teardown must not clear durable session evidence"
+        );
+        *coordinator.registrar.lock().unwrap() = registrar_for_retry;
+        let result = coordinator
+                .remove_controller_session(&process_ref, Some(&context))
+                .await;
+        assert_eq!(
+                result,
+                Err(ResourceRuntimeError::AuthenticationUnavailable)
+        );
+        assert!(
+                coordinator
+                    .controller_sessions
+                    .lock()
+                    .unwrap()
+                    .contains_key(&process_ref),
+                "failed durable clear must retain the already-torn-down session for retry"
+        );
+        *coordinator.assigned_process_api.lock().unwrap() = Some(assigned_process_api);
+        assert_eq!(
+                coordinator
+                    .remove_controller_session(&process_ref, Some(&context))
+                    .await,
+                Ok(())
+        );
+        assert!(
+                !coordinator
+                    .controller_sessions
+                    .lock()
+                    .unwrap()
+                    .contains_key(&process_ref),
+                "successful retry must perform the final session-map removal"
+        );
+        drop(responder);
+        drop(coordinator);
+        let _ = runtime.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11674,7 +28151,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(runtime.zone(), &zone);
-        assert!(runtime.device_tpm_controller_registered());
         assert!(runtime.readiness().store_ready);
         assert!(!runtime.readiness().resource_api_ready);
         assert!(!runtime.readiness().local_session_ready);
@@ -12561,5 +29037,2506 @@ mod tests {
             index.admit(second, &occupancy),
             Err(NetworkEffectError::NetworkAdmissionConflict)
         );
+    }
+
+    #[test]
+    fn qemu_controller_contract_invokes_controller_and_finalizes() {
+        let guest_ref = ResourceRef::parse("Guest/qemu").unwrap();
+        let config = qemu_media_runtime::ProviderConfig::new(
+            "Host/host-system",
+            "qemu-system-x86-64",
+            "Provider/network-local",
+            "Provider/volume-local",
+            None,
+        )
+        .unwrap();
+        let process = qemu_media_runtime::build_process_spec(
+            config.controller_execution_ref.clone(),
+            ResourceRef::parse("Volume/qemu-runtime").unwrap(),
+            Some(ResourceRef::parse("Device/host-kvm").unwrap()),
+            [],
+        )
+        .unwrap();
+        let mut controller = qemu_media_runtime::QemuMediaController::new(
+            config,
+            qemu_media_runtime::GuestProviderSpecSettings::default(),
+            process,
+            guest_ref.clone(),
+        )
+        .unwrap();
+        let mut effect = FrameworkQemuEffect::new(guest_ref.clone());
+        let dependencies = qemu_media_runtime::QemuMediaDependencies::ready(
+            qemu_media_runtime::DeviceObservation {
+                device_ref: ResourceRef::parse("Device/host-kvm").unwrap(),
+                phase: qemu_media_runtime::DevicePhase::Ready,
+                owner_ref: None,
+                platform: qemu_media_runtime::PlatformClass::X86_64Linux,
+                authority_key: [1; 32],
+                process_identity: Some("qemu-media-runner".to_owned()),
+                media_contract: "qemu-media/v1".to_owned(),
+            },
+        );
+        assert_eq!(
+            controller.reconcile(&dependencies, &mut effect).unwrap(),
+            qemu_media_runtime::QemuMediaReconcileOutcome::Ready
+        );
+        assert_eq!(controller.phase(), qemu_media_runtime::QemuMediaPhase::PausedAtBoot);
+        controller.finalize(&mut effect).unwrap();
+        assert!(!controller.finalizer_installed());
+    }
+
+    #[test]
+    fn qemu_guest_child_graph_contains_one_runtime_volume_and_process() {
+        let owner = ResourceRef::parse("Guest/qemu").unwrap();
+        let guest = json!({
+            "spec": {
+                "deviceAttachments": [{"deviceRef": "Device/host-kvm"}],
+                "networkAttachments": [],
+                "provider": {
+                    "settings": serde_json::to_value(
+                        qemu_media_runtime::GuestProviderSpecSettings::default()
+                    )
+                    .unwrap()
+                }
+            }
+        });
+        let provider_config = serde_json::to_value(
+            qemu_media_runtime::ProviderConfig::new(
+                "Host/host-system",
+                "qemu-system-x86-64",
+                "Provider/network-local",
+                "Provider/volume-local",
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let provider = json!({
+            "spec": {
+                "config": provider_config
+            }
+        });
+        let children = DaemonSharedProviderEffects::qemu_guest_children(
+            &guest,
+            &provider,
+            &owner,
+            &ZoneId::parse("work").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.target().resource_type().as_str())
+                .collect::<Vec<_>>(),
+            vec!["Volume", "Process"]
+        );
+        assert_eq!(
+            children[1].dependencies(),
+            &BTreeSet::from([ResourceRef::parse("Volume/qemu-runtime").unwrap()])
+        );
+    }
+
+    #[tokio::test]
+    async fn aca_controller_contract_invokes_controller_and_finalizes() {
+        let profile = aca_runtime::AcaSandboxProfile::new(
+            aca_runtime::AcaProfileId::parse("default").unwrap(),
+            aca_runtime::AcaDiskImageSource::ConfiguredDisk {
+                binding_id: aca_runtime::AcaConfiguredDiskId::parse("image-1").unwrap(),
+            },
+            aca_runtime::AcaCpuMillis::new(500).unwrap(),
+            aca_runtime::AcaMemoryMib::new(2_048).unwrap(),
+            300,
+            None,
+        )
+        .unwrap();
+        let defaults = aca_runtime::AcaRuntimeConfig::new(
+            profile,
+            aca_runtime::AcaReadinessPolicy::new(3, 10).unwrap(),
+            1_000,
+            4,
+        )
+        .unwrap();
+        let config = aca_runtime::AcaProviderConfig::new(
+            ResourceRef::parse("Guest/gateway").unwrap(),
+            aca_runtime::OpaqueAzureRef::parse("tenant").unwrap(),
+            aca_runtime::OpaqueAzureRef::parse("client").unwrap(),
+            aca_runtime::OpaqueAzureRef::parse("subscription").unwrap(),
+            ResourceRef::parse("Credential/control").unwrap(),
+            None,
+            aca_runtime::AcaConfiguredImageId::parse("environment").unwrap(),
+            aca_runtime::AcaConfiguredImageId::parse("resource-group").unwrap(),
+            None,
+            aca_runtime::AcaProfileId::parse("relay").unwrap(),
+            defaults,
+        )
+        .unwrap();
+        let controller = aca_runtime::AzureContainerAppsRuntimeProvider::new(
+            config,
+            Arc::new(FrameworkAcaControl {
+                state: Arc::new(tokio::sync::Mutex::new(FrameworkAcaState::new(1))),
+            }),
+            Arc::new(FrameworkAcaLease),
+        )
+        .unwrap()
+        .controller(aca_runtime::AcaResourceBinding {
+            guest_uid: ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            provider_generation: 1,
+            config_fingerprint: [2; 32],
+        });
+        let mut controller = GuestRuntimeController::Aca { controller };
+        let GuestRuntimeController::Aca { controller } = &mut controller else {
+            unreachable!();
+        };
+        let operation = aca_runtime::AcaOperationId::parse("u6-aca-test").unwrap();
+        assert_eq!(
+            controller.reconcile(operation.clone(), 30_000).await.unwrap(),
+            aca_runtime::AcaReconcileOutcome::Progressing { after_ms: 10 }
+        );
+        assert_eq!(
+            controller.reconcile(operation, 30_000).await.unwrap(),
+            aca_runtime::AcaReconcileOutcome::Converged
+        );
+        assert_eq!(controller.phase(), aca_runtime::AcaPhase::Ready);
+        controller
+            .finalize(
+                aca_runtime::AcaOperationId::parse("u6-aca-delete").unwrap(),
+                30_000,
+            )
+            .await
+            .unwrap();
+        assert!(!controller.finalizer_installed());
+    }
+
+    #[tokio::test]
+    async fn azure_vm_controller_contract_invokes_controller_and_finalizes() {
+        let opaque = |value: &str| d2b_contracts::OpaqueAzureRef::parse(value).unwrap();
+        let config = azure_vm_runtime::AzureVmConfig {
+            tenant_id: None,
+            client_id: None,
+            arm_credential_ref: ResourceRef::parse("Credential/arm").unwrap(),
+            controller_execution_ref: ResourceRef::parse("Guest/gateway").unwrap(),
+            network_ref: None,
+        };
+        let settings = azure_vm_runtime::AzureVmGuestSettings {
+            subscription_id: opaque("subscription"),
+            resource_group: opaque("resource-group"),
+            region: opaque("eastus"),
+            vm_size: opaque("standard"),
+            image_ref: opaque("image"),
+            disk_sku: azure_vm_runtime::DiskSku::PremiumLrs,
+            os_disk_size_gb: None,
+            admin_user: "azureuser".to_owned(),
+            vnet_subscription_id: None,
+            vnet_resource_group: None,
+            vnet_name: opaque("vnet"),
+            subnet_name: opaque("subnet"),
+            assign_public_ip: false,
+            data_disks: Vec::new(),
+            bootstrap_psk_delivery: azure_vm_runtime::BootstrapPskDelivery::VmExtension,
+            bootstrap_deadline_ms: 60_000,
+            child_zone_hosting: false,
+            azure_tags: Vec::new(),
+        };
+        let effect = Arc::new(FrameworkAzureEffect {
+            state: Arc::new(tokio::sync::Mutex::new(FrameworkAzureState::new(&settings))),
+        });
+        let mut controller = azure_vm_runtime::AzureVmController::new(
+            config,
+            settings,
+            effect,
+            Arc::new(FrameworkAzureCredential),
+            None,
+        )
+        .unwrap()
+        .with_bootstrap_service(azure_vm_runtime::BootstrapService::from_state(
+            azure_vm_runtime::BootstrapServiceState::Enrolled,
+        ));
+        assert_eq!(
+            controller
+                .reconcile("work", "123e4567-e89b-42d3-a456-426614174000", 1)
+                .await
+                .unwrap(),
+            azure_vm_runtime::AzureVmReconcileOutcome::Progressing { after_ms: 1_000 }
+        );
+        for _ in 0..2 {
+            controller
+                .reconcile("work", "123e4567-e89b-42d3-a456-426614174000", 1)
+                .await
+                .unwrap();
+            if controller.phase() == azure_vm_runtime::AzureVmPhase::Ready {
+                break;
+            }
+        }
+        assert_eq!(controller.phase(), azure_vm_runtime::AzureVmPhase::Ready);
+        for _ in 0..8 {
+            if let Some(operation) = controller.recovery_state().operation {
+                controller.poll_operation(operation).await.unwrap();
+            }
+            let outcome = controller
+                .finalize("work", "123e4567-e89b-42d3-a456-426614174000", 1)
+                .await
+                .unwrap();
+            let _ = outcome;
+            if !controller.finalizer_installed() {
+                break;
+            }
+        }
+        assert!(!controller.finalizer_installed());
+    }
+
+    #[tokio::test]
+    async fn production_guest_test_store_opens_with_core_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("store.redb");
+        let database = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .unwrap();
+        let zone = ZoneId::parse("work").unwrap();
+        let store_identity = "sha256:".to_owned() + &"d".repeat(64);
+        let runtime = ZoneResourceRuntime::open_internal(
+            zone.clone(),
+            OpenedZoneStore {
+                response: OpenZoneStoreResponse {
+                    zone_store_id: d2b_contracts_resource::v3::storage::ZoneStoreId::parse(
+                        "zone-store-work",
+                    )
+                    .unwrap(),
+                    store_identity,
+                    disposition: ZoneStoreDisposition::Provisioned,
+                    fd_index: 0,
+                },
+                database_fd: database.into(),
+                external_inventory: None,
+            },
+            None,
+            Arc::new(BrokerEvidenceIndex::default()),
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(runtime.readiness().resource_api_ready);
+        assert!(runtime.core_controller_subject.lock().unwrap().is_some());
+        assert!(runtime.process_status_client.lock().unwrap().is_some());
+        let provider = BundleResource::new(
+            ResourceTypeName::parse("Provider").unwrap(),
+            BundleResourceMetadata::new(
+                ResourceName::parse("runtime-qemu-media").unwrap(),
+                zone.clone(),
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            CanonicalJsonObject::parse(
+                br#"{"artifactId":"runtime-qemu-media","config":{"controllerExecutionRef":"Host/host-system","networkProviderRef":"Provider/network-local","volumeProviderRef":"Provider/volume-local"}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let guest_spec_json = br#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"providerRef":"Provider/runtime-qemu-media","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#;
+        serde_json::from_slice::<d2b_contracts_resource::v3::ResourceSpec>(guest_spec_json)
+            .unwrap_or_else(|error| panic!("Guest spec: {error}"));
+        let guest = BundleResource::new(
+            ResourceTypeName::parse("Guest").unwrap(),
+            BundleResourceMetadata::new(
+                ResourceName::parse("qemu").unwrap(),
+                zone.clone(),
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            CanonicalJsonObject::parse(guest_spec_json).unwrap(),
+        )
+        .unwrap();
+        let bundle = ResourceBundle::new(
+            zone.clone(),
+            vec![provider],
+            "sha256:".to_owned() + &"e".repeat(64),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Timestamp::parse("1970-01-01T00:00:00.000Z").unwrap(),
+        )
+        .unwrap()
+        .with_zone_uid(runtime.store.identity().zone_uid().clone());
+        runtime
+            .materialize_desired_bundle(&bundle)
+            .await
+            .unwrap_or_else(|error| panic!("test bundle materialization failed: {error:?}"));
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Provider/runtime-qemu-media").unwrap(),
+                    "u6-test-provider-read",
+                )
+                .await
+                .is_ok()
+        );
+        let guest_bundle = ResourceBundle::new(
+            zone.clone(),
+            vec![guest],
+            "sha256:".to_owned() + &"f".repeat(64),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Timestamp::parse("1970-01-01T00:00:00.000Z").unwrap(),
+        )
+        .unwrap()
+        .with_zone_uid(runtime.store.identity().zone_uid().clone());
+        runtime.materialize_desired_bundle(&guest_bundle).await.unwrap();
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Guest/qemu").unwrap(),
+                    "u6-test-guest-read",
+                )
+                .await
+                .is_ok()
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_materialization_supplies_fixed_process_provider_rows() {
+        let (_directory, runtime, _broker_evidence) = open_production_guest_runtime_for_test().await;
+        let provider_refs = [
+            "Provider/system-core",
+            "Provider/system-minijail",
+            "Provider/system-systemd",
+        ]
+        .into_iter()
+        .map(|provider| ResourceRef::parse(provider).unwrap())
+        .collect::<BTreeSet<_>>();
+        assert!(
+            load_committed_controller_provider_identities(
+                &runtime.zone,
+                &runtime.store,
+                provider_refs.clone(),
+            )
+            .await
+            .is_err(),
+            "missing fixed Provider rows must fail closed"
+        );
+
+        materialize_test_bundle(&runtime, Vec::new()).await;
+        let identities = load_committed_controller_provider_identities(
+            &runtime.zone,
+            &runtime.store,
+            provider_refs,
+        )
+        .await
+        .expect("materialized fixed Provider identities");
+        assert_eq!(identities.len(), 3);
+
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Process",
+                "bootstrap-process",
+                &runtime.zone,
+                r#"{"providerRef":"Provider/system-minijail","executionRef":"Host/host-system","processClass":"worker","template":"reaction"}"#,
+            )],
+        )
+        .await;
+        let process = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "process-assignment-read-after-bootstrap".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "process-assignment-read-after-bootstrap".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: runtime.zone.clone(),
+                target: ResourceRef::parse("Process/bootstrap-process").unwrap(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let authority = Arc::new(CoreAssignmentAuthority {
+            provider_generation: ResourceGeneration::new(17).unwrap(),
+            controller_generation: ControllerGeneration::new(23).unwrap(),
+            session_generation: ReconnectGeneration::new(19).unwrap(),
+            controller_role: ResourceRef::parse("Process/d2b-core-controller").unwrap(),
+            target: ResourceRef::parse("Zone/work").unwrap(),
+            epoch: 29,
+        });
+        let resolver = process_assignment_fence_resolver(
+            Arc::clone(&runtime.store),
+            DaemonMode::Host,
+            Arc::clone(&authority),
+        );
+        let fence = resolver(
+            process.resource_ref.clone(),
+            process.uid.clone(),
+            process.revision,
+        )
+        .await
+        .expect("fixed Provider appearance must requeue assignment admission");
+        assert_eq!(fence.resource_uid, process.uid);
+        assert_eq!(fence.provider_generation, authority.provider_generation);
+        assert_eq!(fence.controller_generation, authority.controller_generation);
+        assert_eq!(fence.session_generation, authority.session_generation);
+        assert_eq!(fence.controller_role, authority.controller_role);
+        assert_eq!(
+            fence.target,
+            ResourceRef::parse("Host/host-system").unwrap()
+        );
+        assert_eq!(fence.epoch, authority.epoch);
+        drop(resolver);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn controller_provider_identity_projection_uses_one_current_store_snapshot() {
+        let (_directory, runtime, broker_evidence) = open_production_guest_runtime_for_test().await;
+        let provider_ref = ResourceRef::parse("Provider/system-minijail").unwrap();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Provider",
+                "system-minijail",
+                &runtime.zone,
+                r#"{"artifactId":"system-minijail","config":{}}"#,
+            )],
+        )
+        .await;
+        let stale_revision = runtime.store.runtime_metadata().await.unwrap().current_revision;
+
+        mark_test_resource_phase(&runtime, &provider_ref, &broker_evidence, "Ready").await;
+        let current = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "provider-identity-current-row".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "provider-identity-current-row".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: runtime.zone.clone(),
+                target: provider_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        assert!(current.revision > stale_revision);
+
+        let identities = load_committed_controller_provider_identities(
+            &runtime.zone,
+            &runtime.store,
+            BTreeSet::from([provider_ref.clone()]),
+        )
+        .await
+        .expect("current Provider status revision must not invalidate its identity");
+        assert_eq!(
+            identities.get(&provider_ref),
+            Some(&(current.uid.clone(), current.generation))
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_cloud_hypervisor_inputs_use_current_provider_snapshot() {
+        let (_directory, mut runtime, broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let provider_ref = ResourceRef::parse("Provider/runtime-cloud-hypervisor").unwrap();
+        let guest_ref = ResourceRef::parse("Guest/cloud-hypervisor").unwrap();
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "Provider",
+                    "runtime-cloud-hypervisor",
+                    &zone,
+                    r#"{"artifactId":"runtime-cloud-hypervisor","config":{"controllerExecutionRef":"Host/host-system","defaultVcpus":2,"defaultMemoryMb":512,"defaultMachineType":"q35","watchdog":true,"adoptionWindowMs":30000,"healthCheckIntervalMs":30000,"healthCheckTimeoutMs":5000,"healthCheckFailureThreshold":3,"startupDeadlineMs":120000}}"#,
+                ),
+                bundle_resource(
+                    "Guest",
+                    "cloud-hypervisor",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"providerRef":"Provider/runtime-cloud-hypervisor","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+            ],
+        )
+        .await;
+        runtime.store_metadata = runtime.store.runtime_metadata().await.unwrap();
+        let activation_revision = runtime.store_metadata.current_revision;
+        let before = read_test_resource(
+            &runtime,
+            provider_ref.clone(),
+            "cloud-hypervisor-inputs-before-status",
+        )
+        .await;
+        let (_, _, expected_config, _) = runtime
+            .cloud_hypervisor_inputs(&guest_ref)
+            .await
+            .expect("activation snapshot must admit the unchanged Provider config");
+
+        mark_test_resource_phase(&runtime, &provider_ref, &broker_evidence, "Ready").await;
+        let after = read_test_resource(
+            &runtime,
+            provider_ref,
+            "cloud-hypervisor-inputs-after-status",
+        )
+        .await;
+        assert!(after.revision > activation_revision);
+        assert_eq!(after.uid, before.uid);
+        assert_eq!(after.generation, before.generation);
+
+        let (_, _, config, _) = runtime
+            .cloud_hypervisor_inputs(&guest_ref)
+            .await
+            .expect("Provider status revision must not invalidate unchanged CH config");
+        assert_eq!(config, expected_config);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_wayland_session_lookup_uses_current_store_snapshot() {
+        let (_directory, mut runtime, broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let guest_ref = ResourceRef::parse("Guest/workstation").unwrap();
+        let host_ref = ResourceRef::parse("Host/host-system").unwrap();
+        let user_ref = ResourceRef::parse("User/alice").unwrap();
+        let session_ref =
+            ResourceRef::parse("display-wayland.d2bus.org.WaylandSession/display-wayland")
+                .unwrap();
+        let session_spec = d2b_provider_display_wayland::WaylandSessionSpec::new(
+            guest_ref.clone(),
+            host_ref.clone(),
+            user_ref.clone(),
+            ResourceRef::parse("display-wayland.d2bus.org.WaylandPolicy/display-wayland").unwrap(),
+            d2b_provider_display_wayland::DisplayIdentity::new(
+                "display",
+                "#112233",
+                "#223344",
+                "#334455",
+            )
+            .unwrap(),
+            true,
+        )
+        .unwrap();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "display-wayland.d2bus.org.WaylandSession",
+                "display-wayland",
+                &zone,
+                &serde_json::to_string(&session_spec).unwrap(),
+            )],
+        )
+        .await;
+        let stored =
+            read_test_resource(&runtime, session_ref.clone(), "wayland-session-before-status")
+                .await;
+        let mut identity = CommittedInteractionIdentity::for_test(
+            zone.clone(),
+            guest_ref,
+            ResourceUid::parse("44444444-4444-4444-8444-444444444444").unwrap(),
+            host_ref,
+            user_ref,
+            BTreeMap::new(),
+            ResourceGeneration::new(1).unwrap(),
+            None,
+            None,
+            None,
+            None,
+        );
+        identity.wayland_session_uid = stored.uid.clone();
+        runtime.interaction_identity = Some(identity);
+        runtime.readiness.resource_api_ready = true;
+        runtime.store_metadata = runtime.store.runtime_metadata().await.unwrap();
+        let activation_revision = runtime.store_metadata.current_revision;
+        let (_, _, expected_spec) = runtime
+            .committed_wayland_session_for_vm("workstation")
+            .await
+            .expect("activation snapshot must admit the unchanged Wayland session")
+            .expect("Wayland session identity is present");
+
+        mark_test_resource_phase(&runtime, &session_ref, &broker_evidence, "Ready").await;
+        let current =
+            read_test_resource(&runtime, session_ref, "wayland-session-after-status").await;
+        assert!(current.revision > activation_revision);
+        assert_eq!(current.uid, stored.uid);
+        assert_eq!(current.generation, stored.generation);
+
+        let (_, uid, spec) = runtime
+            .committed_wayland_session_for_vm("workstation")
+            .await
+            .expect("Wayland status revision must not invalidate unchanged session")
+            .expect("Wayland session identity remains present");
+        assert_eq!(uid, current.uid);
+        assert_eq!(spec, expected_spec);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generated_controller_process_assignment_uses_core_authority_identity() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Provider",
+                "network-local",
+                &zone,
+                r#"{"artifactId":"acceptance-provider","config":{}}"#,
+            )],
+        )
+        .await;
+        let owner = ResourceRef::parse("Provider/network-local").unwrap();
+        let process = BundleResource::new(
+            ResourceTypeName::parse("Process").unwrap(),
+            BundleResourceMetadata::new(
+                ResourceName::parse("controller-e1e6335ae78671758ea381fce5d44fdd").unwrap(),
+                zone.clone(),
+                Some(owner),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            CanonicalJsonObject::parse(
+                br#"{"executionRef":"Host/host-system","processClass":"controller","providerRef":"Provider/system-minijail","template":"acceptance-controller"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        materialize_test_bundle(&runtime, vec![process]).await;
+        let process_ref =
+            ResourceRef::parse("Process/controller-e1e6335ae78671758ea381fce5d44fdd").unwrap();
+        let stored = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "generated-controller-process-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "generated-controller-process-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: process_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let authority = Arc::new(CoreAssignmentAuthority {
+            provider_generation: ResourceGeneration::new(17).unwrap(),
+            controller_generation: ControllerGeneration::new(23).unwrap(),
+            session_generation: ReconnectGeneration::new(19).unwrap(),
+            controller_role: ResourceRef::parse("Process/d2b-core-controller").unwrap(),
+            target: ResourceRef::parse("Zone/work").unwrap(),
+            epoch: 29,
+        });
+        let system_minijail = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "generated-controller-process-provider-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "generated-controller-process-provider-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: ResourceRef::parse("Provider/system-minijail").unwrap(),
+                expected_uid: None,
+                projection: StoreProjection::MetadataOnly,
+            })
+            .await
+            .unwrap();
+        assert_ne!(
+            authority.provider_generation,
+            system_minijail.generation,
+            "test must distinguish Core Provider from Process effect Provider",
+        );
+        let resolver = process_assignment_fence_resolver(
+            Arc::clone(&runtime.store),
+            DaemonMode::Host,
+            Arc::clone(&authority),
+        );
+        let fence = resolver(
+            process_ref.clone(),
+            stored.uid.clone(),
+            stored.revision,
+        )
+        .await
+        .expect("generated controller Process assignment");
+        assert_eq!(fence.provider_generation, authority.provider_generation);
+        assert_eq!(fence.controller_generation, authority.controller_generation);
+        assert_eq!(fence.session_generation, authority.session_generation);
+        assert_eq!(fence.controller_role, authority.controller_role);
+        assert_eq!(
+            fence.target,
+            ResourceRef::parse("Host/host-system").unwrap()
+        );
+        assert_eq!(fence.epoch, authority.epoch);
+
+        let wrong_process = bundle_resource(
+            "Process",
+            "wrong-controller-provider",
+            &zone,
+            r#"{"executionRef":"Host/host-system","processClass":"controller","providerRef":"Provider/not-a-process-provider","template":"acceptance-controller"}"#,
+        );
+        materialize_test_bundle(&runtime, vec![wrong_process]).await;
+        let wrong_ref = ResourceRef::parse("Process/wrong-controller-provider").unwrap();
+        let wrong = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "wrong-controller-provider-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "wrong-controller-provider-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: wrong_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            resolver(wrong_ref, wrong.uid, wrong.revision).await,
+            Err(SourceError::Integrity)
+        ));
+
+        let missing_target = ResourceRef::parse("Process/missing-controller").unwrap();
+        assert!(
+            resolver(
+                missing_target,
+                ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+                ZoneRevision::new(1),
+            )
+            .await
+            .is_err(),
+            "missing Process target must fail closed"
+        );
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn production_runner_persists_core_assignment_for_generated_controller_process() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let owner_ref = ResourceRef::parse("Provider/network-local").unwrap();
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "Provider",
+                    "network-local",
+                    &zone,
+                    r#"{"artifactId":"acceptance-provider","config":{}}"#,
+                ),
+                {
+                    let metadata = BundleResourceMetadata::new(
+                        ResourceName::parse(
+                            "controller-e1e6335ae78671758ea381fce5d44fdd",
+                        )
+                        .unwrap(),
+                        zone.clone(),
+                        Some(owner_ref.clone()),
+                        BTreeMap::new(),
+                        BTreeMap::new(),
+                    );
+                    BundleResource::new(
+                        ResourceTypeName::parse("Process").unwrap(),
+                        metadata,
+                        CanonicalJsonObject::parse(
+                            br#"{"executionRef":"Host/host-system","processClass":"controller","providerRef":"Provider/system-minijail","template":"acceptance-controller"}"#,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap()
+                },
+            ],
+        )
+        .await;
+        let process_ref =
+            ResourceRef::parse("Process/controller-e1e6335ae78671758ea381fce5d44fdd").unwrap();
+        let process = runtime
+            .store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "runner-generated-process-read".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "runner-generated-process-read".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 10_000,
+                },
+                zone: zone.clone(),
+                target: process_ref.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let authority = Arc::new(CoreAssignmentAuthority {
+            provider_generation: ResourceGeneration::new(17).unwrap(),
+            controller_generation: ControllerGeneration::new(23).unwrap(),
+            session_generation: ReconnectGeneration::new(19).unwrap(),
+            controller_role: ResourceRef::parse("Process/d2b-core-controller").unwrap(),
+            target: ResourceRef::parse("Zone/work").unwrap(),
+            epoch: 29,
+        });
+        let authz_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let subject_context = runtime
+            .core_controller_subject
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let subject = runtime
+            .authorizer
+            .issue_authenticated_subject(subject_context, authz_state.clone())
+            .unwrap();
+        let api = runtime
+            .api
+            .registered_controller_api(subject, authz_state.clone(), Vec::new())
+            .unwrap()
+            .with_assignment_fence_resolver(process_assignment_fence_resolver(
+                Arc::clone(&runtime.store),
+                DaemonMode::Host,
+                Arc::clone(&authority),
+            ));
+        let identity = ControllerIdentity::new(
+            zone.clone(),
+            authority.controller_role.clone(),
+            authority.controller_generation,
+            ResourceRef::parse("Provider/system-core").unwrap(),
+            authority.provider_generation,
+            authority.controller_role.clone(),
+            ResourceRef::parse("Host/host-system").unwrap(),
+            None,
+        )
+        .unwrap();
+        let descriptor = process_controller_descriptor(identity).unwrap();
+        let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+        let runner = Runner::new(
+            Arc::new(AssignmentTestReconciler { descriptor }),
+            Arc::clone(&source),
+            RunnerConfig {
+                policy_revision: authz_state.snapshot.policy_revision,
+                api_revision: authz_state.snapshot.api_catalog_revision,
+                configuration_revision: authz_state.snapshot.active_configuration_revision,
+                deadline_tick: 5_000,
+                max_attempts: 3,
+            },
+        )
+        .run();
+        let runner_task = tokio::spawn(runner);
+        let fence = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(fence) = runtime
+                    .store
+                    .assignment_fence(zone.clone(), process_ref.clone())
+                    .await
+                    .unwrap()
+                {
+                    break fence;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("generated Process finalizer assignment timeout");
+        assert_eq!(fence.resource_uid, process.uid);
+        assert_eq!(fence.provider_generation, authority.provider_generation);
+        assert_eq!(fence.controller_generation, authority.controller_generation);
+        assert_eq!(fence.session_generation, authority.session_generation);
+        assert_eq!(fence.controller_role, authority.controller_role);
+        assert_eq!(fence.target, ResourceRef::parse("Host/host-system").unwrap());
+        assert_eq!(fence.epoch, authority.epoch);
+        source.close_watch().unwrap();
+        runner_task.abort();
+        let _ = runner_task.await;
+        let _ = runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sparse_seven_row_bundle_starts_only_present_shared_provider_runners() {
+        let (_directory, mut runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let resources = vec![
+            bundle_resource(
+                "Provider",
+                "network-local",
+                &zone,
+                r#"{"artifactId":"acceptance-provider","config":{}}"#,
+            ),
+            bundle_resource(
+                "Provider",
+                "runtime-qemu-media",
+                &zone,
+                r#"{"artifactId":"runtime-qemu-media","config":{"controllerExecutionRef":"Host/host-system","networkProviderRef":"Provider/network-local","volumeProviderRef":"Provider/volume-local"}}"#,
+            ),
+            bundle_resource(
+                "User",
+                "alice",
+                &zone,
+                r#"{"displayName":"Alice","groups":[],"osUsername":"alice"}"#,
+            ),
+            bundle_resource(
+                "User",
+                "d2bd",
+                &zone,
+                r#"{"displayName":"d2bd","groups":[],"osUsername":"d2bd"}"#,
+            ),
+            bundle_resource(
+                "Device",
+                "host-kvm",
+                &zone,
+                r#"{"deviceClass":"emulated","arbitration":"exclusive","maxConcurrentClaims":1,"inventory":{}}"#,
+            ),
+            bundle_resource(
+                "Guest",
+                "qemu",
+                &zone,
+                r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[{"deviceRef":"Device/host-kvm","exclusive":false}],"networkAttachments":[],"providerRef":"Provider/runtime-qemu-media","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+            ),
+            bundle_resource(
+                "Provider",
+                "acceptance-extra",
+                &zone,
+                r#"{"artifactId":"acceptance-provider","config":{}}"#,
+            ),
+        ];
+        assert_eq!(resources.len(), 7);
+        materialize_test_bundle(&runtime, resources).await;
+        assert_eq!(
+            runtime
+                .committed_resources_of_type("Provider")
+                .await
+                .unwrap()
+                .len(),
+            6
+        );
+        runtime.readiness.resource_api_ready = true;
+        runtime
+            .start_core_controller_runners()
+            .await
+            .expect("sparse bundles must skip absent optional shared Providers");
+        runtime
+            .start_u10_controller_runners()
+            .await
+            .expect("sparse bundles must skip absent Credential Providers");
+        assert!(!runtime.u10_required.load(Ordering::Acquire));
+        assert!(runtime.u10_runner_tasks.lock().unwrap().is_empty());
+        runtime.set_provider_path_ready(true);
+        runtime
+            .require_ready()
+            .expect("sparse bundle must reach Host readiness");
+        assert_eq!(runtime.interaction_state, InteractionState::Absent);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finished_core_runner_withholds_readiness_and_is_replaced_on_reconcile() {
+        let (_directory, mut runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Provider",
+                "network-local",
+                &zone,
+                r#"{"artifactId":"acceptance-provider","config":{}}"#,
+            )],
+        )
+        .await;
+        runtime.readiness.resource_api_ready = true;
+        runtime
+            .start_core_controller_runners()
+            .await
+            .expect("Core runners start for the required Provider");
+        let original_count = runtime
+            .core_runner_tasks
+            .lock()
+            .unwrap()
+            .len();
+        assert!(original_count > 1);
+        assert!(
+            runtime
+                .core_runner_tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|task| !task.is_finished())
+        );
+        runtime.set_provider_path_ready(true);
+        runtime
+            .require_ready()
+            .expect("live Core runners permit readiness");
+
+        let (failed_identity, healthy_identity) = {
+            let tasks = runtime.core_runner_tasks.lock().unwrap();
+            (
+                tasks[0].identity.clone(),
+                tasks[1].identity.clone(),
+            )
+        };
+        runtime.core_runner_tasks.lock().unwrap()[0].handle.abort();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            runtime.require_ready(),
+            Err(ResourceRuntimeError::HandlerNotReady)
+        );
+
+        let saved_authorization_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .take();
+        assert_eq!(
+            runtime.start_core_controller_runners().await,
+            Err(ResourceRuntimeError::AuthenticationUnavailable)
+        );
+        assert_eq!(
+            runtime.require_ready(),
+            Err(ResourceRuntimeError::HandlerNotReady),
+            "failed replacement setup must not restore readiness for the missing required identity"
+        );
+        {
+            let tasks = runtime.core_runner_tasks.lock().unwrap();
+            assert_eq!(tasks.len(), original_count - 1);
+            assert!(
+                tasks
+                    .iter()
+                    .any(|task| task.identity == healthy_identity && !task.is_finished()),
+                "a failed replacement setup must retain live Core siblings"
+            );
+            assert!(
+                tasks.iter().all(|task| task.identity != failed_identity),
+                "the failed Core runner must be removed before replacement setup"
+            );
+        }
+        *runtime.authorization_state.lock().unwrap() = saved_authorization_state;
+
+        runtime
+            .start_core_controller_runners()
+            .await
+            .expect("next reconciliation replaces the finished Core runner");
+        let events = runtime.core_runner_events.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|event| *event == "stop-enter"),
+            "replacement must not stop healthy Core siblings: {events:?}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let tasks = runtime.core_runner_tasks.lock().unwrap();
+                if tasks.len() == original_count && tasks.iter().all(|task| !task.is_finished()) {
+                    break;
+                }
+                drop(tasks);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement Core runners become live");
+        {
+            let tasks = runtime.core_runner_tasks.lock().unwrap();
+            assert_eq!(
+                tasks
+                    .iter()
+                    .filter(|task| task.identity == healthy_identity)
+                    .count(),
+                1,
+                "healthy Core runner must not overlap with a duplicate"
+            );
+            assert_eq!(
+                tasks
+                    .iter()
+                    .filter(|task| task.identity == failed_identity)
+                    .count(),
+                1,
+                "the failed Core identity must have exactly one replacement"
+            );
+        }
+        runtime
+            .require_ready()
+            .expect("readiness returns only after replacement runners are live");
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sparse_host_bundle_registers_both_u7_volume_runners() {
+        let (_directory, mut runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "Provider",
+                    "volume-local",
+                    &zone,
+                    r#"{"artifactId":"acceptance-provider","config":{}}"#,
+                ),
+                bundle_resource(
+                    "Provider",
+                    "volume-virtiofs",
+                    &zone,
+                    r#"{"artifactId":"acceptance-provider","config":{}}"#,
+                ),
+            ],
+        )
+        .await;
+        runtime.readiness.resource_api_ready = true;
+        runtime
+            .start_core_controller_runners()
+            .await
+            .expect("Core runners must be live before U7 readiness");
+        let state = Arc::new(crate::detached_exec_routing_tests::test_state(
+            Default::default(),
+        ));
+        runtime
+            .start_u7_controller_runners(state)
+            .await
+            .expect("sparse host bundle must start both U7 runners");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let registered_and_live = {
+                    let tasks = runtime
+                        .u7_runner_tasks
+                        .lock()
+                        .expect("U7 runner task lock");
+                    tasks.len() == U7_SHARED_PROVIDER_RUNNERS.len()
+                        && tasks.iter().all(|task| !task.is_finished())
+                };
+                if registered_and_live {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both U7 descriptors must register through the Resource API");
+        assert!(runtime.u7_required.load(Ordering::Acquire));
+        runtime.set_provider_path_ready(true);
+        runtime
+            .require_ready()
+            .expect("sparse host composition must reach readiness after U7 registration");
+
+        runtime
+            .stop_u7_controller_runners_locked()
+            .await
+            .expect("U7 runner fixture must stop cleanly");
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn present_u9_provider_without_identity_refuses_readiness_but_keeps_watch() {
+        let (_directory, mut runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Provider",
+                "display-wayland",
+                &zone,
+                r#"{"artifactId":"display-wayland","config":{}}"#,
+            )],
+        )
+        .await;
+        assert!(
+            interaction_resources_present(&zone, &runtime.store)
+                .await
+                .expect("interaction presence scan")
+        );
+        runtime.readiness.resource_api_ready = true;
+        runtime
+            .start_core_controller_runners()
+            .await
+            .expect("Core runners must be live before U9 readiness");
+        runtime.interaction_state = InteractionState::Refused;
+        let state = Arc::new(crate::detached_exec_routing_tests::test_state(
+            Default::default(),
+        ));
+        runtime
+            .start_u9_controller_runners(state)
+            .await
+            .expect("present U9 Provider keeps its filtered watch");
+        assert!(runtime.u9_required.load(Ordering::Acquire));
+        runtime.set_provider_path_ready(true);
+        assert_eq!(
+            runtime.require_ready(),
+            Err(ResourceRuntimeError::InteractionConfigurationUnavailable)
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn exact_host_fixture_user_shape_is_valid_without_provider_ref() {
+        let zone = ZoneId::parse("work").unwrap();
+        let resource_ref = ResourceRef::parse("User/alice").unwrap();
+        let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let resource = ResourceSnapshot::new(
+            ResourceKey::new(zone, resource_ref, uid),
+            ZoneRevision::new(1),
+            ResourceGeneration::new(1).unwrap(),
+            serde_json::to_vec(&json!({
+                "apiVersion": "resources.d2bus.org/v3",
+                "type": "User",
+                "metadata": {
+                    "name": "alice",
+                    "zone": "work",
+                    "uid": "123e4567-e89b-42d3-a456-426614174000",
+                    "generation": 1,
+                    "revision": 1,
+                    "configurationGeneration": 1,
+                    "ownerRef": null,
+                    "finalizers": [],
+                    "deletionRequestedAt": null,
+                    "createdAt": "1970-01-01T00:00:00.000Z",
+                    "updatedAt": "1970-01-01T00:00:00.000Z",
+                    "managedBy": "configuration",
+                },
+                "spec": {
+                    "displayName": "Alice",
+                    "groups": [],
+                    "osUsername": "alice",
+                },
+                "status": {
+                    "completedAt": null,
+                    "conditions": [],
+                    "lastReconciledAt": null,
+                    "observedGeneration": 0,
+                    "outcome": null,
+                    "phase": "Pending",
+                    "resource": {},
+                    "startedAt": null,
+                    "update": {
+                        "dependencies": {"count": 0, "refs": []},
+                        "disruption": "None",
+                        "lastAssessedAt": null,
+                        "observedGeneration": 0,
+                        "operationId": null,
+                        "owned": {"count": 0, "refs": []},
+                        "preserveState": true,
+                        "reasons": [],
+                        "state": "Unknown",
+                        "targetGeneration": 1,
+                    },
+                },
+            }))
+            .unwrap(),
+            false,
+        );
+        assert!(SystemCoreResourceReconciler::valid_spec(&resource));
+    }
+
+    #[tokio::test]
+    async fn injected_process_source_failure_blocks_readiness_with_bounded_diagnostic() {
+        let (_directory, mut runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        runtime.set_provider_path_ready(true);
+        runtime
+            .process_controller_required
+            .store(true, Ordering::Release);
+        let controller = ResourceRef::parse("Process/d2b-core-controller").unwrap();
+        let resource_types = [
+            ResourceTypeName::parse("Process").unwrap(),
+            ResourceTypeName::parse("EphemeralProcess").unwrap(),
+        ];
+        store_runner_failure(
+            &runtime.process_runner_failure,
+            ControllerRunnerFailure::new(
+                controller.clone(),
+                resource_types,
+                RunnerError::Source(SourceError::Integrity),
+            ),
+        );
+        assert_eq!(
+            runtime.require_ready(),
+            Err(ResourceRuntimeError::HandlerNotReady)
+        );
+        let failure = runtime
+            .process_runner_failure
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("process failure diagnostic");
+        assert_eq!(failure.controller(), &controller);
+        assert_eq!(
+            failure.resource_types(),
+            &[
+                ResourceTypeName::parse("Process").unwrap(),
+                ResourceTypeName::parse("EphemeralProcess").unwrap()
+            ]
+        );
+        assert_eq!(failure.error(), RunnerError::Source(SourceError::Integrity));
+        assert_eq!(
+            failure.error().to_string(),
+            "controller source failed: resource plane integrity failure"
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn referenced_missing_credential_provider_fails_closed() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let mut credential: Value = serde_json::from_str(&credential_spec("Guest/gateway"))
+            .expect("credential fixture");
+        credential["providerRef"] =
+            Value::String("Provider/credential-entra".to_owned());
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Credential",
+                "missing-provider",
+                &zone,
+                &serde_json::to_string(&credential).expect("credential JSON"),
+            )],
+        )
+        .await;
+        assert_eq!(
+            runtime.start_u10_controller_runners().await,
+            Err(ResourceRuntimeError::ProviderPathUnavailable)
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn present_credential_provider_keeps_empty_watch_live() {
+        let (_directory, runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Provider",
+                "credential-entra",
+                &zone,
+                r#"{"artifactId":"credential-entra","config":{}}"#,
+            )],
+        )
+        .await;
+        {
+            let _runner_guard = runtime.core_runner_lock.lock().await;
+            runtime
+                .stop_core_controller_runners_locked()
+                .await
+                .expect("core runner fixture must stop cleanly");
+        }
+        runtime
+            .start_u10_controller_runners()
+            .await
+            .expect("present Credential Provider must attach its watch");
+        assert!(runtime.u10_required.load(Ordering::Acquire));
+        assert_eq!(runtime.u10_runner_tasks.lock().unwrap().len(), 1);
+        runtime
+            .stop_u10_controller_runners_locked()
+            .await
+            .expect("Credential runner fixture must stop cleanly");
+        runtime.shutdown().await.unwrap();
+    }
+
+    async fn open_production_guest_runtime_for_test() -> (
+        tempfile::TempDir,
+        ZoneResourceRuntime,
+        Arc<BrokerEvidenceIndex>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("store.redb");
+        let database = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .unwrap();
+        let zone = ZoneId::parse("work").unwrap();
+        let broker_evidence = Arc::new(BrokerEvidenceIndex::default());
+        let runtime = ZoneResourceRuntime::open_internal(
+            zone,
+            OpenedZoneStore {
+                response: OpenZoneStoreResponse {
+                    zone_store_id: d2b_contracts_resource::v3::storage::ZoneStoreId::parse(
+                        "zone-store-work",
+                    )
+                    .unwrap(),
+                    store_identity: "sha256:".to_owned() + &"a".repeat(64),
+                    disposition: ZoneStoreDisposition::Provisioned,
+                    fd_index: 0,
+                },
+                database_fd: database.into(),
+                external_inventory: None,
+            },
+            None,
+            Arc::clone(&broker_evidence),
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        (directory, runtime, broker_evidence)
+    }
+
+    fn bundle_resource(
+        resource_type: &str,
+        name: &str,
+        zone: &ZoneId,
+        spec: &str,
+    ) -> BundleResource {
+        bundle_resource_with_annotations(
+            resource_type,
+            name,
+            zone,
+            spec,
+            BTreeMap::new(),
+        )
+    }
+
+    fn bundle_resource_with_annotations(
+        resource_type: &str,
+        name: &str,
+        zone: &ZoneId,
+        spec: &str,
+        annotations: BTreeMap<String, String>,
+    ) -> BundleResource {
+        BundleResource::new(
+            ResourceTypeName::parse(resource_type).unwrap(),
+            BundleResourceMetadata::new(
+                ResourceName::parse(name).unwrap(),
+                zone.clone(),
+                None,
+                BTreeMap::new(),
+                annotations,
+            ),
+            CanonicalJsonObject::parse(spec.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn credential_spec(gateway: &str) -> String {
+        let scope = d2b_contracts_provider::v3::credential::CredentialScope::new(
+            Some(ResourceRef::parse(gateway).unwrap()),
+            None,
+            None,
+        )
+        .unwrap();
+        let spec = d2b_contracts_provider::v3::credential::CredentialSpec::new(
+            scope,
+            d2b_contracts_provider::v3::credential::AudienceToken::parse(
+                "azure-resource-manager",
+            )
+            .unwrap(),
+            None,
+            vec![
+                d2b_contracts_provider::v3::credential::CredentialOperation::AcquireToken,
+            ],
+            d2b_contracts_provider::v3::credential::RotationSpec::default(),
+            d2b_contracts_provider::v3::credential::ExpirySpec::default(),
+            d2b_contracts_provider::v3::credential::RevocationSpec::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        serde_json::to_string(&spec).unwrap()
+    }
+
+    async fn materialize_test_bundle(
+        runtime: &ZoneResourceRuntime,
+        resources: Vec<BundleResource>,
+    ) {
+        let zone = runtime.zone.clone();
+        let bundle = ResourceBundle::new(
+            zone,
+            resources,
+            "sha256:".to_owned() + &"b".repeat(64),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Timestamp::parse("1970-01-01T00:00:00.000Z").unwrap(),
+        )
+        .unwrap()
+        .with_zone_uid(runtime.store.identity().zone_uid().clone());
+        bundle
+            .verify()
+            .unwrap_or_else(|error| panic!("test bundle verification failed: {error:?}"));
+        runtime
+            .materialize_desired_bundle(&bundle)
+            .await
+            .unwrap_or_else(|error| panic!("test bundle materialization failed: {error:?}"));
+    }
+
+    async fn start_production_guest_runner_fixture(
+        resources: Vec<BundleResource>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ServerState>,
+        Arc<ResourcePlane>,
+        Arc<ZoneResourceRuntime>,
+        Arc<BrokerEvidenceIndex>,
+    ) {
+        let (directory, state, plane, runtime, broker_evidence) =
+            prepare_production_guest_runner_fixture(resources).await;
+        runtime
+            .start_u6_controller_runners(Arc::clone(&state))
+            .await
+            .unwrap();
+        (directory, state, plane, runtime, broker_evidence)
+    }
+
+    async fn prepare_production_guest_runner_fixture(
+        resources: Vec<BundleResource>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ServerState>,
+        Arc<ResourcePlane>,
+        Arc<ZoneResourceRuntime>,
+        Arc<BrokerEvidenceIndex>,
+    ) {
+        let (directory, runtime, broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        materialize_test_bundle(&runtime, resources).await;
+        let state = Arc::new(crate::detached_exec_routing_tests::test_state(
+            Default::default(),
+        ));
+        let zone = runtime.zone.clone();
+        let mut plane = ResourcePlane::new();
+        plane.insert(runtime).unwrap();
+        let plane = crate::install_test_resource_plane(&state, plane);
+        let runtime = plane.zone(&zone).unwrap();
+        (directory, state, plane, runtime, broker_evidence)
+    }
+
+    async fn prepare_production_audio_runner_fixture(
+        resources: Vec<BundleResource>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ServerState>,
+        Arc<ResourcePlane>,
+        Arc<ZoneResourceRuntime>,
+        Arc<BrokerEvidenceIndex>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("store.redb");
+        let database = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .unwrap();
+        let zone = ZoneId::parse("work").unwrap();
+        let response_identity = "sha256:".to_owned() + &"a".repeat(64);
+        let identity = store_identity(&zone, &response_identity).unwrap();
+        let broker_evidence = Arc::new(BrokerEvidenceIndex::default());
+        let mut catalog_types = BTreeSet::new();
+        let catalog_resources = resources
+            .iter()
+            .filter(|resource| {
+                resource.resource_type().as_str().contains(".d2bus.org.")
+                    && catalog_types.insert(resource.resource_type().clone())
+            })
+            .cloned()
+            .collect();
+        let initial_bundle = ResourceBundle::new(
+            zone.clone(),
+            catalog_resources,
+            "sha256:".to_owned() + &"a".repeat(64),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Timestamp::parse("1970-01-01T00:00:00.000Z").unwrap(),
+        )
+        .unwrap()
+        .with_zone_uid(identity.zone_uid().clone());
+        let authority = ZoneAuthorityIdentity::from_bundle_and_storage(
+            &zone,
+            &initial_bundle,
+            &publication_storage_row(&zone, &identity),
+        )
+        .unwrap();
+        let runtime = ZoneResourceRuntime::open_internal(
+            zone,
+            OpenedZoneStore {
+                response: OpenZoneStoreResponse {
+                    zone_store_id: d2b_contracts_resource::v3::storage::ZoneStoreId::parse(
+                        "zone-store-work",
+                    )
+                    .unwrap(),
+                    store_identity: response_identity,
+                    disposition: ZoneStoreDisposition::Provisioned,
+                    fd_index: 0,
+                },
+                database_fd: database.into(),
+                external_inventory: None,
+            },
+            None,
+            Arc::clone(&broker_evidence),
+            None,
+            true,
+            Some(initial_bundle),
+            Some(authority),
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(crate::detached_exec_routing_tests::test_state(
+            Default::default(),
+        ));
+        let zone = runtime.zone.clone();
+        let mut plane = ResourcePlane::new();
+        plane.insert(runtime).unwrap();
+        let plane = crate::install_test_resource_plane(&state, plane);
+        let runtime = plane.zone(&zone).unwrap();
+        materialize_test_bundle(&runtime, resources).await;
+        (directory, state, plane, runtime, broker_evidence)
+    }
+
+    async fn mark_test_resource_ready(
+        runtime: &ZoneResourceRuntime,
+        target: &ResourceRef,
+        broker_evidence: &BrokerEvidenceIndex,
+    ) {
+        mark_test_resource_phase(runtime, target, broker_evidence, "Ready").await;
+    }
+
+    async fn mark_test_resource_phase(
+        runtime: &ZoneResourceRuntime,
+        target: &ResourceRef,
+        broker_evidence: &BrokerEvidenceIndex,
+        phase: &str,
+    ) {
+        let current = runtime
+            .committed_resource_value(target, "u6-test-ready-read")
+            .await
+            .unwrap();
+        let mut status = current.get("status").cloned().unwrap();
+        status["phase"] = Value::String(phase.to_owned());
+        status["observedGeneration"] = current["metadata"]["generation"].clone();
+        let client = runtime.status_client().unwrap();
+        let operation = bounded_operation_id(&format!(
+            "u6-test-ready:{}:{}",
+            target.to_canonical_string(),
+            current["metadata"]["revision"]
+        ));
+        if matches!(
+            target.resource_type().as_str(),
+            "Provider" | "Credential"
+        ) {
+            broker_evidence
+                .insert(DurabilityEvidence {
+                    key: d2b_audit::operation::ZoneOperationKey::derive(
+                        runtime.zone.as_str(),
+                        &operation,
+                    )
+                    .unwrap(),
+                    outcome: d2b_audit::DurabilityOutcome::Success,
+                    effect_durable: true,
+                })
+                .unwrap();
+        }
+        let request = public_update_status_request_from_current(
+            runtime,
+            &json!({
+                "status": status,
+                "expectedRevision": current["metadata"]["revision"],
+            }),
+            &operation,
+            target,
+            current,
+        )
+        .unwrap();
+        let response = client.update_status(request).await;
+        if let Some(error) = response.error.as_ref() {
+            panic!(
+                "test status update rejected: kind={:?} reason={}",
+                error.kind, error.reason
+            );
+        }
+    }
+
+    async fn assert_guest_assignment_fence(
+        runtime: &ZoneResourceRuntime,
+        guest_ref: &ResourceRef,
+        provider_ref: &ResourceRef,
+        controller_ref: &ResourceRef,
+    ) {
+        let guest = runtime
+            .committed_resource_value(guest_ref, "u6-test-fence-read")
+            .await
+            .unwrap();
+        assert_eq!(
+            guest["spec"]["providerRef"],
+            provider_ref.to_canonical_string()
+        );
+        let provider = runtime
+            .committed_resource_value(provider_ref, "u6-test-provider-fence-read")
+            .await
+            .unwrap();
+        let fence = runtime
+            .store
+            .assignment_fence(runtime.zone.clone(), guest_ref.clone())
+            .await
+            .unwrap()
+            .expect("Guest assignment fence");
+        assert_eq!(
+            fence.resource_uid,
+            ResourceUid::parse(guest["metadata"]["uid"].as_str().unwrap()).unwrap()
+        );
+        assert_eq!(
+            fence.resource_revision,
+            ZoneRevision::new(guest["metadata"]["revision"].as_u64().unwrap())
+        );
+        assert_eq!(
+            fence.provider_generation,
+            ResourceGeneration::new(provider["metadata"]["generation"].as_u64().unwrap()).unwrap()
+        );
+        assert_eq!(
+            fence.controller_generation,
+            runtime
+                .store
+                .runtime_metadata()
+                .await
+                .unwrap()
+                .policy_snapshot
+                .controller_generation
+                .unwrap()
+        );
+        assert_eq!(fence.controller_role, controller_ref.clone());
+        assert_eq!(
+            fence.target,
+            ResourceRef::parse(&format!("Zone/{}", runtime.zone.as_str())).unwrap()
+        );
+        assert_eq!(
+            fence.session_generation,
+            runtime
+                .core_controller_subject
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .reconnect_generation()
+        );
+        assert!(fence.epoch > 0);
+        assert!(matches!(fence.scope, ResourceAssignmentScope::Primary));
+    }
+
+    async fn wait_for_test_resource(
+        runtime: &ZoneResourceRuntime,
+        target: &ResourceRef,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Value {
+        for _ in 0..3_000 {
+            if let Ok(value) = runtime
+                .committed_resource_value(target, "u6-test-wait")
+                .await
+                && predicate(&value)
+            {
+                return value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {}", target.to_canonical_string());
+    }
+
+    async fn wait_for_test_resource_gone(runtime: &ZoneResourceRuntime, target: &ResourceRef) {
+        for _ in 0..3_000 {
+            if runtime
+                .committed_resource_value(target, "u6-test-wait-gone")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {}", target.to_canonical_string());
+    }
+
+    async fn request_test_delete(runtime: &ZoneResourceRuntime, target: &ResourceRef) {
+        for attempt in 0..100 {
+            let current = runtime
+                .committed_resource_value(target, "u6-test-delete-read")
+                .await
+                .unwrap();
+            let client = runtime.status_client().unwrap();
+            let operation = format!("u6-test-delete-{attempt}");
+            let request = public_delete_request(
+                runtime,
+                &json!({
+                    "resourceRef": target.to_canonical_string(),
+                    "uid": current["metadata"]["uid"],
+                    "expectedRevision": current["metadata"]["revision"],
+                }),
+                &operation,
+            )
+            .await
+            .unwrap();
+            let response = client.delete(request).await;
+            let Some(error) = response.error.as_ref() else {
+                return;
+            };
+            if error.reason.as_str() == "resource-revision-changed" {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                continue;
+            }
+            panic!(
+                "test delete rejected: kind={:?} reason={}",
+                error.kind, error.reason
+            );
+        }
+        panic!("test delete did not become admitted");
+    }
+
+    async fn add_test_child_finalizer(runtime: &ZoneResourceRuntime, target: &ResourceRef) {
+        let current = runtime
+            .committed_resource_value(target, "u6-test-child-finalizer-read")
+            .await
+            .unwrap();
+        let request = public_update_finalizers_request(
+            runtime,
+            &json!({
+                "resourceRef": target.to_canonical_string(),
+                "uid": current["metadata"]["uid"],
+                "expectedRevision": current["metadata"]["revision"],
+                "addFinalizers": ["test.d2bus.org/hold"],
+                "removeFinalizers": [],
+            }),
+            "u6-test-child-finalizer",
+        )
+        .unwrap();
+        let response = runtime.status_client().unwrap().update_finalizers(request).await;
+        if let Some(error) = response.error.as_ref() {
+            panic!(
+                "test child finalizer update rejected: kind={:?} reason={}",
+                error.kind, error.reason
+            );
+        }
+    }
+
+    async fn create_test_child(
+        runtime: &ZoneResourceRuntime,
+        owner: &ResourceRef,
+        target: &ResourceRef,
+    ) {
+        let process = qemu_media_runtime::build_process_spec(
+            ResourceRef::parse("Host/host-system").unwrap(),
+            ResourceRef::parse("Volume/u6-test-runtime").unwrap(),
+            None,
+            [],
+        )
+        .unwrap();
+        let mut process_spec = serde_json::to_value(process).unwrap();
+        process_spec
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "providerRef".to_owned(),
+                Value::String("Provider/system-minijail".to_owned()),
+            );
+        let canonical = DaemonSharedProviderEffects::guest_child_resource(
+            target,
+            owner,
+            &runtime.zone,
+            process_spec,
+        )
+        .unwrap();
+        let identity = public_identity(
+            runtime,
+            target.resource_type(),
+            target.name().as_str(),
+            None,
+            None,
+            None,
+        );
+        let mut mutation = wire::Mutation::new();
+        mutation.kind =
+            protobuf::EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_CREATE);
+        mutation.target = protobuf::MessageField::some(identity.clone());
+        mutation.precondition = protobuf::MessageField::some(create_precondition());
+        mutation.resource = protobuf::MessageField::some(
+            ch_resource_body(&runtime.zone, target, None, &canonical).unwrap(),
+        );
+        mutation.owner = protobuf::MessageField::some(public_identity(
+            runtime,
+            owner.resource_type(),
+            owner.name().as_str(),
+            None,
+            None,
+            None,
+        ));
+        let mut request = wire::CreateRequest::new();
+        request.meta = protobuf::MessageField::some(public_request_meta(
+            &bounded_operation_id(&format!(
+                "u6-test-child-create:{}",
+                target.to_canonical_string()
+            )),
+        ));
+        request.mutation = protobuf::MessageField::some(mutation);
+        let response = runtime.status_client().unwrap().create(request).await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+    }
+
+    async fn clear_test_child_finalizers(
+        runtime: &ZoneResourceRuntime,
+        target: &ResourceRef,
+    ) {
+        let current = runtime
+            .committed_resource_value(target, "u6-test-child-finalizer-clear-read")
+            .await
+            .unwrap();
+        let request = public_update_finalizers_request(
+            runtime,
+            &json!({
+                "resourceRef": target.to_canonical_string(),
+                "uid": current["metadata"]["uid"],
+                "expectedRevision": current["metadata"]["revision"],
+                "addFinalizers": [],
+                "removeFinalizers": ["test.d2bus.org/hold"],
+            }),
+            "u6-test-child-finalizer-clear",
+        )
+        .unwrap();
+        let response = runtime.status_client().unwrap().update_finalizers(request).await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+    }
+
+    async fn close_production_guest_runtime_fixture(
+        state: Arc<ServerState>,
+        plane: Arc<ResourcePlane>,
+    ) {
+        state
+            .resource_plane
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let mut plane = Arc::try_unwrap(plane).expect("test plane has one owner");
+        plane.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn qemu_framework_runner_invokes_controller_and_finalizes() {
+        let (_directory, runtime, broker_evidence) = open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "Provider",
+                    "runtime-qemu-media",
+                    &zone,
+                    r#"{"artifactId":"runtime-qemu-media","config":{"controllerExecutionRef":"Host/host-system","networkProviderRef":"Provider/network-local","volumeProviderRef":"Provider/volume-local"}}"#,
+                ),
+                bundle_resource(
+                    "Device",
+                    "host-kvm",
+                    &zone,
+                    r#"{"deviceClass":"emulated","arbitration":"exclusive","maxConcurrentClaims":1,"inventory":{}}"#,
+                ),
+                bundle_resource(
+                    "Guest",
+                    "qemu-delete",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[{"deviceRef":"Device/host-kvm","exclusive":false}],"networkAttachments":[],"providerRef":"Provider/runtime-qemu-media","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+                bundle_resource(
+                    "Guest",
+                    "qemu-ready",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[{"deviceRef":"Device/host-kvm","exclusive":false}],"networkAttachments":[],"providerRef":"Provider/runtime-qemu-media","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+            ],
+        )
+        .await;
+        let delete_guest_ref = ResourceRef::parse("Guest/qemu-delete").unwrap();
+        let ready_guest_ref = ResourceRef::parse("Guest/qemu-ready").unwrap();
+        let device_ref = ResourceRef::parse("Device/host-kvm").unwrap();
+        let provider_ref = ResourceRef::parse("Provider/runtime-qemu-media").unwrap();
+
+        let state = Arc::new(crate::detached_exec_routing_tests::test_state(
+            Default::default(),
+        ));
+        let mut plane = ResourcePlane::new();
+        plane.insert(runtime).unwrap();
+        let plane = crate::install_test_resource_plane(&state, plane);
+        let runtime = plane.zone(&zone).unwrap();
+        runtime
+            .start_u6_controller_runners(Arc::clone(&state))
+            .await
+            .unwrap();
+        assert!(
+            !runtime.u6_runner_tasks.lock().unwrap().is_empty(),
+            "U6 runner did not start"
+        );
+
+        let deleting_guest = wait_for_test_resource(&runtime, &delete_guest_ref, |value| {
+            value["metadata"]["finalizers"]
+                .as_array()
+                .is_some_and(|finalizers| !finalizers.is_empty())
+        })
+        .await;
+        assert_eq!(
+            deleting_guest["metadata"]["finalizers"],
+            serde_json::json!([
+                qemu_media_runtime::FINALIZER
+            ])
+        );
+        let ready_guest = wait_for_test_resource(&runtime, &ready_guest_ref, |value| {
+            value["metadata"]["finalizers"]
+                .as_array()
+                .is_some_and(|finalizers| !finalizers.is_empty())
+        })
+        .await;
+        assert_eq!(ready_guest["status"]["phase"], "Pending");
+        assert_eq!(deleting_guest["status"]["phase"], "Pending");
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Volume/qemu-delete-runtime").unwrap(),
+                    "u6-test-first-finalizer-only",
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Process/qemu-delete-qemu").unwrap(),
+                    "u6-test-first-finalizer-only",
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Volume/qemu-ready-runtime").unwrap(),
+                    "u6-test-first-finalizer-only",
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Process/qemu-ready-qemu").unwrap(),
+                    "u6-test-first-finalizer-only",
+                )
+                .await
+                .is_err()
+        );
+        assert_guest_assignment_fence(
+            &runtime,
+            &delete_guest_ref,
+            &provider_ref,
+            &ResourceRef::parse("Process/runtime-qemu-media-controller").unwrap(),
+        )
+        .await;
+        assert_guest_assignment_fence(
+            &runtime,
+            &ready_guest_ref,
+            &provider_ref,
+            &ResourceRef::parse("Process/runtime-qemu-media-controller").unwrap(),
+        )
+        .await;
+        mark_test_resource_ready(&runtime, &device_ref, &broker_evidence).await;
+        mark_test_resource_ready(&runtime, &provider_ref, &broker_evidence).await;
+        let ready_volume_ref = ResourceRef::parse("Volume/qemu-ready-runtime").unwrap();
+        let ready_process_ref = ResourceRef::parse("Process/qemu-ready-qemu").unwrap();
+        let ready_volume = wait_for_test_resource(&runtime, &ready_volume_ref, |_| true).await;
+        mark_test_resource_ready(&runtime, &ready_volume_ref, &broker_evidence).await;
+        let ready_process = wait_for_test_resource(&runtime, &ready_process_ref, |_| true).await;
+        assert!(
+            ready_process["metadata"]["revision"].as_u64().unwrap()
+                > ready_volume["metadata"]["revision"].as_u64().unwrap()
+        );
+        mark_test_resource_ready(&runtime, &ready_process_ref, &broker_evidence).await;
+        let ready_guest = wait_for_test_resource(&runtime, &ready_guest_ref, |value| {
+            value["status"]["phase"] == "Ready"
+                && value["status"]["observedGeneration"] == value["metadata"]["generation"]
+        })
+        .await;
+        assert_eq!(ready_guest["status"]["phase"], "Ready");
+        assert_eq!(ready_guest["status"]["phase"], "Ready");
+        assert_eq!(ready_guest["status"]["phase"], "Ready");
+
+        let delete_volume_ref = ResourceRef::parse("Volume/qemu-delete-runtime").unwrap();
+        let delete_process_ref = ResourceRef::parse("Process/qemu-delete-qemu").unwrap();
+        wait_for_test_resource(&runtime, &delete_volume_ref, |_| true).await;
+        wait_for_test_resource(&runtime, &delete_process_ref, |_| true).await;
+        add_test_child_finalizer(&runtime, &delete_process_ref).await;
+        request_test_delete(&runtime, &delete_guest_ref).await;
+        let deleting_guest = wait_for_test_resource(&runtime, &delete_guest_ref, |value| {
+            value["metadata"]["deletionRequestedAt"].is_string()
+        })
+        .await;
+        assert_eq!(
+            deleting_guest["metadata"]["finalizers"],
+            serde_json::json!([qemu_media_runtime::FINALIZER])
+        );
+        assert_ne!(deleting_guest["status"]["phase"], "Ready");
+        let requested_child = wait_for_test_resource(&runtime, &delete_process_ref, |value| {
+            value["metadata"]["deletionRequestedAt"].is_string()
+        })
+        .await;
+        assert_eq!(
+            requested_child["metadata"]["finalizers"],
+            serde_json::json!(["test.d2bus.org/hold"])
+        );
+        let child_revision = requested_child["metadata"]["revision"].clone();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let still_requested = runtime
+        .committed_resource_value(&delete_process_ref, "u6-test-no-second-delete")
+            .await
+            .unwrap();
+        assert_eq!(still_requested["metadata"]["revision"], child_revision);
+        let owner_while_child_held = runtime
+        .committed_resource_value(&delete_guest_ref, "u6-test-owner-finalizer-retained")
+        .await
+        .unwrap();
+        assert_eq!(
+        owner_while_child_held["metadata"]["finalizers"],
+        serde_json::json!([qemu_media_runtime::FINALIZER])
+        );
+        clear_test_child_finalizers(&runtime, &delete_process_ref).await;
+        wait_for_test_resource_gone(&runtime, &delete_process_ref).await;
+        wait_for_test_resource_gone(&runtime, &delete_volume_ref).await;
+        wait_for_test_resource_gone(&runtime, &delete_guest_ref).await;
+        drop(runtime);
+        close_production_guest_runtime_fixture(state, plane).await;
+    }
+
+    #[tokio::test]
+    async fn aca_framework_runner_invokes_controller_and_finalizes() {
+        let zone = ZoneId::parse("work").unwrap();
+        let credential = credential_spec("Guest/gateway");
+        let (_directory, state, plane, runtime, broker_evidence) =
+            start_production_guest_runner_fixture(vec![
+                bundle_resource(
+                    "Provider",
+                    "runtime-azure-container-apps",
+                    &zone,
+                    r#"{"artifactId":"runtime-azure-container-apps","config":{"gatewayExecutionRef":"Guest/gateway","tenantId":"tenant","clientId":"client","subscriptionId":"subscription","controlCredentialRef":"Credential/aca-control","pullCredentialRef":null,"environmentId":"environment","resourceGroupId":"resource-group","networkRef":null,"sandboxTransportAlias":"relay","defaults":{"profile":{"profileId":"default","diskImage":{"configuredDisk":{"binding_id":"image-1"}},"cpu":500,"memory":2048,"autoSuspendSecs":300,"sandboxIdentityBindingId":null},"readiness":{"attempts":3,"intervalMs":10},"planTtlMs":1000,"completedOperationCapacity":4}}}"#,
+                ),
+                bundle_resource("Credential", "aca-control", &zone, &credential),
+                bundle_resource(
+                    "Guest",
+                    "gateway",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+                bundle_resource(
+                    "Guest",
+                    "aca-delete",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"executionRef":"Guest/gateway","deviceAttachments":[],"networkAttachments":[],"providerRef":"Provider/runtime-azure-container-apps","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+                bundle_resource(
+                    "Guest",
+                    "aca-ready",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"executionRef":"Guest/gateway","deviceAttachments":[],"networkAttachments":[],"providerRef":"Provider/runtime-azure-container-apps","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+            ])
+            .await;
+        let provider_ref = ResourceRef::parse("Provider/runtime-azure-container-apps").unwrap();
+        let credential_ref = ResourceRef::parse("Credential/aca-control").unwrap();
+        let gateway_ref = ResourceRef::parse("Guest/gateway").unwrap();
+
+        let delete_guest_ref = ResourceRef::parse("Guest/aca-delete").unwrap();
+        let ready_guest_ref = ResourceRef::parse("Guest/aca-ready").unwrap();
+        let deleting_guest = wait_for_test_resource(&runtime, &delete_guest_ref, |value| {
+            value["metadata"]["finalizers"]
+                .as_array()
+                .is_some_and(|finalizers| !finalizers.is_empty())
+        })
+        .await;
+        let ready_guest = wait_for_test_resource(&runtime, &ready_guest_ref, |value| {
+            value["metadata"]["finalizers"]
+                .as_array()
+                .is_some_and(|finalizers| !finalizers.is_empty())
+        })
+        .await;
+        assert_eq!(
+            deleting_guest["metadata"]["finalizers"],
+            serde_json::json!([aca_runtime::FINALIZER])
+        );
+        assert_eq!(
+            ready_guest["metadata"]["finalizers"],
+            serde_json::json!([aca_runtime::FINALIZER])
+        );
+        assert_eq!(deleting_guest["status"]["phase"], "Pending");
+        assert_eq!(ready_guest["status"]["phase"], "Pending");
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Endpoint/aca-delete-sandbox-agent").unwrap(),
+                    "u6-test-first-finalizer-only",
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .committed_resource_value(
+                    &ResourceRef::parse("Endpoint/aca-ready-sandbox-agent").unwrap(),
+                    "u6-test-first-finalizer-only",
+                )
+                .await
+                .is_err()
+        );
+        assert_guest_assignment_fence(
+            &runtime,
+            &delete_guest_ref,
+            &provider_ref,
+            &ResourceRef::parse("Process/aca-controller").unwrap(),
+        )
+        .await;
+        assert_guest_assignment_fence(
+            &runtime,
+            &ready_guest_ref,
+            &provider_ref,
+            &ResourceRef::parse("Process/aca-controller").unwrap(),
+        )
+        .await;
+        mark_test_resource_ready(&runtime, &provider_ref, &broker_evidence).await;
+        mark_test_resource_ready(&runtime, &credential_ref, &broker_evidence).await;
+        mark_test_resource_ready(&runtime, &gateway_ref, &broker_evidence).await;
+        let ready_endpoint_ref = ResourceRef::parse("Endpoint/aca-ready-sandbox-agent").unwrap();
+        wait_for_test_resource(&runtime, &ready_endpoint_ref, |_| true).await;
+        mark_test_resource_ready(&runtime, &ready_endpoint_ref, &broker_evidence).await;
+        let ready_guest = wait_for_test_resource(&runtime, &ready_guest_ref, |value| {
+            value["status"]["phase"] == "Ready"
+                && value["status"]["observedGeneration"] == value["metadata"]["generation"]
+        })
+        .await;
+        assert_eq!(ready_guest["status"]["phase"], "Ready");
+
+        let delete_endpoint_ref = ResourceRef::parse("Endpoint/aca-delete-sandbox-agent").unwrap();
+        wait_for_test_resource(&runtime, &delete_endpoint_ref, |_| true).await;
+        add_test_child_finalizer(&runtime, &delete_endpoint_ref).await;
+        request_test_delete(&runtime, &delete_guest_ref).await;
+        let deleting_guest = wait_for_test_resource(&runtime, &delete_guest_ref, |value| {
+            value["metadata"]["deletionRequestedAt"].is_string()
+        })
+        .await;
+        assert_eq!(
+            deleting_guest["metadata"]["finalizers"],
+            serde_json::json!([aca_runtime::FINALIZER])
+        );
+        assert_ne!(deleting_guest["status"]["phase"], "Ready");
+        let requested_child = wait_for_test_resource(&runtime, &delete_endpoint_ref, |value| {
+            value["metadata"]["deletionRequestedAt"].is_string()
+        })
+        .await;
+        assert_eq!(
+            requested_child["metadata"]["finalizers"],
+            serde_json::json!(["test.d2bus.org/hold"])
+        );
+        let child_revision = requested_child["metadata"]["revision"].clone();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let still_requested = runtime
+            .committed_resource_value(&delete_endpoint_ref, "u6-test-no-second-delete")
+            .await
+            .unwrap();
+        assert_eq!(still_requested["metadata"]["revision"], child_revision);
+        let owner_while_child_held = runtime
+            .committed_resource_value(&delete_guest_ref, "u6-test-owner-finalizer-retained")
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_while_child_held["metadata"]["finalizers"],
+            serde_json::json!([aca_runtime::FINALIZER])
+        );
+        clear_test_child_finalizers(&runtime, &delete_endpoint_ref).await;
+        wait_for_test_resource_gone(&runtime, &delete_endpoint_ref).await;
+        wait_for_test_resource_gone(&runtime, &delete_guest_ref).await;
+        drop(runtime);
+        close_production_guest_runtime_fixture(state, plane).await;
+    }
+
+    #[tokio::test]
+    async fn azure_vm_framework_runner_invokes_controller_and_finalizes() {
+        let zone = ZoneId::parse("work").unwrap();
+        let credential = credential_spec("Guest/gateway");
+        let provider_config = azure_vm_runtime::AzureVmConfig {
+            tenant_id: Some(d2b_contracts::OpaqueAzureRef::parse("tenant").unwrap()),
+            client_id: None,
+            arm_credential_ref: ResourceRef::parse("Credential/azure-arm").unwrap(),
+            controller_execution_ref: ResourceRef::parse("Guest/gateway").unwrap(),
+            network_ref: None,
+        };
+        let provider_spec = format!(
+            r#"{{"artifactId":"runtime-azure-virtual-machine","config":{}}}"#,
+            serde_json::to_string(&provider_config).unwrap()
+        );
+        let guest_spec = r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"providerRef":"Provider/runtime-azure-virtual-machine","systemArtifactId":null,"volumeAttachmentDefaults":[],"executionRef":"Guest/hold"}"#;
+        let ready_guest_spec = guest_spec.replace("Guest/hold", "Guest/gateway");
+        let (_directory, state, plane, runtime, broker_evidence) =
+            prepare_production_guest_runner_fixture(vec![
+                bundle_resource(
+                    "Provider",
+                    "runtime-azure-virtual-machine",
+                    &zone,
+                    &provider_spec,
+                ),
+                bundle_resource("Credential", "azure-arm", &zone, &credential),
+                bundle_resource(
+                    "Guest",
+                    "gateway",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+                bundle_resource(
+                    "Guest",
+                    "hold",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+                bundle_resource_with_annotations(
+                    "Guest",
+                    "azure-vm-delete",
+                    &zone,
+                    guest_spec,
+                    BTreeMap::from([(
+                        "d2b.test/azure-vm-settings".to_owned(),
+                        "framework".to_owned(),
+                    )]),
+                ),
+                bundle_resource_with_annotations(
+                    "Guest",
+                    "azure-vm-ready",
+                    &zone,
+                    &ready_guest_spec,
+                    BTreeMap::from([(
+                        "d2b.test/azure-vm-settings".to_owned(),
+                        "framework".to_owned(),
+                    )]),
+                ),
+            ])
+            .await;
+        let provider_ref = ResourceRef::parse("Provider/runtime-azure-virtual-machine").unwrap();
+        let credential_ref = ResourceRef::parse("Credential/azure-arm").unwrap();
+        let gateway_ref = ResourceRef::parse("Guest/gateway").unwrap();
+        mark_test_resource_ready(&runtime, &provider_ref, &broker_evidence).await;
+        mark_test_resource_ready(&runtime, &credential_ref, &broker_evidence).await;
+        mark_test_resource_ready(&runtime, &gateway_ref, &broker_evidence).await;
+        wait_for_test_resource(&runtime, &provider_ref, |value| {
+            value["status"]["phase"] == "Ready"
+        })
+        .await;
+        wait_for_test_resource(&runtime, &credential_ref, |value| {
+            value["status"]["phase"] == "Ready"
+        })
+        .await;
+        wait_for_test_resource(&runtime, &gateway_ref, |value| {
+            value["status"]["phase"] == "Ready"
+        })
+        .await;
+        runtime
+            .start_u6_controller_runners(Arc::clone(&state))
+            .await
+            .unwrap();
+
+        let delete_guest_ref = ResourceRef::parse("Guest/azure-vm-delete").unwrap();
+        let ready_guest_ref = ResourceRef::parse("Guest/azure-vm-ready").unwrap();
+        let deleting_guest = wait_for_test_resource(&runtime, &delete_guest_ref, |value| {
+            value["metadata"]["finalizers"]
+                .as_array()
+                .is_some_and(|finalizers| !finalizers.is_empty())
+        })
+        .await;
+        let ready_guest = wait_for_test_resource(&runtime, &ready_guest_ref, |value| {
+            value["metadata"]["finalizers"]
+                .as_array()
+                .is_some_and(|finalizers| !finalizers.is_empty())
+        })
+        .await;
+        assert_eq!(
+            deleting_guest["metadata"]["finalizers"],
+            serde_json::json!([azure_vm_runtime::FINALIZER])
+        );
+        assert_eq!(
+            ready_guest["metadata"]["finalizers"],
+            serde_json::json!([azure_vm_runtime::FINALIZER])
+        );
+        assert_eq!(deleting_guest["status"]["phase"], "Pending");
+        assert_eq!(ready_guest["status"]["phase"], "Pending");
+        assert_guest_assignment_fence(
+            &runtime,
+            &delete_guest_ref,
+            &provider_ref,
+            &ResourceRef::parse("Process/azure-vm-controller-process").unwrap(),
+        )
+        .await;
+        assert_guest_assignment_fence(
+            &runtime,
+            &ready_guest_ref,
+            &provider_ref,
+            &ResourceRef::parse("Process/azure-vm-controller-process").unwrap(),
+        )
+        .await;
+        let child_ref = ResourceRef::parse("Process/azure-vm-child").unwrap();
+        create_test_child(&runtime, &delete_guest_ref, &child_ref).await;
+        add_test_child_finalizer(&runtime, &child_ref).await;
+        request_test_delete(&runtime, &delete_guest_ref).await;
+        let ready_guest = wait_for_test_resource(&runtime, &ready_guest_ref, |value| {
+            value["status"]["phase"] == "Ready"
+                && value["status"]["observedGeneration"] == value["metadata"]["generation"]
+        })
+        .await;
+        assert_eq!(ready_guest["status"]["phase"], "Ready");
+        let deleting_guest = wait_for_test_resource(&runtime, &delete_guest_ref, |value| {
+            value["metadata"]["deletionRequestedAt"].is_string()
+        })
+        .await;
+        assert_eq!(
+            deleting_guest["metadata"]["finalizers"],
+            serde_json::json!([azure_vm_runtime::FINALIZER])
+        );
+        assert_ne!(deleting_guest["status"]["phase"], "Ready");
+        let requested_child = wait_for_test_resource(&runtime, &child_ref, |value| {
+            value["metadata"]["deletionRequestedAt"].is_string()
+        })
+        .await;
+        assert_eq!(
+            requested_child["metadata"]["finalizers"],
+            serde_json::json!(["test.d2bus.org/hold"])
+        );
+        let child_revision = requested_child["metadata"]["revision"].clone();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let still_requested = runtime
+            .committed_resource_value(&child_ref, "u6-test-no-second-delete")
+            .await
+            .unwrap();
+        assert_eq!(still_requested["metadata"]["revision"], child_revision);
+        let owner_while_child_held = runtime
+            .committed_resource_value(&delete_guest_ref, "u6-test-owner-finalizer-retained")
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_while_child_held["metadata"]["finalizers"],
+            serde_json::json!([azure_vm_runtime::FINALIZER])
+        );
+        clear_test_child_finalizers(&runtime, &child_ref).await;
+        wait_for_test_resource_gone(&runtime, &child_ref).await;
+        wait_for_test_resource_gone(&runtime, &delete_guest_ref).await;
+        drop(runtime);
+        close_production_guest_runtime_fixture(state, plane).await;
     }
 }

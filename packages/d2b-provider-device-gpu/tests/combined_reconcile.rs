@@ -3,9 +3,10 @@ use d2b_contracts_resource::v3::{
 };
 use d2b_provider_device_gpu::{
     GpuAuthorityAdmission, GpuAuthorityLease, GpuBackingToken, GpuClosureProof, GpuController,
-    GpuEffectError, GpuEffectToken, GpuEffectTokenSet, GpuLaunchTicket, GpuLifecycleEffectPort,
-    GpuOwnerProof, GpuPlatformToken, GpuPrincipalToken, GpuProcessIdentity, GpuProcessObservation,
-    GpuProcessRole, GpuReconcileOutcome, GpuSettings, GpuWorkerSpec, VideoWorkerSpec,
+    GpuDependentResource, GpuEffectError, GpuEffectPort, GpuEffectToken, GpuEffectTokenSet,
+    GpuLaunchTicket, GpuLifecycleEffectPort, GpuOwnerProof, GpuPlatformToken, GpuPrincipalToken,
+    GpuProcessIdentity, GpuProcessObservation, GpuProcessRole, GpuReconcileOutcome, GpuSettings,
+    GpuWorkerSpec, VideoWorkerSpec,
 };
 
 #[derive(Default)]
@@ -110,6 +111,29 @@ impl GpuLifecycleEffectPort for FakePort {
     }
 }
 
+impl GpuEffectPort for FakePort {
+    fn open_devices(
+        &mut self,
+        _: &ResourceUid,
+        _: &GpuEffectTokenSet,
+    ) -> Result<GpuLaunchTicket, GpuEffectError> {
+        Ok(GpuLaunchTicket::from_core([2; 16]))
+    }
+
+    fn start(
+        &mut self,
+        role: GpuProcessRole,
+        _: &GpuLaunchTicket,
+    ) -> Result<(), GpuEffectError> {
+        self.starts.push(role);
+        Ok(())
+    }
+
+    fn stop(&mut self, _: GpuProcessRole) -> Result<(), GpuEffectError> {
+        Ok(())
+    }
+}
+
 #[test]
 fn video_starts_only_after_gpu_worker_is_ready() {
     let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
@@ -148,6 +172,47 @@ fn video_starts_only_after_gpu_worker_is_ready() {
     assert_eq!(
         port.starts,
         [GpuProcessRole::FullGpu, GpuProcessRole::Video]
+    );
+}
+
+#[test]
+fn direct_reconcile_is_fenced_until_authority_is_reserved() {
+    let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+    let owner = GpuOwnerProof::new(
+        ResourceRef::parse("Zone/dev").unwrap(),
+        ResourceRef::parse("Guest/workload").unwrap(),
+        uid.clone(),
+        ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap(),
+        ResourceGeneration::new(1).unwrap(),
+    )
+    .unwrap();
+    let admission = GpuAuthorityAdmission::new(
+        owner,
+        GpuBackingToken::from_core([7; 32]),
+        GpuPlatformToken::from_core([8; 32]),
+        DeviceArbitration::Exclusive,
+        1,
+        false,
+        GpuPrincipalToken::from_core([9; 32]),
+    )
+    .unwrap();
+    let tokens = GpuEffectTokenSet::from_core(vec![GpuEffectToken::from_core([2; 32])]).unwrap();
+    let mut controller =
+        GpuController::new_authorized(admission, GpuSettings::default(), tokens).unwrap();
+    let mut port = FakePort::default();
+
+    assert_eq!(
+        controller.reconcile(&mut port),
+        Err(d2b_provider_device_gpu::GpuControllerError::Authority(
+            d2b_provider_device_gpu::GpuAuthorityError::StartupRehydrationRequired
+        ))
+    );
+    assert!(port.starts.is_empty());
+    assert_eq!(
+        controller.finalize(&mut port),
+        Err(d2b_provider_device_gpu::GpuControllerError::Authority(
+            d2b_provider_device_gpu::GpuAuthorityError::StartupRehydrationRequired
+        ))
     );
 }
 
@@ -356,4 +421,59 @@ fn mismatched_matching_observation_is_quarantined() {
         controller.phase(),
         d2b_provider_device_gpu::GpuPhase::Quarantined
     );
+}
+
+#[test]
+fn gpu_upgrade_requires_dependents_to_drain_before_replacement() {
+    let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+    let owner = GpuOwnerProof::new(
+        ResourceRef::parse("Zone/dev").unwrap(),
+        ResourceRef::parse("Guest/workload").unwrap(),
+        uid.clone(),
+        ResourceUid::parse("223e4567-e89b-42d3-a456-426614174001").unwrap(),
+        ResourceGeneration::new(1).unwrap(),
+    )
+    .unwrap();
+    let admission = GpuAuthorityAdmission::new(
+        owner,
+        GpuBackingToken::from_core([7; 32]),
+        GpuPlatformToken::from_core([8; 32]),
+        DeviceArbitration::Exclusive,
+        1,
+        false,
+        GpuPrincipalToken::from_core([9; 32]),
+    )
+    .unwrap();
+    let tokens = GpuEffectTokenSet::from_core(vec![GpuEffectToken::from_core([2; 32])]).unwrap();
+    let mut controller =
+        GpuController::new_authorized(admission, GpuSettings::default(), tokens).unwrap();
+    let desired = GpuSettings {
+        vulkan: false,
+        ..GpuSettings::default()
+    };
+    let dependency = GpuDependentResource::new(
+        ResourceRef::parse("Guest/workload").unwrap(),
+        true,
+        false,
+    )
+    .unwrap();
+    let plan = controller
+        .plan_upgrade(desired, std::slice::from_ref(&dependency))
+        .unwrap();
+    assert_eq!(
+        controller.execute_upgrade(&plan, &mut FakePort::default()),
+        Err(d2b_provider_device_gpu::GpuControllerError::DependenciesNotDrained)
+    );
+}
+
+#[test]
+fn gpu_runner_contract_disables_legacy_scheduling() {
+    let contract = d2b_provider_device_gpu::gpu_runner_contract();
+    assert_eq!(contract.resource_type(), "Device");
+    assert_eq!(
+        contract.finalizer(),
+        d2b_provider_device_gpu::DEVICE_GPU_FINALIZER
+    );
+    assert!(contract.watched_configuration_is_dependency());
+    assert!((30..=60).contains(&contract.repair_interval_secs()));
 }

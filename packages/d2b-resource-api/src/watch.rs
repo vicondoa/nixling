@@ -10,15 +10,13 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use d2b_contracts_resource::v3::{
-    ResourceName, ResourceRef, ResourceTypeName, ResourceUid, ZoneRevision,
-};
+use d2b_contracts_resource::v3::{ResourceRef, ResourceUid, ZoneRevision};
 use d2b_resource_store::{StoreError, StoreErrorKind, StoreWatchReceipt, StoreWatchRequest};
 use d2b_resource_store_redb::{
-    ChangeEvent, RedbResourceStore, SharedChangeBatch, WatchRegistrationId, WatchSignals,
-    WatchStream,
+    ChangeEvent, OwnerChangeEvent, RedbResourceStore, SharedChangeBatch, WatchRegistrationId,
+    WatchSignals, WatchStream,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 
 /// One immutable encoded watch delivery.
 #[derive(Clone, PartialEq, Eq)]
@@ -69,6 +67,7 @@ pub struct WatchOwnerHint {
     child_uid: ResourceUid,
     revision: ZoneRevision,
     event: ChangeEvent,
+    owner_event: OwnerChangeEvent,
 }
 
 impl core::fmt::Debug for WatchOwnerHint {
@@ -79,6 +78,7 @@ impl core::fmt::Debug for WatchOwnerHint {
             .field("child_kind", &self.child_ref.resource_type())
             .field("revision", &self.revision)
             .field("event", &self.event)
+            .field("owner_event", &self.owner_event)
             .finish()
     }
 }
@@ -112,6 +112,11 @@ impl WatchOwnerHint {
     /// Return the child-change event.
     pub const fn event(&self) -> ChangeEvent {
         self.event
+    }
+
+    /// Return the owner-trigger event, including reparent transitions.
+    pub const fn owner_event(&self) -> OwnerChangeEvent {
+        self.owner_event
     }
 }
 
@@ -331,9 +336,7 @@ fn encode_frame(batch: SharedChangeBatch) -> Result<WatchFrame, StoreError> {
     let mut owner_hints = Vec::new();
     for entry in batch.entries() {
         let value = serde_json::to_value(entry).map_err(|_| frame_integrity())?;
-        if let Some(hint) = owner_hint(&value, batch.revision()) {
-            owner_hints.push(hint);
-        }
+        owner_hints.extend(owner_hints_for_entry(entry, batch.revision()));
         entries.push(value);
     }
     let owner_hints_wire = owner_hints
@@ -346,6 +349,7 @@ fn encode_frame(batch: SharedChangeBatch) -> Result<WatchFrame, StoreError> {
                 "childUid": hint.child_uid().as_str(),
                 "revision": hint.revision().get(),
                 "event": hint.event(),
+                "ownerEvent": hint.owner_event(),
             })
         })
         .collect::<Vec<_>>();
@@ -362,42 +366,65 @@ fn encode_frame(batch: SharedChangeBatch) -> Result<WatchFrame, StoreError> {
     })
 }
 
-fn owner_hint(value: &Value, revision: ZoneRevision) -> Option<WatchOwnerHint> {
-    let owner_uid = value
-        .get("owner_uid")
-        .and_then(Value::as_str)
-        .and_then(|value| ResourceUid::parse(value).ok())?;
-    let child_uid = value
-        .get("resource_uid")
-        .and_then(Value::as_str)
-        .and_then(|value| ResourceUid::parse(value).ok())?;
-    let resource_type = value
-        .get("resource_type")
-        .and_then(Value::as_str)
-        .and_then(|value| ResourceTypeName::parse(value).ok())?;
-    let resource_name = value
-        .get("resource_name")
-        .and_then(Value::as_str)
-        .and_then(|value| ResourceName::parse(value).ok())?;
-    let event = value
-        .get("event")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<ChangeEvent>(value).ok())?;
-    let owner_ref = value
-        .get("canonical_resource")
-        .and_then(|value| serde_json::from_value::<Vec<u8>>(value.clone()).ok())
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|resource| resource.pointer("/metadata/ownerRef").cloned())
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .and_then(|value| ResourceRef::parse(&value).ok());
-    Some(WatchOwnerHint {
-        owner_ref,
-        owner_uid,
-        child_ref: ResourceRef::new(resource_type, resource_name),
-        child_uid,
-        revision,
-        event,
-    })
+fn owner_hints_for_entry(
+    entry: &d2b_resource_store_redb::ChangeEntry,
+    revision: ZoneRevision,
+) -> Vec<WatchOwnerHint> {
+    let child_ref = ResourceRef::new(entry.resource_type().clone(), entry.resource_name().clone());
+    let mut hints = Vec::new();
+    let current_owner = entry
+        .owner_ref()
+        .zip(entry.owner_uid())
+        .map(|(owner_ref, owner_uid)| (owner_ref.clone(), owner_uid.clone()));
+    let current_owner = current_owner.or_else(|| {
+        (entry.event() == ChangeEvent::Deleted || entry.event() == ChangeEvent::DeletionRequested)
+            .then(|| {
+                entry
+                    .previous_owner_ref()
+                    .zip(entry.previous_owner_uid())
+                    .map(|(owner_ref, owner_uid)| (owner_ref.clone(), owner_uid.clone()))
+            })
+            .flatten()
+    });
+    if let (Some(owner_ref), Some(owner_uid)) =
+        (entry.previous_owner_ref(), entry.previous_owner_uid())
+    {
+        if current_owner.as_ref() != Some(&(owner_ref.clone(), owner_uid.clone())) {
+            hints.push(WatchOwnerHint {
+                owner_ref: Some(owner_ref.clone()),
+                owner_uid: owner_uid.clone(),
+                child_ref: child_ref.clone(),
+                child_uid: entry.resource_uid().clone(),
+                revision,
+                event: ChangeEvent::MetadataUpdated,
+                owner_event: OwnerChangeEvent::Reparented,
+            });
+        }
+    }
+    if let Some((owner_ref, owner_uid)) = current_owner {
+        hints.push(WatchOwnerHint {
+            owner_ref: Some(owner_ref),
+            owner_uid,
+            child_ref,
+            child_uid: entry.resource_uid().clone(),
+            revision,
+            event: entry.event(),
+            owner_event: owner_change_event(entry.event()),
+        });
+    }
+
+    const fn owner_change_event(event: ChangeEvent) -> OwnerChangeEvent {
+        match event {
+            ChangeEvent::Created => OwnerChangeEvent::Created,
+            ChangeEvent::SpecUpdated => OwnerChangeEvent::SpecUpdated,
+            ChangeEvent::StatusUpdated => OwnerChangeEvent::StatusUpdated,
+            ChangeEvent::MetadataUpdated => OwnerChangeEvent::MetadataUpdated,
+            ChangeEvent::FinalizersUpdated => OwnerChangeEvent::FinalizersUpdated,
+            ChangeEvent::DeletionRequested => OwnerChangeEvent::DeletionRequested,
+            ChangeEvent::Deleted => OwnerChangeEvent::Deleted,
+        }
+    }
+    hints
 }
 
 fn frame_integrity() -> StoreError {
@@ -431,6 +458,7 @@ mod tests {
         StoreOperationContext, StoreProjection, StoreSlot,
     };
     use d2b_resource_store_redb::{StoreIdentity, write_provisioning_marker};
+    use serde_json::Value;
 
     use super::*;
 
@@ -695,6 +723,10 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+        assert_eq!(
+            frames[1].owner_hints()[0].owner_event(),
+            OwnerChangeEvent::Created
         );
     }
 

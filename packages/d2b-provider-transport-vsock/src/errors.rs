@@ -93,6 +93,10 @@ pub enum ServiceError {
     SessionNotReady,
     /// The supplied session is not bound to this Provider's Guest/Zone.
     SessionIdentityMismatch,
+    /// The request carried a zero reconnect generation.
+    InvalidSessionGeneration,
+    /// The request generation does not match the authenticated session.
+    SessionGenerationMismatch,
     /// The request's endpoint ID is malformed.
     InvalidEndpointId,
     /// The request's binding ID is malformed.
@@ -117,6 +121,8 @@ impl ServiceError {
         match self {
             Self::SessionNotReady => "session-not-ready",
             Self::SessionIdentityMismatch => "session-identity-mismatch",
+            Self::InvalidSessionGeneration => "invalid-session-generation",
+            Self::SessionGenerationMismatch => "session-generation-mismatch",
             Self::InvalidEndpointId => "invalid-endpoint-id",
             Self::InvalidBindingId => "invalid-binding-id",
             Self::InvalidDeadline => "invalid-deadline",

@@ -95,6 +95,10 @@
           cp -r ${./packages/d2b-provider-audio-pipewire} $out/packages/d2b-provider-audio-pipewire
           cp -r ${./packages/d2b-provider-clipboard-wayland} $out/packages/d2b-provider-clipboard-wayland
           cp -r ${./packages/d2b-provider-config-nixos} $out/packages/d2b-provider-config-nixos
+          cp -r ${./packages/d2b-provider-credential-entra} $out/packages/d2b-provider-credential-entra
+          cp -r ${./packages/d2b-provider-credential-managed-identity} $out/packages/d2b-provider-credential-managed-identity
+          cp -r ${./packages/d2b-provider-credential-secret-service} $out/packages/d2b-provider-credential-secret-service
+          cp -r ${./packages/d2b-provider-device-gpu} $out/packages/d2b-provider-device-gpu
           cp -r ${./packages/d2b-provider-device-security-key} $out/packages/d2b-provider-device-security-key
           cp -r ${./packages/d2b-provider-device-tpm} $out/packages/d2b-provider-device-tpm
           cp -r ${./packages/d2b-provider-device-usbip} $out/packages/d2b-provider-device-usbip
@@ -103,7 +107,9 @@
           cp -r ${./packages/d2b-provider-notification-desktop} $out/packages/d2b-provider-notification-desktop
           cp -r ${./packages/d2b-provider-observability-otel} $out/packages/d2b-provider-observability-otel
           cp -r ${./packages/d2b-provider-runtime-azure-container-apps} $out/packages/d2b-provider-runtime-azure-container-apps
+          cp -r ${./packages/d2b-provider-runtime-azure-virtual-machine} $out/packages/d2b-provider-runtime-azure-virtual-machine
           cp -r ${./packages/d2b-provider-runtime-cloud-hypervisor} $out/packages/d2b-provider-runtime-cloud-hypervisor
+          cp -r ${./packages/d2b-provider-runtime-qemu-media} $out/packages/d2b-provider-runtime-qemu-media
           cp -r ${./packages/d2b-provider-shell-terminal} $out/packages/d2b-provider-shell-terminal
           cp -r ${./packages/d2b-provider-supervisor} $out/packages/d2b-provider-supervisor
           cp -r ${./packages/d2b-provider-system-core} $out/packages/d2b-provider-system-core
@@ -112,6 +118,7 @@
           cp -r ${./packages/d2b-provider-toolkit} $out/packages/d2b-provider-toolkit
           cp -r ${./packages/d2b-provider-transport-azure-relay} $out/packages/d2b-provider-transport-azure-relay
           cp -r ${./packages/d2b-provider-volume-local} $out/packages/d2b-provider-volume-local
+          cp -r ${./packages/d2b-provider-volume-virtiofs} $out/packages/d2b-provider-volume-virtiofs
           cp -r ${./packages/d2b-resource-api} $out/packages/d2b-resource-api
           cp -r ${./packages/d2b-resource-store} $out/packages/d2b-resource-store
           cp -r ${./packages/d2b-resource-store-redb} $out/packages/d2b-resource-store-redb
@@ -398,6 +405,30 @@
         providerArtifact = import ./nix/provider-artifact.nix {
           inherit pkgs;
         };
+        providerCatalogShape =
+          import ./nixos-modules/generated/provider-catalog-shape.nix;
+        providerMatrixJson = builtins.toJSON {
+          schemaVersion = 1;
+          artifactLayout = providerCatalogShape.artifactLayout;
+          fixedBootstrapProviderIds =
+            providerCatalogShape.fixedBootstrapProviderIds;
+          providerIds = providerCatalogShape.providerIds;
+          providers = providerCatalogShape.providerMatrix;
+        };
+        providerMatrix = pkgs.writeText
+          "d2b-provider-matrix.json"
+          "${providerMatrixJson}\n";
+        providerTestController = rustWorkspace {
+          pname = "d2b-provider-test-controller";
+          cargoBuildFlags = [
+            "--package"
+            "d2b-provider-test-controller"
+            "--bin"
+            "d2b-provider-test-controller"
+          ];
+          doCheck = false;
+          meta.mainProgram = "d2b-provider-test-controller";
+        };
         cloudHypervisorController = rustWorkspace {
           pname = "d2b-cloud-hypervisor-controller";
           cargoBuildFlags = [
@@ -421,22 +452,6 @@
           packageName = "d2b-provider-runtime-cloud-hypervisor";
           signatureId = "default";
         };
-        # The canonical Provider package surface is present before semantic
-        # Provider artifacts are implemented. These outputs compile each
-        # Provider crate and publish only a scaffold marker; owning Provider
-        # units replace the marker with their signed artifact layout.
-        providerScaffoldPackage = packageName:
-          rustWorkspace {
-            pname = packageName;
-            cargoBuildFlags = [ "--package" packageName ];
-            doCheck = false;
-            installPhase = ''
-              runHook preInstall
-              mkdir -p "$out/share/d2b/provider"
-              printf '%s\n' "${packageName}" > "$out/share/d2b/provider/scaffold"
-              runHook postInstall
-            '';
-          };
       in {
         manpages = pkgs.runCommand "d2b-manpages" { } ''
           install -Dm644 ${./docs/manpages/d2b.1} "$out/share/man/man1/d2b.1"
@@ -508,32 +523,10 @@
           doCheck = false;
           meta.mainProgram = "d2b-resource-compiler";
         };
-        d2b-provider-activation-nixos =
-          providerScaffoldPackage "d2b-provider-activation-nixos";
-        d2b-provider-audio-pipewire =
-          providerScaffoldPackage "d2b-provider-audio-pipewire";
-        d2b-provider-clipboard-wayland =
-          providerScaffoldPackage "d2b-provider-clipboard-wayland";
-        d2b-provider-display-wayland =
-          providerScaffoldPackage "d2b-provider-display-wayland";
-        d2b-provider-notification-desktop =
-          providerScaffoldPackage "d2b-provider-notification-desktop";
-        d2b-provider-runtime-azure-container-apps =
-          providerScaffoldPackage "d2b-provider-runtime-azure-container-apps";
-        d2b-provider-runtime-azure-virtual-machine =
-          providerScaffoldPackage "d2b-provider-runtime-azure-virtual-machine";
+        d2b-provider-test-controller = providerTestController;
         d2b-provider-runtime-cloud-hypervisor =
           cloudHypervisorArtifact.package;
-        d2b-provider-runtime-qemu-media =
-          providerScaffoldPackage "d2b-provider-runtime-qemu-media";
-        d2b-provider-shell-terminal =
-          providerScaffoldPackage "d2b-provider-shell-terminal";
-        d2b-provider-transport-azure-relay =
-          providerScaffoldPackage "d2b-provider-transport-azure-relay";
-        d2b-provider-transport-unix =
-          providerScaffoldPackage "d2b-provider-transport-unix";
-        d2b-provider-transport-vsock =
-          providerScaffoldPackage "d2b-provider-transport-vsock";
+        provider-matrix = providerMatrix;
 
         signoz = import ./pkgs/signoz { inherit pkgs; };
         signozOtelCollector = import ./pkgs/signoz-otel-collector { inherit pkgs; };
@@ -629,6 +622,7 @@
                   lib = self.lib // {
                     d2bHostToolOverrides =
                       bazelHostTools.d2bHostToolOverrides;
+                    d2bHostToolBundle = bazelHostTools.package;
                     evalGuest = args: self.lib.evalGuest (args // {
                       d2bHostToolOverrides =
                         bazelHostTools.d2bHostToolOverrides;
@@ -1410,6 +1404,15 @@
       lib = nixpkgs.lib.makeExtensible (_: {
         evalFixture = system: self.checks.${system}.eval-fixture-contracts.fixtureData;
         buildProviderElfShim = providerElfShim;
+        providerMatrix =
+          (import ./nixos-modules/generated/provider-catalog-shape.nix)
+            .providerMatrix;
+        providerIds =
+          (import ./nixos-modules/generated/provider-catalog-shape.nix)
+            .providerIds;
+        providerArtifactLayout =
+          (import ./nixos-modules/generated/provider-catalog-shape.nix)
+            .artifactLayout;
         mkProviderArtifact = args:
           let
             system = args.system or builtins.currentSystem;

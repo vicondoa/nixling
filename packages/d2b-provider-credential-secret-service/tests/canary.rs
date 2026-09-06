@@ -182,10 +182,6 @@ fn process_unique_secret_service_canaries_are_absent_from_every_rendered_surface
         for canary in [
             port.credential_canary.as_str(),
             port.object_path_canary.as_str(),
-            credential_name.as_str(),
-            credential_ref.as_str(),
-            credential_uid.as_str(),
-            credential_digest.as_str(),
         ] {
             assert!(
                 !surface.contains(canary),

@@ -9,7 +9,15 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = "0.1"
 d2b-contracts-provider = { path = "../d2b-contracts-provider", version = "0.0.0-bootstrap" }
 d2b-contracts-zone-session = { path = "../d2b-contracts-zone-session", version = "0.0.0-bootstrap" }
 d2b-contracts-resource = { path = "../d2b-contracts-resource", version = "0.0.0-bootstrap" }
+d2b-provider-toolkit = { path = "../d2b-provider-toolkit", version = "0.0.0-bootstrap" }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[dev-dependencies]
+d2b-session = { path = "../d2b-session", version = "0.0.0-bootstrap" }
+d2b-session-unix = { path = "../d2b-session-unix", version = "0.0.0-bootstrap" }
+ttrpc = { version = "0.9.0", default-features = false, features = ["async", "sync"] }

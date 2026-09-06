@@ -3,7 +3,7 @@
 //! The fixture deliberately stops at the Provider contract boundary. It
 //! carries a descriptor, a Zone path, and bounded canonical payloads; it does
 //! not open a session, resolve a route, or perform an effect. That makes the
-//! same fake useful for registry, RPC, and generated-server tests.
+//! same fake useful for registry, typed service, and generated-server tests.
 
 use std::{
     future::ready,
@@ -13,6 +13,7 @@ use std::{
     },
 };
 
+use d2b_contracts_provider::v3::SpecifiedProviderMethod;
 use d2b_contracts_resource::v3::identity::{
     AuthenticatedSubjectContext, BindingDigest, EvidenceClass, Locality, ReconnectGeneration,
     ServiceName, SessionBinding, SessionPurpose, TranscriptHash, TransportBinding,
@@ -21,15 +22,11 @@ use d2b_contracts_resource::v3::{
     CanonicalJsonObject, ConfigurationGeneration, ResourceGeneration, ResourceName, ResourceRef,
     ResourceTypeName, ResourceUid, SchemaFingerprint, execution_policy::BoundedToken,
 };
-use d2b_contracts_zone_session::v3::{
-    ProviderMethod,
-    zone_routing::{ZoneLabelId, ZonePath},
-};
+use d2b_contracts_zone_session::v3::zone_routing::{ZoneLabelId, ZonePath};
 use d2b_provider::{
     ProviderAgentError, ProviderAgentRequest, ProviderAgentResponse, ProviderAgentService,
     ProviderCapabilitySet, ProviderClass, ProviderDescriptor, ProviderImplementationId,
     ProviderMethodName, ProviderRuntimeError, SessionIdentity,
-    rpc::{AuthenticatedProviderRpc, RpcCall, RpcResponse},
 };
 
 use crate::{
@@ -121,18 +118,24 @@ impl Fixture {
             ResourceName::parse(provider_name)
                 .map_err(|_| d2b_provider::RegistryBuildError::InvalidDescriptor)?,
         );
-        let methods = fixture_methods()
-            .into_iter()
-            .map(Self::method)
-            .chain(
-                ["health", "inspect", "observability"]
-                    .into_iter()
-                    .map(|method| {
-                        ProviderMethodName::parse(method)
-                            .expect("fixture observation methods are valid tokens")
-                    }),
-            )
-            .collect::<Vec<_>>();
+        let methods = if class == ProviderClass::Transport {
+            ProviderCapabilitySet::from_specified(SpecifiedProviderMethod::TRANSPORT_CARRIAGE)
+                .map_err(|_| d2b_provider::RegistryBuildError::InvalidDescriptor)?
+        } else {
+            let methods = fixture_methods()
+                .into_iter()
+                .map(Self::method)
+                .chain(
+                    ["health", "inspect", "observability"]
+                        .into_iter()
+                        .map(|method| {
+                            ProviderMethodName::parse(method)
+                                .expect("fixture observation methods are valid tokens")
+                        }),
+                )
+                .collect::<Vec<_>>();
+            ProviderCapabilitySet::new(methods)?
+        };
         let descriptor = ProviderDescriptor::new(
             zone.clone(),
             provider_ref,
@@ -145,7 +148,7 @@ impl Fixture {
                 .map_err(|_| d2b_provider::RegistryBuildError::InvalidDescriptor)?,
             ServiceName::parse("d2b.provider.v3")
                 .map_err(|_| d2b_provider::RegistryBuildError::InvalidDescriptor)?,
-            ProviderCapabilitySet::new(methods)?,
+            methods,
         )?;
         Self::from_descriptor(descriptor, FIXTURE_NOW_UNIX_MS)
     }
@@ -172,21 +175,17 @@ impl Fixture {
     }
 
     /// Return the canonical lower-kebab name for a closed v3 method.
-    pub fn method(method: ProviderMethod) -> ProviderMethodName {
+    pub fn method(method: SpecifiedProviderMethod) -> ProviderMethodName {
         ProviderMethodName::parse(match method {
-            ProviderMethod::OpenTransport => "open-transport",
-            ProviderMethod::CloseTransport => "close-transport",
-            ProviderMethod::ObserveTransport => "observe-transport",
-            ProviderMethod::AssessUpdate => "assess-update",
-            ProviderMethod::PlanUpgrade => "plan-upgrade",
-            ProviderMethod::ExecuteUpgrade => "execute-upgrade",
+            SpecifiedProviderMethod::OpenTransport => "open-transport",
+            SpecifiedProviderMethod::CloseTransport => "close-transport",
+            SpecifiedProviderMethod::ObserveTransport => "observe-transport",
+            SpecifiedProviderMethod::AssessUpdate => "assess-update",
+            SpecifiedProviderMethod::PlanUpgrade => "plan-upgrade",
+            SpecifiedProviderMethod::ExecuteUpgrade => "execute-upgrade",
+            _ => unreachable!("specified Provider method is closed"),
         })
         .expect("closed Provider methods are valid bounded tokens")
-    }
-
-    /// Construct a bounded RPC request with an empty canonical payload.
-    pub fn call(&self, method: ProviderMethodName) -> Result<RpcCall, ProviderRuntimeError> {
-        RpcCall::new(method, CanonicalJsonObject::empty())
     }
 
     /// Derive authenticated session evidence for this fixture.
@@ -226,19 +225,19 @@ impl Fixture {
     }
 }
 
-fn fixture_methods() -> [ProviderMethod; 6] {
+fn fixture_methods() -> [SpecifiedProviderMethod; 6] {
     [
-        ProviderMethod::OpenTransport,
-        ProviderMethod::CloseTransport,
-        ProviderMethod::ObserveTransport,
-        ProviderMethod::AssessUpdate,
-        ProviderMethod::PlanUpgrade,
-        ProviderMethod::ExecuteUpgrade,
+        SpecifiedProviderMethod::OpenTransport,
+        SpecifiedProviderMethod::CloseTransport,
+        SpecifiedProviderMethod::ObserveTransport,
+        SpecifiedProviderMethod::AssessUpdate,
+        SpecifiedProviderMethod::PlanUpgrade,
+        SpecifiedProviderMethod::ExecuteUpgrade,
     ]
 }
 
-/// A bounded, deterministic Provider implementation used by registry and RPC
-/// tests.
+/// A bounded, deterministic Provider implementation used by registry and
+/// typed service tests.
 #[derive(Clone)]
 pub struct FakeProvider {
     fixture: Fixture,
@@ -304,6 +303,14 @@ impl FakeProvider {
         if let Ok(mut calls) = self.calls.lock() {
             calls.clear();
         }
+    }
+
+    /// Invoke one fixture method with an empty canonical payload.
+    pub fn call(
+        &self,
+        method: ProviderMethodName,
+    ) -> Result<CanonicalJsonObject, ProviderToolkitError> {
+        self.dispatch_method(&method, &CanonicalJsonObject::empty())
     }
 
     /// Run the canonical health, inspection, and observability sequence.
@@ -380,24 +387,6 @@ impl ProviderAgentService for FakeProvider {
             .dispatch_method(&method, request.payload())
             .map(ProviderAgentResponse::new)
             .map_err(|_| ProviderAgentError::HandlerFailed);
-        ready(result)
-    }
-}
-
-impl AuthenticatedProviderRpc for FakeProvider {
-    fn call(
-        &self,
-        context: &d2b_provider::OwnedOperationContext,
-        request: RpcCall,
-    ) -> impl std::future::Future<Output = Result<RpcResponse, ProviderRuntimeError>> + Send {
-        let result = context
-            .identity()
-            .matches_descriptor(self.descriptor())
-            .and_then(|()| {
-                self.dispatch_method(request.method(), request.payload())
-                    .map_err(|_| ProviderRuntimeError::CapabilityDenied)
-            })
-            .and_then(RpcResponse::new);
         ready(result)
     }
 }

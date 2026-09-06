@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use d2b_contracts_resource::v3::{ResourceRef, ZoneId};
 use d2b_provider_transport_vsock::{
-    CLOSE_GRACE_MS, GuestIdentity, MAX_ACTIVE_TRANSPORTS, NamedStreamError, NamedStreamId,
-    NamedStreamPort, OpaqueBindingId, OpaqueEndpointId, OpenTransportRequest, PeerCid,
-    ReadySession, ServiceError, SessionAuthority, SessionKey, SessionProof, TransportPhase,
-    TransportRole, VsockEffectError, VsockEffectPort, VsockTransportService,
+    CLOSE_GRACE_MS, CloseTransportRequest, GuestIdentity, MAX_ACTIVE_TRANSPORTS, NamedStreamError,
+    NamedStreamId, NamedStreamPort, OpaqueBindingId, OpaqueEndpointId, OpenTransportRequest,
+    PeerCid, ReadySession, ServiceError, SessionAuthority, SessionKey, SessionProof,
+    TransportPhase, TransportRole, VsockEffectError, VsockEffectPort, VsockTransportService,
 };
 use ring::rand::{SystemRandom, generate};
 use std::{
@@ -110,13 +110,17 @@ fn identity() -> GuestIdentity {
 }
 
 fn session() -> ReadySession {
+    session_at_generation(1)
+}
+
+fn session_at_generation(generation: u64) -> ReadySession {
     let identity = identity();
     let key = SessionKey::from_core([1; 32]);
-    let mut authority = SessionAuthority::new(identity.clone(), key.clone(), 1);
+    let mut authority = SessionAuthority::new(identity.clone(), key.clone(), generation);
     authority
         .authenticate(
             PeerCid::from_core(42).unwrap(),
-            SessionProof::sign(&key, &identity, nonce(), 1),
+            SessionProof::sign(&key, &identity, nonce(), generation),
         )
         .unwrap()
 }
@@ -128,6 +132,125 @@ fn request() -> OpenTransportRequest {
         TransportRole::Initiator,
         1_000,
     )
+    .with_session_generation(1)
+}
+
+#[test]
+fn ready_session_retains_the_core_generation_fence() {
+    assert_eq!(session_at_generation(7).generation(), 7);
+}
+
+#[test]
+fn open_rejects_a_mismatched_core_generation() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let effect = FakeEffect {
+            peers: Arc::new(Mutex::new(Vec::new())),
+            closes: Arc::new(Mutex::new(0)),
+            open_delay: None,
+            close_delay: None,
+            hang_close: false,
+            fail_close: Arc::new(Mutex::new(false)),
+        };
+        let service = VsockTransportService::new(
+            effect,
+            FakeStreams {
+                next: Arc::new(Mutex::new(0)),
+                closes: Arc::new(Mutex::new(0)),
+                peers: Arc::new(Mutex::new(Vec::new())),
+                open_delay: None,
+                close_delay: None,
+                hang_close: false,
+            },
+            identity(),
+        );
+        assert_eq!(
+            service
+                .open_transport(
+                    &session_at_generation(2),
+                    request().with_session_generation(1)
+                )
+                .await
+                .unwrap_err(),
+            ServiceError::SessionGenerationMismatch
+        );
+        assert_eq!(
+            service
+                .open_transport(
+                    &session_at_generation(2),
+                    request().with_session_generation(0)
+                )
+                .await
+                .unwrap_err(),
+            ServiceError::InvalidSessionGeneration
+        );
+    });
+}
+
+#[test]
+fn reconnect_reopens_only_carriage_for_the_new_core_generation() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let effect = FakeEffect {
+            peers: Arc::new(Mutex::new(Vec::new())),
+            closes: Arc::new(Mutex::new(0)),
+            open_delay: None,
+            close_delay: None,
+            hang_close: false,
+            fail_close: Arc::new(Mutex::new(false)),
+        };
+        let effect_peers = Arc::clone(&effect.peers);
+        let effect_closes = Arc::clone(&effect.closes);
+        let service = VsockTransportService::new(
+            effect,
+            FakeStreams {
+                next: Arc::new(Mutex::new(0)),
+                closes: Arc::new(Mutex::new(0)),
+                peers: Arc::new(Mutex::new(Vec::new())),
+                open_delay: None,
+                close_delay: None,
+                hang_close: false,
+            },
+            identity(),
+        );
+        let first = service
+            .open_transport(
+                &session_at_generation(1),
+                request().with_session_generation(1),
+            )
+            .await
+            .unwrap();
+        service
+            .close_transport(CloseTransportRequest {
+                transport_handle: first.transport_handle,
+            })
+            .await
+            .unwrap();
+
+        let second = service
+            .open_transport(
+                &session_at_generation(2),
+                request().with_session_generation(2),
+            )
+            .await
+            .unwrap();
+        assert_ne!(first.transport_handle, second.transport_handle);
+        assert_eq!(effect_peers.lock().unwrap().len(), 2);
+        assert_eq!(*effect_closes.lock().unwrap(), 1);
+        service
+            .close_transport(CloseTransportRequest {
+                transport_handle: second.transport_handle,
+            })
+            .await
+            .unwrap();
+        assert_eq!(*effect_closes.lock().unwrap(), 2);
+    });
 }
 
 #[test]

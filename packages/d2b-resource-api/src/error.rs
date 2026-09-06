@@ -242,6 +242,31 @@ mod tests {
     }
 
     #[test]
+    fn assignment_required_conflict_is_wire_valid_and_retryable() {
+        let error = map_store_error(StoreError::new(
+            StoreErrorKind::ResourceConflict,
+            Some(ZoneRevision::new(8)),
+            None,
+            RetryClass::Reauthorize,
+            "assignment-required",
+        ));
+        assert_eq!(error.kind(), ResourceErrorKind::ResourceConflict);
+        assert_eq!(error.current_revision(), Some(ZoneRevision::new(8)));
+        assert_eq!(error.retry_class(), RetryClass::Reauthorize);
+        let wire = to_wire_error(&error);
+        assert_eq!(
+            wire.kind.enum_value().unwrap(),
+            wire::ResourceErrorKind::RESOURCE_ERROR_KIND_RESOURCE_CONFLICT
+        );
+        assert_eq!(wire.current_revision, Some(8));
+        assert_eq!(
+            wire.retry_class.enum_value().unwrap(),
+            wire::RetryClass::RETRY_CLASS_REAUTHORIZE
+        );
+        assert_eq!(wire.reason, "assignment-required");
+    }
+
+    #[test]
     fn invalid_store_error_metadata_fails_closed_without_panicking() {
         let error = map_store_error(StoreError::new(
             StoreErrorKind::ResourceNotFound,

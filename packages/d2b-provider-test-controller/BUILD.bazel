@@ -1,0 +1,46 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+exports_files(
+    [
+        "BUILD.bazel",
+        "Cargo.toml",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+rust_binary(
+    name = "d2b-provider-test-controller",
+    srcs = ["src/main.rs"],
+    compile_data = ["Cargo.toml"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//packages/d2b-core-controller:d2b_core_controller",
+        "//packages/d2b-contracts-zone-session:d2b_contracts_zone_session",
+        "//packages/d2b-session:d2b_session",
+        "//packages/d2b-session-unix:d2b_session_unix",
+    ] + all_crate_deps(normal = True, cargo_only = True),
+)
+
+rust_test(
+    name = "unit",
+    srcs = ["src/main.rs"],
+    compile_data = ["Cargo.toml"],
+    deps = [
+        "//packages/d2b-core-controller:d2b_core_controller",
+        "//packages/d2b-contracts-zone-session:d2b_contracts_zone_session",
+        "//packages/d2b-session:d2b_session",
+        "//packages/d2b-session-unix:d2b_session_unix",
+    ] + all_crate_deps(normal = True, cargo_only = True),
+)
+
+rust_test(
+    name = "controller",
+    srcs = ["tests/controller.rs"],
+    compile_data = ["Cargo.toml"],
+    args = ["$(rootpath :d2b-provider-test-controller)"],
+    data = [":d2b-provider-test-controller"],
+    deps = [
+        ":d2b-provider-test-controller",
+    ] + all_crate_deps(normal = True, normal_dev = True, cargo_only = True),
+)

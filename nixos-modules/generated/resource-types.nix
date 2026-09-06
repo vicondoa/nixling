@@ -5,6 +5,7 @@
 # The canonical ADR 0046 standard ResourceType registry. Qualified
 # Provider types are appended only from installed signed schemas and
 # are therefore absent here.
+# Provider-owned qualified types remain outside this registry: activation-nixos.d2bus.org.NixosGeneration, telemetry.d2bus.org.TelemetryBinding, telemetry.d2bus.org.TelemetryService.
 [
   "Zone"
   "ZoneLink"

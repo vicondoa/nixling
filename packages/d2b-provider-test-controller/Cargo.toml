@@ -1,0 +1,20 @@
+[package]
+name = "d2b-provider-test-controller"
+version = "0.0.0-bootstrap"
+edition = "2024"
+publish = false
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+d2b-core-controller = { path = "../d2b-core-controller", version = "0.0.0-bootstrap" }
+d2b-contracts-zone-session = { path = "../d2b-contracts-zone-session", version = "0.0.0-bootstrap" }
+d2b-session = { path = "../d2b-session", version = "0.0.0-bootstrap" }
+d2b-session-unix = { path = "../d2b-session-unix", version = "0.0.0-bootstrap", default-features = false, features = ["host-socket", "native-vsock"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+
+[[bin]]
+name = "d2b-provider-test-controller"
+path = "src/main.rs"

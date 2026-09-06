@@ -149,4 +149,339 @@
     "d2bdDigest"
     "brokerDigest"
   ];
+
+  # Additional trust-envelope fields checked when published.
+  trustFields = [
+    "trustEpoch"
+    "revocationRef"
+    "publisherRoot"
+    "signatureId"
+    "conformanceAttestationDigest"
+  ];
+
+  # The immutable Provider output layout.
+  artifactLayout = {
+    executableDirectory = "bin";
+    metadataDirectory = "share/d2b/provider";
+    multiBinary = true;
+    requiredFiles = [
+      "share/d2b/provider/provider-manifest.json"
+      "share/d2b/provider/provider-manifest.json.sig"
+      "share/d2b/provider/config-schema.json"
+    ];
+    noBinaryBootstrapProvider = "system-core";
+    fixedBootstrapProviders = [
+      "system-core"
+      "system-minijail"
+    ];
+  };
+
+  # The closed Provider identity/package/dossier/test matrix.
+  providerMatrix = [
+    {
+      provider = "system-core";
+      package = "d2b-provider-system-core";
+      source = "packages/d2b-provider-system-core/src/host_reconciler.rs";
+      test = "packages/d2b-provider-system-core/tests/host_reconciliation.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-system-core.md";
+      bazelTarget = "//packages/d2b-provider-system-core:all-tests";
+      unit = "U5";
+      bootstrap = true;
+    }
+    {
+      provider = "system-systemd";
+      package = "d2b-provider-system-systemd";
+      source = "packages/d2b-provider-system-systemd/src/controller.rs";
+      test = "packages/d2b-provider-system-systemd/tests/controller.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-system-systemd.md";
+      bazelTarget = "//packages/d2b-provider-system-systemd:all-tests";
+      unit = "U5";
+      bootstrap = false;
+    }
+    {
+      provider = "system-minijail";
+      package = "d2b-provider-system-minijail";
+      source = "packages/d2b-provider-system-minijail/src/launch.rs";
+      test = "packages/d2b-provider-system-minijail/tests/conformance.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-system-minijail.md";
+      bazelTarget = "//packages/d2b-provider-system-minijail:all-tests";
+      unit = "U5";
+      bootstrap = true;
+    }
+    {
+      provider = "runtime-cloud-hypervisor";
+      package = "d2b-provider-runtime-cloud-hypervisor";
+      source = "packages/d2b-provider-runtime-cloud-hypervisor/src/controller.rs";
+      test = "packages/d2b-provider-runtime-cloud-hypervisor/tests/reconcile_state_machine_test.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-runtime-cloud-hypervisor.md";
+      bazelTarget = "//packages/d2b-provider-runtime-cloud-hypervisor:all-tests";
+      unit = "U6";
+      bootstrap = false;
+    }
+    {
+      provider = "runtime-qemu-media";
+      package = "d2b-provider-runtime-qemu-media";
+      source = "packages/d2b-provider-runtime-qemu-media/src/controller/reconcile.rs";
+      test = "packages/d2b-provider-runtime-qemu-media/tests/lifecycle.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-runtime-qemu-media.md";
+      bazelTarget = "//packages/d2b-provider-runtime-qemu-media:all-tests";
+      unit = "U6";
+      bootstrap = false;
+    }
+    {
+      provider = "runtime-azure-container-apps";
+      package = "d2b-provider-runtime-azure-container-apps";
+      source = "packages/d2b-provider-runtime-azure-container-apps/src/controller.rs";
+      test = "packages/d2b-provider-runtime-azure-container-apps/tests/provider_lifecycle.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-runtime-azure-container-apps.md";
+      bazelTarget = "//packages/d2b-provider-runtime-azure-container-apps:all-tests";
+      unit = "U6";
+      bootstrap = false;
+    }
+    {
+      provider = "runtime-azure-virtual-machine";
+      package = "d2b-provider-runtime-azure-virtual-machine";
+      source = "packages/d2b-provider-runtime-azure-virtual-machine/src/controller/mod.rs";
+      test = "packages/d2b-provider-runtime-azure-virtual-machine/tests/lifecycle_hermetic.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-runtime-azure-virtual-machine.md";
+      bazelTarget = "//packages/d2b-provider-runtime-azure-virtual-machine:all-tests";
+      unit = "U6";
+      bootstrap = false;
+    }
+    {
+      provider = "volume-local";
+      package = "d2b-provider-volume-local";
+      source = "packages/d2b-provider-volume-local/src/controller.rs";
+      test = "packages/d2b-provider-volume-local/tests/volume_local.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-volume-local.md";
+      bazelTarget = "//packages/d2b-provider-volume-local:all-tests";
+      unit = "U7";
+      bootstrap = false;
+    }
+    {
+      provider = "volume-virtiofs";
+      package = "d2b-provider-volume-virtiofs";
+      source = "packages/d2b-provider-volume-virtiofs/src/controller.rs";
+      test = "packages/d2b-provider-volume-virtiofs/tests/lifecycle.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-volume-virtiofs.md";
+      bazelTarget = "//packages/d2b-provider-volume-virtiofs:all-tests";
+      unit = "U7";
+      bootstrap = false;
+    }
+    {
+      provider = "network-local";
+      package = "d2b-provider-network-local";
+      source = "packages/d2b-provider-network-local/src/controller.rs";
+      test = "packages/d2b-provider-network-local/tests/reconcile.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-network-local.md";
+      bazelTarget = "//packages/d2b-provider-network-local:all-tests";
+      unit = "U8";
+      bootstrap = false;
+    }
+    {
+      provider = "device-tpm";
+      package = "d2b-provider-device-tpm";
+      source = "packages/d2b-provider-device-tpm/src/resource_controller.rs";
+      test = "packages/d2b-provider-device-tpm/tests/resource_controller.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-device-tpm.md";
+      bazelTarget = "//packages/d2b-provider-device-tpm:all-tests";
+      unit = "U8";
+      bootstrap = false;
+    }
+    {
+      provider = "device-usbip";
+      package = "d2b-provider-device-usbip";
+      source = "packages/d2b-provider-device-usbip/src/controller.rs";
+      test = "packages/d2b-provider-device-usbip/tests/service_binding_lifecycle.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-device-usbip.md";
+      bazelTarget = "//packages/d2b-provider-device-usbip:all-tests";
+      unit = "U8";
+      bootstrap = false;
+    }
+    {
+      provider = "device-security-key";
+      package = "d2b-provider-device-security-key";
+      source = "packages/d2b-provider-device-security-key/src/controller.rs";
+      test = "packages/d2b-provider-device-security-key/tests/lease_state_machine.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-device-security-key.md";
+      bazelTarget = "//packages/d2b-provider-device-security-key:all-tests";
+      unit = "U8";
+      bootstrap = false;
+    }
+    {
+      provider = "device-gpu";
+      package = "d2b-provider-device-gpu";
+      source = "packages/d2b-provider-device-gpu/src/controller.rs";
+      test = "packages/d2b-provider-device-gpu/tests/combined_reconcile.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-device-gpu.md";
+      bazelTarget = "//packages/d2b-provider-device-gpu:all-tests";
+      unit = "U8";
+      bootstrap = false;
+    }
+    {
+      provider = "display-wayland";
+      package = "d2b-provider-display-wayland";
+      source = "packages/d2b-provider-display-wayland/src/controller.rs";
+      test = "packages/d2b-provider-display-wayland/tests/provider_behavior.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-display-wayland.md";
+      bazelTarget = "//packages/d2b-provider-display-wayland:all-tests";
+      unit = "U9";
+      bootstrap = false;
+    }
+    {
+      provider = "audio-pipewire";
+      package = "d2b-provider-audio-pipewire";
+      source = "packages/d2b-provider-audio-pipewire/src/controller.rs";
+      test = "packages/d2b-provider-audio-pipewire/tests/controller.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-audio-pipewire.md";
+      bazelTarget = "//packages/d2b-provider-audio-pipewire:all-tests";
+      unit = "U9";
+      bootstrap = false;
+    }
+    {
+      provider = "clipboard-wayland";
+      package = "d2b-provider-clipboard-wayland";
+      source = "packages/d2b-provider-clipboard-wayland/src/controller/mod.rs";
+      test = "packages/d2b-provider-clipboard-wayland/tests/provider_behavior.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-clipboard-wayland.md";
+      bazelTarget = "//packages/d2b-provider-clipboard-wayland:all-tests";
+      unit = "U9";
+      bootstrap = false;
+    }
+    {
+      provider = "notification-desktop";
+      package = "d2b-provider-notification-desktop";
+      source = "packages/d2b-provider-notification-desktop/src/controller.rs";
+      test = "packages/d2b-provider-notification-desktop/tests/provider_behavior.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-notification-desktop.md";
+      bazelTarget = "//packages/d2b-provider-notification-desktop:all-tests";
+      unit = "U9";
+      bootstrap = false;
+    }
+    {
+      provider = "shell-terminal";
+      package = "d2b-provider-shell-terminal";
+      source = "packages/d2b-provider-shell-terminal/src/service/controller.rs";
+      test = "packages/d2b-provider-shell-terminal/tests/controller_reconcile.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-shell-terminal.md";
+      bazelTarget = "//packages/d2b-provider-shell-terminal:all-tests";
+      unit = "U9";
+      bootstrap = false;
+    }
+    {
+      provider = "credential-secret-service";
+      package = "d2b-provider-credential-secret-service";
+      source = "packages/d2b-provider-credential-secret-service/src/controller.rs";
+      test = "packages/d2b-provider-credential-secret-service/tests/session.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-credential-secret-service.md";
+      bazelTarget = "//packages/d2b-provider-credential-secret-service:all-tests";
+      unit = "U10";
+      bootstrap = false;
+    }
+    {
+      provider = "credential-entra";
+      package = "d2b-provider-credential-entra";
+      source = "packages/d2b-provider-credential-entra/src/controller.rs";
+      test = "packages/d2b-provider-credential-entra/tests/controller.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-credential-entra.md";
+      bazelTarget = "//packages/d2b-provider-credential-entra:all-tests";
+      unit = "U10";
+      bootstrap = false;
+    }
+    {
+      provider = "credential-managed-identity";
+      package = "d2b-provider-credential-managed-identity";
+      source = "packages/d2b-provider-credential-managed-identity/src/controller.rs";
+      test = "packages/d2b-provider-credential-managed-identity/tests/binding.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-credential-managed-identity.md";
+      bazelTarget = "//packages/d2b-provider-credential-managed-identity:all-tests";
+      unit = "U10";
+      bootstrap = false;
+    }
+    {
+      provider = "transport-unix";
+      package = "d2b-provider-transport-unix";
+      source = "packages/d2b-provider-transport-unix/src/portal.rs";
+      test = "packages/d2b-provider-transport-unix/tests/transport.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-transport-unix.md";
+      bazelTarget = "//packages/d2b-provider-transport-unix:all-tests";
+      unit = "U11";
+      bootstrap = false;
+    }
+    {
+      provider = "transport-vsock";
+      package = "d2b-provider-transport-vsock";
+      source = "packages/d2b-provider-transport-vsock/src/service.rs";
+      test = "packages/d2b-provider-transport-vsock/tests/service.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-transport-vsock.md";
+      bazelTarget = "//packages/d2b-provider-transport-vsock:all-tests";
+      unit = "U11";
+      bootstrap = false;
+    }
+    {
+      provider = "transport-azure-relay";
+      package = "d2b-provider-transport-azure-relay";
+      source = "packages/d2b-provider-transport-azure-relay/src/relay_transport.rs";
+      test = "packages/d2b-provider-transport-azure-relay/tests/fake_relay_transport.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-transport-azure-relay.md";
+      bazelTarget = "//packages/d2b-provider-transport-azure-relay:all-tests";
+      unit = "U11";
+      bootstrap = false;
+    }
+    {
+      provider = "observability-otel";
+      package = "d2b-provider-observability-otel";
+      source = "packages/d2b-provider-observability-otel/src/controller.rs";
+      test = "packages/d2b-provider-observability-otel/tests/binding_controller.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-observability-otel.md";
+      bazelTarget = "//packages/d2b-provider-observability-otel:all-tests";
+      unit = "U12";
+      bootstrap = false;
+    }
+    {
+      provider = "activation-nixos";
+      package = "d2b-provider-activation-nixos";
+      source = "packages/d2b-provider-activation-nixos/src/controller.rs";
+      test = "packages/d2b-provider-activation-nixos/tests/reconcile.rs";
+      dossier = "docs/specs/providers/ADR-046-provider-activation-nixos.md";
+      bazelTarget = "//packages/d2b-provider-activation-nixos:all-tests";
+      unit = "U12";
+      bootstrap = false;
+    }
+  ];
+
+  providerIds = [
+    "system-core"
+    "system-systemd"
+    "system-minijail"
+    "runtime-cloud-hypervisor"
+    "runtime-qemu-media"
+    "runtime-azure-container-apps"
+    "runtime-azure-virtual-machine"
+    "volume-local"
+    "volume-virtiofs"
+    "network-local"
+    "device-tpm"
+    "device-usbip"
+    "device-security-key"
+    "device-gpu"
+    "display-wayland"
+    "audio-pipewire"
+    "clipboard-wayland"
+    "notification-desktop"
+    "shell-terminal"
+    "credential-secret-service"
+    "credential-entra"
+    "credential-managed-identity"
+    "transport-unix"
+    "transport-vsock"
+    "transport-azure-relay"
+    "observability-otel"
+    "activation-nixos"
+  ];
+
+  fixedBootstrapProviderIds = [
+    "system-core"
+    "system-minijail"
+  ];
 }

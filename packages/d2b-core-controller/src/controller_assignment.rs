@@ -2707,6 +2707,19 @@ impl fmt::Debug for ControllerAssignmentRegistry {
 }
 
 impl ControllerAssignmentRegistry {
+    /// Reserve the next assignment epoch after all durable observations.
+    pub fn reserve_epoch_after(&mut self, floor: u64) -> Result<u64, AssignmentError> {
+        if self.next_epoch < floor {
+            self.next_epoch = floor;
+        }
+        let epoch = self
+            .next_epoch
+            .checked_add(1)
+            .ok_or(AssignmentError::EpochExhausted)?;
+        self.next_epoch = epoch;
+        AssignmentEpoch::new(epoch).map(|value| value.get())
+    }
+
     /// Admit one resource from the committed store snapshot.
     pub fn admit(
         &mut self,

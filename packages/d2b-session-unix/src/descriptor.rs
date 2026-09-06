@@ -277,6 +277,11 @@ impl ReceivedPacket {
         &self.payload
     }
 
+    /// Consume the packet payload in a zeroizing owner.
+    pub fn into_payload_zeroizing(self) -> zeroize::Zeroizing<Vec<u8>> {
+        zeroize::Zeroizing::new(self.payload)
+    }
+
     pub fn control_count(&self) -> usize {
         self.controls.len()
     }

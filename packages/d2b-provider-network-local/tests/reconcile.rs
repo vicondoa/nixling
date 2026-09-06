@@ -20,6 +20,7 @@ use d2b_provider_network_local::{
         NetworkEffectPort, NetworkReconciler, NetworkResourcePort, ReconcileInput,
         ReconcileProgress,
     },
+    plan::{PlanStep, compute_plan, ActualState},
 };
 
 #[derive(Clone, Default)]
@@ -146,7 +147,7 @@ impl NetworkResourcePort for FakePorts {
         self.push("volume-upsert")
     }
 
-    async fn write_volume_content(
+    async fn upsert_volume_content(
         &self,
         _: &NetworkConfigContent,
     ) -> Result<(), NetworkEffectError> {
@@ -538,4 +539,33 @@ fn finalizer_removes_volume_attachment_before_guest_and_volume() {
         resources.events(),
         ["volume-detach", "guest-delete", "volume-delete"]
     );
+}
+
+#[test]
+fn matching_mdns_state_does_not_schedule_a_second_effect() {
+    let plan = compute_plan(
+        &spec("10.20.0.0/24", "192.0.2.0/30"),
+        true,
+        ActualState {
+            bridges_ready: true,
+            sysctls_ready: true,
+            firewall_ready: true,
+            volume_ready: true,
+            guest_ready: true,
+            attachment_ready: true,
+            agent_ready: true,
+            mdns_matches: true,
+        },
+    );
+
+    assert!(!plan.steps().contains(&PlanStep::ReconcileMdns));
+}
+
+#[test]
+fn network_runner_is_the_only_scheduler_and_watches_config_as_dependency() {
+    let contract = d2b_provider_network_local::controller::network_runner_contract();
+    assert_eq!(contract.resource_type(), "Network");
+    assert_eq!(contract.finalizer(), "network.d2bus.org/fabric-cleanup");
+    assert!(contract.watched_configuration_is_dependency());
+    assert!((30..=60).contains(&contract.repair_interval_secs()));
 }

@@ -15,7 +15,8 @@ use d2b_contracts_provider::v3::credential_controller::{
     CredentialControllerError, CredentialControllerHandlers, CredentialControllerHealth,
     CredentialObservabilityError, CredentialObserveInput, CredentialReconcileInput,
     CredentialRevocationInput, CredentialSingleFlight, CredentialTelemetryFrame,
-    CredentialTelemetryOperation, CredentialTelemetryOutcome, observe_credential,
+    CredentialProviderKind, CredentialTelemetryOperation, CredentialTelemetryOutcome,
+    observe_credential,
     reconcile_credential, revoke_credential,
 };
 use d2b_contracts_resource::v3::ResourceRef;
@@ -25,6 +26,12 @@ use crate::{
     CREDENTIAL_SESSION_PURPOSE, EntraClientState, EntraPlacement, EntraResourceHealth,
     LOGIN_ENDPOINT_PURPOSE, MAX_REFRESH_ATTEMPTS, PROVIDER_REF,
 };
+
+/// Finalizer owned by the Entra Credential controller.
+pub const PROVIDER_REVOKE_FINALIZER: &str =
+    d2b_contracts_provider::v3::credential_controller::CREDENTIAL_PROVIDER_REVOKE_FINALIZER;
+/// Provider identity used by the shared controller registration.
+pub const PROVIDER_KIND: CredentialProviderKind = CredentialProviderKind::Entra;
 
 /// Canonical provider-visible Endpoint policy for the Entrablau service.
 #[derive(Clone, PartialEq, Eq)]
@@ -129,7 +136,11 @@ impl EntraController {
         client_state: EntraClientState,
         metadata: Option<&CredentialMetadata>,
     ) -> Result<EntraStatusProjection, CredentialServiceError> {
-        self.reconcile_with_health(client_state, metadata, EntraResourceHealth::Ready, 0)
+        let resource_health = match client_state {
+            EntraClientState::Ready => EntraResourceHealth::Ready,
+            EntraClientState::InteractionRequired => EntraResourceHealth::Degraded,
+        };
+        self.reconcile_with_health(client_state, metadata, resource_health, 0)
     }
 
     /// Project bounded non-secret state with owning-resource health.
@@ -326,6 +337,7 @@ mod tests {
             required.status.interaction_state(),
             CredentialInteractionState::Required
         );
+        assert_eq!(required.resource_health, EntraResourceHealth::Degraded);
         let ready = controller()
             .reconcile(EntraClientState::Ready, None)
             .unwrap();

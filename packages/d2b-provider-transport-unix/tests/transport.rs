@@ -1,7 +1,7 @@
 use d2b_contracts_resource::v3::{ResourceRef, ZoneId};
 use d2b_provider_transport_unix::{
-    BrokerRole, OpenTransportRequest, PortalError, RouteClass, SocketKind, TransportPortal,
-    TransportRequestBinding,
+    BrokerRole, ExpectedPeer, OpenTransportRequest, PortalError, RouteClass, SocketKind,
+    TransportPortal, TransportRequestBinding,
 };
 use rustix::{
     fd::AsFd,
@@ -11,6 +11,7 @@ use rustix::{
         AddressFamily, SocketFlags, SocketType, socketpair,
         sockopt::{get_socket_passcred, get_socket_type},
     },
+    process::{getgid, getuid},
 };
 
 fn binding() -> TransportRequestBinding {
@@ -61,6 +62,34 @@ fn accepted_fd_peer_and_request_context_are_bound_once() {
     );
     assert!(portal.close(opened.handle()).is_ok());
     assert!(portal.close(opened.handle()).is_ok(), "close is idempotent");
+}
+
+#[test]
+fn peer_credentials_are_kernel_bound_and_wrong_peers_are_rejected() {
+    let portal = TransportPortal::new();
+    let expected = ExpectedPeer::new(getuid().as_raw(), getgid().as_raw());
+    let (accepted, _peer) = pair(SocketType::SEQPACKET);
+    let opened = portal
+        .open(
+            binding().with_expected_peer(expected),
+            OpenTransportRequest::new(SocketKind::Seqpacket, RouteClass::LocalPortal, false),
+            accepted,
+        )
+        .expect("current process peer credentials");
+    portal.close(opened.handle()).expect("close accepted peer");
+
+    let (wrong_peer, _peer) = pair(SocketType::SEQPACKET);
+    let wrong = ExpectedPeer::new(expected.uid().saturating_add(1), expected.gid());
+    assert_eq!(
+        portal
+            .open(
+                binding().with_expected_peer(wrong),
+                OpenTransportRequest::new(SocketKind::Seqpacket, RouteClass::LocalPortal, false),
+                wrong_peer,
+            )
+            .expect_err("mismatched kernel peer must fail closed"),
+        PortalError::PeerCredentials
+    );
 }
 
 #[test]

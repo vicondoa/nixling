@@ -23,8 +23,8 @@ use d2b_core_controller::controller_assignment::{
     ScopedResourceScope,
 };
 use d2b_resource_api::authz::{
-    ApiMethod, AuthorizationRequest, AuthorizationState, AuthorizationTarget, PolicySet,
-    ResourceVerb, SessionVerb,
+    ApiMethod, AuthorizationRequest, AuthorizationState, AuthorizationTarget, NativeAuthorizer,
+    PolicySet, ResourceVerb, SessionVerb,
 };
 use d2b_resource_api::watch::{WatchFrame, WatchSink, WatchSinkError};
 use d2b_session::{
@@ -1399,6 +1399,11 @@ impl ZoneBus {
         Ok(())
     }
 
+    /// Borrow the native authorizer shared by this Zone bus.
+    pub fn native_authorizer(&self) -> Arc<NativeAuthorizer> {
+        self.core.authorizer.native_authorizer()
+    }
+
     /// Fail closed for all new work while durable policy is unavailable.
     pub fn mark_policy_unavailable(&self) {
         self.core.authorizer.mark_policy_unavailable();
@@ -2238,6 +2243,21 @@ impl ZoneRegistrar {
         verified_peer: &VerifiedUnixPeer,
         committed: CommittedControllerProcessSubjectInput,
     ) -> d2b_session::Result<()> {
+        self.install_committed_controller_process_subject_for_service(
+            verified_peer,
+            committed,
+            ServicePackage::ResourceV3,
+        )
+    }
+
+    /// Install an external Provider controller Process subject for one exact
+    /// authenticated service package.
+    pub fn install_committed_controller_process_subject_for_service(
+        &self,
+        verified_peer: &VerifiedUnixPeer,
+        committed: CommittedControllerProcessSubjectInput,
+        service: ServicePackage,
+    ) -> d2b_session::Result<()> {
         let CommittedControllerProcessSubjectInput {
             provider_ref,
             provider_uid,
@@ -2258,7 +2278,7 @@ impl ZoneRegistrar {
         .with_process_ref(process_ref)?
         .with_controller_generation(controller_generation)
         .with_execution_ref(execution_ref)?
-        .for_service(ServicePackage::ResourceV3);
+        .for_service(service);
         self.unix_subjects.install(subject, &self.core.zone)
     }
 

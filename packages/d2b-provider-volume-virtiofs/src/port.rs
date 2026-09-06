@@ -49,13 +49,13 @@ pub trait VirtiofsExportEffectPort: Send + Sync {
 
     /// Check the zero-length store-view marker before a ro-store launch.
     ///
-    /// The default is used by adapters for non-store-view Exports and keeps
-    /// the marker prerequisite additive for existing effect ports.
+    /// Adapters must explicitly prove the marker. A missing implementation
+    /// fails closed instead of permitting a store-view worker launch.
     fn observe_store_view_marker(
         &self,
         _export: &ExportSpec,
     ) -> impl Future<Output = Result<bool, VirtiofsExportError>> + Send {
-        async { Ok(true) }
+        async { Ok(false) }
     }
 
     /// Delete the Export-owned worker and its Endpoint.

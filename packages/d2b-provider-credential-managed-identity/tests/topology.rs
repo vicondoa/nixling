@@ -2,7 +2,7 @@ use d2b_contracts_provider::v3::credential::{CredentialMethod, PlacementBinding}
 use d2b_contracts_resource::v3::ResourceRef;
 use d2b_provider_credential_managed_identity::{
     AGENT_BINARY, CONTROLLER_BINARY, ManagedIdentityController, ManagedIdentityPlacement,
-    ManagedIdentityRoute, agent_binary_entrypoint, controller_binary_entrypoint,
+    ManagedIdentityRoute,
 };
 
 fn controller(binding: PlacementBinding, execution: &str) -> ManagedIdentityController {
@@ -95,9 +95,7 @@ fn teardown_releases_the_finalizer_only_after_revocation_and_process_deletion() 
 }
 
 #[test]
-fn the_two_role_specific_binaries_exist_and_fail_closed_until_runtime_registration() {
+fn the_two_role_specific_binaries_have_stable_names() {
     assert_eq!(CONTROLLER_BINARY, "d2b-managed-identity-controller");
     assert_eq!(AGENT_BINARY, "d2b-managed-identity-agent");
-    assert_eq!(controller_binary_entrypoint(), 78);
-    assert_eq!(agent_binary_entrypoint(), 78);
 }

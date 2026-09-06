@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::broker::{
     BrokerFrame, BrokerLaunchIntent, BrokerLaunchResolver, BundleBackedLaunchResolver,
-    broker_round_trip,
+    broker_round_trip, wait_pidfd_observer,
 };
 
 const MAX_PENDING_OBSERVATIONS: usize = 1024;
@@ -233,6 +233,15 @@ pub trait SystemdEffectOwner: Send + Sync + 'static {
         expected: &SystemdInvocationIdentity,
     ) -> Result<SystemdEffectLaunch<Self::Handle>, ProcessEffectError>;
 
+    /// Wait for the exact local authority to become readable.
+    fn wait(
+        &self,
+        _handle: &Self::Handle,
+        _timeout: std::time::Duration,
+    ) -> Result<(), ProcessEffectError> {
+        Err(ProcessEffectError::PidfdUnavailable)
+    }
+
     /// Stop only the unit represented by the verified local handle.
     ///
     /// A successful [`ProcessStopClass::Terminate`] result certifies that the
@@ -442,6 +451,14 @@ impl<O: SystemdEffectOwner> ProcessEffectBackend for SystemdProcessBackend<O> {
             return Err(ProcessEffectError::IdentityChanged);
         }
         Ok(handle)
+    }
+
+    fn wait(
+        &self,
+        handle: &Self::Handle,
+        timeout: std::time::Duration,
+    ) -> Result<(), ProcessEffectError> {
+        self.owner.wait(handle, timeout)
     }
 
     fn stop(
@@ -734,6 +751,14 @@ impl SystemdEffectOwner for BrokerSystemdEffectOwner {
                 identity: actual,
             },
         ))
+    }
+
+    fn wait(
+        &self,
+        handle: &Self::Handle,
+        timeout: std::time::Duration,
+    ) -> Result<(), ProcessEffectError> {
+        wait_pidfd_observer(&handle.pidfd, timeout)
     }
 
     fn stop(

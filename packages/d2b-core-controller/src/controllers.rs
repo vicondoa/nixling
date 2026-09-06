@@ -4,6 +4,15 @@ use std::collections::BTreeMap;
 
 use d2b_contracts_resource::v3::resource_status::MAX_STATUS_COLLECTION_ENTRIES;
 use d2b_contracts_resource::v3::{ResourceCurrencySet, ResourceRef, UpdateState};
+use d2b_contracts_resource::v3::quota::QUOTA_DRAIN_FINALIZER;
+use d2b_contracts_zone_session::v3::{
+    EMERGENCY_DRAIN_FINALIZER, RESOURCE_EXPORT_DRAIN_FINALIZER,
+    RESOURCE_IMPORT_DRAIN_FINALIZER, ZONE_LINK_DRAIN_FINALIZER,
+};
+use d2b_contracts_zone_session::v3::role::ROLE_BINDING_DRAIN_FINALIZER;
+
+/// The Core finalizer used while Provider API bindings are withdrawn.
+pub const CORE_PROVIDER_API_BINDING_FINALIZER: &str = "core.provider-api-binding";
 
 /// Closed fixed core handler set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -67,7 +76,97 @@ impl CoreHandlerKind {
             Self::Store => "store",
         }
     }
+
 }
+
+/// One fixed ResourceType owner hosted by the Core controller process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreResourceControllerRegistration {
+    handler: CoreHandlerKind,
+    resource_type: &'static str,
+    finalizer: Option<&'static str>,
+    consumes_owner_triggers: bool,
+}
+
+impl CoreResourceControllerRegistration {
+    /// Return the Core handler that owns this ResourceType.
+    pub const fn handler(self) -> CoreHandlerKind {
+        self.handler
+    }
+
+    /// Return the canonical ResourceType spelling.
+    pub const fn resource_type(self) -> &'static str {
+        self.resource_type
+    }
+
+    /// Return the exact Core finalizer, when this ResourceType has one.
+    pub const fn finalizer(self) -> Option<&'static str> {
+        self.finalizer
+    }
+
+    /// Whether owner-child changes are delivered to this controller.
+    pub const fn consumes_owner_triggers(self) -> bool {
+        self.consumes_owner_triggers
+    }
+}
+
+/// The closed ResourceType owner set hosted by the fixed Core process.
+pub const CORE_RESOURCE_CONTROLLER_REGISTRATIONS: [CoreResourceControllerRegistration; 9] = [
+    CoreResourceControllerRegistration {
+        handler: CoreHandlerKind::Configuration,
+        resource_type: "Zone",
+        finalizer: None,
+        consumes_owner_triggers: false,
+    },
+    CoreResourceControllerRegistration {
+        handler: CoreHandlerKind::ZoneLinks,
+        resource_type: "ZoneLink",
+        finalizer: Some(ZONE_LINK_DRAIN_FINALIZER),
+        consumes_owner_triggers: false,
+    },
+    CoreResourceControllerRegistration {
+        handler: CoreHandlerKind::Provider,
+        resource_type: "Provider",
+        finalizer: Some(CORE_PROVIDER_API_BINDING_FINALIZER),
+        consumes_owner_triggers: true,
+    },
+    CoreResourceControllerRegistration {
+        handler: CoreHandlerKind::Authorization,
+        resource_type: "Role",
+        finalizer: None,
+        consumes_owner_triggers: false,
+    },
+    CoreResourceControllerRegistration {
+        handler: CoreHandlerKind::Authorization,
+        resource_type: "RoleBinding",
+        finalizer: Some(ROLE_BINDING_DRAIN_FINALIZER),
+        consumes_owner_triggers: false,
+    },
+    CoreResourceControllerRegistration {
+        handler: CoreHandlerKind::Budgets,
+        resource_type: "Quota",
+        finalizer: Some(QUOTA_DRAIN_FINALIZER),
+        consumes_owner_triggers: false,
+    },
+    CoreResourceControllerRegistration {
+        handler: CoreHandlerKind::Budgets,
+        resource_type: "EmergencyPolicy",
+        finalizer: Some(EMERGENCY_DRAIN_FINALIZER),
+        consumes_owner_triggers: false,
+    },
+    CoreResourceControllerRegistration {
+        handler: CoreHandlerKind::Ownership,
+        resource_type: "ResourceExport",
+        finalizer: Some(RESOURCE_EXPORT_DRAIN_FINALIZER),
+        consumes_owner_triggers: true,
+    },
+    CoreResourceControllerRegistration {
+        handler: CoreHandlerKind::Ownership,
+        resource_type: "ResourceImport",
+        finalizer: Some(RESOURCE_IMPORT_DRAIN_FINALIZER),
+        consumes_owner_triggers: true,
+    },
+];
 
 /// Closed handler phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

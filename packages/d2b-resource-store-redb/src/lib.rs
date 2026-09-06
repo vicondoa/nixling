@@ -28,7 +28,7 @@ use d2b_audit::{
 };
 use d2b_contracts_resource::v3::{
     ConfigurationGeneration, ControllerGeneration, ResourceUid, Timestamp, ZoneId, ZoneRevision,
-    canonical_digest, identity::STANDARD_RESOURCE_TYPES,
+    ResourceRef, canonical_digest, identity::STANDARD_RESOURCE_TYPES,
 };
 use d2b_resource_store::MutationSealBody;
 use d2b_resource_store::mutation_seal::{MutationSealAcceptor, SealedMutation};
@@ -36,7 +36,7 @@ use d2b_resource_store::{
     PolicySnapshot, StoreCommitResult, StoreError, StoreGetRequest, StoreInspectSchemaRequest,
     StoreListRequest, StoreListResult, StoreResolveRequest, StoreResolvedIdentity,
     StoreSealIdentity, StoreSlot, StoreWatchReceipt, StoreWatchRequest, StoredResource,
-    StoredSchema,
+    StoredSchema, ResourceAssignmentFence,
 };
 use d2b_telemetry::BoundedEmitter;
 use redb::Database;
@@ -50,8 +50,8 @@ use crate::audit::NoopMutationAudit;
 use crate::metrics::{EmitterStoreTelemetry, NoopStoreTelemetry, StoreTelemetry};
 
 pub use actor::{
-    BackendSignals, GROUP_COMMIT_MAX, MAX_CONCURRENT_READS, READ_LIFETIME, READ_POOL_THREADS,
-    SharedChangeBatch, WRITE_QUEUE_CAPACITY,
+    BackendSignals, GROUP_COMMIT_MAX, LIST_READ_LIFETIME, MAX_CONCURRENT_READS, READ_LIFETIME,
+    READ_POOL_THREADS, SharedChangeBatch, WRITE_QUEUE_CAPACITY,
 };
 pub use backup::{
     BackupRow, BackupTable, LOGICAL_BACKUP_FORMAT_VERSION, LogicalBackup, MAX_LOGICAL_BACKUP_BYTES,
@@ -69,8 +69,8 @@ pub use migration::{
     upgrade_owned_after_backup,
 };
 pub use ownership::{
-    MAX_OWNER_CHAIN_DEPTH, OwnerBinding, OwnerIndex, OwnerIndexMutation, OwnershipError,
-    ReverseOwnerEntry,
+    MAX_OWNER_CHAIN_DEPTH, OwnerBinding, OwnerChangeEvent, OwnerIndex, OwnerIndexMutation,
+    OwnershipError, ReverseOwnerEntry,
 };
 pub use revision_log::{
     MAX_COMPACTION_BYTES_PER_TRANSACTION, MAX_COMPACTION_ROWS_PER_TRANSACTION,
@@ -955,8 +955,9 @@ impl RedbResourceStore {
                 "authority-operation-claim-envelope-invalid",
             ));
         }
+        let request_digest = transaction::authority_payload_digest_value(&envelope)?;
         self.writer
-            .authority_prepare(operation_id.clone(), payload)
+            .authority_prepare(operation_id.clone(), payload, request_digest)
             .await?;
         Ok(AuthorityOperationCapability {
             store: Arc::clone(self),
@@ -1087,6 +1088,10 @@ impl RedbResourceStore {
 }
 
 impl AuthorityOperationCapability {
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
     pub async fn record_effect(&self, state: AuthorityOperationState) -> Result<(), StoreError> {
         self.store
             .writer
@@ -1136,6 +1141,15 @@ fn policy_snapshot_from_meta(meta: &transaction::StoreMeta) -> Result<PolicySnap
 impl RedbResourceStore {
     pub async fn get(&self, request: StoreGetRequest) -> Result<StoredResource, StoreError> {
         self.reads.get(request).await
+    }
+
+    /// Read the durable assignment evidence attached to one resource.
+    pub async fn assignment_fence(
+        &self,
+        zone: ZoneId,
+        target: ResourceRef,
+    ) -> Result<Option<ResourceAssignmentFence>, StoreError> {
+        self.reads.assignment_fence(zone, target).await
     }
 
     pub async fn list(&self, request: StoreListRequest) -> Result<StoreListResult, StoreError> {

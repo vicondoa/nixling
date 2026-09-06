@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use d2b_contracts_provider::v3::SpecifiedProviderMethod;
 use d2b_contracts_resource::v3::execution_policy::{BoundedToken, PrimitiveSpecError};
 
 use crate::error::RegistryBuildError;
@@ -148,6 +149,24 @@ impl ProviderCapabilitySet {
         Ok(Self(methods))
     }
 
+    /// Build the exact capability set for specified Provider methods.
+    pub fn from_specified(
+        methods: impl IntoIterator<Item = SpecifiedProviderMethod>,
+    ) -> Result<Self, RegistryBuildError> {
+        Self::new(
+            methods
+                .into_iter()
+                .map(specified_method_name)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| RegistryBuildError::InvalidDescriptor)?,
+        )
+    }
+
+    /// Whether the set contains the exact specified Provider method.
+    pub fn contains_specified_method(&self, method: SpecifiedProviderMethod) -> bool {
+        specified_method_name(method).is_ok_and(|method| self.contains_method(&method))
+    }
+
     /// Whether this Provider publishes the exact method.
     pub fn contains_method(&self, method: &ProviderMethodName) -> bool {
         self.0.contains(method)
@@ -167,4 +186,19 @@ impl ProviderCapabilitySet {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+fn specified_method_name(
+    method: SpecifiedProviderMethod,
+) -> Result<ProviderMethodName, RegistryBuildError> {
+    ProviderMethodName::parse(match method {
+        SpecifiedProviderMethod::AssessUpdate => "assess-update",
+        SpecifiedProviderMethod::PlanUpgrade => "plan-upgrade",
+        SpecifiedProviderMethod::ExecuteUpgrade => "execute-upgrade",
+        SpecifiedProviderMethod::OpenTransport => "open-transport",
+        SpecifiedProviderMethod::CloseTransport => "close-transport",
+        SpecifiedProviderMethod::ObserveTransport => "observe-transport",
+        _ => return Err(RegistryBuildError::InvalidDescriptor),
+    })
+    .map_err(|_| RegistryBuildError::InvalidDescriptor)
 }

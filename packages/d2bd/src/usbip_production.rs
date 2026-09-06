@@ -82,6 +82,7 @@ impl UsbipBindingContext {
     }
 
     /// Resolve Core-owned context before any host firewall or runner effect.
+    #[allow(dead_code)]
     pub(crate) fn before_host_effects(
         vm_id: impl Into<String>,
         env: impl Into<String>,
@@ -115,6 +116,10 @@ impl AuthorityLedger {
         token[..8].copy_from_slice(&sequence.to_be_bytes());
         token
     }
+}
+
+pub(crate) fn new_authority_ledger() -> Arc<Mutex<AuthorityLedger>> {
+    Arc::new(Mutex::new(AuthorityLedger::default()))
 }
 
 /// Core-owned child-resource seam for USBIP Binding realization.

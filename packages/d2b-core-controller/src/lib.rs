@@ -58,8 +58,21 @@ pub use controller_assignment::{
     ScopedResourceFilter, ScopedResourceMutation, ScopedResourceQuery, ScopedResourceScope,
 };
 pub use controllers::{
-    AggregateHealth, CoreHandlerKind, CoreHandlerRegistry, CurrencyAggregation,
+    AggregateHealth, CORE_PROVIDER_API_BINDING_FINALIZER, CORE_RESOURCE_CONTROLLER_REGISTRATIONS,
+    CoreHandlerKind, CoreHandlerRegistry, CoreResourceControllerRegistration, CurrencyAggregation,
     CurrencyAggregationError, HandlerOutcome, HandlerPhase, HandlerStatus,
+};
+pub use d2b_controller_toolkit::{
+    CommitDecision, CommitOutcome, ControllerDescriptor, ControllerExecutionPolicy,
+    ControllerHealth, ControllerIdentity, ControllerSelector, ControllerSource, ControllerVerb,
+    DependencySnapshot, DisruptionClass, DrainResult, FinalizeResult, FreshSnapshot,
+    HandlerFailure, InitialList, InitialResource, MutationIntent, MutationIntentKind,
+    ObservationResult, OperationContext, PriorityLane, ProjectionDisposition, ReconcileContext,
+    ReconcileDisposition, ReconcilePlan, ReconcileProjection, ReconcileReason, ReconcileResult,
+    ResourceKey, ResourceMutationBatch, ResourceReconciler, ResourceRegistration, ResourceSnapshot,
+    ResyncPolicy, Runner, RunnerConfig, RunnerError, SelectorField, SourceError,
+    StatusPersistence, TriggerReason, TriggerSet, UpdateAssessment, UpdateAssessmentState,
+    UpgradePlan, UpgradeStage, ValidationResult, WatchEvent, WatchFailure, WatchHint,
 };
 pub use dependencies::{
     DependencyError, DependencyEvent, DependencyIndex, DependencyTeardownPlan, DependencyTrigger,
@@ -83,10 +96,11 @@ pub use owner_reconcile::{
     DesiredChild, MAX_OWNER_CHILD_BATCH, MAX_OWNER_CHILD_DEPENDENCIES, ObservedChild,
     OwnedChildIntent, OwnedChildKind, OwnerBatchRecovery, OwnerBatchResult, OwnerChildBatch,
     OwnerChildIdentity, OwnerGraph, OwnerGraphError, OwnerIndex, OwnerLimits, OwnerMutation,
-    OwnerReconcileError, OwnerReconcilePlan, OwnerTrigger, TeardownPlan,
+    OwnerReconcileError, OwnerReconcilePlan, OwnerTrigger, ProcessSchedulingClass, TeardownPlan,
 };
 pub use runtime::{
-    CoreAdmissionCounts, CoreControllerSource, CoreDispatchOutcome, CoreReconcileError,
-    CoreResourceReconciler, CoreSourceError, RegisteredControllerApi,
+    CoreAdmissionCounts, CoreControllerDescriptorError, CoreControllerSource, CoreDispatchOutcome,
+    CoreReconcileError, CoreResourceReconciler, CoreSourceError, RegisteredControllerApi,
+    core_controller_descriptors,
 };
 pub use zone_status::{SystemCoreStatusEmitter, ZoneRuntimeMetadata, ZoneStatusInput};

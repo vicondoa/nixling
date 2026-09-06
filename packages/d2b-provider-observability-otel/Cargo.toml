@@ -16,3 +16,4 @@ d2b-provider-toolkit = { path = "../d2b-provider-toolkit", version = "0.0.0-boot
 serde.workspace = true
 serde_json.workspace = true
 rustix = { workspace = true }
+zeroize = "1"

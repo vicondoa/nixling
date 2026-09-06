@@ -41,6 +41,53 @@ pub const CONFIG_VOLUME_MAX_BYTES: u64 = 4 * 1024 * 1024;
 pub const CONFIG_VOLUME_MAX_INODES: u64 = 128;
 /// Guest mount path for the read-only config view.
 pub const CONFIG_MOUNT_PATH: &str = "/run/d2b/net-config";
+/// Network-local's exact Resource finalizer.
+pub const NETWORK_FINALIZER: &str = "network.d2bus.org/fabric-cleanup";
+/// Default descriptor repair interval.
+pub const NETWORK_REPAIR_INTERVAL_SECS: u64 = 30;
+/// Maximum descriptor repair interval.
+pub const NETWORK_MAX_REPAIR_INTERVAL_SECS: u64 = 60;
+
+/// The cutover contract for the Network resource owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkRunnerContract {
+    resource_type: &'static str,
+    finalizer: &'static str,
+    repair_interval_secs: u64,
+    watched_configuration_is_dependency: bool,
+}
+
+impl NetworkRunnerContract {
+    /// Return the owned ResourceType.
+    pub const fn resource_type(self) -> &'static str {
+        self.resource_type
+    }
+
+    /// Return the exact Network finalizer.
+    pub const fn finalizer(self) -> &'static str {
+        self.finalizer
+    }
+
+    /// Return the bounded repair interval.
+    pub const fn repair_interval_secs(self) -> u64 {
+        self.repair_interval_secs
+    }
+
+    /// Whether watched configuration is treated as a dependency.
+    pub const fn watched_configuration_is_dependency(self) -> bool {
+        self.watched_configuration_is_dependency
+    }
+}
+
+/// Return the one shared-Runner registration for Network-local.
+pub const fn network_runner_contract() -> NetworkRunnerContract {
+    NetworkRunnerContract {
+        resource_type: "Network",
+        finalizer: NETWORK_FINALIZER,
+        repair_interval_secs: NETWORK_REPAIR_INTERVAL_SECS,
+        watched_configuration_is_dependency: true,
+    }
+}
 
 /// Closed condition reason emitted by the state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -744,8 +791,8 @@ pub trait NetworkResourcePort: Send + Sync {
         &self,
         spec: &VolumeSpec,
     ) -> impl Future<Output = Result<(), NetworkEffectError>> + Send;
-    /// Write all four bounded config payloads through the Volume service.
-    fn write_volume_content(
+    /// Persist the desired bounded config projection for the Volume owner.
+    fn upsert_volume_content(
         &self,
         content: &NetworkConfigContent,
     ) -> impl Future<Output = Result<(), NetworkEffectError>> + Send;
@@ -779,7 +826,7 @@ pub trait NetworkResourcePort: Send + Sync {
     fn delete_volume(&self) -> impl Future<Output = Result<(), NetworkEffectError>> + Send;
 }
 
-/// Four bounded files written through the Volume service.
+/// Four bounded files carried in the desired Volume content projection.
 #[derive(Clone, PartialEq, Eq)]
 pub struct NetworkConfigContent {
     /// dnsmasq configuration bytes.
@@ -1043,7 +1090,7 @@ where
         if content.provenance() != Some(&provenance) {
             return Err(NetworkEffectError::NetworkAdmissionMismatch);
         }
-        self.resources.write_volume_content(&content).await?;
+        self.resources.upsert_volume_content(&content).await?;
         if !input.volume_ready {
             return Ok(ReconcileProgress::Pending(
                 NetworkConditionReason::VolumeNotReady,
@@ -1191,8 +1238,28 @@ pub fn config_volume_spec(
     )
     .map_err(|_| NetworkEffectError::InvalidState)?;
     let mut layout = vec![
-        LayoutEntry::root_directory(owner.clone(), owner.clone(), "0750")
-            .map_err(|_| NetworkEffectError::InvalidState)?,
+        LayoutEntry::new(
+            "",
+            EntryType::Directory,
+            owner.clone(),
+            owner.clone(),
+            "0750",
+            None,
+            Vec::new(),
+            Vec::new(),
+            ForeignChildPolicy::Preserve,
+            true,
+            false,
+            SensitivityClass::Private,
+            CreatePolicy::CreateIfAbsent,
+            RepairPolicy::ExactOwner,
+            CleanupPolicy::Never,
+            EntryAdoptionPolicy::AdoptWithLiveOwnerProof,
+            EntryRestartPolicy::RecreateOnControllerRestart,
+            LeaseClass::None,
+            vec![Invariant::NoSymlink],
+        )
+        .map_err(|_| NetworkEffectError::InvalidState)?,
     ];
     for path in [
         "dnsmasq.conf",
@@ -1218,7 +1285,7 @@ pub fn config_volume_spec(
                 RepairPolicy::ExactOwner,
                 CleanupPolicy::OwnerControlled,
                 EntryAdoptionPolicy::AdoptWithLiveOwnerProof,
-                EntryRestartPolicy::PreserveAcrossControllerRestart,
+                EntryRestartPolicy::RecreateOnControllerRestart,
                 LeaseClass::None,
                 vec![Invariant::NoSymlink, Invariant::BrokerOpaqueIdOnly],
             )

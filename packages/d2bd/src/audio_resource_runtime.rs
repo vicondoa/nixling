@@ -1,18 +1,21 @@
 //! Durable Zone-owned reconciliation for AudioService and AudioBinding rows.
 //!
 //! Audio policy resources are durable store objects.  This module is the
-//! daemon-side owner that relists them after restart, validates their
-//! relationships, and keeps one controller per binding until finalization.
+//! daemon-side owner that reconciles fresh per-resource snapshots, validates
+//! their relationships, and keeps one controller per binding until
+//! finalization.
 //! Host effects still flow through the broker-backed mediator in
 //! `audio_dispatch`; this registry owns policy state, not privileged handles.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use d2b_contracts_provider::v3::semantic_services::child_resources::BindingChildSet;
-use d2b_contracts_resource::resource_proto as wire;
+#[cfg(test)]
 use d2b_contracts_resource::v3::ZoneRevision;
-use d2b_contracts_resource::v3::{ResourceEnvelope, ResourceRef, ResourceTypeName, ZoneId};
+use d2b_contracts_resource::v3::{ResourceEnvelope, ResourceRef, ZoneId};
 use d2b_provider_audio_pipewire::{
     AudioArbitrationState, AudioBindingController, AudioBindingPhase, AudioBindingSpec,
     AudioBindingStatus, AudioControllerError, AudioEnforcementPosture, AudioLastSetApplied,
@@ -20,12 +23,7 @@ use d2b_provider_audio_pipewire::{
     MicDecision, resource_type::PROVIDER_REF, shared_microphone_arbiter,
     validate_audio_binding_in_zone, validate_audio_service,
 };
-use d2b_resource_api::{
-    RedbBackend, ResourceApiClient, service::UnavailableUpgradeDispatcher, watch::ResourceWatch,
-};
-use d2b_resource_store::{
-    StoreListRequest, StoreOperationContext, StoreProjection, StoreWatchRequest, StoredResource,
-};
+use d2b_resource_store::StoredResource;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 
@@ -36,16 +34,6 @@ use crate::binding_child_resource_runtime::BindingChildOwner;
 pub(crate) const AUDIO_SERVICE_TYPE: &str = "audio.d2bus.org.AudioService";
 pub(crate) const AUDIO_BINDING_TYPE: &str = "audio.d2bus.org.AudioBinding";
 const GUEST_TYPE: &str = "Guest";
-const AUDIO_FINALIZER: &str = "audio.d2bus.org/cleanup";
-type DecodedAudioBinding = (String, (StoredResource, AudioBindingSpec));
-
-/// One relisted audio resource snapshot.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct AudioResourceSnapshot {
-    pub services: Vec<StoredResource>,
-    pub bindings: Vec<StoredResource>,
-    pub guests: Vec<StoredResource>,
-}
 
 /// Stable errors for the daemon-owned audio resource path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +137,6 @@ pub(crate) struct AudioResourceRuntime {
     services: BTreeMap<String, AudioServiceSpec>,
     service_microphones: BTreeMap<String, d2b_provider_audio_pipewire::SharedMicrophoneArbiter>,
     bindings: BTreeMap<String, AudioBindingRecord>,
-    pending_finalizers: BTreeMap<String, StoredResource>,
 }
 
 impl core::fmt::Debug for AudioResourceRuntime {
@@ -172,238 +159,240 @@ impl AudioResourceRuntime {
             services: BTreeMap::new(),
             service_microphones: BTreeMap::new(),
             bindings: BTreeMap::new(),
-            pending_finalizers: BTreeMap::new(),
         }
     }
 
-    /// Reconcile the complete durable snapshot. Removed bindings are
-    /// finalized before service authority is replaced or released.
-    pub(crate) fn reconcile(
+    /// Reconcile one authored AudioService without touching sibling rows.
+    pub(crate) fn reconcile_service_resource(
         &mut self,
-        snapshot: AudioResourceSnapshot,
+        resource: &StoredResource,
     ) -> Result<(), AudioResourceRuntimeError> {
-        let services = decode_services(&self.zone, &snapshot.services)?;
-        self.service_microphones
-            .retain(|service_ref, _| services.contains_key(service_ref));
-        let guests = decode_guest_names(&snapshot.guests)?;
-        let bindings = decode_bindings(&self.zone, &snapshot.bindings)?;
-        validate_relationships(&services, &bindings, &guests)?;
+        if resource.zone != self.zone
+            || resource.resource_ref.resource_type().as_str() != AUDIO_SERVICE_TYPE
+            || !is_audio_resource(resource, &self.zone)?
+        {
+            return Err(AudioResourceRuntimeError::InvalidResource);
+        }
+        let spec: AudioServiceSpec = decode_spec(resource)?;
+        validate_audio_service(&spec)
+            .map_err(|_| AudioResourceRuntimeError::InvalidResource)?;
+        let key = resource.resource_ref.to_canonical_string();
+        if deletion_requested(resource) {
+            if self
+                .bindings
+                .values()
+                .any(|record| record.spec.service_ref == resource.resource_ref)
+            {
+                return Err(AudioResourceRuntimeError::InvalidRelationship);
+            }
+            self.services.remove(&key);
+            self.service_microphones.remove(&key);
+        } else {
+            self.services.insert(key, spec);
+        }
+        Ok(())
+    }
+
+    /// Reconcile one authored AudioBinding against its exact fresh
+    /// AudioService and Guest dependencies.
+    pub(crate) fn reconcile_binding_resource(
+        &mut self,
+        resource: &StoredResource,
+        service: &StoredResource,
+        guest: &StoredResource,
+    ) -> Result<Option<AudioBindingRuntimeStatus>, AudioResourceRuntimeError> {
+        if resource.zone != self.zone
+            || resource.resource_ref.resource_type().as_str() != AUDIO_BINDING_TYPE
+            || !is_audio_resource(resource, &self.zone)?
+        {
+            return Err(AudioResourceRuntimeError::InvalidResource);
+        }
+        let mut spec: AudioBindingSpec = decode_spec(resource)?;
+        spec.zone = self.zone.as_str().to_owned();
+        validate_audio_binding_in_zone(&spec, self.zone.as_str())
+            .map_err(|_| AudioResourceRuntimeError::InvalidResource)?;
+        if deletion_requested(resource) {
+            return Err(AudioResourceRuntimeError::InvalidRelationship);
+        }
+        if service.resource_ref != spec.service_ref
+            || service.zone != self.zone
+            || service.resource_ref.resource_type().as_str() != AUDIO_SERVICE_TYPE
+            || deletion_requested(service)
+            || !is_audio_resource(service, &self.zone)?
+        {
+            return Err(AudioResourceRuntimeError::InvalidRelationship);
+        }
+        let service_spec: AudioServiceSpec = decode_spec(service)?;
+        validate_audio_service(&service_spec)
+            .map_err(|_| AudioResourceRuntimeError::InvalidRelationship)?;
+        if guest.resource_ref != spec.target_ref
+            || guest.zone != self.zone
+            || guest.resource_ref.resource_type().as_str() != GUEST_TYPE
+            || deletion_requested(guest)
+            || ResourceEnvelope::from_json(&guest.canonical_json).is_err()
+        {
+            return Err(AudioResourceRuntimeError::InvalidRelationship);
+        }
+
+        self.services
+            .insert(service.resource_ref.to_canonical_string(), service_spec.clone());
+        let key = resource.resource_ref.to_canonical_string();
+        let children = AudioBindingController::<DaemonAudioMediator>::child_resources(
+            &resource.resource_ref,
+            &spec,
+        )
+        .map_err(|_| AudioResourceRuntimeError::InvalidRelationship)?;
+        if let Some(record) = self.bindings.get_mut(&key)
+            && record.spec == spec
+            && let Some(controller) = record.controller.as_mut()
+        {
+            match controller.reconcile(&spec, self.zone.as_str(), record.lease) {
+                Ok(result) => {
+                    record.status = result.status;
+                }
+                Err(AudioControllerError::Admission) => {
+                    return Err(AudioResourceRuntimeError::InvalidRelationship);
+                }
+                Err(AudioControllerError::Mediator(_)) => {
+                    record.status = unavailable_status(
+                        AudioBindingPhase::Degraded,
+                        controller.mediator().host_readiness(),
+                        controller.mediator().guest_readiness(),
+                    );
+                }
+            }
+            record.children = Some(children);
+            return Ok(Some(AudioBindingRuntimeStatus {
+                resource: resource.resource_ref.clone(),
+                status: record.status,
+            }));
+        }
+
+        let promoted = if let Some(old) = self.bindings.get_mut(&key) {
+            if let Some(controller) = old.controller.as_mut() {
+                controller
+                    .finalize_shared(old.lease)
+                    .map_err(AudioResourceRuntimeError::Controller)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(promoted) = promoted {
+            self.activate_promoted(promoted)?;
+        }
+        self.bindings.remove(&key);
+
+        let lease = lease_for(&resource.resource_ref);
         let manifest = crate::load_json::<d2b_core::manifest_v04::ManifestV04>(
             &self.state.config.artifacts.public_manifest_path,
         )
         .ok();
-        let active_targets = bindings
-            .iter()
-            .filter(|(_, (resource, _))| !deletion_requested(resource))
-            .map(|(_, (_, spec))| spec.target_ref.clone())
-            .collect::<BTreeSet<_>>();
-
-        let desired_keys = bindings
-            .iter()
-            .map(|(key, _)| key.clone())
-            .collect::<BTreeSet<_>>();
-        let removed = self
-            .bindings
-            .keys()
-            .filter(|key| !desired_keys.contains(*key))
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in removed {
-            let promoted = if let Some(record) = self.bindings.get_mut(&key) {
-                if let Some(controller) = record.controller.as_mut() {
-                    controller
-                        .finalize_shared(record.lease)
-                        .map_err(AudioResourceRuntimeError::Controller)?
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some(promoted) = promoted {
-                self.activate_promoted(promoted)?;
-            }
-            self.bindings.remove(&key);
-        }
-
-        for (key, (resource, spec)) in bindings {
-            if deletion_requested(&resource) {
-                if !self.bindings.contains_key(&key) && !active_targets.contains(&spec.target_ref) {
-                    self.revoke_unmanaged_binding(&spec, manifest.as_ref())?;
-                }
-                let promoted = if let Some(record) = self.bindings.get_mut(&key) {
-                    if let Some(controller) = record.controller.as_mut() {
-                        controller
-                            .finalize_shared(record.lease)
-                            .map_err(AudioResourceRuntimeError::Controller)?
-                    } else {
-                        None
+        let capability = manifest
+            .as_ref()
+            .and_then(|manifest| manifest.vms.get(spec.target_ref.name().as_str()))
+            .and_then(audio_capability_for_vm);
+        let (controller, status) = match capability {
+            None => (
+                None,
+                unavailable_status(
+                    AudioBindingPhase::Degraded,
+                    HostAudioReadiness::Unavailable,
+                    GuestAudioReadiness::Unavailable,
+                ),
+            ),
+            Some(capability) => {
+                let capability = if service_spec.service_role == AudioServiceRole::Projection {
+                    d2b_core::provider_capabilities::AudioProviderCapability {
+                        host_enforcement:
+                            d2b_core::provider_capabilities::AudioHostEnforcementKind::None,
+                        ..capability
                     }
                 } else {
-                    None
+                    capability
                 };
-                if let Some(promoted) = promoted {
-                    self.activate_promoted(promoted)?;
-                }
-                self.bindings.remove(&key);
-                if has_audio_finalizer(&resource) {
-                    self.pending_finalizers.insert(key.clone(), resource);
-                }
-                continue;
-            }
-            let service = services
-                .get(&spec.service_ref.to_canonical_string())
-                .ok_or(AudioResourceRuntimeError::InvalidRelationship)?;
-            if let Some(record) = self.bindings.get_mut(&key)
-                && record.spec == spec
-                && let Some(controller) = record.controller.as_mut()
-            {
-                let children = AudioBindingController::<DaemonAudioMediator>::child_resources(
-                    &resource.resource_ref,
-                    &spec,
-                )
-                .map_err(|_| AudioResourceRuntimeError::InvalidRelationship)?;
-                match controller.reconcile(&spec, self.zone.as_str(), record.lease) {
-                    Ok(result) => {
-                        record.status = result.status;
-                    }
+                let mediator = DaemonAudioMediator::new(
+                    self.state.as_ref(),
+                    spec.target_ref.name().as_str(),
+                    capability,
+                    d2b_contracts_broker::broker_wire::BrokerCallerRole::AdminUid {
+                        uid: self.state.daemon_uid,
+                    },
+                );
+                let microphone = self
+                    .service_microphones
+                    .entry(spec.service_ref.to_canonical_string())
+                    .or_insert_with(|| shared_microphone_arbiter(64))
+                    .clone();
+                let mut controller =
+                    AudioBindingController::with_shared_microphone(mediator, microphone);
+                match controller.reconcile(&spec, self.zone.as_str(), lease) {
+                    Ok(result) => (Some(controller), result.status),
                     Err(AudioControllerError::Admission) => {
                         return Err(AudioResourceRuntimeError::InvalidRelationship);
                     }
                     Err(AudioControllerError::Mediator(_)) => {
-                        record.status = unavailable_status(
-                            AudioBindingPhase::Degraded,
-                            controller.mediator().host_readiness(),
-                            controller.mediator().guest_readiness(),
-                        );
-                    }
-                }
-                record.children = Some(children);
-                continue;
-            }
-            let promoted = if let Some(old) = self.bindings.get_mut(&key) {
-                if let Some(controller) = old.controller.as_mut() {
-                    controller
-                        .finalize_shared(old.lease)
-                        .map_err(AudioResourceRuntimeError::Controller)?
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some(promoted) = promoted {
-                self.activate_promoted(promoted)?;
-            }
-            self.bindings.remove(&key);
-
-            let lease = lease_for(&resource.resource_ref);
-            let children = AudioBindingController::<DaemonAudioMediator>::child_resources(
-                &resource.resource_ref,
-                &spec,
-            )
-            .map_err(|_| AudioResourceRuntimeError::InvalidRelationship)?;
-            let (controller, status) = {
-                let capability = manifest
-                    .as_ref()
-                    .and_then(|manifest| manifest.vms.get(spec.target_ref.name().as_str()))
-                    .and_then(audio_capability_for_vm);
-                match capability {
-                    None => (
-                        None,
-                        unavailable_status(
-                            AudioBindingPhase::Degraded,
-                            HostAudioReadiness::Unavailable,
-                            GuestAudioReadiness::Unavailable,
-                        ),
-                    ),
-                    Some(capability) => {
-                        let capability = if service.service_role == AudioServiceRole::Projection {
-                            d2b_core::provider_capabilities::AudioProviderCapability {
-                                host_enforcement:
-                                    d2b_core::provider_capabilities::AudioHostEnforcementKind::None,
-                                ..capability
-                            }
-                        } else {
-                            capability
+                        let (host_readiness, guest_readiness) = {
+                            let mediator = controller.mediator();
+                            (mediator.host_readiness(), mediator.guest_readiness())
                         };
-                        let mediator = DaemonAudioMediator::new(
-                            self.state.as_ref(),
-                            spec.target_ref.name().as_str(),
-                            capability,
-                            d2b_contracts_broker::broker_wire::BrokerCallerRole::AdminUid {
-                                uid: self.state.daemon_uid,
-                            },
-                        );
-                        let microphone = self
-                            .service_microphones
-                            .entry(spec.service_ref.to_canonical_string())
-                            .or_insert_with(|| shared_microphone_arbiter(64))
-                            .clone();
-                        let mut controller =
-                            AudioBindingController::with_shared_microphone(mediator, microphone);
-                        let result = controller.reconcile(&spec, self.zone.as_str(), lease);
-                        match result {
-                            Ok(result) => (Some(controller), result.status),
-                            Err(AudioControllerError::Admission) => {
-                                return Err(AudioResourceRuntimeError::InvalidRelationship);
-                            }
-                            Err(AudioControllerError::Mediator(_)) => {
-                                let mediator = controller.mediator();
-                                let host_readiness = mediator.host_readiness();
-                                let guest_readiness = mediator.guest_readiness();
-                                (
-                                    Some(controller),
-                                    unavailable_status(
-                                        AudioBindingPhase::Degraded,
-                                        host_readiness,
-                                        guest_readiness,
-                                    ),
-                                )
-                            }
-                        }
+                        (
+                            Some(controller),
+                            unavailable_status(
+                                AudioBindingPhase::Degraded,
+                                host_readiness,
+                                guest_readiness,
+                            ),
+                        )
                     }
                 }
-            };
-            self.bindings.insert(
-                key,
-                AudioBindingRecord {
-                    spec,
-                    lease,
-                    controller,
-                    status,
-                    children: Some(children),
-                },
-            );
-        }
-        self.services = services;
-        Ok(())
-    }
-
-    fn revoke_unmanaged_binding(
-        &self,
-        spec: &AudioBindingSpec,
-        manifest: Option<&d2b_core::manifest_v04::ManifestV04>,
-    ) -> Result<(), AudioResourceRuntimeError> {
-        let capability = manifest
-            .and_then(|manifest| manifest.vms.get(spec.target_ref.name().as_str()))
-            .and_then(audio_capability_for_vm)
-            .ok_or(AudioResourceRuntimeError::Controller(
-                AudioControllerError::Mediator(
-                    d2b_provider_audio_pipewire::AudioMediatorError::ProviderSessionUnavailable,
-                ),
-            ))?;
-        let mediator = DaemonAudioMediator::new(
-            self.state.as_ref(),
-            spec.target_ref.name().as_str(),
-            capability,
-            d2b_contracts_broker::broker_wire::BrokerCallerRole::AdminUid {
-                uid: self.state.daemon_uid,
+            }
+        };
+        self.bindings.insert(
+            key,
+            AudioBindingRecord {
+                spec,
+                lease,
+                controller,
+                status,
+                children: Some(children),
             },
         );
-        AudioBindingController::new(mediator)
-            .revoke_unmanaged()
-            .map_err(AudioResourceRuntimeError::Controller)
+        Ok(Some(AudioBindingRuntimeStatus {
+            resource: resource.resource_ref.clone(),
+            status,
+        }))
+    }
+
+    /// Remove one deleting AudioBinding from the in-memory authority.
+    pub(crate) fn finalize_binding_resource(
+        &mut self,
+        resource: &StoredResource,
+    ) -> Result<(), AudioResourceRuntimeError> {
+        if resource.zone != self.zone
+            || resource.resource_ref.resource_type().as_str() != AUDIO_BINDING_TYPE
+            || !is_audio_resource(resource, &self.zone)?
+        {
+            return Err(AudioResourceRuntimeError::InvalidResource);
+        }
+        let key = resource.resource_ref.to_canonical_string();
+        let promoted = if let Some(record) = self.bindings.get_mut(&key) {
+            if let Some(controller) = record.controller.as_mut() {
+                controller
+                    .finalize_shared(record.lease)
+                    .map_err(AudioResourceRuntimeError::Controller)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(promoted) = promoted {
+            self.activate_promoted(promoted)?;
+        }
+        self.bindings.remove(&key);
+        Ok(())
     }
 
     fn activate_promoted(
@@ -439,12 +428,6 @@ impl AudioResourceRuntime {
             .collect()
     }
 
-    pub(crate) fn take_pending_finalizers(&mut self) -> Vec<StoredResource> {
-        std::mem::take(&mut self.pending_finalizers)
-            .into_values()
-            .collect()
-    }
-
     /// Return the currently declared children for one authored Binding.
     pub(crate) fn children_for(&self, binding_ref: &ResourceRef) -> Option<&BindingChildSet> {
         self.bindings
@@ -452,31 +435,25 @@ impl AudioResourceRuntime {
             .and_then(|record| record.children.as_ref())
     }
 
-    /// Build Core-owned child reconciliation owners from the complete
-    /// authoritative Binding relist.
-    pub(crate) fn child_owners(
+    /// Build one Core-owned child reconciliation owner for an AudioBinding.
+    pub(crate) fn child_owner_for(
         &self,
-        bindings: &[StoredResource],
-    ) -> Result<Vec<BindingChildOwner>, AudioResourceRuntimeError> {
-        bindings
-            .iter()
-            .map(|resource| {
-                let desired = if deletion_requested(resource) {
-                    None
-                } else {
-                    Some(
-                        self.children_for(&resource.resource_ref)
-                            .cloned()
-                            .ok_or(AudioResourceRuntimeError::InvalidRelationship)?,
-                    )
-                };
-                Ok(BindingChildOwner {
-                    resource: resource.clone(),
-                    desired,
-                    fenced: false,
-                })
-            })
-            .collect()
+        resource: &StoredResource,
+    ) -> Result<BindingChildOwner, AudioResourceRuntimeError> {
+        let desired = if deletion_requested(resource) {
+            None
+        } else {
+            Some(
+                self.children_for(&resource.resource_ref)
+                    .cloned()
+                    .ok_or(AudioResourceRuntimeError::InvalidRelationship)?,
+            )
+        };
+        Ok(BindingChildOwner {
+            resource: resource.clone(),
+            desired,
+            fenced: false,
+        })
     }
 }
 
@@ -522,93 +499,7 @@ fn deletion_requested(resource: &StoredResource) -> bool {
         .is_some_and(|value| !value.is_null())
 }
 
-pub(crate) fn has_audio_finalizer(resource: &StoredResource) -> bool {
-    serde_json::from_slice::<serde_json::Value>(&resource.canonical_json)
-        .ok()
-        .and_then(|value| value.get("metadata").cloned())
-        .and_then(|metadata| metadata.get("finalizers").cloned())
-        .and_then(|value| value.as_array().cloned())
-        .is_some_and(|values| {
-            values
-                .iter()
-                .any(|value| value.as_str() == Some(AUDIO_FINALIZER))
-        })
-}
-
-fn audio_binding_requires_finalizer(resource: &StoredResource, zone: &ZoneId) -> bool {
-    if resource.zone != *zone
-        || resource.resource_ref.resource_type().as_str() != AUDIO_BINDING_TYPE
-        || deletion_requested(resource)
-        || !is_audio_resource(resource, zone).unwrap_or(false)
-    {
-        return false;
-    }
-    let Ok(mut spec) = decode_spec::<AudioBindingSpec>(resource) else {
-        return false;
-    };
-    spec.zone = zone.as_str().to_owned();
-    validate_audio_binding_in_zone(&spec, zone.as_str()).is_ok()
-}
-
-pub(crate) async fn update_audio_finalizer(
-    client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
-    resource: &StoredResource,
-    add: bool,
-) -> Result<(), AudioResourceRuntimeError> {
-    let mut target = wire::ResourceIdentity::new();
-    target.zone = resource.zone.to_canonical_string();
-    target.resource_type = resource.resource_ref.resource_type().as_str().to_owned();
-    target.name = resource.resource_ref.name().as_str().to_owned();
-    target.uid = Some(resource.uid.as_str().to_owned());
-    target.generation = Some(resource.generation.get());
-    target.revision = Some(resource.revision.get());
-
-    let mut precondition = wire::Precondition::new();
-    precondition.kind =
-        protobuf::EnumOrUnknown::new(wire::PreconditionKind::PRECONDITION_KIND_EXACT_REVISION);
-    precondition.expected_revision = Some(resource.revision.get());
-    precondition.expected_uid = Some(resource.uid.as_str().to_owned());
-
-    let operation = crate::resource_runtime::bounded_operation_id(&format!(
-        "audio-runtime-finalizer-{}-{}-{}",
-        resource.resource_ref.to_canonical_string(),
-        resource.revision.get(),
-        if add { "add" } else { "remove" }
-    ));
-    let mut mutation = wire::Mutation::new();
-    mutation.kind =
-        protobuf::EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_FINALIZERS);
-    mutation.target = protobuf::MessageField::some(target);
-    mutation.precondition = protobuf::MessageField::some(precondition);
-    if add {
-        mutation.add_finalizers.push(AUDIO_FINALIZER.to_owned());
-    } else {
-        mutation.remove_finalizers.push(AUDIO_FINALIZER.to_owned());
-    }
-    let mut request = wire::UpdateFinalizersRequest::new();
-    let mut meta = wire::RequestMeta::new();
-    meta.operation_id = operation.clone();
-    meta.idempotency_key = operation.clone();
-    meta.correlation_id = operation.clone();
-    meta.trace_id = operation;
-    request.meta = protobuf::MessageField::some(meta);
-    request.mutation = protobuf::MessageField::some(mutation);
-    let response = client.update_finalizers(request).await;
-    if response.error.is_some() || response.resource.is_none() {
-        return Err(AudioResourceRuntimeError::Controller(
-            AudioControllerError::Admission,
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) async fn remove_audio_finalizer(
-    client: &ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>,
-    resource: &StoredResource,
-) -> Result<(), AudioResourceRuntimeError> {
-    update_audio_finalizer(client, resource, false).await
-}
-
+#[cfg(test)]
 fn decode_services(
     zone: &ZoneId,
     resources: &[StoredResource],
@@ -628,25 +519,6 @@ fn decode_services(
         }
     }
     Ok(services)
-}
-
-fn decode_bindings(
-    zone: &ZoneId,
-    resources: &[StoredResource],
-) -> Result<Vec<DecodedAudioBinding>, AudioResourceRuntimeError> {
-    let mut bindings = Vec::new();
-    for resource in resources {
-        if !is_audio_resource(resource, zone)? {
-            continue;
-        }
-        let mut spec: AudioBindingSpec = decode_spec(resource)?;
-        spec.zone = zone.as_str().to_owned();
-        validate_audio_binding_in_zone(&spec, zone.as_str())
-            .map_err(|_| AudioResourceRuntimeError::InvalidResource)?;
-        let key = resource.resource_ref.to_canonical_string();
-        bindings.push((key, (resource.clone(), spec)));
-    }
-    Ok(bindings)
 }
 
 fn is_audio_resource(
@@ -669,20 +541,7 @@ fn is_audio_resource(
         .is_some_and(|provider| provider.to_canonical_string() == PROVIDER_REF))
 }
 
-fn decode_guest_names(
-    resources: &[StoredResource],
-) -> Result<BTreeSet<String>, AudioResourceRuntimeError> {
-    resources
-        .iter()
-        .map(|resource| {
-            if resource.resource_ref.resource_type().as_str() != GUEST_TYPE {
-                return Err(AudioResourceRuntimeError::InvalidResource);
-            }
-            Ok(resource.resource_ref.to_canonical_string())
-        })
-        .collect()
-}
-
+#[cfg(test)]
 fn validate_relationships(
     services: &BTreeMap<String, AudioServiceSpec>,
     bindings: &[(String, (StoredResource, AudioBindingSpec))],
@@ -717,329 +576,6 @@ fn decode_spec<T: DeserializeOwned>(
         );
     }
     serde_json::from_value(spec).map_err(|_| AudioResourceRuntimeError::InvalidResource)
-}
-
-/// Build a store list request for one audio resource type.
-pub(crate) fn audio_list_request(
-    zone: &ZoneId,
-    resource_type: ResourceTypeName,
-    suffix: &'static str,
-) -> StoreListRequest {
-    StoreListRequest {
-        operation: StoreOperationContext {
-            operation_id: format!("audio-resource-reconcile:{suffix}"),
-            idempotency_key: None,
-            correlation_id: format!("audio-resource-reconcile:{suffix}"),
-            trace_id: None,
-            deadline_ms: 10_000,
-        },
-        zone: zone.clone(),
-        resource_types: vec![resource_type],
-        resource_names: Vec::new(),
-        filters: Vec::new(),
-        page_size: 256,
-        cursor: None,
-        projection: StoreProjection::Full,
-    }
-}
-
-/// Build the one watch that covers all durable audio dependencies.
-pub(crate) fn audio_watch_request(zone: &ZoneId) -> StoreWatchRequest {
-    StoreWatchRequest {
-        operation: StoreOperationContext {
-            operation_id: "audio-resource-watch".to_owned(),
-            idempotency_key: None,
-            correlation_id: "audio-resource-watch".to_owned(),
-            trace_id: None,
-            deadline_ms: 10_000,
-        },
-        zone: zone.clone(),
-        resource_types: vec![
-            ResourceTypeName::parse(AUDIO_SERVICE_TYPE).expect("static audio service type"),
-            ResourceTypeName::parse(AUDIO_BINDING_TYPE).expect("static audio binding type"),
-            ResourceTypeName::parse(GUEST_TYPE).expect("static guest type"),
-            ResourceTypeName::parse("Process").expect("static process type"),
-            ResourceTypeName::parse("EphemeralProcess").expect("static ephemeral process type"),
-            ResourceTypeName::parse("Endpoint").expect("static endpoint type"),
-        ],
-        resource_names: Vec::new(),
-        filters: Vec::new(),
-        after_revision: ZoneRevision::new(0),
-        initial_credits: 64,
-        projection: StoreProjection::Full,
-    }
-}
-
-/// Relist all pages for one resource type before a controller transition.
-pub(crate) async fn list_audio_resources(
-    store: &d2b_resource_store_redb::RedbResourceStore,
-    zone: &ZoneId,
-    resource_type: ResourceTypeName,
-    suffix: &'static str,
-) -> Result<Vec<StoredResource>, AudioResourceRuntimeError> {
-    let mut request = audio_list_request(zone, resource_type, suffix);
-    let mut resources = Vec::new();
-    loop {
-        let result = store
-            .list(request.clone())
-            .await
-            .map_err(|_| AudioResourceRuntimeError::InvalidResource)?;
-        resources.extend(result.resources);
-        let Some(cursor) = result.next_cursor else {
-            break;
-        };
-        request.cursor = Some(cursor);
-    }
-    Ok(resources)
-}
-
-/// Run a watch-driven relist loop for a Zone-owned audio registry.
-pub(crate) async fn run_audio_watch(
-    mut watch: ResourceWatch,
-    store: Arc<d2b_resource_store_redb::RedbResourceStore>,
-    zone: ZoneId,
-    registry: Arc<std::sync::Mutex<Option<AudioResourceRuntime>>>,
-    status_client: Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>,
-) {
-    loop {
-        let Some(batch) = watch.recv().await else {
-            if watch.resume().await.is_err() {
-                return;
-            }
-            continue;
-        };
-        let revision = batch.revision();
-        let snapshot = match list_audio_snapshot(&store, &zone).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tracing::warn!(error = %error, "audio resource relist failed after watch event");
-                if watch.resume().await.is_err() {
-                    return;
-                }
-                continue;
-            }
-        };
-        let mut snapshot = snapshot;
-        let mut finalizer_retry = false;
-        let mut finalizer_added = false;
-        for resource in &snapshot.bindings {
-            if audio_binding_requires_finalizer(resource, &zone) && !has_audio_finalizer(resource) {
-                if let Err(error) =
-                    update_audio_finalizer(status_client.as_ref(), resource, true).await
-                {
-                    tracing::warn!(
-                        error = %error,
-                        finalizer = AUDIO_FINALIZER,
-                        "audio finalizer addition failed before effect reconciliation"
-                    );
-                    finalizer_retry = true;
-                } else {
-                    finalizer_added = true;
-                }
-            }
-        }
-        if finalizer_retry {
-            if watch.resume().await.is_err() {
-                return;
-            }
-            continue;
-        }
-        if finalizer_added {
-            snapshot = match list_audio_snapshot(&store, &zone).await {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "audio resource relist failed after finalizer addition"
-                    );
-                    if watch.resume().await.is_err() {
-                        return;
-                    }
-                    continue;
-                }
-            };
-        }
-        let binding_resources = snapshot.bindings.clone();
-        let (statuses, pending_finalizers, child_owners, mut retry) = match registry.lock() {
-            Ok(mut slot) => match slot.as_mut() {
-                Some(runtime) => match runtime.reconcile(snapshot) {
-                    Ok(()) => match runtime.child_owners(&binding_resources) {
-                        Ok(owners) => (
-                            Some(runtime.statuses()),
-                            runtime.take_pending_finalizers(),
-                            Some(owners),
-                            false,
-                        ),
-                        Err(error) => {
-                            tracing::warn!(
-                                error = %error,
-                                "audio child owner construction failed"
-                            );
-                            (None, Vec::new(), None, true)
-                        }
-                    },
-                    Err(error) => {
-                        tracing::warn!(error = %error, "audio resource reconciliation degraded");
-                        (None, Vec::new(), None, true)
-                    }
-                },
-                None => (None, Vec::new(), None, false),
-            },
-            Err(_) => return,
-        };
-        let converged_children = match child_owners.as_ref() {
-            Some(owners) => {
-                match crate::binding_child_resource_runtime::reconcile_binding_children(
-                    &store,
-                    status_client.as_ref(),
-                    &zone,
-                    owners,
-                )
-                .await
-                {
-                    Ok(converged) => converged,
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            "audio child-resource reconciliation failed"
-                        );
-                        retry = true;
-                        BTreeSet::new()
-                    }
-                }
-            }
-            None => BTreeSet::new(),
-        };
-        let children =
-            match crate::binding_child_resource_runtime::list_binding_children(&store, &zone).await
-            {
-                Ok(children) => children,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "audio child-resource relist failed before status projection"
-                    );
-                    retry = true;
-                    Vec::new()
-                }
-            };
-        if let Some(owners) = child_owners.as_ref() {
-            for owner in owners {
-                if owner.desired.is_none()
-                    && converged_children.contains(&owner.resource.resource_ref)
-                    && has_audio_finalizer(&owner.resource)
-                    && let Err(error) =
-                        remove_audio_finalizer(status_client.as_ref(), &owner.resource).await
-                {
-                    tracing::warn!(
-                        error = %error,
-                        finalizer = AUDIO_FINALIZER,
-                        "audio finalizer removal failed"
-                    );
-                    retry = true;
-                }
-            }
-        }
-        let owner_refs = child_owners
-            .as_ref()
-            .map(|owners| {
-                owners
-                    .iter()
-                    .map(|owner| owner.resource.resource_ref.clone())
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
-        for resource in pending_finalizers {
-            if owner_refs.contains(&resource.resource_ref)
-                || !converged_children.contains(&resource.resource_ref)
-                || !has_audio_finalizer(&resource)
-            {
-                continue;
-            }
-            if let Err(error) = remove_audio_finalizer(status_client.as_ref(), &resource).await {
-                tracing::warn!(
-                    error = %error,
-                    finalizer = AUDIO_FINALIZER,
-                    "recovered audio finalizer removal failed"
-                );
-                retry = true;
-            }
-        }
-        // Finalizer mutations advance parent revisions. Relist the
-        // authoritative Binding rows before status writes so exact
-        // UID/revision preconditions remain current.
-        let binding_resources = match list_audio_resources(
-            &store,
-            &zone,
-            ResourceTypeName::parse(AUDIO_BINDING_TYPE).expect("static audio binding type"),
-            "binding-status",
-        )
-        .await
-        {
-            Ok(resources) => resources,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "audio Binding relist failed before status projection"
-                );
-                retry = true;
-                Vec::new()
-            }
-        };
-        if let Some(statuses) = statuses {
-            for status in statuses {
-                let Some(resource) = binding_resources
-                    .iter()
-                    .find(|resource| resource.resource_ref == status.resource)
-                else {
-                    continue;
-                };
-                let projection = match audio_binding_status_projection_with_status(
-                    resource,
-                    &children,
-                    &status.status,
-                ) {
-                    Ok(projection) => projection,
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            "audio status projection construction failed"
-                        );
-                        retry = true;
-                        continue;
-                    }
-                };
-                let status = audio_binding_status_value(status.status);
-                let lifecycle_status = serde_json::json!({
-                    "phase": status.get("phase").cloned().unwrap_or(serde_json::Value::Null)
-                });
-                if let Err(error) =
-                    crate::resource_runtime::persist_resource_status_with_projection(
-                        status_client.as_ref(),
-                        resource,
-                        &lifecycle_status,
-                        Some(&projection),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        error = %error,
-                        "audio status projection persistence failed"
-                    );
-                    retry = true;
-                }
-            }
-        }
-        if retry {
-            if watch.resume().await.is_err() {
-                return;
-            }
-            continue;
-        }
-        if watch.acknowledge(revision).await.is_err() && watch.resume().await.is_err() {
-            return;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1105,38 +641,6 @@ pub(crate) fn audio_binding_status_projection_with_status(
     }))
 }
 
-pub(crate) async fn list_audio_snapshot(
-    store: &d2b_resource_store_redb::RedbResourceStore,
-    zone: &ZoneId,
-) -> Result<AudioResourceSnapshot, AudioResourceRuntimeError> {
-    let services = list_audio_resources(
-        store,
-        zone,
-        ResourceTypeName::parse(AUDIO_SERVICE_TYPE).expect("static audio service type"),
-        "service",
-    )
-    .await?;
-    let bindings = list_audio_resources(
-        store,
-        zone,
-        ResourceTypeName::parse(AUDIO_BINDING_TYPE).expect("static audio binding type"),
-        "binding",
-    )
-    .await?;
-    let guests = list_audio_resources(
-        store,
-        zone,
-        ResourceTypeName::parse(GUEST_TYPE).expect("static guest type"),
-        "guest",
-    )
-    .await?;
-    Ok(AudioResourceSnapshot {
-        services,
-        bindings,
-        guests,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,6 +702,8 @@ mod tests {
                 "123e4567-e89b-42d3-a456-426614174000",
             )
             .unwrap(),
+            owner_uid: None,
+            owner_generation: None,
             generation: d2b_contracts_resource::v3::ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(1),
             canonical_json: canonical,
@@ -1282,29 +788,6 @@ mod tests {
     }
 
     #[test]
-    fn watch_covers_audio_dependencies_and_owned_children() {
-        let zone = ZoneId::parse("dev").unwrap();
-        let request = audio_watch_request(&zone);
-        assert_eq!(request.zone, zone);
-        assert_eq!(request.initial_credits, 64);
-        assert_eq!(
-            request
-                .resource_types
-                .iter()
-                .map(ResourceTypeName::as_str)
-                .collect::<Vec<_>>(),
-            vec![
-                AUDIO_SERVICE_TYPE,
-                AUDIO_BINDING_TYPE,
-                GUEST_TYPE,
-                "Process",
-                "EphemeralProcess",
-                "Endpoint",
-            ]
-        );
-    }
-
-    #[test]
     fn relationship_validation_rejects_missing_guest_and_cross_service() {
         let zone = ZoneId::parse("dev").unwrap();
         let service_ref = ResourceRef::parse("audio.d2bus.org.AudioService/owner").unwrap();
@@ -1322,6 +805,8 @@ mod tests {
                 "123e4567-e89b-42d3-a456-426614174000",
             )
             .unwrap(),
+            owner_uid: None,
+            owner_generation: None,
             generation: d2b_contracts_resource::v3::ResourceGeneration::new(1).unwrap(),
             revision: ZoneRevision::new(1),
             canonical_json: br#"{"metadata":{}}"#.to_vec(),

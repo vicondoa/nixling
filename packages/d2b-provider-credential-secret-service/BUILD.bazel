@@ -14,6 +14,7 @@ rust_library(
         "//packages/d2b-contracts-provider:d2b_contracts_provider",
         "//packages/d2b-contracts-resource:d2b_contracts_resource",
         "//packages/d2b-contracts-zone-session:d2b_contracts_zone_session",
+        "//packages/d2b-provider-toolkit:d2b_provider_toolkit",
     ] + all_crate_deps(normal = True, cargo_only = True),
 )
 
@@ -22,6 +23,23 @@ rust_binary(
     srcs = ["src/main.rs"],
     compile_data = ["Cargo.toml"],
     visibility = ["//visibility:public"],
+    deps = [":d2b_provider_credential_secret_service"] + all_crate_deps(normal = True, cargo_only = True),
+)
+
+rust_test(
+    name = "entrypoint",
+    srcs = ["tests/entrypoint.rs"],
+    compile_data = ["Cargo.toml"],
+    crate_root = "tests/entrypoint.rs",
+    data = [":d2b-provider-credential-secret-service"],
+    env = {
+        "CARGO_BIN_EXE_d2b-provider-credential-secret-service": "$(rootpath :d2b-provider-credential-secret-service)",
+    },
+    rustc_env = {
+        "CARGO_BIN_EXE_d2b-provider-credential-secret-service": "$(rootpath :d2b-provider-credential-secret-service)",
+    },
+    visibility = ["//visibility:public"],
+    deps = [":d2b_provider_credential_secret_service"] + all_crate_deps(normal = True, normal_dev = True, cargo_only = True),
 )
 
 rust_test(
@@ -127,6 +145,9 @@ rust_test(
     name = "d2b_provider_credential_secret_service_test",
     compile_data = ["Cargo.toml"],
     crate = ":d2b_provider_credential_secret_service",
+    deps = [
+        "//packages/d2b-session-unix:d2b_session_unix",
+    ],
 )
 
 rust_test(
@@ -140,6 +161,9 @@ rust_test(
         "//packages/d2b-contracts-provider:d2b_contracts_provider",
         "//packages/d2b-contracts-resource:d2b_contracts_resource",
         "//packages/d2b-contracts-zone-session:d2b_contracts_zone_session",
+        "//packages/d2b-provider-toolkit:d2b_provider_toolkit",
+        "//packages/d2b-session:d2b_session",
+        "//packages/d2b-session-unix:d2b_session_unix",
         ":d2b_provider_credential_secret_service",
     ] + all_crate_deps(normal = True, normal_dev = True, cargo_only = True),
 )

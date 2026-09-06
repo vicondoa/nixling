@@ -25,6 +25,7 @@ mod scheduler;
 mod server;
 mod streams;
 mod transport;
+mod typed_stream;
 
 pub use bootstrap::{AdmittedBootstrapPsk, BootstrapAdmission, BootstrapPsk, Secret32};
 pub use cancellation::{Cancellation, RequestRegistry};
@@ -55,9 +56,10 @@ pub use server::{
 };
 pub use streams::{NamedStreamMux, StreamEvent, StreamId, StreamPhase};
 pub use transport::{
-    OwnedTransport, TransportDescriptor, TransportError, TransportPacket, TransportReader,
-    TransportWriter, serialized_transport_split,
+    OwnedTransport, OwnedTransportHandle, TransportDescriptor, TransportError, TransportPacket,
+    TransportReader, TransportWriter, serialized_transport_split,
 };
+pub use typed_stream::ComponentSessionStream;
 
 pub use admission::{
     AuthenticatedComponentSession, AuthenticatedSessionDriver, AuthenticatedSessionRouteBinding,

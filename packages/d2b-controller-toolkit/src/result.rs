@@ -1,9 +1,11 @@
 //! Bounded handler plans, results, projections, and upgrade contracts.
 
 use d2b_contracts_resource::v3::{
-    MAX_BATCH_MUTATIONS, ResourceGeneration, ResourcePhase, ResourceRef, ResourceUid, ZoneRevision,
-    resource::MAX_RESOURCE_ENVELOPE_BYTES, resource_status::MAX_STATUS_BYTES,
+    MAX_BATCH_MUTATIONS, MAX_REQUEST_CANONICAL_BYTES, ResourceGeneration, ResourcePhase,
+    ResourceRef, ResourceUid, ZoneRevision, resource::MAX_RESOURCE_ENVELOPE_BYTES,
+    resource_status::MAX_STATUS_BYTES,
 };
+use std::collections::BTreeSet;
 
 use crate::ResourceKey;
 
@@ -39,6 +41,12 @@ impl MutationIntent {
     ) -> Result<Self, ResultError> {
         if matches!(kind, MutationIntentKind::Create) != expected_revision.is_none() {
             return Err(ResultError::InvalidExpectedRevision);
+        }
+        if expected_revision.is_some_and(|revision| revision.get() == 0) {
+            return Err(ResultError::InvalidExpectedRevision);
+        }
+        if matches!(kind, MutationIntentKind::Create) != expected_uid.is_none() {
+            return Err(ResultError::InvalidExpectedUid);
         }
         if canonical_resource.as_ref().is_some_and(Vec::is_empty) {
             return Err(ResultError::EmptyMutationPayload);
@@ -117,6 +125,16 @@ impl ResourceMutationBatch {
         if mutations.len() > MAX_BATCH_MUTATIONS {
             return Err(ResultError::MutationBatchTooLarge);
         }
+        let mut targets = BTreeSet::new();
+        if mutations
+            .iter()
+            .any(|mutation| !targets.insert(&mutation.target))
+        {
+            return Err(ResultError::DuplicateMutationTarget);
+        }
+        if total_payload_bytes(&mutations) > MAX_REQUEST_CANONICAL_BYTES {
+            return Err(ResultError::MutationBatchPayloadTooLarge);
+        }
         Ok(Self { mutations })
     }
 
@@ -124,6 +142,33 @@ impl ResourceMutationBatch {
     pub fn mutations(&self) -> &[MutationIntent] {
         &self.mutations
     }
+
+    /// Return the total canonical payload size in this transaction.
+    pub fn payload_bytes(&self) -> usize {
+        total_payload_bytes(&self.mutations)
+    }
+
+    pub(crate) fn validate_against(
+        &self,
+        target: &ResourceKey,
+        revision: ZoneRevision,
+    ) -> Result<(), ResultError> {
+        if self.mutations.iter().any(|mutation| {
+            mutation.target == *target.resource_ref()
+                && (mutation.expected_uid.as_ref() != Some(target.uid())
+                    || mutation.expected_revision != Some(revision))
+        }) {
+            return Err(ResultError::MutationFenceMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn total_payload_bytes(mutations: &[MutationIntent]) -> usize {
+    mutations
+        .iter()
+        .filter_map(|mutation| mutation.canonical_resource.as_ref())
+        .fold(0usize, |total, payload| total.saturating_add(payload.len()))
 }
 
 impl core::fmt::Debug for ResourceMutationBatch {
@@ -182,6 +227,7 @@ pub enum ReconcileReason {
     ReconcilePass,
     HandlerRetryable,
     HandlerExhausted,
+    SourceBackpressure,
     HandlerTerminal,
     DeadlineExceeded,
     Cancelled,
@@ -198,6 +244,7 @@ impl ReconcileReason {
             Self::ReconcilePass => "reconcile-pass",
             Self::HandlerRetryable => "handler-retryable",
             Self::HandlerExhausted => "handler-exhausted",
+            Self::SourceBackpressure => "source-backpressure",
             Self::HandlerTerminal => "handler-terminal",
             Self::DeadlineExceeded => "deadline-exceeded",
             Self::Cancelled => "cancelled",
@@ -214,6 +261,9 @@ impl ReconcileReason {
             Self::HandlerRetryable => "check controller health and retry reconciliation",
             Self::HandlerExhausted => {
                 "check controller health before explicitly retrying reconciliation"
+            }
+            Self::SourceBackpressure => {
+                "retry reconciliation after resource-plane backpressure subsides"
             }
             Self::HandlerTerminal => "check controller configuration before retrying",
             Self::DeadlineExceeded => "check controller dependencies and retry reconciliation",
@@ -313,7 +363,9 @@ impl core::fmt::Debug for ReconcileProjection {
 pub struct ReconcileResult {
     processed_revision: ZoneRevision,
     processed_generation: ResourceGeneration,
+    /// The only Resource API mutation transaction in this result.
     mutation_batch: Option<ResourceMutationBatch>,
+    /// A status projection committed with the result transaction when present.
     status_candidate: Option<Vec<u8>>,
     disposition: ReconcileDisposition,
     next_tick: Option<u64>,
@@ -429,6 +481,23 @@ impl ReconcileResult {
         self.mutation_batch.as_ref()
     }
 
+    /// Attach the single Resource API mutation transaction to this result.
+    pub fn with_mutation_batch(
+        mut self,
+        mutation_batch: ResourceMutationBatch,
+    ) -> Result<Self, ResultError> {
+        if self.mutation_batch.is_some() {
+            return Err(ResultError::MultipleMutationTransactions);
+        }
+        self.mutation_batch = Some(mutation_batch);
+        Ok(self)
+    }
+
+    /// Return the number of Resource API mutation transactions in this result.
+    pub const fn mutation_transaction_count(&self) -> usize {
+        if self.mutation_batch.is_some() { 1 } else { 0 }
+    }
+
     /// Borrow a layered status candidate.
     pub fn status_candidate(&self) -> Option<&[u8]> {
         self.status_candidate.as_deref()
@@ -500,6 +569,9 @@ pub enum ValidationResult {
 }
 
 /// Effect-free plan produced before ordinary or expedited reconcile.
+///
+/// A non-no-op plan with no effect IDs is a mutation-only pass and does not
+/// require operation-ledger acceptance.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReconcilePlan {
     effect_ids: Vec<String>,
@@ -527,6 +599,11 @@ impl ReconcilePlan {
     /// Number of planned effect identities.
     pub fn effect_count(&self) -> usize {
         self.effect_ids.len()
+    }
+
+    /// Borrow the exact bounded effect identities for durable admission.
+    pub fn effect_ids(&self) -> &[String] {
+        &self.effect_ids
     }
 }
 
@@ -727,10 +804,15 @@ impl UpgradePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultError {
     InvalidExpectedRevision,
+    InvalidExpectedUid,
     EmptyMutationPayload,
     MutationPayloadTooLarge,
     EmptyMutationBatch,
     MutationBatchTooLarge,
+    MutationBatchPayloadTooLarge,
+    DuplicateMutationTarget,
+    MutationFenceMismatch,
+    MultipleMutationTransactions,
     InvalidRequeue,
     EmptyStatusCandidate,
     StatusCandidateTooLarge,
@@ -745,12 +827,21 @@ impl core::fmt::Display for ResultError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::InvalidExpectedRevision => "mutation expected revision does not match its kind",
+            Self::InvalidExpectedUid => "mutation expected UID does not match its kind",
             Self::EmptyMutationPayload => "canonical mutation payload must not be empty",
             Self::MutationPayloadTooLarge => {
                 "canonical mutation payload exceeds the resource bound"
             }
             Self::EmptyMutationBatch => "mutation batch must not be empty",
             Self::MutationBatchTooLarge => "mutation batch exceeds the contract bound",
+            Self::MutationBatchPayloadTooLarge => {
+                "mutation batch payload exceeds the request bound"
+            }
+            Self::DuplicateMutationTarget => "mutation batch contains a duplicate target",
+            Self::MutationFenceMismatch => "self mutation fence does not match the fresh target",
+            Self::MultipleMutationTransactions => {
+                "reconcile result must contain at most one mutation transaction"
+            }
             Self::InvalidRequeue => "requeue-at disposition requires exactly one next tick",
             Self::EmptyStatusCandidate => "status candidate must not be empty",
             Self::StatusCandidateTooLarge => "status candidate exceeds the status bound",
@@ -793,6 +884,124 @@ mod tests {
         )
         .unwrap();
         assert!(ResourceMutationBatch::new(vec![mutation; MAX_BATCH_MUTATIONS + 1]).is_err());
+    }
+
+    #[test]
+    fn multiple_mutations_are_one_transaction_and_second_transaction_is_rejected() {
+        let first = MutationIntent::new(
+            ResourceRef::parse("Process/first").unwrap(),
+            None,
+            None,
+            MutationIntentKind::Create,
+            Some(b"{}".to_vec()),
+        )
+        .unwrap();
+        let second = MutationIntent::new(
+            ResourceRef::parse("Process/second").unwrap(),
+            None,
+            None,
+            MutationIntentKind::Create,
+            Some(b"{}".to_vec()),
+        )
+        .unwrap();
+        let batch = ResourceMutationBatch::new(vec![first, second]).unwrap();
+        assert_eq!(batch.mutations().len(), 2);
+
+        let result =
+            ReconcileResult::converged(ZoneRevision::new(1), ResourceGeneration::new(1).unwrap())
+                .with_mutation_batch(batch.clone())
+                .unwrap();
+        assert_eq!(result.mutation_transaction_count(), 1);
+        assert_eq!(
+            result.with_mutation_batch(batch).unwrap_err(),
+            ResultError::MultipleMutationTransactions
+        );
+    }
+
+    #[test]
+    fn mutation_items_require_exact_update_uid_and_unique_targets() {
+        let target = ResourceRef::parse("Process/app").unwrap();
+        assert_eq!(
+            MutationIntent::new(
+                target.clone(),
+                None,
+                Some(ZoneRevision::new(2)),
+                MutationIntentKind::UpdateSpec,
+                Some(b"{}".to_vec()),
+            )
+            .unwrap_err(),
+            ResultError::InvalidExpectedUid
+        );
+        let uid = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let first = MutationIntent::new(
+            target.clone(),
+            Some(uid.clone()),
+            Some(ZoneRevision::new(2)),
+            MutationIntentKind::UpdateSpec,
+            Some(b"{}".to_vec()),
+        )
+        .unwrap();
+        let second = MutationIntent::new(
+            target,
+            Some(uid),
+            Some(ZoneRevision::new(2)),
+            MutationIntentKind::UpdateStatus,
+            Some(b"{}".to_vec()),
+        )
+        .unwrap();
+        assert_eq!(
+            ResourceMutationBatch::new(vec![first, second]).unwrap_err(),
+            ResultError::DuplicateMutationTarget
+        );
+    }
+
+    #[test]
+    fn mutation_batch_bounds_total_payload_bytes() {
+        let first = MutationIntent::new(
+            ResourceRef::parse("Process/first").unwrap(),
+            None,
+            None,
+            MutationIntentKind::Create,
+            Some(vec![0; 200_000]),
+        )
+        .unwrap();
+        let second = MutationIntent::new(
+            ResourceRef::parse("Process/second").unwrap(),
+            None,
+            None,
+            MutationIntentKind::Create,
+            Some(vec![0; 200_000]),
+        )
+        .unwrap();
+        let third = MutationIntent::new(
+            ResourceRef::parse("Process/third").unwrap(),
+            None,
+            None,
+            MutationIntentKind::Create,
+            Some(vec![0; 200_000]),
+        )
+        .unwrap();
+        assert_eq!(
+            ResourceMutationBatch::new(vec![first, second, third]).unwrap_err(),
+            ResultError::MutationBatchPayloadTooLarge
+        );
+    }
+
+    #[test]
+    fn self_mutations_must_match_the_fresh_uid_and_revision() {
+        let mutation = MutationIntent::new(
+            ResourceRef::parse("Process/app").unwrap(),
+            Some(ResourceUid::parse("123e4567-e89b-42d3-a456-426614174001").unwrap()),
+            Some(ZoneRevision::new(2)),
+            MutationIntentKind::UpdateSpec,
+            Some(b"{}".to_vec()),
+        )
+        .unwrap();
+        let batch = ResourceMutationBatch::new(vec![mutation]).unwrap();
+        assert_eq!(
+            batch.validate_against(&key(), ZoneRevision::new(2)),
+            Err(ResultError::MutationFenceMismatch)
+        );
     }
 
     #[test]

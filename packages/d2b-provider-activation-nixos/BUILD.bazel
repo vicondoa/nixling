@@ -37,13 +37,6 @@ rust_library(
 )
 
 rust_test(
-    name = "scaffold",
-    srcs = ["tests/scaffold.rs"],
-    compile_data = ["Cargo.toml"],
-    visibility = ["//visibility:public"],
-)
-
-rust_test(
     name = "d2b_provider_activation_nixos_test",
     compile_data = ["Cargo.toml"],
     crate = ":d2b_provider_activation_nixos_test_support",

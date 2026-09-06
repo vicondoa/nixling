@@ -6,7 +6,7 @@
 //! never taken from the request payload.
 
 use d2b_contracts_resource::v3::identity::{AuthenticatedSubjectContext, ServiceName};
-use d2b_contracts_resource::v3::{ResourceGeneration, ResourceRef};
+use d2b_contracts_resource::v3::{ResourceGeneration, ResourceRef, identity::ReconnectGeneration};
 use d2b_contracts_zone_session::v3::zone_routing::ZonePath;
 
 use crate::{descriptor::ProviderDescriptor, error::ProviderRuntimeError};
@@ -23,6 +23,7 @@ pub struct SessionIdentity {
     subject_ref: ResourceRef,
     provider_ref: ResourceRef,
     provider_generation: ResourceGeneration,
+    session_generation: ReconnectGeneration,
     service: ServiceName,
 }
 
@@ -31,7 +32,7 @@ impl SessionIdentity {
     ///
     /// `zone` is supplied by the local Zone runtime that owns the registry,
     /// not by the peer. The subject must already carry the Provider binding
-    /// and Provider generation its evidence established.
+    /// and Provider/session generations its evidence established.
     pub fn from_authenticated(
         zone: ZonePath,
         subject: &AuthenticatedSubjectContext,
@@ -51,6 +52,7 @@ impl SessionIdentity {
             subject_ref: subject.subject_ref().clone(),
             provider_ref,
             provider_generation,
+            session_generation: subject.reconnect_generation(),
             service: subject.service().clone(),
         })
     }
@@ -75,6 +77,11 @@ impl SessionIdentity {
         self.provider_generation
     }
 
+    /// Return the authenticated reconnect generation.
+    pub const fn session_generation(&self) -> ReconnectGeneration {
+        self.session_generation
+    }
+
     /// The selected service.
     pub const fn service(&self) -> &ServiceName {
         &self.service
@@ -91,6 +98,9 @@ impl SessionIdentity {
         if self.zone != *descriptor.zone()
             || self.provider_ref != *descriptor.provider_ref()
             || self.provider_generation != descriptor.provider_generation()
+            || descriptor
+                .session_generation()
+                .is_some_and(|generation| generation != self.session_generation)
             || self.service != *descriptor.service()
         {
             return Err(ProviderRuntimeError::SessionIdentityMismatch);

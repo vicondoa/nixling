@@ -34,6 +34,7 @@ d2b-provider-supervisor = { path = "../d2b-provider-supervisor", version = "0.0.
 d2b-provider-activation-nixos = { path = "../d2b-provider-activation-nixos", version = "0.0.0-bootstrap" }
 d2b-provider-config-nixos = { path = "../d2b-provider-config-nixos", version = "0.0.0-bootstrap" }
 d2b-provider-volume-local = { path = "../d2b-provider-volume-local", version = "0.0.0-bootstrap" }
+d2b-provider-volume-virtiofs = { path = "../d2b-provider-volume-virtiofs", version = "0.0.0-bootstrap" }
 d2b-process = { path = "../d2b-process", version = "0.0.0-bootstrap" }
 d2b-process-conformance = { path = "../d2b-process-conformance", version = "0.0.0-bootstrap" }
 d2b-bus = { path = "../d2b-bus", version = "0.0.0-bootstrap" }
@@ -52,6 +53,7 @@ d2b-provider = { path = "../d2b-provider", version = "0.0.0-bootstrap" }
 d2b-provider-device-tpm = { path = "../d2b-provider-device-tpm", version = "0.0.0-bootstrap" }
 d2b-provider-device-security-key = { path = "../d2b-provider-device-security-key", version = "0.0.0-bootstrap" }
 d2b-provider-device-usbip = { path = "../d2b-provider-device-usbip", version = "0.0.0-bootstrap" }
+d2b-provider-device-gpu = { path = "../d2b-provider-device-gpu", version = "0.0.0-bootstrap" }
 d2b-provider-observability-otel = { path = "../d2b-provider-observability-otel", version = "0.0.0-bootstrap" }
 d2b-provider-display-wayland = { path = "../d2b-provider-display-wayland", version = "0.0.0-bootstrap" }
 d2b-provider-clipboard-wayland = { path = "../d2b-provider-clipboard-wayland", version = "0.0.0-bootstrap" }
@@ -59,10 +61,16 @@ d2b-provider-notification-desktop = { path = "../d2b-provider-notification-deskt
 d2b-provider-audio-pipewire = { path = "../d2b-provider-audio-pipewire", version = "0.0.0-bootstrap" }
 d2b-provider-network-local = { path = "../d2b-provider-network-local", version = "0.0.0-bootstrap" }
 d2b-provider-runtime-cloud-hypervisor = { path = "../d2b-provider-runtime-cloud-hypervisor", version = "0.0.0-bootstrap" }
+d2b-provider-runtime-qemu-media = { path = "../d2b-provider-runtime-qemu-media", version = "0.0.0-bootstrap" }
+d2b-provider-runtime-azure-virtual-machine = { path = "../d2b-provider-runtime-azure-virtual-machine", version = "0.0.0-bootstrap" }
 # v2 constellation contract crates (ADR 0032). The peer-module skeletons in
 # src/realm_stubs.rs wire this trait surface; they are compile-only
 # and NOT called from the running daemon (zero behavior change).
 d2b-provider-runtime-azure-container-apps = { path = "../d2b-provider-runtime-azure-container-apps", version = "0.0.0-bootstrap" }
+d2b-provider-credential-secret-service = { path = "../d2b-provider-credential-secret-service", version = "0.0.0-bootstrap" }
+d2b-provider-credential-entra = { path = "../d2b-provider-credential-entra", version = "0.0.0-bootstrap" }
+d2b-provider-credential-managed-identity = { path = "../d2b-provider-credential-managed-identity", version = "0.0.0-bootstrap" }
+d2b-provider-toolkit = { path = "../d2b-provider-toolkit", version = "0.0.0-bootstrap" }
 d2b-provider-transport-azure-relay = { path = "../d2b-provider-transport-azure-relay", version = "0.0.0-bootstrap" }
 protobuf = "3.7.2"
 serde.workspace = true

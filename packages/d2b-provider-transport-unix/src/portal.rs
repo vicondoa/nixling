@@ -205,10 +205,10 @@ impl TransportPortal {
         request: OpenTransportRequest,
         fd: OwnedFd,
     ) -> Result<OpenedTransport, PortalError> {
+        validate_and_prepare(&fd, request)?;
         let accepted =
             AcceptedTransport::bind(binding, fd).map_err(|_| PortalError::PeerCredentials)?;
         let (binding, peer, fd) = accepted.into_parts();
-        validate_and_prepare(&fd, request)?;
         let descriptor = TransportDescriptor {
             socket_kind: request.socket_kind(),
             attachments_enabled: request.attachments_enabled(),

@@ -418,11 +418,26 @@ pub fn plan_finalization(
 
     let mut children = input.direct_children;
     children.sort_by_key(|child| (deletion_rank(child.role), child.target.clone()));
-    if let Some(child) = children.into_iter().next() {
+    if let Some(child) = children
+        .iter()
+        .find(|child| !child.deletion_requested)
+        .cloned()
+    {
         steps.push(FinalizationStep::DeleteChild(child));
         return Ok(GuestFinalizationPlan {
             guest_uid: input.guest_uid,
             disposition: FinalizationDisposition::Progressing,
+            steps,
+        });
+    }
+
+    if !children.is_empty() {
+        steps.push(FinalizationStep::WaitForDescendants);
+        return Ok(GuestFinalizationPlan {
+            guest_uid: input.guest_uid,
+            disposition: FinalizationDisposition::Blocked(
+                FinalizationBlockReason::TransitiveDescendant,
+            ),
             steps,
         });
     }

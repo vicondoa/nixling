@@ -33,6 +33,85 @@ fn controller_uses_opaque_resource_effects_and_preserves_volume_on_finalize() {
 }
 
 #[test]
+fn repeated_reconcile_reuses_children_and_keeps_persistent_evidence() {
+    let device = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+    let device_ref = ResourceRef::parse("Device/work-tpm").unwrap();
+    let execution = ResourceRef::parse("Host/host-system").unwrap();
+    let effects = ScriptedEffects::default();
+    let mut controller = TpmResourceController::new(device, device_ref, execution).unwrap();
+
+    block_on(controller.reconcile(&effects)).unwrap();
+    let first_status = controller.status();
+    block_on(controller.reconcile(&effects)).unwrap();
+    let second_status = controller.status();
+
+    assert_eq!(first_status, second_status);
+    assert_eq!(
+        effects.events.lock().unwrap().as_slice(),
+        ["volume", "flush", "process", "endpoint", "endpoint"]
+    );
+    assert_eq!(
+        first_status.marker_status,
+        d2b_provider_device_tpm::TpmMarkerStatus::Verified
+    );
+    assert!(first_status.state_volume_ref.is_some());
+    assert!(first_status.swtpm_process_ref.is_some());
+    assert!(first_status.last_flush_ref.is_some());
+    assert!(first_status.tpm_endpoint_ref.is_some());
+}
+
+#[test]
+fn persisted_evidence_rehydrates_without_recreating_children() {
+    let device = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+    let device_ref = ResourceRef::parse("Device/work-tpm").unwrap();
+    let execution = ResourceRef::parse("Host/host-system").unwrap();
+    let effects = ScriptedEffects::default();
+    let mut controller =
+        TpmResourceController::new(device.clone(), device_ref.clone(), execution.clone()).unwrap();
+    block_on(controller.reconcile(&effects)).unwrap();
+    let status = controller.status();
+
+    let mut restored =
+        TpmResourceController::from_status(device, device_ref, execution, &status).unwrap();
+    let restored_effects = ScriptedEffects::default();
+    block_on(restored.reconcile(&restored_effects)).unwrap();
+    assert_eq!(restored.status(), status);
+    assert_eq!(
+        restored_effects.events.lock().unwrap().as_slice(),
+        ["volume", "endpoint"]
+    );
+}
+
+#[test]
+fn tampered_persisted_status_fails_before_child_reuse() {
+    let device = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
+    let device_ref = ResourceRef::parse("Device/work-tpm").unwrap();
+    let execution = ResourceRef::parse("Host/host-system").unwrap();
+    let effects = ScriptedEffects::default();
+    let mut controller =
+        TpmResourceController::new(device.clone(), device_ref.clone(), execution.clone()).unwrap();
+    block_on(controller.reconcile(&effects)).unwrap();
+    let mut status = controller.status();
+    status.marker_status = d2b_provider_device_tpm::TpmMarkerStatus::Tampered;
+
+    assert!(matches!(
+        TpmResourceController::from_status(device, device_ref, execution, &status),
+        Err(d2b_provider_device_tpm::TpmResourceControllerError::Effect(
+            TpmResourceEffectError::StateIntegrity
+        ))
+    ));
+}
+
+#[test]
+fn tpm_runner_contract_disables_legacy_scheduling() {
+    let contract = d2b_provider_device_tpm::tpm_runner_contract();
+    assert_eq!(contract.resource_type(), "Device");
+    assert_eq!(contract.finalizer(), d2b_provider_device_tpm::DEVICE_TPM_FINALIZER);
+    assert!(contract.watched_configuration_is_dependency());
+    assert!((30..=60).contains(&contract.repair_interval_secs()));
+}
+
+#[test]
 fn controller_rejects_non_host_execution_refs() {
     let device = ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").unwrap();
     let device_ref = ResourceRef::parse("Device/work-tpm").unwrap();

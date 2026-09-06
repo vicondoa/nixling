@@ -50,6 +50,20 @@ in
         executionRef = "Guest/dev-vm";
         systemArtifactId = "dev-vm-system";
       };
+      metadataBoundary = {
+        managedBy = builtins.hasAttr "managedBy"
+          (valid.config.d2b._activationNixos.mkNixosGenerationResource {
+            name = "dev-vm-gen-7";
+            executionRef = "Guest/dev-vm";
+            systemArtifactId = "dev-vm-system";
+          });
+        configurationGeneration = builtins.hasAttr "configurationGeneration"
+          (valid.config.d2b._activationNixos.mkNixosGenerationResource {
+            name = "dev-vm-gen-7";
+            executionRef = "Guest/dev-vm";
+            systemArtifactId = "dev-vm-system";
+          });
+      };
       minijail = valid.config.d2b._systemMinijail;
       systemd = valid.config.d2b._systemSystemd.config;
       audio = builtins.removeAttrs valid.config.d2b._audioV3 [
@@ -78,6 +92,10 @@ in
           systemArtifactId = "dev-vm-system";
           activationMode = "switch";
         };
+      };
+      metadataBoundary = {
+        managedBy = false;
+        configurationGeneration = false;
       };
       minijail = {
         providerRef = "Provider/system-minijail";

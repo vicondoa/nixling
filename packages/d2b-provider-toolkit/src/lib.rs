@@ -45,14 +45,18 @@
 mod agent;
 mod audit;
 mod bootstrap;
+mod credential;
 mod dispatch;
 mod error;
+#[cfg(feature = "unix-transport")]
+mod fd10;
 mod fixture;
 mod redaction;
 mod registration;
 mod runtime;
 mod server;
 mod session_runtime;
+mod typed_boundary;
 mod values;
 
 pub mod conformance;
@@ -72,11 +76,30 @@ pub use audit::{
 pub use bootstrap::{
     AllocatorSessionBinding, PROVIDER_RESOURCE_TYPE, ProviderAgentBootstrap, ProviderAgentIdentity,
 };
+pub use credential::{
+    CredentialAuthorizationSource, CredentialRequestMetadata, RouteCredentialAuthorization,
+    credential_service, run_authenticated_credential_provider,
+};
 pub use d2b_session::{
-    AuthenticatedComponentSession, AuthenticatedSessionRouteBinding, ComponentSessionDriver,
-    StreamEvent, StreamId,
+    AuthenticatedComponentSession, AuthenticatedSessionRouteBinding, Cancellation,
+    ComponentSessionDriver, StreamEvent, StreamId,
 };
 pub use dispatch::{DispatchLimiter, DispatchPermit, MAX_DISPATCH_IN_FLIGHT};
+#[cfg(feature = "unix-transport")]
+pub use fd10::{
+    CredentialDeliveryKeyHandoff, CredentialDeliveryKeyMaterial, GUEST_CREDENTIAL_BACKEND_FD,
+    GUEST_CREDENTIAL_BACKEND_PROTOCOL, GUEST_CREDENTIAL_BACKEND_SERVICE,
+    CredentialSensitiveBytes,
+    GuestCredentialBackend, GuestCredentialBackendError, GuestCredentialBackendHandler,
+    GuestCredentialBackendHandlerError, GuestCredentialBackendHandlerFuture,
+    GuestCredentialBackendReply, GuestCredentialBackendResponderLease,
+    GuestCredentialBackendResponse, PROVIDER_BOOTSTRAP_STREAM_CREDIT,
+    PROVIDER_BOOTSTRAP_STREAM_ID, PROVIDER_DELIVERY_KEY_STREAM_CREDIT,
+    PROVIDER_DELIVERY_KEY_STREAM_ID, PROVIDER_READY_MARKER, PROVIDER_READY_STREAM_CREDIT,
+    PROVIDER_READY_STREAM_ID, ProviderFd10Spec, ProviderSessionMetadata, run_from_fd10,
+    zeroizing_bytes,
+    spawn_guest_credential_backend_responder,
+};
 pub use error::ProviderToolkitError;
 pub use fixture::{
     DeterministicClock, FakeProvider, Fixture, SampleLeaseRequest, sample_lease_request,
@@ -86,8 +109,8 @@ pub use registration::{
     ExactRegistration, ToolkitError, register_exact_instances, validate_manifest_registration,
 };
 pub use runtime::{
-    ProviderAdmission, ProviderEntrypoint, ProviderLifecycle, ProviderRuntimeError,
-    ProviderSessionAdmission,
+    AuthenticatedRoute, ProviderAdmission, ProviderEntrypoint, ProviderLifecycle,
+    ProviderRuntimeError, ProviderSessionAdmission,
 };
 pub use server::{
     GeneratedProviderServiceServer, GeneratedServiceDescriptor, MAX_SERVER_IN_FLIGHT, ServerError,
@@ -97,6 +120,7 @@ pub use session_runtime::{
     AuthenticatedProviderFrameCodec, AuthenticatedProviderRequest, run_authenticated_provider,
     serve_authenticated_component_session, validate_provider_route,
 };
+pub use typed_boundary::{ComponentSessionService, TransportProvider};
 pub use values::{
     ProviderHealth, ProviderHealthState, ProviderInspection, ProviderObservability, ProviderValues,
     ValuesError,
@@ -105,5 +129,7 @@ pub use values::{
 /// Audited Unix attachment types used by Provider-specific transport adapters.
 #[cfg(feature = "unix-transport")]
 pub mod unix {
-    pub use d2b_session_unix::{AcceptedAttachment, CreditBundle, VerifiedPacket};
+    pub use d2b_session_unix::{
+        AcceptedAttachment, CreditBundle, VerifiedPacket, credential_provider_endpoint_policy,
+    };
 }

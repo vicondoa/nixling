@@ -212,6 +212,14 @@ impl VolumeLayoutEffectPort for &ScriptedPort {
         self.record(PortCall::Marker);
         Ok(self.marker)
     }
+
+    async fn materialize_network_config(
+        &self,
+        _root: &VolumeRootHandle,
+        _projection: &crate::NetworkConfigContentProjection,
+    ) -> Result<crate::NetworkConfigMaterializationEvidence, VolumeLocalError> {
+        Err(VolumeLocalError::EffectFailed)
+    }
 }
 
 /// Canonical Volume fixtures.
@@ -351,6 +359,16 @@ pub mod fixtures {
                 },
             ],
         }))
+    }
+
+    /// The canonical Guest store-view Volume selected by a Nix closure.
+    pub fn nix_closure_store_view_volume() -> VolumeSpec {
+        let mut rendered = serde_json::to_value(store_view_volume()).expect("fixture serializes");
+        rendered["source"]["settings"] = json!({
+            "kind": "nix-closure",
+            "systemArtifactId": "acceptance-system"
+        });
+        serde_json::from_value(rendered).expect("conformant Nix closure Volume spec")
     }
 
     /// The canonical per-Guest TPM state Volume.

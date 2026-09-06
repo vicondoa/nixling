@@ -1087,6 +1087,7 @@ dependencies = [
  "d2b-contracts-broker",
  "d2b-contracts-resource",
  "d2b-contracts-zone-session",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -1159,7 +1160,9 @@ dependencies = [
  "d2b-contracts-provider",
  "d2b-contracts-resource",
  "d2b-contracts-zone-session",
+ "d2b-provider-toolkit",
  "serde_json",
+ "tokio",
 ]
 
 
@@ -1170,7 +1173,9 @@ dependencies = [
  "d2b-contracts-provider",
  "d2b-contracts-resource",
  "d2b-contracts-zone-session",
+ "d2b-provider-toolkit",
  "serde_json",
+ "tokio",
 ]
 
 
@@ -1181,7 +1186,9 @@ dependencies = [
  "d2b-contracts-provider",
  "d2b-contracts-resource",
  "d2b-contracts-zone-session",
+ "d2b-provider-toolkit",
  "serde_json",
+ "tokio",
 ]
 
 
@@ -1303,6 +1310,7 @@ dependencies = [
  "rustix 0.38.44",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 
@@ -1444,6 +1452,7 @@ dependencies = [
 name = "d2b-provider-toolkit"
 version = "0.0.0-bootstrap"
 dependencies = [
+ "async-trait",
  "d2b-contracts-provider",
  "d2b-contracts-resource",
  "d2b-contracts-zone-session",
@@ -1451,9 +1460,12 @@ dependencies = [
  "d2b-session",
  "d2b-session-unix",
  "schemars",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "ttrpc",
+ "zeroize",
 ]
 
 
@@ -1662,6 +1674,7 @@ dependencies = [
  "tokio",
  "tokio-vsock",
  "uapi",
+ "zeroize",
 ]
 
 

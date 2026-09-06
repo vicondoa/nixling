@@ -653,6 +653,7 @@ impl fmt::Debug for CredentialResponse {
 pub struct CredentialAuthorization {
     delivery_session_params: Option<DeliverySessionParams>,
     authenticated_subject: Option<AuthenticatedSubjectContext>,
+    user_ref: Option<ResourceRef>,
     session_proof: Option<Arc<dyn Any + Send + Sync>>,
     authenticated_session: Option<CredentialSessionBinding>,
 }
@@ -662,6 +663,7 @@ impl Clone for CredentialAuthorization {
         Self {
             delivery_session_params: self.delivery_session_params.clone(),
             authenticated_subject: self.authenticated_subject.clone(),
+            user_ref: self.user_ref.clone(),
             session_proof: self.session_proof.clone(),
             authenticated_session: self.authenticated_session.clone(),
         }
@@ -672,6 +674,7 @@ impl PartialEq for CredentialAuthorization {
     fn eq(&self, other: &Self) -> bool {
         self.delivery_session_params == other.delivery_session_params
             && self.authenticated_subject == other.authenticated_subject
+            && self.user_ref == other.user_ref
             && match (&self.session_proof, &other.session_proof) {
                 (None, None) => true,
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
@@ -707,6 +710,7 @@ impl CredentialAuthorization {
         Ok(Self {
             delivery_session_params,
             authenticated_subject: None,
+            user_ref: None,
             session_proof: None,
             authenticated_session: None,
         })
@@ -741,6 +745,29 @@ impl CredentialAuthorization {
     /// Borrow trusted subject context supplied by the authenticated adapter.
     pub const fn authenticated_subject_context(&self) -> Option<&AuthenticatedSubjectContext> {
         self.authenticated_subject.as_ref()
+    }
+
+    /// Borrow the exact authenticated User scope claim, when one was supplied.
+    pub const fn user_ref(&self) -> Option<&ResourceRef> {
+        self.user_ref.as_ref()
+    }
+
+    /// Attach an exact User scope claim without changing the authenticated
+    /// Provider subject.
+    pub fn with_user_ref(
+        mut self,
+        user_ref: Option<ResourceRef>,
+    ) -> Result<Self, CredentialServiceError> {
+        if user_ref
+            .as_ref()
+            .is_some_and(|reference| reference.resource_type().as_str() != "User")
+        {
+            return Err(CredentialServiceError::new(
+                CredentialServiceErrorCode::OperationDenied,
+            ));
+        }
+        self.user_ref = user_ref;
+        Ok(self)
     }
 
     /// Borrow the authenticated session, when the adapter supplied one.
@@ -826,6 +853,7 @@ impl fmt::Debug for CredentialSessionBinding {
 }
 
 /// Provider-side implementation of the five service methods.
+#[async_trait::async_trait]
 pub trait CredentialProvider: Send + Sync {
     /// Dispatch one already-admitted exact method.
     fn dispatch(
@@ -834,6 +862,16 @@ pub trait CredentialProvider: Send + Sync {
         request: &CredentialRequest,
         authorization: &CredentialAuthorization,
     ) -> Result<CredentialResponse, CredentialServiceError>;
+
+    /// Dispatch one method without blocking the ComponentSession runtime.
+    async fn dispatch_async(
+        &self,
+        method: CredentialMethod,
+        request: &CredentialRequest,
+        authorization: &CredentialAuthorization,
+    ) -> Result<CredentialResponse, CredentialServiceError> {
+        self.dispatch(method, request, authorization)
+    }
 }
 
 /// Dispatch to a Provider and enforce the authorization-owned response shape.
@@ -844,6 +882,26 @@ pub fn dispatch_authorized_provider<P: CredentialProvider + ?Sized>(
     authorization: &CredentialAuthorization,
 ) -> Result<CredentialResponse, CredentialServiceError> {
     let response = provider.dispatch(method, request, authorization)?;
+    if response.method() != method
+        || response.delivery_session_params() != authorization.delivery_session_params()
+    {
+        return Err(CredentialServiceError::new(
+            CredentialServiceErrorCode::InvariantFailure,
+        ));
+    }
+    Ok(response)
+}
+
+/// Dispatch asynchronously and enforce the authorization-owned response shape.
+pub async fn dispatch_authorized_provider_async<P: CredentialProvider + ?Sized>(
+    provider: &P,
+    method: CredentialMethod,
+    request: &CredentialRequest,
+    authorization: &CredentialAuthorization,
+) -> Result<CredentialResponse, CredentialServiceError> {
+    let response = provider
+        .dispatch_async(method, request, authorization)
+        .await?;
     if response.method() != method
         || response.delivery_session_params() != authorization.delivery_session_params()
     {

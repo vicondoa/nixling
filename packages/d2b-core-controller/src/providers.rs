@@ -145,18 +145,52 @@ impl ProviderHandler {
             return Err(ProviderError::ConformanceInvalid);
         }
 
+        let mut plan = Self::plan_observed(provider_ref, intent, observation)?;
+        if matches!(intent, ProviderIntent::Enable | ProviderIntent::Update) {
+            plan.actions = manifest
+                .components()
+                .iter()
+                .map(|component| {
+                    ProviderChildAction::EnsureComponent(component.component_type())
+                })
+                .collect();
+            if manifest.declares_state_volume() {
+                plan.actions
+                    .push(ProviderChildAction::EnsureDeclaredStateVolume);
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Project an already admitted Provider from its trusted runtime evidence.
+    ///
+    /// Manifest admission remains the authority for artifact, descriptor, and
+    /// registration identity. This entry point is used by the active Core
+    /// handler after those facts have been established by the runtime and
+    /// represented in the owned Process/session observations.
+    pub fn plan_observed(
+        provider_ref: &ResourceRef,
+        intent: ProviderIntent,
+        observation: ProviderObservation,
+    ) -> Result<ProviderPlan, ProviderError> {
+        if provider_ref.resource_type().as_str() != "Provider" {
+            return Err(ProviderError::WrongResourceType);
+        }
+        if !observation.package_present {
+            return Err(ProviderError::PackageUnavailable);
+        }
+        if !observation.config_valid {
+            return Err(ProviderError::ConfigInvalid);
+        }
+        if !observation.graph_valid {
+            return Err(ProviderError::GraphInvalid);
+        }
+        if !observation.conformance_valid {
+            return Err(ProviderError::ConformanceInvalid);
+        }
+
         match intent {
             ProviderIntent::Enable | ProviderIntent::Update => {
-                let mut actions = manifest
-                    .components()
-                    .iter()
-                    .map(|component| {
-                        ProviderChildAction::EnsureComponent(component.component_type())
-                    })
-                    .collect::<Vec<_>>();
-                if manifest.declares_state_volume() {
-                    actions.push(ProviderChildAction::EnsureDeclaredStateVolume);
-                }
                 let ready = observation.required_dependencies_ready
                     && observation.required_components_ready;
                 Ok(ProviderPlan {
@@ -169,7 +203,7 @@ impl ProviderHandler {
                     } else {
                         ProviderPhase::Pending
                     },
-                    actions,
+                    actions: Vec::new(),
                     publish_exports: ready,
                 })
             }

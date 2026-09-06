@@ -55,6 +55,7 @@ members = [
     "packages/d2b-session-unix",
     "packages/d2b-controller-toolkit",
     "packages/d2b-core-controller",
+    "packages/d2b-provider-test-controller",
     "packages/d2b-resource-api",
     "packages/d2b-resource-store",
     "packages/d2b-resource-store-redb",

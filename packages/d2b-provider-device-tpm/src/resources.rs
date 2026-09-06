@@ -16,7 +16,7 @@ fn device_short(device_uid: &ResourceUid) -> String {
         .as_str()
         .bytes()
         .filter(|byte| byte.is_ascii_hexdigit())
-        .take(12)
+        .take(32)
         .map(char::from)
         .collect()
 }
@@ -40,7 +40,7 @@ fn build_tpm_state_volume_spec_with_short(
     if execution_ref.resource_type().as_str() != "Host" {
         return Err(TpmResourceEffectError::InvalidExecutionRef);
     }
-    if short.len() != 12 {
+    if short.len() != 32 {
         return Err(TpmResourceEffectError::InvalidDevice);
     }
     let owner = format!("User/device-{short}-swtpm-system");
@@ -286,7 +286,7 @@ mod tests {
                 .user_ref()
                 .unwrap()
                 .to_canonical_string(),
-            "User/device-6f9619ff8b86-swtpm-system"
+            "User/device-6f9619ff8b864d01b42d00cf4fc964ff-swtpm-system"
         );
         assert_eq!(
             process.execution().sandbox().namespace_classes(),
@@ -324,6 +324,24 @@ mod tests {
         assert_ne!(
             resource["metadata"]["ownerRef"],
             serde_json::json!(format!("Device/{device}"))
+        );
+    }
+
+    #[test]
+    fn state_child_names_preserve_the_full_device_incarnation() {
+        let first = ResourceUid::parse("6f9619ff-8b86-4d01-b42d-00cf4fc964ff").unwrap();
+        let second = ResourceUid::parse("6f9619ff-8b86-4d01-b42d-00cf4fc96500").unwrap();
+        let device_ref = ResourceRef::parse("Device/vm-tpm").unwrap();
+        let host = ResourceRef::parse("Host/host-system").unwrap();
+
+        let first_resource =
+            build_tpm_state_volume_resource(&first, &device_ref, "dev", &host).unwrap();
+        let second_resource =
+            build_tpm_state_volume_resource(&second, &device_ref, "dev", &host).unwrap();
+
+        assert_ne!(
+            first_resource["metadata"]["name"],
+            second_resource["metadata"]["name"]
         );
     }
 

@@ -15,6 +15,8 @@ use crate::{ControllerIdentity, ResourceKey, TriggerSet};
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResourceSnapshot {
     key: ResourceKey,
+    owner_uid: Option<ResourceUid>,
+    owner_generation: Option<ResourceGeneration>,
     revision: ZoneRevision,
     generation: ResourceGeneration,
     canonical_json: Vec<u8>,
@@ -32,6 +34,8 @@ impl ResourceSnapshot {
     ) -> Self {
         Self {
             key,
+            owner_uid: None,
+            owner_generation: None,
             revision,
             generation,
             canonical_json,
@@ -42,6 +46,27 @@ impl ResourceSnapshot {
     /// Borrow the immutable identity.
     pub const fn key(&self) -> &ResourceKey {
         &self.key
+    }
+
+    /// Borrow the immutable singular owner UID when the store supplied it.
+    pub fn owner_uid(&self) -> Option<&ResourceUid> {
+        self.owner_uid.as_ref()
+    }
+
+    /// Return the immutable owner generation when the source supplied it.
+    pub const fn owner_generation(&self) -> Option<ResourceGeneration> {
+        self.owner_generation
+    }
+
+    /// Attach the store's immutable owner identity to this snapshot.
+    pub fn with_owner_identity(
+        mut self,
+        owner_uid: Option<ResourceUid>,
+        owner_generation: Option<ResourceGeneration>,
+    ) -> Self {
+        self.owner_uid = owner_uid;
+        self.owner_generation = owner_generation;
+        self
     }
 
     /// Return the fresh revision.
@@ -155,6 +180,16 @@ impl OperationContext {
     pub fn idempotency_key(&self) -> &str {
         &self.idempotency_key
     }
+
+    /// Borrow the request correlation ID.
+    pub fn correlation_id(&self) -> &str {
+        &self.correlation_id
+    }
+
+    /// Borrow the optional trace ID.
+    pub fn trace_id(&self) -> Option<&str> {
+        self.trace_id.as_deref()
+    }
 }
 
 impl core::fmt::Debug for OperationContext {
@@ -212,8 +247,8 @@ impl core::fmt::Debug for Cancellation {
 
 /// Typed durable-commit evidence consumed by an expedited pass.
 ///
-/// The toolkit exposes no public constructor or fields. Production issuance
-/// remains unavailable until a trusted durable commit adapter lands.
+/// The fields remain private. The toolkit's trusted source adapter issues
+/// proofs only after verifying the matching committed revision.
 ///
 /// Foreign controller code cannot forge a committed proof:
 ///
@@ -243,7 +278,6 @@ pub struct CommittedRevisionProof {
 }
 
 impl CommittedRevisionProof {
-    #[cfg(test)]
     pub(crate) fn issue(
         zone: ZoneId,
         resource_uid: ResourceUid,
@@ -317,6 +351,7 @@ pub struct ReconcileContext {
     high_water_revision: ZoneRevision,
     operation: OperationContext,
     attempt: u32,
+    now_tick: u64,
     deadline_tick: u64,
     cancellation: Cancellation,
     policy_revision: u64,
@@ -335,6 +370,7 @@ impl ReconcileContext {
         high_water_revision: ZoneRevision,
         operation: OperationContext,
         attempt: u32,
+        now_tick: u64,
         deadline_tick: u64,
         cancellation: Cancellation,
         policy_revision: u64,
@@ -349,6 +385,7 @@ impl ReconcileContext {
             high_water_revision,
             operation,
             attempt,
+            now_tick,
             deadline_tick,
             cancellation,
             policy_revision,
@@ -367,6 +404,7 @@ impl ReconcileContext {
         high_water_revision: ZoneRevision,
         operation: OperationContext,
         attempt: u32,
+        now_tick: u64,
         deadline_tick: u64,
         cancellation: Cancellation,
         policy_revision: u64,
@@ -381,6 +419,7 @@ impl ReconcileContext {
             high_water_revision,
             operation,
             attempt,
+            now_tick,
             deadline_tick,
             cancellation,
             policy_revision,
@@ -399,6 +438,7 @@ impl ReconcileContext {
         high_water_revision: ZoneRevision,
         operation: OperationContext,
         attempt: u32,
+        now_tick: u64,
         deadline_tick: u64,
         cancellation: Cancellation,
         policy_revision: u64,
@@ -425,6 +465,7 @@ impl ReconcileContext {
             high_water_revision,
             operation,
             attempt,
+            now_tick,
             deadline_tick,
             cancellation,
             policy_revision,
@@ -495,6 +536,11 @@ impl ReconcileContext {
         self.attempt
     }
 
+    /// Return the monotonic tick at which this worker began.
+    pub const fn now_tick(&self) -> u64 {
+        self.now_tick
+    }
+
     /// Return the monotonic deadline tick.
     pub const fn deadline_tick(&self) -> u64 {
         self.deadline_tick
@@ -544,6 +590,7 @@ impl core::fmt::Debug for ReconcileContext {
             .field("high_water_revision", &self.high_water_revision)
             .field("operation", &self.operation)
             .field("attempt", &self.attempt)
+            .field("now_tick", &self.now_tick)
             .field("deadline_tick", &self.deadline_tick)
             .field("cancellation", &self.cancellation)
             .field("policy_revision", &self.policy_revision)
@@ -636,6 +683,7 @@ mod tests {
             ZoneRevision::new(4),
             operation(),
             1,
+            0,
             20,
             Cancellation::default(),
             5,
@@ -701,6 +749,7 @@ mod tests {
             ZoneRevision::new(4),
             operation(),
             1,
+            0,
             20,
             Cancellation::default(),
             5,
@@ -778,6 +827,7 @@ mod tests {
             OperationContext::new(OPERATION, OPERATION, OPERATION, Some(OPERATION.to_owned()))
                 .unwrap(),
             1,
+            0,
             20,
             Cancellation::default(),
             5,

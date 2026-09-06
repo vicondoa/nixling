@@ -41,6 +41,16 @@ pub fn validate_resource_attributes(
 }
 
 fn valid_resource_attribute_value(key: &str, value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    if lowered.contains("secret")
+        || lowered.contains("credential")
+        || lowered.contains("token")
+        || lowered.contains("password")
+        || lowered.contains("privatekey")
+        || lowered.contains("bearer ")
+    {
+        return false;
+    }
     let identity_key = matches!(
         key,
         "d2b.zone"
@@ -136,6 +146,13 @@ mod tests {
         assert!(
             validate_resource_attributes(&BTreeMap::from([("zone".to_owned(), "work".to_owned())]))
                 .is_err()
+        );
+        assert!(
+            validate_resource_attributes(&BTreeMap::from([(
+                "source".to_owned(),
+                "credential-canary".to_owned()
+            )]))
+            .is_err()
         );
     }
 }
