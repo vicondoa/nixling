@@ -51,6 +51,16 @@ impl QueueHint {
             operation,
         })
     }
+
+    pub(crate) fn coalesce(&mut self, hint: &Self) {
+        if hint.high_water_revision > self.high_water_revision {
+            self.high_water_revision = hint.high_water_revision;
+        }
+        if hint.high_water_revision >= self.high_water_revision {
+            self.operation = hint.operation.clone();
+        }
+        self.reasons.union_with(&hint.reasons);
+    }
 }
 
 impl core::fmt::Debug for QueueHint {
