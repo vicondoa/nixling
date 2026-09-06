@@ -2712,12 +2712,35 @@ fn merge_status(current: &[u8], candidate: &[u8]) -> Result<Vec<u8>, SourceError
         .map_err(|_| SourceError::Integrity)?;
     let status = d2b_contracts_resource::v3::CanonicalJsonValue::parse(candidate)
         .map_err(|_| SourceError::Integrity)?;
-    let d2b_contracts_resource::v3::CanonicalJsonValue::Object(status) = status else {
+    let d2b_contracts_resource::v3::CanonicalJsonValue::Object(mut status) = status else {
         return Err(SourceError::Integrity);
     };
     let d2b_contracts_resource::v3::CanonicalJsonValue::Object(root) = &mut resource else {
         return Err(SourceError::Integrity);
     };
+    if let Some(d2b_contracts_resource::v3::CanonicalJsonValue::Object(current_status)) =
+        root.get("status")
+        && let Some(controller_session) = current_status
+            .get("resource")
+            .and_then(|resource| match resource {
+                d2b_contracts_resource::v3::CanonicalJsonValue::Object(resource) => {
+                    resource.get("controllerSession")
+                }
+                _ => None,
+            })
+            .cloned()
+    {
+        let resource = status
+            .entry("resource".to_owned())
+            .or_insert_with(|| {
+                d2b_contracts_resource::v3::CanonicalJsonValue::Object(BTreeMap::new())
+            });
+        if let d2b_contracts_resource::v3::CanonicalJsonValue::Object(resource) = resource {
+            resource
+                .entry("controllerSession".to_owned())
+                .or_insert(controller_session);
+        }
+    }
     root.insert(
         "status".to_owned(),
         d2b_contracts_resource::v3::CanonicalJsonValue::Object(status),
@@ -5500,6 +5523,27 @@ mod tests {
         assert_eq!(value["metadata"]["name"], "status");
         assert_eq!(value["status"]["phase"], "Ready");
         assert!(value["metadata"]["uid"].is_null());
+    }
+
+    #[test]
+    fn status_candidates_preserve_controller_session_evidence() {
+        let mut current: Value = serde_json::from_slice(&canonical_host("status", None)).unwrap();
+        current["status"]["resource"]["controllerSession"] = serde_json::json!({
+            "ready": true,
+            "sessionGeneration": 3,
+        });
+        let current = serde_json::to_vec(&current).unwrap();
+        let merged = merge_status(
+            &current,
+            br#"{"observedGeneration":1,"phase":"Ready","resource":{"restartCount":1}}"#,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&merged).unwrap();
+        assert_eq!(
+            value["status"]["resource"]["controllerSession"]["sessionGeneration"],
+            3
+        );
+        assert_eq!(value["status"]["resource"]["restartCount"], 1);
     }
 
     #[tokio::test]

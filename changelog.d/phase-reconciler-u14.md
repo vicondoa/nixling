@@ -140,6 +140,8 @@
 - Routed Cloud Hypervisor Guest status, finalizer, and child mutations through
   the current U6 assignment fence instead of the unassigned system-core
   client.
+- Preserved durable controller-session evidence when later Process status
+  projections are committed from stale snapshots.
 
 ### Removed
 
