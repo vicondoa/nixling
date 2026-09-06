@@ -8303,7 +8303,7 @@ pub fn compose_shared_provider_runner_descriptors(
 }
 
 #[derive(Clone)]
-struct CoreAssignmentAuthority {
+pub(super) struct CoreAssignmentAuthority {
     provider_generation: ResourceGeneration,
     controller_generation: ControllerGeneration,
     session_generation: ReconnectGeneration,
@@ -9230,6 +9230,7 @@ impl PolicyProjection {
 struct CloudHypervisorResourceSession {
     client: Arc<CloudHypervisorResourceClient>,
     mutation_client: Arc<CloudHypervisorResourceClient>,
+    assigned_mutation_api: Arc<RedbRegisteredControllerApi>,
     providers: Arc<crate::process_provider_runtime::ProductionProcessProviders>,
     guest_sessions: Arc<
         tokio::sync::Mutex<
@@ -9320,6 +9321,20 @@ fn guest_session_evidence(
 impl std::fmt::Debug for CloudHypervisorResourceSession {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("CloudHypervisorResourceSession(<redacted>)")
+    }
+}
+
+fn cloud_hypervisor_assigned_mutation_error(
+    error: SourceError,
+) -> CloudHypervisorResourceApiError {
+    match error {
+        SourceError::Conflict(_) | SourceError::Integrity => {
+            CloudHypervisorResourceApiError::Conflict
+        }
+        SourceError::Unavailable
+        | SourceError::Backpressure
+        | SourceError::Cancelled
+        | SourceError::Timeout => CloudHypervisorResourceApiError::Transport,
     }
 }
 
@@ -10046,7 +10061,6 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 let payload = CanonicalJsonValue::parse(&payload_bytes)
                     .map_err(|_| CloudHypervisorResourceApiError::InvalidResponse)?
                     .to_canonical_bytes();
-                let mut request = wire::UpdateStatusRequest::new();
                 let mut operation_payload =
                     format!("{}:{}:", current.uid.as_str(), current.revision.get()).into_bytes();
                 operation_payload.extend_from_slice(&payload);
@@ -10055,42 +10069,14 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                         d2b_contracts_resource::v3::resource_schema::RESOURCE_ENVELOPE_DOMAIN_TAG,
                         &operation_payload,
                     );
-                request.meta = MessageField::some(public_request_meta(&format!(
+                let operation_id = format!(
                     "ch-update-status-{}",
-                    payload_operation_digest.trim_start_matches("sha256:"),
-                )));
-                let mut mutation = wire::Mutation::new();
-                mutation.kind = EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_STATUS);
-                mutation.target = MessageField::some(ch_identity(
-                    &current.zone,
-                    &current.resource_ref,
-                    Some(&current.uid),
-                    Some(current.generation.get()),
-                    Some(current.revision.get()),
-                ));
-                mutation.precondition =
-                    MessageField::some(ch_exact_precondition(&current.uid, current.revision));
-                mutation.resource = MessageField::some(
-                    ch_resource_body(
-                        &current.zone,
-                        &current.resource_ref,
-                        Some(&current.uid),
-                        &payload,
-                    )
-                    .inspect_err(|_| {
-                        tracing::warn!("Cloud Hypervisor status update failed: resource-body");
-                    })?,
+                    payload_operation_digest.trim_start_matches("sha256:")
                 );
-                request.mutation = MessageField::some(mutation);
-                let response = self.mutation_client.update_status(request).await;
-                if let Some(error) = response.error.as_ref() {
-                    tracing::warn!(
-                        error_kind = ?error.kind,
-                        reason = %error.reason,
-                        "Cloud Hypervisor status update was rejected",
-                    );
-                    return Err(CloudHypervisorResourceApiError::Conflict);
-                }
+                self.assigned_mutation_api
+                    .persist_assigned_status(&current, payload, &operation_id)
+                    .await
+                    .map_err(cloud_hypervisor_assigned_mutation_error)?;
                 Ok(CloudHypervisorResourceResponse::StatusUpdated)
             }
             CloudHypervisorResourceRequest::ObserveProcessAdoption {
@@ -10464,38 +10450,33 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                     self.finalizer_clear_requested.store(true, Ordering::Release);
                     return Ok(CloudHypervisorResourceResponse::LifecycleApplied);
                 }
-                let mut request = wire::UpdateFinalizersRequest::new();
-                request.meta = MessageField::some(public_request_meta(&format!(
+                let current = self
+                    .guest_for_fenced_operation(
+                        &guest_ref,
+                        &guest_uid,
+                        "cloud-hypervisor-clear-finalizer",
+                    )
+                    .await?;
+                if current.revision != guest_revision {
+                    return Err(CloudHypervisorResourceApiError::Conflict);
+                }
+                let operation_id = format!(
                     "cloud-hypervisor-clear-finalizer-{}-{}",
                     guest_uid.as_str(),
                     guest_revision.get(),
-                )));
-                let mut mutation = wire::Mutation::new();
-                mutation.kind =
-                    EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_FINALIZERS);
-                mutation.target = MessageField::some(ch_identity(
-                    &self.zone,
-                    &guest_ref,
-                    Some(&guest_uid),
-                    None,
-                    Some(guest_revision.get()),
-                ));
-                mutation.precondition =
-                    MessageField::some(ch_exact_precondition(&guest_uid, guest_revision));
-                mutation.remove_finalizers.push(
-                    d2b_provider_runtime_cloud_hypervisor::GUEST_CONTROLLER_FINALIZER.to_owned(),
                 );
-                request.mutation = MessageField::some(mutation);
-                let response = self.mutation_client.update_finalizers(request).await;
-                if let Some(error) = response.error.as_ref() {
-                    tracing::warn!(
-                        error_kind = ?error.kind,
-                        reason = %error.reason,
-                        guest_revision = guest_revision.get(),
-                        "Cloud Hypervisor Guest finalizer removal was rejected",
-                    );
-                    return Err(CloudHypervisorResourceApiError::Conflict);
-                }
+                self.assigned_mutation_api
+                    .persist_assigned_finalizers(
+                        &current,
+                        Vec::new(),
+                        vec![
+                            d2b_provider_runtime_cloud_hypervisor::GUEST_CONTROLLER_FINALIZER
+                                .to_owned(),
+                        ],
+                        &operation_id,
+                    )
+                    .await
+                    .map_err(cloud_hypervisor_assigned_mutation_error)?;
                 Ok(CloudHypervisorResourceResponse::LifecycleApplied)
             }
             CloudHypervisorResourceRequest::EnsureGuestFinalizer {
@@ -10503,32 +10484,41 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 guest_uid,
                 guest_revision,
             } => {
-                let mut request = wire::UpdateFinalizersRequest::new();
-                request.meta = MessageField::some(public_request_meta(&format!(
+                let current = self
+                    .guest_for_fenced_operation(
+                        &guest_ref,
+                        &guest_uid,
+                        "cloud-hypervisor-ensure-finalizer",
+                    )
+                    .await?;
+                if current.revision != guest_revision {
+                    return Err(CloudHypervisorResourceApiError::Conflict);
+                }
+                let envelope = ResourceEnvelope::from_json(&current.canonical_json)
+                    .map_err(|_| CloudHypervisorResourceApiError::InvalidResponse)?;
+                if envelope.metadata().finalizers().iter().any(|finalizer| {
+                    finalizer.as_str()
+                        == d2b_provider_runtime_cloud_hypervisor::GUEST_CONTROLLER_FINALIZER
+                }) {
+                    return Ok(CloudHypervisorResourceResponse::LifecycleApplied);
+                }
+                let operation_id = format!(
                     "cloud-hypervisor-ensure-finalizer-{}-{}",
                     guest_uid.as_str(),
                     guest_revision.get(),
-                )));
-                let mut mutation = wire::Mutation::new();
-                mutation.kind =
-                    EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_FINALIZERS);
-                mutation.target = MessageField::some(ch_identity(
-                    &self.zone,
-                    &guest_ref,
-                    Some(&guest_uid),
-                    None,
-                    Some(guest_revision.get()),
-                ));
-                mutation.precondition =
-                    MessageField::some(ch_exact_precondition(&guest_uid, guest_revision));
-                mutation.add_finalizers.push(
-                    d2b_provider_runtime_cloud_hypervisor::GUEST_CONTROLLER_FINALIZER.to_owned(),
                 );
-                request.mutation = MessageField::some(mutation);
-                let response = self.mutation_client.update_finalizers(request).await;
-                if response.error.is_some() {
-                    return Err(CloudHypervisorResourceApiError::Conflict);
-                }
+                self.assigned_mutation_api
+                    .persist_assigned_finalizers(
+                        &current,
+                        vec![
+                            d2b_provider_runtime_cloud_hypervisor::GUEST_CONTROLLER_FINALIZER
+                                .to_owned(),
+                        ],
+                        Vec::new(),
+                        &operation_id,
+                    )
+                    .await
+                    .map_err(cloud_hypervisor_assigned_mutation_error)?;
                 Ok(CloudHypervisorResourceResponse::LifecycleApplied)
             }
         }
@@ -12791,6 +12781,102 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .clone()
             .ok_or(ResourceRuntimeError::AuthenticationUnavailable)
+    }
+
+    async fn cloud_hypervisor_assigned_mutation_api(
+        &self,
+        provider_ref: &ResourceRef,
+    ) -> Result<Arc<RedbRegisteredControllerApi>, ResourceRuntimeError> {
+        let provider = retry_transient_store_read(
+            &self.zone,
+            "cloud-hypervisor-assignment-provider",
+            || {
+                self.store.get(StoreGetRequest {
+                    operation: StoreOperationContext {
+                        operation_id: "cloud-hypervisor-assignment-provider".to_owned(),
+                        idempotency_key: None,
+                        correlation_id: "cloud-hypervisor-assignment-provider".to_owned(),
+                        trace_id: None,
+                        deadline_ms: 10_000,
+                    },
+                    zone: self.zone.clone(),
+                    target: provider_ref.clone(),
+                    expected_uid: None,
+                    projection: StoreProjection::MetadataOnly,
+                })
+            },
+        )
+        .await
+        .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        if provider.zone != self.zone
+            || provider.resource_ref != *provider_ref
+            || provider.generation.get() == 0
+        {
+            return Err(ResourceRuntimeError::HandlerNotReady);
+        }
+        let provider_ref_text = provider_ref.to_canonical_string();
+        let registration = U6_SHARED_PROVIDER_RUNNERS
+            .iter()
+            .copied()
+            .find(|registration| registration.provider_ref == provider_ref_text)
+            .ok_or(ResourceRuntimeError::CapabilityUnavailable)?;
+        let subject_context = self
+            .core_controller_subject
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let authorization_state = self
+            .authorization_state
+            .lock()
+            .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
+            .clone()
+            .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
+        let controller_generation = self
+            .store_metadata
+            .policy_snapshot
+            .controller_generation
+            .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+        let session_generation = subject_context.reconnect_generation();
+        let provider_generations = BTreeMap::from([(provider_ref.clone(), provider.generation)]);
+        let descriptor = compose_shared_guest_runner_descriptors(
+            [registration],
+            self.zone.clone(),
+            controller_generation,
+            &provider_generations,
+            session_generation,
+        )?
+        .into_iter()
+        .next()
+        .map(|(_, descriptor)| descriptor)
+        .ok_or(ResourceRuntimeError::HandlerNotReady)?;
+        let controller_ref = ResourceRef::parse(registration.controller_ref)
+            .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
+        let (assignments, authority) = self
+            .u12_controller_assignments(
+                &descriptor,
+                controller_ref,
+                provider.generation,
+                controller_generation,
+                session_generation,
+            )
+            .await?;
+        let subject = self
+            .authorizer
+            .issue_authenticated_subject(subject_context, authorization_state.clone())
+            .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
+        let api = self
+            .api
+            .registered_controller_api(subject, authorization_state, assignments)
+            .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
+        let allowed_types = descriptor.resource_types().cloned().collect::<BTreeSet<_>>();
+        Ok(Arc::new(api.with_assignment_fence_resolver(
+            shared_provider_assignment_fence_resolver(
+                Arc::clone(&self.store),
+                allowed_types,
+                authority,
+            ),
+        )))
     }
 
     fn process_controller_api(
@@ -15386,9 +15472,19 @@ impl ZoneResourceRuntime {
             .inspect_err(|error| {
                 tracing::warn!(error = ?error, "Cloud Hypervisor reconcile stage failed: deployment");
             })?;
+            let assigned_mutation_api = self
+                .cloud_hypervisor_assigned_mutation_api(&provider_ref)
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        error = ?error,
+                        "Cloud Hypervisor reconcile stage failed: assignment-api",
+                    );
+                })?;
             let session = CloudHypervisorResourceSession {
                 client: Arc::clone(&client),
                 mutation_client: self.status_client()?,
+                assigned_mutation_api,
                 providers: state
                     .provider_runtime
                     .process_providers()
@@ -21692,6 +21788,60 @@ fn assignment_fence_store_error(error: &StoreError, fallback_revision: ZoneRevis
     }
 }
 
+pub(super) fn shared_provider_assignment_fence_resolver(
+    store: Arc<RedbResourceStore>,
+    allowed_types: BTreeSet<ResourceTypeName>,
+    authority: Arc<CoreAssignmentAuthority>,
+) -> AssignmentFenceResolver {
+    Arc::new(move |target, uid, revision| {
+        let store = Arc::clone(&store);
+        let authority = Arc::clone(&authority);
+        let allowed_types = allowed_types.clone();
+        Box::pin(async move {
+            if !allowed_types.contains(target.resource_type()) {
+                return Err(SourceError::Integrity);
+            }
+            if let Some(stored) = store
+                .assignment_fence(store.identity().zone().clone(), target.clone())
+                .await
+                .map_err(|error| match error.kind() {
+                    StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure => {
+                        SourceError::Backpressure
+                    }
+                    StoreErrorKind::Timeout => SourceError::Timeout,
+                    _ => SourceError::Unavailable,
+                })?
+            {
+                if stored.resource_uid != uid
+                    || stored.epoch > authority.epoch
+                    || (stored.epoch == authority.epoch
+                        && (stored.provider_generation != authority.provider_generation
+                            || stored.controller_generation != authority.controller_generation
+                            || stored.controller_role != authority.controller_role
+                            || stored.target != authority.target
+                            || stored.session_generation != authority.session_generation))
+                {
+                    return Err(SourceError::Integrity);
+                }
+                if stored.epoch == authority.epoch && stored.resource_revision != revision {
+                    return Err(SourceError::Conflict(stored.resource_revision));
+                }
+            }
+            Ok(ResourceAssignmentFence {
+                resource_uid: uid,
+                resource_revision: revision,
+                provider_generation: authority.provider_generation,
+                controller_generation: authority.controller_generation,
+                controller_role: authority.controller_role.clone(),
+                target: authority.target.clone(),
+                session_generation: authority.session_generation,
+                epoch: authority.epoch,
+                scope: ResourceAssignmentScope::Primary,
+            })
+        })
+    })
+}
+
 fn process_assignment_fence_resolver(
     store: Arc<RedbResourceStore>,
     mode: DaemonMode,
@@ -24381,6 +24531,26 @@ mod tests {
         assert_eq!(
             SharedProviderResourceKind::from_registration(U6_SHARED_PROVIDER_RUNNERS[3]).unwrap(),
             SharedProviderResourceKind::AzureVirtualMachineGuest
+        );
+    }
+
+    #[test]
+    fn cloud_hypervisor_assigned_mutation_errors_keep_retry_classes() {
+        assert_eq!(
+            cloud_hypervisor_assigned_mutation_error(SourceError::Conflict(ZoneRevision::new(2))),
+            CloudHypervisorResourceApiError::Conflict
+        );
+        assert_eq!(
+            cloud_hypervisor_assigned_mutation_error(SourceError::Integrity),
+            CloudHypervisorResourceApiError::Conflict
+        );
+        assert_eq!(
+            cloud_hypervisor_assigned_mutation_error(SourceError::Backpressure),
+            CloudHypervisorResourceApiError::Transport
+        );
+        assert_eq!(
+            cloud_hypervisor_assigned_mutation_error(SourceError::Timeout),
+            CloudHypervisorResourceApiError::Transport
         );
     }
 

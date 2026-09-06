@@ -294,13 +294,7 @@ impl RedbRegisteredControllerApi {
     ) -> Result<(), SourceError> {
         let envelope =
             ResourceEnvelope::from_json(&canonical_resource).map_err(|_| SourceError::Integrity)?;
-        if envelope.metadata().uid() != &resource.uid
-            || envelope.metadata().generation() != resource.generation
-            || envelope.metadata().revision() != resource.revision
-            || envelope.metadata().zone() != &resource.zone
-        {
-            return Err(SourceError::Integrity);
-        }
+        validate_assigned_resource_identity(&self.store, resource, &envelope)?;
         let mutation = StoreMutation {
             kind: ResourceMutationKind::UpdateStatus,
             zone: resource.zone.clone(),
@@ -323,6 +317,73 @@ impl RedbRegisteredControllerApi {
             correlation_id: operation_id,
             trace_id: None,
             deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
+        };
+        match self
+            .commit_store_mutations(
+                &resource.zone,
+                resource.revision,
+                &resource.uid,
+                &resource.resource_ref,
+                Some(resource.generation),
+                operation,
+                vec![mutation],
+            )
+            .await?
+        {
+            CommitOutcome::Committed(_) | CommitOutcome::CommittedStatusPending(_) => Ok(()),
+            CommitOutcome::Conflict(revision) => Err(SourceError::Conflict(revision)),
+        }
+    }
+
+    /// Persist a finalizer delta through the controller assignment fence
+    /// owned by this adapter.
+    pub async fn persist_assigned_finalizers(
+        &self,
+        resource: &StoredResource,
+        add_finalizers: Vec<String>,
+        remove_finalizers: Vec<String>,
+        operation_id: &str,
+    ) -> Result<(), SourceError> {
+        let envelope =
+            ResourceEnvelope::from_json(&resource.canonical_json).map_err(|_| SourceError::Integrity)?;
+        validate_assigned_resource_identity(&self.store, resource, &envelope)?;
+        let add_finalizers = add_finalizers
+            .into_iter()
+            .map(|value| {
+                FinalizerId::parse(value).map_err(|_| SourceError::Integrity)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let remove_finalizers = remove_finalizers
+            .into_iter()
+            .map(|value| {
+                FinalizerId::parse(value).map_err(|_| SourceError::Integrity)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if add_finalizers.is_empty() && remove_finalizers.is_empty() {
+            return Ok(());
+        }
+        let operation_id = operation_id.to_owned();
+        let operation = StoreOperationContext {
+            operation_id: operation_id.clone(),
+            idempotency_key: Some(operation_id.clone()),
+            correlation_id: operation_id,
+            trace_id: None,
+            deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
+        };
+        let mutation = StoreMutation {
+            kind: ResourceMutationKind::UpdateFinalizers,
+            zone: resource.zone.clone(),
+            target: resource.resource_ref.clone(),
+            expected: ExpectedRevision::Exact(resource.revision),
+            expected_uid: Some(resource.uid.clone()),
+            owner: None,
+            canonical_resource: None,
+            add_finalizers,
+            remove_finalizers,
+            wait_for_reconcile: false,
+            reconcile_deadline_ms: None,
+            configuration_generation: None,
+            assignment: None,
         };
         match self
             .commit_store_mutations(
@@ -2579,6 +2640,24 @@ const fn resource_verb(kind: ResourceMutationKind) -> ResourceVerb {
     }
 }
 
+fn validate_assigned_resource_identity(
+    store: &RedbResourceStore,
+    resource: &StoredResource,
+    envelope: &ResourceEnvelope,
+) -> Result<(), SourceError> {
+    if resource.zone != *store.identity().zone()
+        || envelope.resource_type() != resource.resource_ref.resource_type()
+        || envelope.metadata().name() != resource.resource_ref.name()
+        || envelope.metadata().uid() != &resource.uid
+        || envelope.metadata().generation() != resource.generation
+        || envelope.metadata().revision() != resource.revision
+        || envelope.metadata().zone() != &resource.zone
+    {
+        return Err(SourceError::Integrity);
+    }
+    Ok(())
+}
+
 fn operation_class(context: &ReconcileContext) -> &'static str {
     if context
         .reasons()
@@ -3608,6 +3687,238 @@ mod tests {
         assert_eq!(
             persisted_value["status"]["resource"]["controllerSession"]["ready"],
             true
+        );
+    }
+
+    #[tokio::test]
+    async fn assigned_status_and_finalizer_writes_keep_the_assignment_fence() {
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
+        let target = ResourceRef::parse("Host/owner").unwrap();
+        store
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
+                target.clone(),
+                canonical_host("owner", None),
+                None,
+                "create-owner-assignment",
+            ))
+            .await
+            .unwrap();
+        let stored = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-assignment".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-assignment".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let assignment = primary_assignment(stored.uid.clone(), stored.revision);
+        let api = service
+            .registered_controller_api(
+                subject,
+                state,
+                vec![(target.clone(), assignment.clone())],
+            )
+            .unwrap();
+        let mut status_value: Value = serde_json::from_slice(&stored.canonical_json).unwrap();
+        status_value["status"]["phase"] = Value::String("Ready".to_owned());
+        status_value["status"]["observedGeneration"] = Value::from(stored.generation.get());
+        let status = CanonicalJsonValue::parse(&serde_json::to_vec(&status_value).unwrap())
+            .unwrap()
+            .to_canonical_bytes();
+        api.persist_assigned_status(&stored, status, "assigned-guest-status")
+            .await
+            .unwrap();
+        let after_status = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-after-status".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-after-status".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: Some(stored.uid.clone()),
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        api.persist_assigned_finalizers(
+            &after_status,
+            vec!["core.controller".to_owned()],
+            Vec::new(),
+            "assigned-guest-finalizer",
+        )
+        .await
+        .unwrap();
+        let after_finalizer = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-after-finalizer".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-after-finalizer".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: Some(stored.uid.clone()),
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&after_finalizer.canonical_json).unwrap();
+        assert_eq!(value["status"]["phase"], "Ready");
+        assert_eq!(
+            value["metadata"]["finalizers"],
+            serde_json::json!(["core.controller"])
+        );
+        let fence = store
+            .assignment_fence(ZoneId::parse("work").unwrap(), target.clone())
+            .await
+            .unwrap()
+            .expect("assigned writes must persist their fence");
+        assert_eq!(fence.resource_uid, after_finalizer.uid);
+        assert_eq!(fence.resource_revision, after_finalizer.revision);
+        assert_eq!(fence.provider_generation, assignment.provider_generation);
+        assert_eq!(fence.controller_generation, assignment.controller_generation);
+        assert_eq!(fence.controller_role, assignment.controller_role);
+        assert_eq!(fence.target, assignment.target);
+        assert_eq!(fence.session_generation, assignment.session_generation);
+        assert_eq!(fence.epoch, assignment.epoch);
+        assert!(matches!(fence.scope, ResourceAssignmentScope::Primary));
+    }
+
+    #[tokio::test]
+    async fn assigned_finalizer_write_has_no_unassigned_fallback() {
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
+        let target = ResourceRef::parse("Host/owner").unwrap();
+        store
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
+                target.clone(),
+                canonical_host("owner", None),
+                None,
+                "create-owner-unassigned",
+            ))
+            .await
+            .unwrap();
+        let stored = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-unassigned".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-unassigned".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target,
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let api = service
+            .registered_controller_api(subject, state, Vec::new())
+            .unwrap();
+        assert_eq!(
+            api.persist_assigned_status(
+                &stored,
+                stored.canonical_json.clone(),
+                "unassigned-guest-status",
+            )
+            .await
+            .unwrap_err(),
+            SourceError::Integrity
+        );
+        assert_eq!(
+            api.persist_assigned_finalizers(
+                &stored,
+                vec!["core.controller".to_owned()],
+                Vec::new(),
+                "unassigned-guest-finalizer",
+            )
+            .await
+            .unwrap_err(),
+            SourceError::Integrity
+        );
+    }
+
+    #[tokio::test]
+    async fn assigned_mutations_reject_stale_uid_and_revision_identity() {
+        let (_directory, store, service, subject, state, issuer_slot) =
+            authorized_test_setup().await;
+        let target = ResourceRef::parse("Host/owner").unwrap();
+        store
+            .commit_verified(verified_create_from_slot(
+                &issuer_slot,
+                target.clone(),
+                canonical_host("owner", None),
+                None,
+                "create-owner-stale-identity",
+            ))
+            .await
+            .unwrap();
+        let stored = store
+            .get(StoreGetRequest {
+                operation: StoreOperationContext {
+                    operation_id: "read-owner-stale-identity".to_owned(),
+                    idempotency_key: None,
+                    correlation_id: "read-owner-stale-identity".to_owned(),
+                    trace_id: None,
+                    deadline_ms: 1_000,
+                },
+                zone: ZoneId::parse("work").unwrap(),
+                target: target.clone(),
+                expected_uid: None,
+                projection: StoreProjection::Full,
+            })
+            .await
+            .unwrap();
+        let api = service
+            .registered_controller_api(
+                subject,
+                state,
+                vec![(target, primary_assignment(stored.uid.clone(), stored.revision))],
+            )
+            .unwrap();
+        let mut stale_uid = stored.clone();
+        stale_uid.uid = ResourceUid::parse("223e4567-e89b-42d3-a456-426614174000").unwrap();
+        assert_eq!(
+            api.persist_assigned_status(
+                &stale_uid,
+                stored.canonical_json.clone(),
+                "stale-assigned-status",
+            )
+            .await
+            .unwrap_err(),
+            SourceError::Integrity
+        );
+        let mut stale_revision = stored.clone();
+        stale_revision.revision = ZoneRevision::new(stored.revision.get() + 1);
+        assert_eq!(
+            api.persist_assigned_finalizers(
+                &stale_revision,
+                vec!["core.controller".to_owned()],
+                Vec::new(),
+                "stale-assigned-finalizer",
+            )
+            .await
+            .unwrap_err(),
+            SourceError::Integrity
         );
     }
 

@@ -137,6 +137,8 @@
   controller-session evidence from crossing assignment or session fences.
 - Classified replayed `assignment-required` failures as retryable resource
   conflicts and kept their ResourceError wire representation valid.
+- Routed Cloud Hypervisor Guest status and finalizer writes through the current
+  U6 assignment fence instead of the unassigned system-core client.
 
 ### Removed
 

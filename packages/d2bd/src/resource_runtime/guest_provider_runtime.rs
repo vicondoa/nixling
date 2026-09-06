@@ -6,7 +6,7 @@
 //! custody.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::Arc,
 };
 
@@ -14,12 +14,10 @@ use d2b_contracts_resource::v3::{
     ControllerGeneration, ResourceGeneration, ResourceRef, ZoneId, identity::ReconnectGeneration,
 };
 use d2b_core_controller::{
-    ControllerDescriptor, CoreControllerSource, Runner, RunnerConfig, SourceError,
+    ControllerDescriptor, CoreControllerSource, Runner, RunnerConfig,
 };
-use d2b_resource_api::registered::AssignmentFenceResolver;
 use d2b_resource_store::{
-    ResourceAssignmentFence, ResourceAssignmentScope, StoreErrorKind, StoreGetRequest,
-    StoreOperationContext, StoreProjection,
+    StoreErrorKind, StoreGetRequest, StoreOperationContext, StoreProjection,
 };
 use d2bd_runtime::resource_runtime_support::retry_transient_store_read;
 use super::{
@@ -164,60 +162,13 @@ pub(crate) async fn start(
             .api
             .registered_controller_api(subject, authorization_state.clone(), assignments)
             .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
-        let allowed_types = descriptor
-            .resource_types()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let resolver_store = Arc::clone(&runtime.store);
-        let resolver_zone = runtime.zone.clone();
-        let resolver_authority = Arc::clone(&authority);
-        let resolver: AssignmentFenceResolver = Arc::new(move |target, uid, revision| {
-            let store = Arc::clone(&resolver_store);
-            let zone = resolver_zone.clone();
-            let authority = Arc::clone(&resolver_authority);
-            let allowed_types = allowed_types.clone();
-            Box::pin(async move {
-                if !allowed_types.contains(target.resource_type()) {
-                    return Err(SourceError::Integrity);
-                }
-                if let Some(stored) = store.assignment_fence(zone, target.clone()).await.map_err(
-                    |error| match error.kind() {
-                        StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure => {
-                            SourceError::Backpressure
-                        }
-                        StoreErrorKind::Timeout => SourceError::Timeout,
-                        _ => SourceError::Unavailable,
-                    },
-                )? {
-                    if stored.resource_uid != uid
-                        || stored.epoch > authority.epoch
-                        || (stored.epoch == authority.epoch
-                            && (stored.provider_generation != authority.provider_generation
-                                || stored.controller_generation != authority.controller_generation
-                                || stored.controller_role != authority.controller_role
-                                || stored.target != authority.target
-                                || stored.session_generation != authority.session_generation))
-                    {
-                        return Err(SourceError::Integrity);
-                    }
-                    if stored.epoch == authority.epoch && stored.resource_revision != revision {
-                        return Err(SourceError::Conflict(stored.resource_revision));
-                    }
-                }
-                Ok(ResourceAssignmentFence {
-                    resource_uid: uid,
-                    resource_revision: revision,
-                    provider_generation: authority.provider_generation,
-                    controller_generation: authority.controller_generation,
-                    controller_role: authority.controller_role.clone(),
-                    target: authority.target.clone(),
-                    session_generation: authority.session_generation,
-                    epoch: authority.epoch,
-                    scope: ResourceAssignmentScope::Primary,
-                })
-            })
-        });
-        let api = api.with_assignment_fence_resolver(resolver);
+        let api = api.with_assignment_fence_resolver(
+            super::shared_provider_assignment_fence_resolver(
+                Arc::clone(&runtime.store),
+                descriptor.resource_types().cloned().collect(),
+                authority,
+            ),
+        );
         let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
         let reconciler = GuestRuntimeReconciler::new(descriptor, kind, Arc::clone(&effects));
         let runner = Runner::new(
@@ -304,6 +255,7 @@ async fn provider_generations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn every_guest_runtime_registration_is_provider_ref_scoped() {
