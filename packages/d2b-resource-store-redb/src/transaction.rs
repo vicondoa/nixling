@@ -3826,7 +3826,10 @@ fn validate_owner_child_assignment_fence(
     current_revision: u64,
     ordinal: u32,
 ) -> Result<(), StoreError> {
-    if mutation.target.resource_type().as_str() != PROCESS_RESOURCE_TYPE
+    if !matches!(
+        mutation.target.resource_type().as_str(),
+        PROCESS_RESOURCE_TYPE | "Endpoint" | "Volume"
+    )
         || fence.resource_uid != *owner_uid
         || fence.resource_revision != owner_revision
     {

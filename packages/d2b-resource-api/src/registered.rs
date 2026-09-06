@@ -402,6 +402,121 @@ impl RedbRegisteredControllerApi {
         }
     }
 
+    /// Commit deterministic Guest children under their assigned Guest owner.
+    ///
+    /// All deterministic Guest children receive an owner-child assignment
+    /// fence. The external assignment transport only exposes Process child
+    /// scope, but this internal store path also binds Endpoint and Volume
+    /// children to the exact owner identity.
+    pub async fn commit_assigned_child_mutations(
+        &self,
+        owner: &StoredResource,
+        mutations: Vec<StoreMutation>,
+        operation_id: &str,
+    ) -> Result<Vec<StoredResource>, SourceError> {
+        let owner_envelope =
+            ResourceEnvelope::from_json(&owner.canonical_json).map_err(|_| SourceError::Integrity)?;
+        validate_assigned_resource_identity(&self.store, owner, &owner_envelope)?;
+        if mutations.is_empty() || mutations.len() > 128 || operation_id.is_empty() {
+            return Err(SourceError::Integrity);
+        }
+        let mut reads = Vec::new();
+        for mutation in &mutations {
+            if mutation.zone != owner.zone
+                || mutation.owner.as_ref() != Some(&owner.resource_ref)
+                || mutation.target == owner.resource_ref
+                || !matches!(
+                    mutation.target.resource_type().as_str(),
+                    "Process" | "Endpoint" | "Volume"
+                )
+                || !matches!(
+                    mutation.kind,
+                    ResourceMutationKind::Create
+                        | ResourceMutationKind::UpdateSpec
+                        | ResourceMutationKind::Delete
+                )
+            {
+                return Err(SourceError::Integrity);
+            }
+            match mutation.kind {
+                ResourceMutationKind::Create => {
+                    if !matches!(mutation.expected, ExpectedRevision::CreateAbsent)
+                        || mutation.expected_uid.is_some()
+                        || mutation.canonical_resource.is_none()
+                    {
+                        return Err(SourceError::Integrity);
+                    }
+                    reads.push((mutation.target.clone(), None));
+                }
+                ResourceMutationKind::UpdateSpec => {
+                    let ExpectedRevision::Exact(revision) = mutation.expected else {
+                        return Err(SourceError::Integrity);
+                    };
+                    let Some(uid) = mutation.expected_uid.clone() else {
+                        return Err(SourceError::Integrity);
+                    };
+                    if mutation.canonical_resource.is_none() {
+                        return Err(SourceError::Integrity);
+                    }
+                    reads.push((mutation.target.clone(), Some((uid, revision))));
+                }
+                ResourceMutationKind::Delete => {
+                    let ExpectedRevision::Exact(revision) = mutation.expected else {
+                        return Err(SourceError::Integrity);
+                    };
+                    let Some(uid) = mutation.expected_uid.as_ref() else {
+                        return Err(SourceError::Integrity);
+                    };
+                    if mutation.canonical_resource.is_some() {
+                        return Err(SourceError::Integrity);
+                    }
+                    let _ = (uid, revision);
+                }
+                _ => unreachable!("child mutation kind validated above"),
+            }
+        }
+        let operation_id = operation_id.to_owned();
+        let operation = StoreOperationContext {
+            operation_id: operation_id.clone(),
+            idempotency_key: Some(operation_id.clone()),
+            correlation_id: operation_id.clone(),
+            trace_id: None,
+            deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
+        };
+        match self
+            .commit_store_mutations(
+                &owner.zone,
+                owner.revision,
+                &owner.uid,
+                &owner.resource_ref,
+                Some(owner.generation),
+                operation,
+                mutations,
+            )
+            .await?
+        {
+            CommitOutcome::Committed(_) | CommitOutcome::CommittedStatusPending(_) => {}
+            CommitOutcome::Conflict(revision) => return Err(SourceError::Conflict(revision)),
+        }
+        let mut resources = Vec::with_capacity(reads.len());
+        for (target, expected) in reads {
+            let expected_uid = expected.as_ref().map(|(uid, _)| uid.clone());
+            let resource = self
+                .store
+                .get(StoreGetRequest {
+                    operation: Self::operation(operation_id.clone()),
+                    zone: owner.zone.clone(),
+                    target,
+                    expected_uid,
+                    projection: StoreProjection::Full,
+                })
+                .await
+                .map_err(|error| source_error(error, owner.revision))?;
+            resources.push(resource);
+        }
+        Ok(resources)
+    }
+
     #[cfg(test)]
     fn inject_status_timeouts(&self, count: usize) {
         self.status_timeouts_remaining
@@ -858,7 +973,10 @@ impl RedbRegisteredControllerApi {
                 .as_ref()
                 .is_some_and(|owner| owner == context_target)
                 && mutation.target != *context_target
-                && mutation.target.resource_type().as_str() == "Process"
+                && matches!(
+                    mutation.target.resource_type().as_str(),
+                    "Process" | "Endpoint" | "Volume"
+                )
                 && matches!(
                     mutation.kind,
                     ResourceMutationKind::Create
@@ -2820,7 +2938,10 @@ fn owner_child_assignment_fence(
     owner_generation: ResourceGeneration,
     child_ref: &ResourceRef,
 ) -> Result<ResourceAssignmentFence, SourceError> {
-    if child_ref.resource_type().as_str() != "Process"
+    if !matches!(
+        child_ref.resource_type().as_str(),
+        "Process" | "Endpoint" | "Volume"
+    )
         || owner_generation.get() == 0
         || parent_fence.resource_uid != *owner_uid
         || parent_fence.resource_revision != owner_revision

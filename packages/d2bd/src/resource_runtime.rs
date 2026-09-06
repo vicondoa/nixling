@@ -155,9 +155,9 @@ use d2b_resource_api::{
     service::UnavailableUpgradeDispatcher,
 };
 use d2b_resource_store::{
-    PolicySnapshot, ResourceAssignmentFence, ResourceAssignmentScope, StoreError, StoreErrorKind,
-    StoreGetRequest, StoreListRequest, StoreListResult, StoreOperationContext, StoreProjection,
-    StoredResource,
+    ExpectedRevision, PolicySnapshot, ResourceAssignmentFence, ResourceAssignmentScope,
+    ResourceMutationKind, StoreError, StoreErrorKind, StoreGetRequest, StoreListRequest,
+    StoreListResult, StoreMutation, StoreOperationContext, StoreProjection, StoredResource,
 };
 use d2b_resource_store_redb::{
     AuthorityOperationState, BrokerEvidenceIndex, LogicalBackup, RedbResourceStore,
@@ -9229,7 +9229,6 @@ impl PolicyProjection {
 /// controller crate; those remain behind this d2bd composition seam.
 struct CloudHypervisorResourceSession {
     client: Arc<CloudHypervisorResourceClient>,
-    mutation_client: Arc<CloudHypervisorResourceClient>,
     assigned_mutation_api: Arc<RedbRegisteredControllerApi>,
     providers: Arc<crate::process_provider_runtime::ProductionProcessProviders>,
     guest_sessions: Arc<
@@ -9858,57 +9857,52 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 Ok(CloudHypervisorResourceResponse::Dependencies(dependencies))
             }
             CloudHypervisorResourceRequest::CommitBatch { batch } => {
-                let mut request = wire::CommitBatchRequest::new();
-                request.meta = MessageField::some(public_request_meta(&format!(
+                let owner = self
+                    .get_stored(batch.owner_ref(), "cloud-hypervisor-commit-owner")
+                    .await?;
+                if owner.uid != *batch.owner_uid() || owner.revision != batch.owner_revision() {
+                    return Err(CloudHypervisorResourceApiError::Conflict);
+                }
+                let operation_id = format!(
                     "cloud-hypervisor-commit-children-{}-{}",
                     batch.owner_uid().as_str(),
                     batch.owner_revision().get(),
-                )));
+                );
+                let mut mutations = Vec::with_capacity(batch.mutations().len());
                 for mutation in batch.mutations() {
                     let canonical = batch
                         .canonical_payload(mutation.target())
                         .map_err(|_| CloudHypervisorResourceApiError::InvalidResponse)?;
-                    let mut wire_mutation = wire::Mutation::new();
-                    wire_mutation.kind =
-                        EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_CREATE);
-                    wire_mutation.target = MessageField::some(ch_identity(
-                        batch.zone(),
-                        mutation.target(),
-                        None,
-                        None,
-                        None,
-                    ));
-                    wire_mutation.precondition = MessageField::some(ch_create_precondition());
-                    wire_mutation.resource = MessageField::some(ch_resource_body(
-                        batch.zone(),
-                        mutation.target(),
-                        None,
-                        &canonical,
-                    )?);
-                    wire_mutation.owner = MessageField::some(ch_identity(
-                        batch.zone(),
-                        batch.owner_ref(),
-                        Some(batch.owner_uid()),
-                        None,
-                        Some(batch.owner_revision().get()),
-                    ));
-                    request.mutations.push(wire_mutation);
+                    mutations.push(StoreMutation {
+                        kind: ResourceMutationKind::Create,
+                        zone: batch.zone().clone(),
+                        target: mutation.target().clone(),
+                        expected: ExpectedRevision::CreateAbsent,
+                        expected_uid: None,
+                        owner: Some(batch.owner_ref().clone()),
+                        canonical_resource: Some(canonical),
+                        add_finalizers: Vec::new(),
+                        remove_finalizers: Vec::new(),
+                        wait_for_reconcile: false,
+                        reconcile_deadline_ms: None,
+                        configuration_generation: None,
+                        assignment: None,
+                    });
                 }
-                let response = self.mutation_client.commit_batch(request).await;
-                if response.error.is_some() {
-                    return Err(CloudHypervisorResourceApiError::Conflict);
-                }
-                let mut committed = Vec::new();
-                for resource in &response.resources {
-                    let stored = stored_resource_from_wire(resource)
-                        .ok_or(CloudHypervisorResourceApiError::InvalidResponse)?;
+                let stored = self
+                    .assigned_mutation_api
+                    .commit_assigned_child_mutations(&owner, mutations, &operation_id)
+                    .await
+                    .map_err(cloud_hypervisor_assigned_mutation_error)?;
+                let mut committed = Vec::with_capacity(stored.len());
+                for resource in stored {
                     committed.push(
                         d2b_provider_runtime_cloud_hypervisor::CommittedChild::new(
-                            stored.resource_ref,
+                            resource.resource_ref,
                             batch.owner_ref().clone(),
-                            stored.zone,
-                            stored.uid,
-                            stored.revision,
+                            resource.zone,
+                            resource.uid,
+                            resource.revision,
                         )
                         .map_err(|_| CloudHypervisorResourceApiError::InvalidResponse)?,
                     );
@@ -9935,7 +9929,6 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 )?;
                 let payload = replace_public_field(&current_value, "spec", merged_spec)
                     .map_err(|_| CloudHypervisorResourceApiError::InvalidResponse)?;
-                let mut request = wire::UpdateSpecRequest::new();
                 let mut operation_payload = format!(
                     "{}:{}:",
                     update.expected_uid().as_str(),
@@ -9948,39 +9941,53 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                         d2b_contracts_resource::v3::resource_schema::RESOURCE_ENVELOPE_DOMAIN_TAG,
                         &operation_payload,
                     );
-                request.meta = MessageField::some(public_request_meta(&format!(
+                let operation_id = format!(
                     "ch-update-child-{}",
-                    payload_operation_digest.trim_start_matches("sha256:"),
-                )));
-                let identity = ch_identity(
-                    &current.zone,
-                    update.target(),
-                    Some(update.expected_uid()),
-                    Some(current.generation.get()),
-                    Some(update.expected_revision().get()),
+                    payload_operation_digest.trim_start_matches("sha256:")
                 );
-                let mut mutation = wire::Mutation::new();
-                mutation.kind = EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_UPDATE_SPEC);
-                mutation.target = MessageField::some(identity);
-                mutation.precondition = MessageField::some(ch_exact_precondition(
-                    update.expected_uid(),
-                    update.expected_revision(),
-                ));
-                mutation.resource = MessageField::some(ch_resource_body(
-                    &current.zone,
-                    update.target(),
-                    Some(update.expected_uid()),
-                    &payload,
-                )?);
-                request.mutation = MessageField::some(mutation);
-                let response = self.mutation_client.update_spec(request).await;
-                if response.error.is_some() {
+                let envelope = ResourceEnvelope::from_json(&current.canonical_json)
+                    .map_err(|_| CloudHypervisorResourceApiError::InvalidResponse)?;
+                let owner_ref = envelope
+                    .metadata()
+                    .owner_ref()
+                    .cloned()
+                    .ok_or(CloudHypervisorResourceApiError::Conflict)?;
+                if owner_ref.resource_type().as_str() != "Guest"
+                    || current.owner_uid.is_none()
+                {
                     return Err(CloudHypervisorResourceApiError::Conflict);
                 }
-                let stored = response
-                    .resource
-                    .as_ref()
-                    .and_then(stored_resource_from_wire)
+                let owner = self
+                    .get_stored(&owner_ref, "cloud-hypervisor-update-child-owner")
+                    .await?;
+                if current.owner_uid.as_ref() != Some(&owner.uid) {
+                    return Err(CloudHypervisorResourceApiError::Conflict);
+                }
+                let stored = self
+                    .assigned_mutation_api
+                    .commit_assigned_child_mutations(
+                        &owner,
+                        vec![StoreMutation {
+                            kind: ResourceMutationKind::UpdateSpec,
+                            zone: current.zone.clone(),
+                            target: update.target().clone(),
+                            expected: ExpectedRevision::Exact(update.expected_revision()),
+                            expected_uid: Some(update.expected_uid().clone()),
+                            owner: Some(owner_ref),
+                            canonical_resource: Some(payload),
+                            add_finalizers: Vec::new(),
+                            remove_finalizers: Vec::new(),
+                            wait_for_reconcile: false,
+                            reconcile_deadline_ms: None,
+                            configuration_generation: None,
+                            assignment: None,
+                        }],
+                        &operation_id,
+                    )
+                    .await
+                    .map_err(cloud_hypervisor_assigned_mutation_error)?
+                    .into_iter()
+                    .next()
                     .ok_or(CloudHypervisorResourceApiError::InvalidResponse)?;
                 Ok(CloudHypervisorResourceResponse::Updated(
                     d2b_provider_runtime_cloud_hypervisor::CommittedChild::new(
@@ -10390,12 +10397,13 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 guest_uid,
                 child,
             } => {
-                self.guest_for_fenced_operation(
-                    &guest_ref,
-                    &guest_uid,
-                    "cloud-hypervisor-delete-child",
-                )
-                .await?;
+                let owner = self
+                    .guest_for_fenced_operation(
+                        &guest_ref,
+                        &guest_uid,
+                        "cloud-hypervisor-delete-child",
+                    )
+                    .await?;
                 let current = self
                     .get_stored(child.target(), "cloud-hypervisor-delete-child-fence")
                     .await?;
@@ -10407,34 +10415,33 @@ impl AuthenticatedResourceSession for CloudHypervisorResourceSession {
                 if envelope.metadata().owner_ref() != Some(&guest_ref) {
                     return Err(CloudHypervisorResourceApiError::Conflict);
                 }
-                let mut request = wire::DeleteRequest::new();
-                request.meta = MessageField::some(public_request_meta(&format!(
+                let operation_id = format!(
                     "cloud-hypervisor-delete-child-{}-{}",
                     child.uid().as_str(),
                     child.revision().get(),
-                )));
-                let mut mutation = wire::Mutation::new();
-                mutation.kind = EnumOrUnknown::new(wire::MutationKind::MUTATION_KIND_DELETE);
-                mutation.target = MessageField::some(ch_identity(
-                    &self.zone,
-                    child.target(),
-                    Some(child.uid()),
-                    None,
-                    Some(child.revision().get()),
-                ));
-                mutation.precondition =
-                    MessageField::some(ch_exact_precondition(child.uid(), child.revision()));
-                request.mutation = MessageField::some(mutation);
-                let response = self.mutation_client.delete(request).await;
-                if let Some(error) = response.error.as_ref() {
-                    tracing::warn!(
-                        error_kind = ?error.kind,
-                        reason = %error.reason,
-                        child_revision = child.revision().get(),
-                        "Cloud Hypervisor child deletion was rejected",
-                    );
-                    return Err(CloudHypervisorResourceApiError::Conflict);
-                }
+                );
+                self.assigned_mutation_api
+                    .commit_assigned_child_mutations(
+                        &owner,
+                        vec![StoreMutation {
+                            kind: ResourceMutationKind::Delete,
+                            zone: current.zone.clone(),
+                            target: child.target().clone(),
+                            expected: ExpectedRevision::Exact(child.revision()),
+                            expected_uid: Some(child.uid().clone()),
+                            owner: Some(guest_ref),
+                            canonical_resource: None,
+                            add_finalizers: Vec::new(),
+                            remove_finalizers: Vec::new(),
+                            wait_for_reconcile: false,
+                            reconcile_deadline_ms: None,
+                            configuration_generation: None,
+                            assignment: None,
+                        }],
+                        &operation_id,
+                    )
+                    .await
+                    .map_err(cloud_hypervisor_assigned_mutation_error)?;
                 Ok(CloudHypervisorResourceResponse::LifecycleApplied)
             }
             CloudHypervisorResourceRequest::ClearGuestFinalizer {
@@ -10540,12 +10547,6 @@ fn ch_identity(
     identity.generation = generation;
     identity.revision = revision;
     identity
-}
-
-fn ch_create_precondition() -> wire::Precondition {
-    let mut precondition = wire::Precondition::new();
-    precondition.kind = EnumOrUnknown::new(wire::PreconditionKind::PRECONDITION_KIND_CREATE_ABSENT);
-    precondition
 }
 
 fn ch_exact_precondition(uid: &ResourceUid, revision: ZoneRevision) -> wire::Precondition {
@@ -15483,7 +15484,6 @@ impl ZoneResourceRuntime {
                 })?;
             let session = CloudHypervisorResourceSession {
                 client: Arc::clone(&client),
-                mutation_client: self.status_client()?,
                 assigned_mutation_api,
                 providers: state
                     .provider_runtime
