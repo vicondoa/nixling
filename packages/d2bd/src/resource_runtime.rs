@@ -14944,16 +14944,16 @@ impl ZoneResourceRuntime {
         if identity.subject_ref() != &expected_guest {
             return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
         }
-        let resource = committed_resource(
+        let (resource, snapshot_revision) = current_committed_resource(
             &self.zone,
             &self.store,
-            self.store_metadata.current_revision,
             identity.wayland_session_ref(),
+            "interaction-wayland-session-current",
         )
         .await?;
         let spec = committed_wayland_session_spec(
             &self.zone,
-            self.store_metadata.current_revision,
+            snapshot_revision,
             &resource,
         )?;
         if spec.guest_ref() != &expected_guest || !spec.cross_domain_trusted() {
@@ -16113,19 +16113,19 @@ impl ZoneResourceRuntime {
             .cloned()
             .filter(|reference| d2b_provider_runtime_cloud_hypervisor::is_provider_ref(reference))
             .ok_or(ResourceRuntimeError::CapabilityUnavailable)?;
+        let (provider, snapshot_revision) = current_committed_resource(
+            &self.zone,
+            &self.store,
+            &provider_ref,
+            "cloud-hypervisor-guest-inputs",
+        )
+        .await?;
         let guest_spec =
             serde_json::from_slice::<GuestSpec>(&envelope.spec().base().to_canonical_bytes())
                 .map_err(|_| ResourceRuntimeError::CapabilityUnavailable)?;
-        let provider = committed_resource(
-            &self.zone,
-            &self.store,
-            self.store_metadata.current_revision,
-            &provider_ref,
-        )
-        .await?;
         let (provider_spec, _, _, _, _) = committed_provider_spec(
             &self.zone,
-            self.store_metadata.current_revision,
+            snapshot_revision,
             &provider,
             &provider_ref,
         )?;
@@ -20357,15 +20357,7 @@ async fn committed_resource(
     current_revision: ZoneRevision,
     resource_ref: &ResourceRef,
 ) -> Result<StoredResource, ResourceRuntimeError> {
-    if !matches!(
-        resource_ref.resource_type().as_str(),
-        "Guest"
-            | "Host"
-            | "Provider"
-            | "User"
-            | "display-wayland.d2bus.org.WaylandPolicy"
-            | "display-wayland.d2bus.org.WaylandSession"
-    ) {
+    if !is_supported_committed_resource_ref(resource_ref) {
         return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
     }
     let operation_id = format!(
@@ -20388,6 +20380,68 @@ async fn committed_resource(
         })
         .await
         .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
+    validate_committed_resource(zone, current_revision, resource_ref, resource)
+}
+
+async fn current_committed_resource(
+    zone: &ZoneId,
+    store: &RedbResourceStore,
+    resource_ref: &ResourceRef,
+    operation_id: &str,
+) -> Result<(StoredResource, ZoneRevision), ResourceRuntimeError> {
+    if !is_supported_committed_resource_ref(resource_ref) {
+        return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
+    }
+    let snapshot = store
+        .list(StoreListRequest {
+            operation: StoreOperationContext {
+                operation_id: operation_id.to_owned(),
+                idempotency_key: None,
+                correlation_id: operation_id.to_owned(),
+                trace_id: None,
+                deadline_ms: 10_000,
+            },
+            zone: zone.clone(),
+            resource_types: vec![resource_ref.resource_type().clone()],
+            resource_names: vec![resource_ref.name().clone()],
+            filters: Vec::new(),
+            page_size: 1,
+            cursor: None,
+            projection: StoreProjection::Full,
+        })
+        .await
+        .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
+    if snapshot.truncated || snapshot.next_cursor.is_some() || snapshot.resources.len() != 1 {
+        return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
+    }
+    let snapshot_revision = snapshot.snapshot_revision;
+    let resource = snapshot
+        .resources
+        .into_iter()
+        .next()
+        .ok_or(ResourceRuntimeError::InteractionConfigurationUnavailable)?;
+    let resource = validate_committed_resource(zone, snapshot_revision, resource_ref, resource)?;
+    Ok((resource, snapshot_revision))
+}
+
+fn is_supported_committed_resource_ref(resource_ref: &ResourceRef) -> bool {
+    matches!(
+        resource_ref.resource_type().as_str(),
+        "Guest"
+            | "Host"
+            | "Provider"
+            | "User"
+            | "display-wayland.d2bus.org.WaylandPolicy"
+            | "display-wayland.d2bus.org.WaylandSession"
+    )
+}
+
+fn validate_committed_resource(
+    zone: &ZoneId,
+    current_revision: ZoneRevision,
+    resource_ref: &ResourceRef,
+    resource: StoredResource,
+) -> Result<StoredResource, ResourceRuntimeError> {
     if resource.zone != *zone
         || resource.resource_ref != *resource_ref
         || resource.generation.get() == 0
@@ -29090,6 +29144,143 @@ mod tests {
             identities.get(&provider_ref),
             Some(&(current.uid.clone(), current.generation))
         );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_cloud_hypervisor_inputs_use_current_provider_snapshot() {
+        let (_directory, mut runtime, broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let provider_ref = ResourceRef::parse("Provider/runtime-cloud-hypervisor").unwrap();
+        let guest_ref = ResourceRef::parse("Guest/cloud-hypervisor").unwrap();
+        materialize_test_bundle(
+            &runtime,
+            vec![
+                bundle_resource(
+                    "Provider",
+                    "runtime-cloud-hypervisor",
+                    &zone,
+                    r#"{"artifactId":"runtime-cloud-hypervisor","config":{"controllerExecutionRef":"Host/host-system","defaultVcpus":2,"defaultMemoryMb":512,"defaultMachineType":"q35","watchdog":true,"adoptionWindowMs":30000,"healthCheckIntervalMs":30000,"healthCheckTimeoutMs":5000,"healthCheckFailureThreshold":3,"startupDeadlineMs":120000}}"#,
+                ),
+                bundle_resource(
+                    "Guest",
+                    "cloud-hypervisor",
+                    &zone,
+                    r#"{"allowedDomains":["system"],"budget":{},"defaultDomain":"system","defaultUserRef":null,"deviceAttachments":[],"networkAttachments":[],"providerRef":"Provider/runtime-cloud-hypervisor","systemArtifactId":null,"volumeAttachmentDefaults":[]}"#,
+                ),
+            ],
+        )
+        .await;
+        runtime.store_metadata = runtime.store.runtime_metadata().await.unwrap();
+        let activation_revision = runtime.store_metadata.current_revision;
+        let before = read_test_resource(
+            &runtime,
+            provider_ref.clone(),
+            "cloud-hypervisor-inputs-before-status",
+        )
+        .await;
+        let (_, _, expected_config, _) = runtime
+            .cloud_hypervisor_inputs(&guest_ref)
+            .await
+            .expect("activation snapshot must admit the unchanged Provider config");
+
+        mark_test_resource_phase(&runtime, &provider_ref, &broker_evidence, "Ready").await;
+        let after = read_test_resource(
+            &runtime,
+            provider_ref,
+            "cloud-hypervisor-inputs-after-status",
+        )
+        .await;
+        assert!(after.revision > activation_revision);
+        assert_eq!(after.uid, before.uid);
+        assert_eq!(after.generation, before.generation);
+
+        let (_, _, config, _) = runtime
+            .cloud_hypervisor_inputs(&guest_ref)
+            .await
+            .expect("Provider status revision must not invalidate unchanged CH config");
+        assert_eq!(config, expected_config);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_wayland_session_lookup_uses_current_store_snapshot() {
+        let (_directory, mut runtime, broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        let guest_ref = ResourceRef::parse("Guest/workstation").unwrap();
+        let host_ref = ResourceRef::parse("Host/host-system").unwrap();
+        let user_ref = ResourceRef::parse("User/alice").unwrap();
+        let session_ref =
+            ResourceRef::parse("display-wayland.d2bus.org.WaylandSession/display-wayland")
+                .unwrap();
+        let session_spec = d2b_provider_display_wayland::WaylandSessionSpec::new(
+            guest_ref.clone(),
+            host_ref.clone(),
+            user_ref.clone(),
+            ResourceRef::parse("display-wayland.d2bus.org.WaylandPolicy/display-wayland").unwrap(),
+            d2b_provider_display_wayland::DisplayIdentity::new(
+                "display",
+                "#112233",
+                "#223344",
+                "#334455",
+            )
+            .unwrap(),
+            true,
+        )
+        .unwrap();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "display-wayland.d2bus.org.WaylandSession",
+                "display-wayland",
+                &zone,
+                &serde_json::to_string(&session_spec).unwrap(),
+            )],
+        )
+        .await;
+        let stored =
+            read_test_resource(&runtime, session_ref.clone(), "wayland-session-before-status")
+                .await;
+        let mut identity = CommittedInteractionIdentity::for_test(
+            zone.clone(),
+            guest_ref,
+            ResourceUid::parse("44444444-4444-4444-8444-444444444444").unwrap(),
+            host_ref,
+            user_ref,
+            BTreeMap::new(),
+            ResourceGeneration::new(1).unwrap(),
+            None,
+            None,
+            None,
+            None,
+        );
+        identity.wayland_session_uid = stored.uid.clone();
+        runtime.interaction_identity = Some(identity);
+        runtime.readiness.resource_api_ready = true;
+        runtime.store_metadata = runtime.store.runtime_metadata().await.unwrap();
+        let activation_revision = runtime.store_metadata.current_revision;
+        let (_, _, expected_spec) = runtime
+            .committed_wayland_session_for_vm("workstation")
+            .await
+            .expect("activation snapshot must admit the unchanged Wayland session")
+            .expect("Wayland session identity is present");
+
+        mark_test_resource_phase(&runtime, &session_ref, &broker_evidence, "Ready").await;
+        let current =
+            read_test_resource(&runtime, session_ref, "wayland-session-after-status").await;
+        assert!(current.revision > activation_revision);
+        assert_eq!(current.uid, stored.uid);
+        assert_eq!(current.generation, stored.generation);
+
+        let (_, uid, spec) = runtime
+            .committed_wayland_session_for_vm("workstation")
+            .await
+            .expect("Wayland status revision must not invalidate unchanged session")
+            .expect("Wayland session identity remains present");
+        assert_eq!(uid, current.uid);
+        assert_eq!(spec, expected_spec);
         runtime.shutdown().await.unwrap();
     }
 

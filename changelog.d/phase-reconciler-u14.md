@@ -1,5 +1,8 @@
 ### Changed
 
+- Live Cloud Hypervisor inputs and Wayland session lookups now validate exact
+  StoreList snapshots against their returned revision, so status-only Provider
+  updates do not invalidate unchanged typed configuration.
 - Replaced only finished Core runner identities during reconciliation, keeping
   healthy Core and Provider siblings live and ensuring every required runner
   identity is present before reporting success.
