@@ -14826,10 +14826,15 @@ impl ZoneResourceRuntime {
                 let Some(expected_provider) = provider_selector.as_deref() else {
                     return true;
                 };
-                ResourceEnvelope::from_json(&resource.canonical_json)
+                serde_json::from_slice::<Value>(&resource.canonical_json)
                     .ok()
-                    .and_then(|envelope| envelope.spec().provider_ref().cloned())
-                    .is_some_and(|provider| provider.to_canonical_string() == expected_provider)
+                    .and_then(|value| {
+                        value
+                            .pointer("/spec/providerRef")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .is_some_and(|provider| provider == expected_provider)
             })
             .collect::<Vec<_>>();
         let mut durable_epoch = 0;
