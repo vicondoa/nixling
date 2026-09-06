@@ -1,5 +1,9 @@
 ### Changed
 
+- Retried bounded transient StoreBackpressure/Timeout during Zone startup,
+  activation, Core/provider relists, and Process composition with delayed
+  async backoff, waitable bounded redb read admission, preserved typed store
+  diagnostics, and readiness withheld on exhaustion.
 - Live Cloud Hypervisor inputs and Wayland session lookups now validate exact
   StoreList snapshots against their returned revision, so status-only Provider
   updates do not invalidate unchanged typed configuration.

@@ -3,11 +3,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
+    future::Future,
     io::{self, Read},
     os::unix::fs::FileTypeExt,
     path::Path,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::resource_api::{ParsedListRequest, ResourceRuntimeError};
@@ -56,6 +57,132 @@ use d2b_core_controller::{
 /// Provider-neutral Core assignment registry shared by Resource API and bus
 /// admission for one Zone runtime.
 pub type AssignmentRegistry = Arc<Mutex<ControllerAssignmentRegistry>>;
+
+const TRANSIENT_STORE_READ_ATTEMPTS: usize = 4;
+const TRANSIENT_STORE_READ_BUDGET: Duration = Duration::from_secs(1);
+const TRANSIENT_STORE_LIST_BUDGET: Duration = Duration::from_secs(4);
+const TRANSIENT_STORE_READ_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(5),
+    Duration::from_millis(20),
+    Duration::from_millis(80),
+];
+
+/// Retry only transient redb read pressure while preserving the original
+/// typed store error for the caller's final mapping.
+pub async fn retry_transient_store_read<T, F, Fut>(
+    zone: &ZoneId,
+    operation: &str,
+    mut read: F,
+) -> Result<T, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    retry_transient_store_read_with_budget(
+        zone,
+        operation,
+        &mut read,
+        TRANSIENT_STORE_READ_BUDGET,
+    )
+    .await
+}
+
+/// Retry a bounded list page with enough budget for redb's one-second
+/// transaction lifetime before a subsequent attempt.
+pub async fn retry_transient_store_list<T, F, Fut>(
+    zone: &ZoneId,
+    operation: &str,
+    mut read: F,
+) -> Result<T, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    retry_transient_store_read_with_budget(
+        zone,
+        operation,
+        &mut read,
+        TRANSIENT_STORE_LIST_BUDGET,
+    )
+    .await
+}
+
+async fn retry_transient_store_read_with_budget<T, F, Fut>(
+    zone: &ZoneId,
+    operation: &str,
+    read: &mut F,
+    budget: Duration,
+) -> Result<T, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    for attempt in 1..=TRANSIENT_STORE_READ_ATTEMPTS {
+        match read().await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    StoreErrorKind::Backpressure
+                        | StoreErrorKind::StoreBackpressure
+                        | StoreErrorKind::Timeout
+                ) && attempt < TRANSIENT_STORE_READ_ATTEMPTS =>
+            {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    tracing::error!(
+                        zone = %zone.as_str(),
+                        operation,
+                        attempt,
+                        max_attempts = TRANSIENT_STORE_READ_ATTEMPTS,
+                        store_error_kind = ?error.kind(),
+                        reason_code = error.reason_code(),
+                        "store read retry budget expired; returning last typed error",
+                    );
+                    return Err(error);
+                }
+                let backoff = TRANSIENT_STORE_READ_BACKOFF[attempt - 1].min(remaining);
+                tracing::warn!(
+                    zone = %zone.as_str(),
+                    operation,
+                    attempt,
+                    max_attempts = TRANSIENT_STORE_READ_ATTEMPTS,
+                    store_error_kind = ?error.kind(),
+                    reason_code = error.reason_code(),
+                    backoff_ms = backoff.as_millis(),
+                    "transient store read pressure; retrying after bounded backoff",
+                );
+                tokio::time::sleep(backoff).await;
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::error!(
+                        zone = %zone.as_str(),
+                        operation,
+                        attempt,
+                        max_attempts = TRANSIENT_STORE_READ_ATTEMPTS,
+                        store_error_kind = ?error.kind(),
+                        reason_code = error.reason_code(),
+                        "store read retry budget expired; returning last typed error",
+                    );
+                    return Err(error);
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    zone = %zone.as_str(),
+                    operation,
+                    attempt,
+                    max_attempts = TRANSIENT_STORE_READ_ATTEMPTS,
+                    store_error_kind = ?error.kind(),
+                    reason_code = error.reason_code(),
+                    "store read failed after bounded transient retries",
+                );
+                return Err(error);
+            }
+        }
+    }
+    unreachable!("startup store retry loop always returns")
+}
 
 /// Fixed Provider identities required by the generated Process resources.
 ///
@@ -117,8 +244,8 @@ use d2b_resource_api::{
     service::UnavailableUpgradeDispatcher,
 };
 use d2b_resource_store::{
-    PolicySnapshot, StoreListRequest, StoreListResult, StoreOperationContext, StoreProjection,
-    StoreSlot, StoredResource,
+    PolicySnapshot, StoreError, StoreErrorKind, StoreListRequest, StoreListResult,
+    StoreOperationContext, StoreProjection, StoreSlot, StoredResource,
 };
 use d2b_resource_store_redb::{RedbResourceStore, StoreIdentity, StoreRuntimeMetadata};
 use d2b_session::{
@@ -1000,8 +1127,7 @@ pub async fn resolve_zone_user(
     let mut resources = Vec::new();
     let mut cursor = None;
     loop {
-        let page = store
-            .list(StoreListRequest {
+        let request = StoreListRequest {
                 operation: StoreOperationContext {
                     operation_id: operation_id.to_owned(),
                     idempotency_key: None,
@@ -1014,10 +1140,13 @@ pub async fn resolve_zone_user(
                 resource_names: Vec::new(),
                 filters: Vec::new(),
                 page_size: 500,
-                cursor,
+                cursor: cursor.clone(),
                 projection: StoreProjection::Full,
-            })
-            .await
+            };
+        let page = retry_transient_store_list(zone, operation_id, || {
+            store.list(request.clone())
+        })
+        .await
             .map_err(|_| ResourceRuntimeError::IdentityUnbound)?;
         resources.extend(page.resources);
         cursor = page.next_cursor;
@@ -1055,8 +1184,7 @@ pub async fn load_committed_policy_resources(
     for resource_type in resource_types {
         let mut cursor = None;
         loop {
-            let page = store
-                .list(StoreListRequest {
+            let request = StoreListRequest {
                     operation: StoreOperationContext {
                         operation_id: operation_id.to_owned(),
                         idempotency_key: None,
@@ -1069,10 +1197,13 @@ pub async fn load_committed_policy_resources(
                     resource_names: Vec::new(),
                     filters: Vec::new(),
                     page_size: 500,
-                    cursor,
+                    cursor: cursor.clone(),
                     projection: StoreProjection::Full,
-                })
-                .await
+                };
+            let page = retry_transient_store_list(zone, operation_id, || {
+                store.list(request.clone())
+            })
+            .await
                 .map_err(|_| ResourceRuntimeError::AuthorizationUnavailable)?;
             resources.extend(page.resources);
             cursor = page.next_cursor;
@@ -1244,8 +1375,7 @@ pub async fn ensure_bootstrap_host_resource(
 ) -> Result<(), ResourceRuntimeError> {
     let host_type =
         ResourceTypeName::parse("Host").map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-    let page = store
-        .list(StoreListRequest {
+    let request = StoreListRequest {
             operation: StoreOperationContext {
                 operation_id: "system-core-bootstrap-list-host".to_owned(),
                 idempotency_key: None,
@@ -1260,8 +1390,11 @@ pub async fn ensure_bootstrap_host_resource(
             page_size: 2,
             cursor: None,
             projection: StoreProjection::MetadataOnly,
-        })
-        .await
+        };
+    let page = retry_transient_store_list(zone, "system-core-bootstrap-list-host", || {
+        store.list(request.clone())
+    })
+    .await
         .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
     if !page.resources.is_empty() {
         return Ok(());
@@ -1414,8 +1547,7 @@ pub async fn ensure_bootstrap_zone_resource(
 ) -> Result<(), ResourceRuntimeError> {
     let zone_type =
         ResourceTypeName::parse("Zone").map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-    let page = store
-        .list(StoreListRequest {
+    let request = StoreListRequest {
             operation: StoreOperationContext {
                 operation_id: "system-core-bootstrap-list-zone".to_owned(),
                 idempotency_key: None,
@@ -1430,8 +1562,11 @@ pub async fn ensure_bootstrap_zone_resource(
             page_size: 2,
             cursor: None,
             projection: StoreProjection::Full,
-        })
-        .await
+        };
+    let page = retry_transient_store_list(zone, "system-core-bootstrap-list-zone", || {
+        store.list(request.clone())
+    })
+    .await
         .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
     if !page.resources.is_empty() {
         return validate_zone_self_resource_rows(zone, zone_uid, &page.resources);
@@ -1504,9 +1639,12 @@ pub async fn materialize_zone_resource_bundle(
     meta.correlation_id = operation_id;
     request.meta = protobuf::MessageField::some(meta);
     request.mutations = mutations;
-    let configuration_generation = store
-        .runtime_metadata()
-        .await
+    let configuration_generation = retry_transient_store_read(
+        zone,
+        "resource-bundle-materialization-metadata",
+        || store.runtime_metadata(),
+    )
+    .await
         .map_err(|_| ResourceRuntimeError::StoreReadFailed)?
         .policy_snapshot
         .active_configuration_revision;
@@ -1559,15 +1697,17 @@ async fn plan_zone_resource_bundle(
     if store.identity().zone() != zone || store.identity().zone_uid() != bundle_zone_uid {
         return Err(ResourceRuntimeError::HandlerNotReady);
     }
-    let metadata = store
-        .runtime_metadata()
-        .await
+    let metadata = retry_transient_store_read(
+        zone,
+        "resource-bundle-materialization-metadata",
+        || store.runtime_metadata(),
+    )
+    .await
         .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
     let mut existing = BTreeMap::new();
     let mut cursor = None;
     loop {
-        let page = store
-            .list(StoreListRequest {
+        let request = StoreListRequest {
                 operation: StoreOperationContext {
                     operation_id: "resource-bundle-materialization-list".to_owned(),
                     idempotency_key: None,
@@ -1580,10 +1720,13 @@ async fn plan_zone_resource_bundle(
                 resource_names: Vec::new(),
                 filters: Vec::new(),
                 page_size: 256,
-                cursor,
+                cursor: cursor.clone(),
                 projection: StoreProjection::Full,
-            })
-            .await
+            };
+        let page = retry_transient_store_list(zone, "resource-bundle-materialization-list", || {
+            store.list(request.clone())
+        })
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         for resource in page.resources {
             existing.insert(resource.resource_ref.clone(), resource);
@@ -1778,8 +1921,7 @@ pub async fn validate_zone_self_resource(
     if store.identity().zone_uid() != zone_uid || store.identity().store_uid() != store_uid {
         return Err(ResourceRuntimeError::HandlerNotReady);
     }
-    let page = store
-        .list(StoreListRequest {
+    let request = StoreListRequest {
             operation: StoreOperationContext {
                 operation_id: "zone-self-resource-validation".to_owned(),
                 idempotency_key: None,
@@ -1797,8 +1939,11 @@ pub async fn validate_zone_self_resource(
             page_size: 16,
             cursor: None,
             projection: StoreProjection::Full,
-        })
-        .await
+        };
+    let page = retry_transient_store_list(zone, "zone-self-resource-validation", || {
+        store.list(request.clone())
+    })
+    .await
         .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
     validate_zone_self_resource_rows(zone, zone_uid, &page.resources)
 }
@@ -2815,6 +2960,7 @@ mod tests {
     use d2b_resource_api::authz::{
         ApiMethod, AuthorizationDenial, AuthorizationRequest, AuthorizationTarget,
     };
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn bootstrap_zone_create_body_is_complete_after_uid_placeholder() {
@@ -2848,6 +2994,186 @@ mod tests {
             "00000000-0000-4000-8000-000000000000"
         );
         assert_eq!(envelope.metadata().managed_by(), ManagedBy::Controller);
+    }
+
+    #[tokio::test]
+    async fn startup_store_reads_retry_transient_metadata_and_get_pressure() {
+        let zone = ZoneId::parse("work").unwrap();
+        for (operation, kind) in [
+            ("runtime-metadata", StoreErrorKind::StoreBackpressure),
+            ("shared-provider-runner-provider", StoreErrorKind::Backpressure),
+        ] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_for_read = Arc::clone(&calls);
+            let result = retry_transient_store_read(&zone, operation, move || {
+                let attempt = calls_for_read.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Err(StoreError::new(
+                            kind,
+                            None,
+                            None,
+                            RetryClass::Never,
+                            "test-startup-store-read",
+                        ))
+                    } else {
+                        Ok(attempt)
+                    }
+                }
+            })
+            .await;
+
+            assert_eq!(result, Ok(1));
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "{operation}");
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_store_list_timeout_retries_after_worker_lifetime() {
+        let zone = ZoneId::parse("work").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_read = Arc::clone(&calls);
+        let retry = tokio::spawn(async move {
+            retry_transient_store_list(&zone, "startup-list-timeout", move || {
+                let attempt = calls_for_read.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        tokio::time::sleep(
+                            d2b_resource_store_redb::LIST_READ_LIFETIME
+                                + Duration::from_millis(25),
+                        )
+                        .await;
+                        Err(StoreError::new(
+                            StoreErrorKind::Timeout,
+                            None,
+                            None,
+                            RetryClass::Never,
+                            "redb-read-lifetime-exceeded",
+                        ))
+                    } else {
+                        Ok(attempt)
+                    }
+                }
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(
+            d2b_resource_store_redb::LIST_READ_LIFETIME + Duration::from_millis(25),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(retry.await.unwrap(), Ok(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn startup_store_retry_uses_delayed_async_backoff() {
+        let zone = ZoneId::parse("work").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_read = Arc::clone(&calls);
+        let retry = tokio::spawn(async move {
+            retry_transient_store_read(&zone, "startup-backoff", move || {
+                let attempt = calls_for_read.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(if attempt < 2 {
+                    Err(StoreError::new(
+                        StoreErrorKind::Backpressure,
+                        None,
+                        None,
+                        RetryClass::Never,
+                        "test-startup-backpressure",
+                    ))
+                } else {
+                    Ok(attempt)
+                })
+            })
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(retry.await.unwrap(), Ok(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn startup_store_read_exhaustion_preserves_typed_error_and_fails_closed() {
+        let zone = ZoneId::parse("work").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_read = Arc::clone(&calls);
+        let exhausted = retry_transient_store_read(&zone, "process-resource-reconcile", move || {
+            calls_for_read.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Err::<(), _>(StoreError::new(
+                StoreErrorKind::Timeout,
+                None,
+                None,
+                RetryClass::Never,
+                "test-startup-store-timeout",
+            )))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(exhausted.kind(), StoreErrorKind::Timeout);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_read = Arc::clone(&calls);
+        let not_found =
+            retry_transient_store_read(&zone, "interaction-presence-providers", move || {
+                calls_for_read.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(StoreError::new(
+                    StoreErrorKind::ResourceNotFound,
+                    None,
+                    None,
+                    RetryClass::Never,
+                    "test-startup-store-not-found",
+                )))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(not_found.kind(), StoreErrorKind::ResourceNotFound);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        for kind in [
+            StoreErrorKind::AuthorizationDenied,
+            StoreErrorKind::StoreIntegrityFailure,
+        ] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_for_read = Arc::clone(&calls);
+            let error = retry_transient_store_read(&zone, "runtime-integrity-check", move || {
+                calls_for_read.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(StoreError::new(
+                    kind,
+                    None,
+                    None,
+                    RetryClass::Never,
+                    "test-startup-store-non-transient",
+                )))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     fn user_resource(name: &str, uid: &str, os_username: &str, phase: &str) -> StoredResource {

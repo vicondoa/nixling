@@ -1853,6 +1853,7 @@ fn audit_resource_type(resource_type: &str) -> &'static str {
 
 pub(crate) struct ReadPool {
     senders: Vec<std::sync::mpsc::SyncSender<ReadWork>>,
+    queue_permits: Vec<Arc<tokio::sync::Semaphore>>,
     next_worker: AtomicU64,
     zone: ZoneId,
     permits: Arc<tokio::sync::Semaphore>,
@@ -1872,6 +1873,7 @@ impl ReadPool {
             MAX_CONCURRENT_READS
         );
         let mut senders = Vec::with_capacity(READ_POOL_THREADS);
+        let mut queue_permits = Vec::with_capacity(READ_POOL_THREADS);
         let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(READ_POOL_THREADS);
         for index in 0..READ_POOL_THREADS {
             let database = Arc::clone(&database);
@@ -1890,10 +1892,12 @@ impl ReadPool {
                 }
             };
             senders.push(sender);
+            queue_permits.push(Arc::new(tokio::sync::Semaphore::new(per_worker_capacity)));
             threads.push(thread);
         }
         Ok(Self {
             senders,
+            queue_permits,
             next_worker: AtomicU64::new(0),
             zone,
             permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_READS)),
@@ -1929,20 +1933,36 @@ impl ReadPool {
         lifetime: Duration,
     ) -> Result<T, StoreError> {
         let started = Instant::now();
-        let permit = Arc::clone(&self.permits)
-            .try_acquire_owned()
-            .map_err(|_| backpressure())?;
-        let (response, receiver) = oneshot::channel();
-        let deadline = Instant::now() + lifetime;
+        let deadline = started + lifetime;
+        let admission_deadline = tokio::time::Instant::now() + lifetime;
         let worker = usize::try_from(
             self.next_worker.fetch_add(1, Ordering::Relaxed) % READ_POOL_THREADS as u64,
         )
         .expect("read-worker index fits usize");
+        let queue_permit = tokio::time::timeout_at(
+            admission_deadline,
+            Arc::clone(&self.queue_permits[worker]).acquire_owned(),
+        )
+        .await
+        .map_err(|_| timeout())?
+        .map_err(|_| crate::transaction::integrity("read-pool-closed"))?;
+        let permit = tokio::time::timeout_at(
+            admission_deadline,
+            Arc::clone(&self.permits).acquire_owned(),
+        )
+        .await
+        .map_err(|_| timeout())?
+        .map_err(|_| crate::transaction::integrity("read-pool-closed"))?;
+        let (response, receiver) = oneshot::channel();
+        let (worker_started, worker_started_receiver) = oneshot::channel();
+        let wait_for_worker_completion = hold.is_some();
         self.senders[worker]
             .try_send(ReadWork {
                 command: make(response),
                 deadline,
                 permit,
+                queue_permit,
+                started: worker_started,
                 hold,
             })
             .map_err(|error| match error {
@@ -1951,10 +1971,23 @@ impl ReadPool {
                     crate::transaction::integrity("read-pool-closed")
                 }
             })?;
-        let result = tokio::time::timeout(lifetime + Duration::from_millis(25), receiver)
+        // Bound the wait while work is still queued and while production work
+        // is executing. The test hold deliberately awaits worker completion so
+        // it can prove the blocking worker retains and then releases its permit.
+        tokio::time::timeout_at(admission_deadline, worker_started_receiver)
             .await
             .map_err(|_| timeout())?
-            .map_err(|_| crate::transaction::integrity("read-response-closed"))?;
+            .map_err(|_| crate::transaction::integrity("read-start-closed"))?;
+        let result = if wait_for_worker_completion {
+            receiver
+                .await
+                .map_err(|_| crate::transaction::integrity("read-response-closed"))?
+        } else {
+            tokio::time::timeout_at(admission_deadline, receiver)
+                .await
+                .map_err(|_| timeout())?
+                .map_err(|_| crate::transaction::integrity("read-response-closed"))?
+        };
         let outcome = if result.is_ok() { "ok" } else { "error" };
         self.telemetry.metric(
             StoreMetric::ReadDuration,
@@ -2072,6 +2105,17 @@ impl ReadPool {
     pub(crate) fn available_permits(&self) -> usize {
         self.permits.available_permits()
     }
+
+    #[cfg(test)]
+    pub(crate) fn reserve_permits(&self, count: usize) -> Vec<OwnedSemaphorePermit> {
+        (0..count)
+            .map(|_| {
+                Arc::clone(&self.permits)
+                    .try_acquire_owned()
+                    .expect("test reserve fits read capacity")
+            })
+            .collect()
+    }
 }
 
 impl Drop for ReadPool {
@@ -2099,6 +2143,8 @@ struct ReadWork {
     command: ReadCommand,
     deadline: Instant,
     permit: OwnedSemaphorePermit,
+    queue_permit: OwnedSemaphorePermit,
+    started: oneshot::Sender<()>,
     hold: Option<ReadHold>,
 }
 
@@ -2153,11 +2199,15 @@ fn read_worker(database: Arc<Database>, receiver: std::sync::mpsc::Receiver<Read
             command,
             deadline,
             permit,
+            queue_permit,
+            started,
             hold,
         }) = command
         else {
             return;
         };
+        drop(queue_permit);
+        let _ = started.send(());
         if Instant::now() >= deadline {
             send_read_result(command, Err(timeout()));
             drop(permit);

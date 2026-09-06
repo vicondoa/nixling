@@ -3206,11 +3206,146 @@ fn scm_rights_receipt_racing_fork_exec_never_leaks_the_database_inode() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn read_lifetime_is_enforced_by_the_paused_clock() {
+async fn read_adapter_waits_for_worker_completion_before_releasing_permit() {
     let (_directory, file, marker) = provisioned_store();
     let store = provision_store(file, marker, identity()).await.unwrap();
     let store = Arc::new(store);
     let (started, started_receiver) = tokio::sync::oneshot::channel();
+    let (release, release_receiver) = std::sync::mpsc::channel();
+    let (completed, completed_receiver) = tokio::sync::oneshot::channel();
+    let probe_store = Arc::clone(&store);
+    let mut probe = tokio::spawn(async move {
+        probe_store
+            .reads
+            .expiry_probe(started, release_receiver, completed)
+            .await
+    });
+    started_receiver.await.unwrap();
+    tokio::time::advance(READ_LIFETIME + std::time::Duration::from_millis(25)).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::ZERO, &mut probe)
+            .await
+            .is_err(),
+        "the adapter must wait for the blocking worker instead of applying an outer timeout"
+    );
+    assert_eq!(store.reads.available_permits(), MAX_CONCURRENT_READS - 1);
+    release.send(()).unwrap();
+    completed_receiver.await.unwrap();
+    let error = probe.await.unwrap().unwrap_err();
+    assert_eq!(error.kind(), d2b_resource_store::StoreErrorKind::Timeout);
+    assert_eq!(store.reads.available_permits(), MAX_CONCURRENT_READS);
+}
+
+#[tokio::test]
+async fn read_submission_waits_for_capacity_without_stacking_permits() {
+    let (_directory, file, marker) = provisioned_store();
+    let store = Arc::new(
+        provision_store(file, marker, identity())
+            .await
+            .expect("provision read-pool fixture"),
+    );
+    let mut probes = Vec::with_capacity(READ_POOL_THREADS);
+    let mut releases = Vec::with_capacity(READ_POOL_THREADS);
+    let mut completed_receivers = Vec::with_capacity(READ_POOL_THREADS);
+    let mut started_receivers = Vec::with_capacity(READ_POOL_THREADS);
+    for _ in 0..READ_POOL_THREADS {
+        let (started, started_receiver) = tokio::sync::oneshot::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        let (completed, completed_receiver) = tokio::sync::oneshot::channel();
+        let probe_store = Arc::clone(&store);
+        probes.push(tokio::spawn(async move {
+            probe_store
+                .reads
+                .expiry_probe(started, release_receiver, completed)
+                .await
+        }));
+        releases.push(release);
+        started_receivers.push(started_receiver);
+        completed_receivers.push(completed_receiver);
+    }
+    for started_receiver in started_receivers {
+        started_receiver.await.unwrap();
+    }
+    let reserved = store
+        .reads
+        .reserve_permits(MAX_CONCURRENT_READS - READ_POOL_THREADS);
+    assert_eq!(store.reads.available_permits(), 0);
+
+    let (extra_started, mut extra_started_receiver) = tokio::sync::oneshot::channel();
+    let (extra_release, extra_release_receiver) = std::sync::mpsc::channel();
+    let (extra_completed, extra_completed_receiver) = tokio::sync::oneshot::channel();
+    let extra_store = Arc::clone(&store);
+    let extra = tokio::spawn(async move {
+        extra_store
+            .reads
+            .expiry_probe(extra_started, extra_release_receiver, extra_completed)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            &mut extra_started_receiver
+        )
+        .await
+        .is_err(),
+        "a saturated pool must keep the extra read from starting"
+    );
+    assert_eq!(store.reads.available_permits(), 0);
+
+    releases[0].send(()).expect("release in-flight probe");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        &mut extra_started_receiver,
+    )
+    .await
+    .expect("released capacity must admit the extra probe")
+    .expect("extra worker start sender");
+    assert_eq!(store.reads.available_permits(), 0);
+
+    extra_release.send(()).expect("release extra probe");
+    extra_completed_receiver
+        .await
+        .expect("extra worker completion");
+    let extra_error = extra.await.expect("extra probe task").unwrap_err();
+    assert_eq!(extra_error.kind(), StoreErrorKind::Timeout);
+
+    completed_receivers
+        .remove(0)
+        .await
+        .expect("first worker completion");
+    let first_error = probes
+        .remove(0)
+        .await
+        .expect("first probe task")
+        .unwrap_err();
+    assert_eq!(first_error.kind(), StoreErrorKind::Timeout);
+
+    for ((release, completed_receiver), probe) in releases
+        .into_iter()
+        .skip(1)
+        .zip(completed_receivers.into_iter())
+        .zip(probes)
+    {
+        release.send(()).expect("release in-flight probe");
+        completed_receiver.await.expect("worker completion");
+        let error = probe.await.expect("probe task").unwrap_err();
+        assert_eq!(error.kind(), StoreErrorKind::Timeout);
+    }
+
+    drop(reserved);
+    assert_eq!(store.reads.available_permits(), MAX_CONCURRENT_READS);
+}
+
+#[tokio::test(start_paused = true)]
+async fn read_submission_times_out_while_waiting_for_capacity() {
+    let (_directory, file, marker) = provisioned_store();
+    let store = Arc::new(
+        provision_store(file, marker, identity())
+            .await
+            .expect("provision read-pool fixture"),
+    );
+    let reserved = store.reads.reserve_permits(MAX_CONCURRENT_READS);
+    let (started, mut started_receiver) = tokio::sync::oneshot::channel();
     let (release, release_receiver) = std::sync::mpsc::channel();
     let (completed, completed_receiver) = tokio::sync::oneshot::channel();
     let probe_store = Arc::clone(&store);
@@ -3220,13 +3355,22 @@ async fn read_lifetime_is_enforced_by_the_paused_clock() {
             .expiry_probe(started, release_receiver, completed)
             .await
     });
-    started_receiver.await.unwrap();
+
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::ZERO, &mut started_receiver)
+            .await
+            .is_err(),
+        "a read waiting for capacity must not reach a worker"
+    );
+    assert_eq!(store.reads.available_permits(), 0);
+
     tokio::time::advance(READ_LIFETIME + std::time::Duration::from_millis(1)).await;
     let error = probe.await.unwrap().unwrap_err();
-    assert_eq!(error.kind(), d2b_resource_store::StoreErrorKind::Timeout);
-    assert_eq!(store.reads.available_permits(), MAX_CONCURRENT_READS - 1);
-    release.send(()).unwrap();
-    completed_receiver.await.unwrap();
+    assert_eq!(error.kind(), StoreErrorKind::Timeout);
+    assert!(completed_receiver.await.is_err());
+    drop(release);
+    drop(reserved);
     assert_eq!(store.reads.available_permits(), MAX_CONCURRENT_READS);
 }
 

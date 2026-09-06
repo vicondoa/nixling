@@ -21,6 +21,7 @@ use d2b_resource_store::{
     ResourceAssignmentFence, ResourceAssignmentScope, StoreErrorKind, StoreGetRequest,
     StoreOperationContext, StoreProjection,
 };
+use d2bd_runtime::resource_runtime_support::retry_transient_store_read;
 use super::{
     DaemonSharedProviderEffects, ResourceRuntimeError, SharedProviderEffectExecutor,
     GuestRuntimeReconciler, SharedProviderResourceKind, SharedProviderRunnerRegistration,
@@ -258,9 +259,7 @@ async fn provider_generations(
     for registration in U6_SHARED_PROVIDER_RUNNERS {
         let provider_ref = ResourceRef::parse(registration.provider_ref)
             .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-        match runtime
-            .store
-            .get(StoreGetRequest {
+        let request = StoreGetRequest {
                 operation: StoreOperationContext {
                     operation_id: "u6-provider-generation".to_owned(),
                     idempotency_key: None,
@@ -272,8 +271,13 @@ async fn provider_generations(
                 target: provider_ref.clone(),
                 expected_uid: None,
                 projection: StoreProjection::MetadataOnly,
-            })
-            .await
+            };
+        match retry_transient_store_read(
+            &runtime.zone,
+            "u6-provider-generation",
+            || runtime.store.get(request.clone()),
+        )
+        .await
         {
             Ok(provider) if provider.zone == runtime.zone && provider.generation.get() > 0 => {
                 generations.insert(provider_ref, provider.generation);

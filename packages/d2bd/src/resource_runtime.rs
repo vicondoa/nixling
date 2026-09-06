@@ -155,7 +155,7 @@ use d2b_resource_api::{
     service::UnavailableUpgradeDispatcher,
 };
 use d2b_resource_store::{
-    PolicySnapshot, ResourceAssignmentFence, ResourceAssignmentScope, StoreErrorKind,
+    PolicySnapshot, ResourceAssignmentFence, ResourceAssignmentScope, StoreError, StoreErrorKind,
     StoreGetRequest, StoreListRequest, StoreListResult, StoreOperationContext, StoreProjection,
     StoredResource,
 };
@@ -189,7 +189,8 @@ use d2bd_runtime::resource_runtime_support::{
     initial_policy_snapshot, map_startup_error, materialize_zone_resource_bundle,
     new_assignment_registry, public_list_request, public_operation_id, public_request_meta,
     persist_resource_controller_session_evidence, refreshed_policy_subject_fingerprints,
-    register_system_core_session, runtime_authorizer, runtime_policy, store_identity,
+    register_system_core_session, retry_transient_store_list, retry_transient_store_read,
+    runtime_authorizer, runtime_policy, store_identity,
     store_identity_for_authority, unix_transport, validate_zone_resource_bundle,
     validate_zone_self_resource, zone_runtime_metadata,
 };
@@ -8394,9 +8395,7 @@ async fn u9_provider_generations(
         }
         let provider_ref = ResourceRef::parse(registration.provider_ref)
             .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-        match runtime
-            .store
-            .get(StoreGetRequest {
+        let request = StoreGetRequest {
                 operation: StoreOperationContext {
                     operation_id: "u9-provider-generation".to_owned(),
                     idempotency_key: None,
@@ -8408,8 +8407,13 @@ async fn u9_provider_generations(
                 target: provider_ref.clone(),
                 expected_uid: None,
                 projection: StoreProjection::MetadataOnly,
-            })
-            .await
+            };
+        match retry_transient_store_read(
+            &runtime.zone,
+            "u9-provider-generation",
+            || runtime.store.get(request.clone()),
+        )
+        .await
         {
             Ok(provider) if provider.zone == runtime.zone && provider.generation.get() > 0 => {
                 generations.insert(provider_ref, provider.generation);
@@ -11068,9 +11072,12 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::AuthorityUnavailable)?,
         );
         let authority_index = authority_recovery.index();
-        let store_metadata = store
-            .runtime_metadata()
-            .await
+        let store_metadata = retry_transient_store_read(
+            &zone,
+            "runtime-open-metadata",
+            || store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         if let Some(authority) = authority_identity.as_ref() {
             if store_metadata.zone_uid != *authority.zone_uid()
@@ -11124,7 +11131,7 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?,
         );
         let mut interaction_provider_configuration = None;
-        let mut interaction_provider_configuration_refused = false;
+        let mut interaction_provider_configuration_refused;
         let mut interaction_identity = None;
 
         let mut core = CoreProcess::new();
@@ -11135,6 +11142,8 @@ impl ZoneResourceRuntime {
         let mut process_status_client = None;
         let mut core_controller_subject = None;
         let defer_activation = authority_identity.is_some();
+        let mut final_store_metadata = store_metadata.clone();
+        let mut interaction_state = InteractionState::Absent;
         let (
             resource_api_ready,
             local_session_ready,
@@ -11254,17 +11263,21 @@ impl ZoneResourceRuntime {
                             tracing::error!(zone = %zone.as_str(), error = ?error, "resource runtime Zone bundle materialization failed");
                         })?;
                 }
-                let store_metadata = store
-                    .runtime_metadata()
-                    .await
+                let current_store_metadata = retry_transient_store_read(
+                    &zone,
+                    "runtime-open-metadata-after-materialization",
+                    || store.runtime_metadata(),
+                )
+                .await
                     .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+                final_store_metadata = current_store_metadata.clone();
                 (
                     interaction_provider_configuration,
                     interaction_provider_configuration_refused,
                 ) = match load_interaction_provider_configuration(
                     &zone,
                     &store,
-                    store_metadata.current_revision,
+                    current_store_metadata.current_revision,
                 )
                 .await
                 {
@@ -11291,7 +11304,7 @@ impl ZoneResourceRuntime {
                 interaction_identity = match load_committed_interaction_identity(
                     &zone,
                     &store,
-                    store_metadata.current_revision,
+                    current_store_metadata.current_revision,
                     interaction_provider_configuration.as_ref(),
                 )
                 .await
@@ -11307,6 +11320,14 @@ impl ZoneResourceRuntime {
                         None
                     }
                 };
+                let interaction_present =
+                    interaction_resources_present(&zone, &store).await?;
+                interaction_state = derive_interaction_state(
+                    interaction_present,
+                    interaction_provider_configuration.as_ref(),
+                    interaction_identity.as_ref(),
+                    interaction_provider_configuration_refused,
+                );
                 let system_core = system_core_startup_result(&zone, &store)
                     .await
                     .inspect_err(|error| {
@@ -11350,8 +11371,8 @@ impl ZoneResourceRuntime {
                     },
                     RecoverySnapshot {
                         startup_epoch: 0,
-                        checkpoint_revision: store_metadata.current_revision.get(),
-                        active_configuration_revision: store_metadata
+                        checkpoint_revision: current_store_metadata.current_revision.get(),
+                        active_configuration_revision: current_store_metadata
                             .policy_snapshot
                             .active_configuration_revision
                             .get(),
@@ -11370,7 +11391,7 @@ impl ZoneResourceRuntime {
                     d2bd_runtime::resource_runtime_support::mark_core_handlers(
                     &mut core,
                     aggregate_handler_phase,
-                    store_metadata.current_revision.get(),
+                    current_store_metadata.current_revision.get(),
                 )
                 .inspect_err(|error| {
                     tracing::error!(zone = %zone.as_str(), error = ?error, "resource runtime handler marking failed");
@@ -11400,7 +11421,7 @@ impl ZoneResourceRuntime {
                                     handler_phase_to_zone_phase(system_core.user_phase),
                                 )
                                 .with_runtime_metadata(zone_runtime_metadata(
-                                    &store_metadata,
+                                    &current_store_metadata,
                                     system_core.total_resource_count,
                                     system_core.generation_cleanup_pending,
                                     system_core.cleanup_pending_count,
@@ -11412,22 +11433,7 @@ impl ZoneResourceRuntime {
                 )
             }
         };
-        let store_metadata = store
-            .runtime_metadata()
-            .await
-            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let interaction_state = if defer_activation {
-            InteractionState::Absent
-        } else {
-            let interaction_present =
-                interaction_resources_present(&zone, &store).await?;
-            derive_interaction_state(
-                interaction_present,
-                interaction_provider_configuration.as_ref(),
-                interaction_identity.as_ref(),
-                interaction_provider_configuration_refused,
-            )
-        };
+        let store_metadata = final_store_metadata;
         let defer_core_start = authority_identity.is_some();
         let bus = bus.map(Arc::new);
         let authorization_state = Arc::new(Mutex::new(authorization_state));
@@ -11772,10 +11778,12 @@ impl ZoneResourceRuntime {
     /// writes after this point.
     pub(crate) async fn activate_published_bundle(&mut self) -> Result<(), ResourceRuntimeError> {
         self.refresh_authorization_policy().await?;
-        let store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let store_metadata = retry_transient_store_read(
+            &self.zone,
+            "runtime-activate-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
 
         let (interaction_provider_configuration, mut interaction_provider_configuration_refused) =
@@ -11850,12 +11858,14 @@ impl ZoneResourceRuntime {
             HandlerPhase::Degraded
         };
         self.start_core_controller_runners().await?;
-        let store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let store_metadata = retry_transient_store_read(
+            &self.zone,
+            "runtime-activate-metadata-after-core-runners",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
-        let stage = {
+        {
             let recovered_authority = self.authority_index.lock().await;
             let mut core = self
                 .core
@@ -11889,13 +11899,8 @@ impl ZoneResourceRuntime {
                 aggregate_handler_phase,
                 store_metadata.current_revision.get(),
             )?;
-            core.publish_readiness().map_err(map_startup_error)?
         };
-        self.store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
-            .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
+        self.store_metadata = store_metadata;
         self.zone_status = Mutex::new(
             SystemCoreStatusEmitter::new()
                 .emit(
@@ -11914,6 +11919,13 @@ impl ZoneResourceRuntime {
                 )
                 .map_err(|_| ResourceRuntimeError::HandlerNotReady)?,
         );
+        let stage = {
+            let mut core = self
+                .core
+                .lock()
+                .map_err(|_| ResourceRuntimeError::CoreStartupFailed)?;
+            core.publish_readiness().map_err(map_startup_error)?
+        };
         self.readiness = ZoneRuntimeReadiness {
             store_ready: true,
             resource_api_ready: true,
@@ -12144,10 +12156,12 @@ impl ZoneResourceRuntime {
     }
 
     async fn refresh_authorization_policy_locked(&self) -> Result<(), ResourceRuntimeError> {
-        let metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let metadata = retry_transient_store_read(
+            &self.zone,
+            "authorization-policy-refresh-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
         let current = self
             .policy_projection
@@ -12185,10 +12199,12 @@ impl ZoneResourceRuntime {
             ),
         )
         .await?;
-        let current_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let current_metadata = retry_transient_store_read(
+            &self.zone,
+            "authorization-policy-refresh-verify",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::PolicyUnavailable)?;
         if current_metadata != metadata {
             return Err(ResourceRuntimeError::PolicyUnavailable);
@@ -12827,6 +12843,34 @@ impl ZoneResourceRuntime {
         Ok((core_authority, authorization_state))
     }
 
+    // Assignment-fence reads are one owner-scoped relist. The redb adapter
+    // waits asynchronously for bounded read capacity; retrying here would
+    // give every resource a fresh retry budget and serialize startup.
+    async fn durable_assignment_epoch<F, Fut>(
+        resource_refs: &[ResourceRef],
+        mut read: F,
+    ) -> Result<u64, ResourceRuntimeError>
+    where
+        F: FnMut(&ResourceRef) -> Fut,
+        Fut: std::future::Future<
+            Output = Result<Option<ResourceAssignmentFence>, d2b_resource_store::StoreError>,
+        >,
+    {
+        if resource_refs.len() > d2b_core_controller::controller_assignment::MAX_ASSIGNMENTS {
+            return Err(ResourceRuntimeError::AuthorizationUnavailable);
+        }
+        let mut maximum = 0;
+        for resource_ref in resource_refs {
+            if let Some(fence) = read(resource_ref)
+                .await
+                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?
+            {
+                maximum = maximum.max(fence.epoch);
+            }
+        }
+        Ok(maximum)
+    }
+
     async fn core_assignment_fences(
         &self,
         rotate_epoch: bool,
@@ -12846,10 +12890,12 @@ impl ZoneResourceRuntime {
             .map_err(|_| ResourceRuntimeError::AuthenticationUnavailable)?
             .clone()
             .ok_or(ResourceRuntimeError::AuthenticationUnavailable)?;
-        let metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let metadata = retry_transient_store_read(
+            &self.zone,
+            "core-controller-assignment-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         let controller_generation = metadata
             .policy_snapshot
@@ -12865,9 +12911,7 @@ impl ZoneResourceRuntime {
         let mut resources = Vec::new();
         let mut cursor = None;
         loop {
-            let page = self
-                .store
-                .list(StoreListRequest {
+            let request = StoreListRequest {
                     operation: StoreOperationContext {
                         operation_id: "core-controller-assignment-relist".to_owned(),
                         idempotency_key: None,
@@ -12880,12 +12924,20 @@ impl ZoneResourceRuntime {
                     resource_names: Vec::new(),
                     filters: Vec::new(),
                     page_size: 256,
-                    cursor,
+                    cursor: cursor.clone(),
                     projection: StoreProjection::MetadataOnly,
-                })
-                .await
+                };
+            let page = retry_transient_store_list(
+                &self.zone,
+                "core-controller-assignment-relist",
+                || self.store.list(request.clone()),
+            )
+            .await
                 .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
             resources.extend(page.resources);
+            if resources.len() > d2b_core_controller::controller_assignment::MAX_ASSIGNMENTS {
+                return Err(ResourceRuntimeError::AuthorizationUnavailable);
+            }
             cursor = page.next_cursor;
             if cursor.is_none() {
                 break;
@@ -12903,20 +12955,15 @@ impl ZoneResourceRuntime {
         let target = ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
             .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
         let session_generation = subject.reconnect_generation();
-        let durable_epoch = {
-            let mut maximum = 0;
-            for resource in &resources {
-                if let Some(fence) = self
-                    .store
-                    .assignment_fence(self.zone.clone(), resource.resource_ref.clone())
-                    .await
-                    .map_err(|_| ResourceRuntimeError::StoreReadFailed)?
-                {
-                    maximum = maximum.max(fence.epoch);
-                }
-            }
-            maximum
-        };
+        let resource_refs = resources
+            .iter()
+            .map(|resource| resource.resource_ref.clone())
+            .collect::<Vec<_>>();
+        let durable_epoch = Self::durable_assignment_epoch(&resource_refs, |resource_ref| {
+            self.store
+                .assignment_fence(self.zone.clone(), resource_ref.clone())
+        })
+        .await?;
         let current_epoch = self.core_assignment_epoch.load(Ordering::Acquire);
         let floor = current_epoch.max(durable_epoch);
         let epoch = if rotate_epoch || current_epoch == 0 || durable_epoch > current_epoch {
@@ -12992,9 +13039,7 @@ impl ZoneResourceRuntime {
         &self,
         provider_ref: &ResourceRef,
     ) -> Result<ResourceGeneration, ResourceRuntimeError> {
-        let resource = self
-            .store
-            .get(StoreGetRequest {
+        let request = StoreGetRequest {
                 operation: StoreOperationContext {
                     operation_id: "shared-provider-runner-provider".to_owned(),
                     idempotency_key: None,
@@ -13006,8 +13051,13 @@ impl ZoneResourceRuntime {
                 target: provider_ref.clone(),
                 expected_uid: None,
                 projection: StoreProjection::MetadataOnly,
-            })
-            .await
+            };
+        let resource = retry_transient_store_read(
+            &self.zone,
+            "shared-provider-runner-provider",
+            || self.store.get(request.clone()),
+        )
+        .await
             .map_err(|error| {
                 if error.kind() == StoreErrorKind::ResourceNotFound {
                     ResourceRuntimeError::HandlerNotReady
@@ -13577,9 +13627,7 @@ impl ZoneResourceRuntime {
             };
             let provider_ref = ResourceRef::parse(provider_ref_text)
                 .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-            let provider = match self
-                .store
-                .get(StoreGetRequest {
+            let request = StoreGetRequest {
                     operation: StoreOperationContext {
                         operation_id: format!("u10-provider-{provider_name}"),
                         idempotency_key: None,
@@ -13591,8 +13639,13 @@ impl ZoneResourceRuntime {
                     target: provider_ref.clone(),
                     expected_uid: None,
                     projection: StoreProjection::MetadataOnly,
-                })
-                .await
+                };
+            let provider = match retry_transient_store_read(
+                &self.zone,
+                &request.operation.operation_id,
+                || self.store.get(request.clone()),
+            )
+            .await
             {
                 Ok(provider) => provider,
                 Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
@@ -14385,9 +14438,7 @@ impl ZoneResourceRuntime {
                 };
                 let provider_ref = ResourceRef::parse(provider_ref_text)
                     .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-                let provider = match self
-                    .store
-                    .get(StoreGetRequest {
+                let request = StoreGetRequest {
                         operation: StoreOperationContext {
                             operation_id: format!("u12-provider-{provider_name}"),
                             idempotency_key: None,
@@ -14399,8 +14450,13 @@ impl ZoneResourceRuntime {
                         target: provider_ref.clone(),
                         expected_uid: None,
                         projection: StoreProjection::MetadataOnly,
-                    })
-                    .await
+                    };
+                let provider = match retry_transient_store_read(
+                    &self.zone,
+                    &request.operation.operation_id,
+                    || self.store.get(request.clone()),
+                )
+                .await
                 {
                     Ok(provider) => provider,
                     Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
@@ -14632,9 +14688,7 @@ impl ZoneResourceRuntime {
         let mut resources = Vec::new();
         let mut cursor = None;
         loop {
-            let page = self
-                .store
-                .list(StoreListRequest {
+            let request = StoreListRequest {
                     operation: StoreOperationContext {
                         operation_id: "u12-controller-assignment-relist".to_owned(),
                         idempotency_key: None,
@@ -14647,12 +14701,20 @@ impl ZoneResourceRuntime {
                     resource_names: Vec::new(),
                     filters: Vec::new(),
                     page_size: 256,
-                    cursor,
+                    cursor: cursor.clone(),
                     projection: StoreProjection::MetadataOnly,
-                })
-                .await
+                };
+            let page = retry_transient_store_list(
+                &self.zone,
+                "u12-controller-assignment-relist",
+                || self.store.list(request.clone()),
+            )
+            .await
                 .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
             resources.extend(page.resources);
+            if resources.len() > d2b_core_controller::controller_assignment::MAX_ASSIGNMENTS {
+                return Err(ResourceRuntimeError::AuthorizationUnavailable);
+            }
             cursor = page.next_cursor;
             if cursor.is_none() {
                 break;
@@ -14660,17 +14722,15 @@ impl ZoneResourceRuntime {
         }
         let target = ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
             .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-        let mut durable_epoch = 0;
-        for resource in &resources {
-            if let Some(fence) = self
-                .store
-                .assignment_fence(self.zone.clone(), resource.resource_ref.clone())
-                .await
-                .map_err(|_| ResourceRuntimeError::StoreReadFailed)?
-            {
-                durable_epoch = durable_epoch.max(fence.epoch);
-            }
-        }
+        let resource_refs = resources
+            .iter()
+            .map(|resource| resource.resource_ref.clone())
+            .collect::<Vec<_>>();
+        let durable_epoch = Self::durable_assignment_epoch(&resource_refs, |resource_ref| {
+            self.store
+                .assignment_fence(self.zone.clone(), resource_ref.clone())
+        })
+        .await?;
         let epoch = self
             .core_assignment_epoch
             .load(Ordering::Acquire)
@@ -15019,9 +15079,7 @@ impl ZoneResourceRuntime {
         let mut cursor = None;
         let mut out = Vec::new();
         loop {
-            let page = self
-                .store
-                .list(StoreListRequest {
+            let request = StoreListRequest {
                     operation: StoreOperationContext {
                         operation_id: "network-admission-scan".to_owned(),
                         idempotency_key: None,
@@ -15034,10 +15092,15 @@ impl ZoneResourceRuntime {
                     resource_names: Vec::new(),
                     filters: Vec::new(),
                     page_size: 512,
-                    cursor,
+                    cursor: cursor.clone(),
                     projection: StoreProjection::Full,
-                })
-                .await
+                };
+            let page = retry_transient_store_list(
+                &self.zone,
+                "network-admission-scan",
+                || self.store.list(request.clone()),
+            )
+            .await
                 .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
             for resource in page.resources {
                 out.push(
@@ -15058,9 +15121,7 @@ impl ZoneResourceRuntime {
         target: &ResourceRef,
         operation_id: &str,
     ) -> Result<Value, ResourceRuntimeError> {
-        let resource = self
-            .store
-            .get(StoreGetRequest {
+        let request = StoreGetRequest {
                 operation: StoreOperationContext {
                     operation_id: operation_id.to_owned(),
                     idempotency_key: None,
@@ -15072,8 +15133,11 @@ impl ZoneResourceRuntime {
                 target: target.clone(),
                 expected_uid: None,
                 projection: StoreProjection::Full,
-            })
-            .await
+            };
+        let resource = retry_transient_store_read(&self.zone, operation_id, || {
+            self.store.get(request.clone())
+        })
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         if resource.zone != self.zone || resource.resource_ref != *target {
             return Err(ResourceRuntimeError::StoreReadFailed);
@@ -16621,10 +16685,12 @@ impl ControllerSessionCoordinator {
         if contexts.is_empty() {
             return Ok(());
         }
-        let store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let store_metadata = retry_transient_store_read(
+            &self.zone,
+            "controller-session-fence-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         let current_controller_generation = store_metadata.policy_snapshot.controller_generation;
         let provider_refs = contexts
@@ -16745,10 +16811,12 @@ impl ControllerSessionCoordinator {
             self.reconcile_controller_assignments(&providers).await?;
             return Ok(());
         }
-        let store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let store_metadata = retry_transient_store_read(
+            &self.zone,
+            "controller-session-reconcile-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         let bootstrap_contexts = providers.controller_bootstrap_contexts(&self.zone);
         let active_processes = self
@@ -17309,10 +17377,12 @@ impl ControllerSessionCoordinator {
         if !providers.has_controller_bootstrap(context.process_ref(), context) {
             return Ok(false);
         }
-        let metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let metadata = retry_transient_store_read(
+            &self.zone,
+            "controller-session-context-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         if controller_generation_is_stale(
             metadata.policy_snapshot.controller_generation,
@@ -17760,9 +17830,7 @@ impl ControllerSessionCoordinator {
         let mut resources = Vec::new();
         let mut resource_uids = BTreeSet::new();
         loop {
-            let page = self
-                .store
-                .list(StoreListRequest {
+            let request = StoreListRequest {
                     operation: StoreOperationContext {
                         operation_id: "controller-assignment-list".to_owned(),
                         idempotency_key: None,
@@ -17775,10 +17843,15 @@ impl ControllerSessionCoordinator {
                     resource_names: Vec::new(),
                     filters: Vec::new(),
                     page_size: 128,
-                    cursor,
+                    cursor: cursor.clone(),
                     projection: StoreProjection::Full,
-                })
-                .await
+                };
+            let page = retry_transient_store_list(
+                &self.zone,
+                "controller-assignment-list",
+                || self.store.list(request.clone()),
+            )
+            .await
                 .map_err(|error| {
                     if matches!(
                         error.kind(),
@@ -17990,10 +18063,12 @@ impl ControllerSessionCoordinator {
             return Err(authentication_error("resource-peer-mismatch"));
         }
 
-        let store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let store_metadata = retry_transient_store_read(
+            &self.zone,
+            "controller-process-bootstrap-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         let provider_resource = committed_resource(
             &self.zone,
@@ -18218,10 +18293,12 @@ impl ControllerSessionCoordinator {
         &self,
         providers: &crate::process_provider_runtime::ProductionProcessProviders,
     ) -> Result<(), ResourceRuntimeError> {
-        let store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let store_metadata = retry_transient_store_read(
+            &self.zone,
+            "controller-policy-refresh-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         let provider_subjects = match load_controller_policy_subjects(
             &self.zone,
@@ -18327,10 +18404,12 @@ impl ZoneResourceRuntime {
         coordinator
             .fence_process_resources(&providers, &resources)
             .await?;
-        let store_metadata = self
-            .store
-            .runtime_metadata()
-            .await
+        let store_metadata = retry_transient_store_read(
+            &self.zone,
+            "process-reconcile-metadata",
+            || self.store.runtime_metadata(),
+        )
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         let controller_generation = core_authority.controller_generation;
         let stale_task = {
@@ -19840,8 +19919,7 @@ async fn interaction_resources_present(
         .collect::<Result<Vec<_>, _>>()?;
     let mut cursor = None;
     loop {
-        let page = store
-            .list(StoreListRequest {
+        let request = StoreListRequest {
                 operation: StoreOperationContext {
                     operation_id: "interaction-presence-providers".to_owned(),
                     idempotency_key: None,
@@ -19854,10 +19932,13 @@ async fn interaction_resources_present(
                 resource_names: provider_names.clone(),
                 filters: Vec::new(),
                 page_size: 16,
-                cursor,
+                cursor: cursor.clone(),
                 projection: StoreProjection::Full,
-            })
-            .await
+            };
+        let page = retry_transient_store_list(zone, "interaction-presence-providers", || {
+            store.list(request.clone())
+        })
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         if !page.resources.is_empty() {
             return Ok(true);
@@ -19870,8 +19951,7 @@ async fn interaction_resources_present(
 
     let mut cursor = None;
     loop {
-        let page = store
-            .list(StoreListRequest {
+        let request = StoreListRequest {
                 operation: StoreOperationContext {
                     operation_id: "interaction-presence-resources".to_owned(),
                     idempotency_key: None,
@@ -19884,10 +19964,13 @@ async fn interaction_resources_present(
                 resource_names: Vec::new(),
                 filters: Vec::new(),
                 page_size: 512,
-                cursor,
+                cursor: cursor.clone(),
                 projection: StoreProjection::Full,
-            })
-            .await
+            };
+        let page = retry_transient_store_list(zone, "interaction-presence-resources", || {
+            store.list(request.clone())
+        })
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         for resource in page.resources {
             if is_u9_resource_type(&resource.resource_ref.resource_type()) {
@@ -19940,8 +20023,7 @@ async fn load_interaction_provider_configuration(
         .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
     let notification_ref = ResourceRef::parse("Provider/notification-desktop")
         .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
-    let page = store
-        .list(StoreListRequest {
+    let request = StoreListRequest {
             operation,
             zone: zone.clone(),
             resource_types: vec![provider_type],
@@ -19955,10 +20037,19 @@ async fn load_interaction_provider_configuration(
             page_size: 2,
             cursor: None,
             projection: StoreProjection::Full,
-        })
-        .await
+        };
+    let page = retry_transient_store_list(zone, "interaction-provider-config", || {
+        store.list(request.clone())
+    })
+    .await
         .map_err(|error| {
-            tracing::error!(zone = %zone.as_str(), error = ?error, "bootstrap Host list failed");
+            tracing::error!(
+                zone = %zone.as_str(),
+                operation = "interaction-provider-config",
+                store_error_kind = ?error.kind(),
+                reason_code = error.reason_code(),
+                "interaction Provider configuration list failed",
+            );
             ResourceRuntimeError::StoreReadFailed
         })?;
     if page.next_cursor.is_some() {
@@ -20012,8 +20103,7 @@ async fn load_committed_interaction_identity(
         trace_id: None,
         deadline_ms: 10_000,
     };
-    let page = store
-        .list(StoreListRequest {
+    let request = StoreListRequest {
             operation,
             zone: zone.clone(),
             resource_types: vec![session_resource_type],
@@ -20022,8 +20112,11 @@ async fn load_committed_interaction_identity(
             page_size: 2,
             cursor: None,
             projection: StoreProjection::Full,
-        })
-        .await
+        };
+    let page = retry_transient_store_list(zone, "interaction-wayland-session", || {
+        store.list(request.clone())
+    })
+    .await
         .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
     if page.next_cursor.is_some() {
         return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
@@ -20364,12 +20457,11 @@ async fn committed_resource(
         "interaction-identity:{}",
         resource_ref.to_canonical_string()
     );
-    let resource = store
-        .get(StoreGetRequest {
+    let request = StoreGetRequest {
             operation: StoreOperationContext {
                 operation_id: operation_id.clone(),
                 idempotency_key: None,
-                correlation_id: operation_id,
+                correlation_id: operation_id.clone(),
                 trace_id: None,
                 deadline_ms: 10_000,
             },
@@ -20377,8 +20469,11 @@ async fn committed_resource(
             target: resource_ref.clone(),
             expected_uid: None,
             projection: StoreProjection::Full,
-        })
-        .await
+        };
+    let resource = retry_transient_store_read(zone, &operation_id, || {
+        store.get(request.clone())
+    })
+    .await
         .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
     validate_committed_resource(zone, current_revision, resource_ref, resource)
 }
@@ -20392,8 +20487,7 @@ async fn current_committed_resource(
     if !is_supported_committed_resource_ref(resource_ref) {
         return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
     }
-    let snapshot = store
-        .list(StoreListRequest {
+    let request = StoreListRequest {
             operation: StoreOperationContext {
                 operation_id: operation_id.to_owned(),
                 idempotency_key: None,
@@ -20408,8 +20502,11 @@ async fn current_committed_resource(
             page_size: 1,
             cursor: None,
             projection: StoreProjection::Full,
-        })
-        .await
+        };
+    let snapshot = retry_transient_store_list(zone, operation_id, || {
+        store.list(request.clone())
+    })
+    .await
         .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
     if snapshot.truncated || snapshot.next_cursor.is_some() || snapshot.resources.len() != 1 {
         return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
@@ -20489,8 +20586,7 @@ async fn load_committed_controller_provider_identities(
         .collect::<Result<Vec<_>, _>>()?;
     let page_size = u32::try_from(provider_refs.len())
         .map_err(|_| ResourceRuntimeError::InteractionConfigurationUnavailable)?;
-    let snapshot = store
-        .list(StoreListRequest {
+    let request = StoreListRequest {
             operation: StoreOperationContext {
                 operation_id: "controller-provider-identity-snapshot".to_owned(),
                 idempotency_key: None,
@@ -20505,8 +20601,13 @@ async fn load_committed_controller_provider_identities(
             page_size,
             cursor: None,
             projection: StoreProjection::Full,
-        })
-        .await
+        };
+    let snapshot = retry_transient_store_list(
+        zone,
+        "controller-provider-identity-snapshot",
+        || store.list(request.clone()),
+    )
+    .await
         .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
     if snapshot.truncated || snapshot.next_cursor.is_some() {
         return Err(ResourceRuntimeError::InteractionConfigurationUnavailable);
@@ -20619,14 +20720,13 @@ impl ProcessOwnerIdentityLoader for CommittedProcessOwnerIdentityLoader {
         &self,
         owner_ref: &ResourceRef,
     ) -> Result<ResourceUid, ProcessResourceRuntimeError> {
-        let resource = self
-            .store
-            .get(StoreGetRequest {
+        let operation_id = format!(
+            "process-owner-identity-retry:{}",
+            owner_ref.to_canonical_string()
+        );
+        let request = StoreGetRequest {
                 operation: StoreOperationContext {
-                    operation_id: format!(
-                        "process-owner-identity-retry:{}",
-                        owner_ref.to_canonical_string()
-                    ),
+                    operation_id: operation_id.clone(),
                     idempotency_key: None,
                     correlation_id: "process-owner-identity-retry".to_owned(),
                     trace_id: None,
@@ -20636,8 +20736,11 @@ impl ProcessOwnerIdentityLoader for CommittedProcessOwnerIdentityLoader {
                 target: owner_ref.clone(),
                 expected_uid: None,
                 projection: StoreProjection::Full,
-            })
-            .await
+            };
+        let resource = retry_transient_store_read(&self.zone, &operation_id, || {
+            self.store.get(request.clone())
+        })
+        .await
             .map_err(|_| ProcessResourceRuntimeError::OwnerIdentityUnavailable)?;
         if resource.zone != self.zone || resource.resource_ref != *owner_ref {
             return Err(ProcessResourceRuntimeError::OwnerIdentityUnavailable);
@@ -21468,8 +21571,7 @@ async fn system_core_startup_result(
     let mut resources = Vec::new();
     let mut cursor = None;
     loop {
-        let page = store
-            .list(StoreListRequest {
+        let request = StoreListRequest {
                 operation: StoreOperationContext {
                     operation_id: "system-core-startup-summary".to_owned(),
                     idempotency_key: None,
@@ -21482,10 +21584,13 @@ async fn system_core_startup_result(
                 resource_names: Vec::new(),
                 filters: Vec::new(),
                 page_size: 128,
-                cursor,
+                cursor: cursor.clone(),
                 projection: StoreProjection::Full,
-            })
-            .await
+            };
+        let page = retry_transient_store_list(zone, "system-core-startup-summary", || {
+            store.list(request.clone())
+        })
+        .await
             .map_err(|_| ResourceRuntimeError::StoreReadFailed)?;
         resources.extend(page.resources);
         cursor = page.next_cursor;
@@ -21494,9 +21599,12 @@ async fn system_core_startup_result(
         }
     }
     let total_resource_count = resources.len().min(u32::MAX as usize) as u32;
-    let active_configuration_generation = store
-        .runtime_metadata()
-        .await
+    let active_configuration_generation = retry_transient_store_read(
+        zone,
+        "system-core-startup-metadata",
+        || store.runtime_metadata(),
+    )
+    .await
         .map_err(|_| ResourceRuntimeError::StoreReadFailed)?
         .policy_snapshot
         .active_configuration_revision
@@ -21571,6 +21679,19 @@ fn map_process_runtime_error(error: ProcessResourceRuntimeError) -> ResourceRunt
     }
 }
 
+fn assignment_fence_store_error(error: &StoreError, fallback_revision: ZoneRevision) -> SourceError {
+    match error.kind() {
+        StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure => {
+            SourceError::Backpressure
+        }
+        StoreErrorKind::Timeout => SourceError::Timeout,
+        StoreErrorKind::ResourceConflict => {
+            SourceError::Conflict(error.current_revision().unwrap_or(fallback_revision))
+        }
+        _ => SourceError::Unavailable,
+    }
+}
+
 fn process_assignment_fence_resolver(
     store: Arc<RedbResourceStore>,
     mode: DaemonMode,
@@ -21604,16 +21725,7 @@ fn process_assignment_fence_resolver(
                     projection: StoreProjection::Full,
                 })
                 .await
-                .map_err(|error| match error.kind() {
-                    StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure => {
-                        SourceError::Backpressure
-                    }
-                    StoreErrorKind::Timeout => SourceError::Timeout,
-                    StoreErrorKind::ResourceConflict => {
-                        SourceError::Conflict(error.current_revision().unwrap_or(revision))
-                    }
-                    _ => SourceError::Unavailable,
-                })?;
+                .map_err(|error| assignment_fence_store_error(&error, revision))?;
             if resource.revision != revision {
                 return Err(SourceError::Conflict(resource.revision));
             }
@@ -21661,32 +21773,37 @@ fn process_assignment_fence_resolver(
                     projection: StoreProjection::MetadataOnly,
                 })
                 .await
+            {
+                Ok(provider) if provider.generation.get() > 0 => provider,
+                Ok(_) => {
+                    return Err(integrity(&target, "target-provider-generation-invalid"));
+                }
+                Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
+                    let current_revision = store
+                        .runtime_metadata()
+                        .await
+                        .map_err(|error| assignment_fence_store_error(&error, revision))?
+                        .current_revision;
+                    return Err(SourceError::Conflict(current_revision));
+                }
+                Err(error) if error.kind() == StoreErrorKind::ResourceConflict => {
+                    return Err(SourceError::Conflict(
+                        error.current_revision().unwrap_or(revision),
+                    ));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure
+                    ) =>
                 {
-                    Ok(provider) if provider.generation.get() > 0 => provider,
-                    Ok(_) => {
-                        return Err(integrity(&target, "target-provider-generation-invalid"));
-                    }
-                    Err(error) if error.kind() == StoreErrorKind::ResourceNotFound => {
-                        let current_revision = store
-                            .runtime_metadata()
-                            .await
-                            .map_err(|_| SourceError::Unavailable)?
-                            .current_revision;
-                        return Err(SourceError::Conflict(current_revision));
-                    }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure
-                        ) =>
-                    {
-                        return Err(SourceError::Backpressure);
-                    }
-                    Err(error) if error.kind() == StoreErrorKind::Timeout => {
-                        return Err(SourceError::Timeout);
-                    }
-                    Err(_) => return Err(SourceError::Integrity),
-                };
+                    return Err(SourceError::Backpressure);
+                }
+                Err(error) if error.kind() == StoreErrorKind::Timeout => {
+                    return Err(SourceError::Timeout);
+                }
+                Err(_) => return Err(SourceError::Integrity),
+            };
             Ok(ResourceAssignmentFence {
                 resource_uid: uid,
                 resource_revision: revision,
@@ -21728,7 +21845,7 @@ fn system_core_assignment_fence_resolver(
                     projection: StoreProjection::Full,
                 })
                 .await
-                .map_err(|_| SourceError::Unavailable)?;
+                .map_err(|error| assignment_fence_store_error(&error, revision))?;
             if resource.revision != revision
                 || !matches!(
                     resource.resource_ref.resource_type().as_str(),
@@ -21766,13 +21883,16 @@ fn system_core_assignment_fence_resolver(
                         SourceError::Backpressure
                     }
                     StoreErrorKind::Timeout => SourceError::Timeout,
+                    StoreErrorKind::ResourceConflict => {
+                        SourceError::Conflict(error.current_revision().unwrap_or(revision))
+                    }
                     StoreErrorKind::ResourceNotFound => SourceError::Unavailable,
                     _ => SourceError::Integrity,
                 })?;
             let controller_generation = store
                 .runtime_metadata()
                 .await
-                .map_err(|_| SourceError::Unavailable)?
+                .map_err(|error| assignment_fence_store_error(&error, revision))?
                 .policy_snapshot
                 .controller_generation
                 .ok_or(SourceError::Integrity)?;
@@ -23150,6 +23270,57 @@ mod tests {
     use d2b_session_unix::{CreditPool, CreditScopeSet, OutboundPacket, prearmed_seqpacket_pair};
 
     const TEST_PROCESS_FINALIZER: &str = "process-system-minijail.d2bus.org/cleanup";
+
+    #[tokio::test]
+    async fn assignment_fence_relist_is_bounded_and_does_not_retry_each_resource() {
+        let resource_refs = [
+            ResourceRef::parse("Host/host-system").unwrap(),
+            ResourceRef::parse("User/alice").unwrap(),
+            ResourceRef::parse("Provider/system-core").unwrap(),
+        ];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_read = Arc::clone(&calls);
+        let epoch = ZoneResourceRuntime::durable_assignment_epoch(&resource_refs, move |_resource_ref| {
+            calls_for_read.fetch_add(1, Ordering::SeqCst);
+            async {
+                Ok(Some(ResourceAssignmentFence {
+                    resource_uid: ResourceUid::parse(
+                        "123e4567-e89b-42d3-a456-426614174000",
+                    )
+                    .unwrap(),
+                    resource_revision: ZoneRevision::new(1),
+                    provider_generation: ResourceGeneration::new(1).unwrap(),
+                    controller_generation: ControllerGeneration::new(1).unwrap(),
+                    controller_role: ResourceRef::parse("Process/system-core").unwrap(),
+                    target: ResourceRef::parse("Zone/work").unwrap(),
+                    session_generation: ReconnectGeneration::new(1).unwrap(),
+                    epoch: 7,
+                    scope: ResourceAssignmentScope::Primary,
+                }))
+            }
+        })
+        .await
+        .expect("bounded assignment-fence relist");
+        assert_eq!(epoch, 7);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            resource_refs.len(),
+            "one relist pass must read each assignment fence once"
+        );
+
+        let oversized = vec![
+            resource_refs[0].clone();
+            d2b_core_controller::controller_assignment::MAX_ASSIGNMENTS + 1
+        ];
+        let result = ZoneResourceRuntime::durable_assignment_epoch(&oversized, |_resource_ref| async {
+            Ok::<Option<ResourceAssignmentFence>, d2b_resource_store::StoreError>(None)
+        })
+        .await;
+        assert_eq!(
+            result,
+            Err(ResourceRuntimeError::AuthorizationUnavailable)
+        );
+    }
 
     #[test]
     fn trusted_provider_catalog_includes_declared_export_only() {

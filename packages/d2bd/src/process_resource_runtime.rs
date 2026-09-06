@@ -55,6 +55,7 @@ use crate::process_provider_runtime::{
     ProviderAdoption, ProviderLiveness, execution_target_allowed,
 };
 use d2bd_runtime::guest_resource_runtime::SessionBoundStore;
+use d2bd_runtime::resource_runtime_support::retry_transient_store_list;
 use d2bd_runtime::target_runtime::DaemonMode;
 
 const PROCESS_TYPE: &str = "Process";
@@ -3560,9 +3561,10 @@ pub(crate) async fn list_process_resources(
     let mut request = process_resource_list_request(zone);
     let mut resources = Vec::new();
     loop {
-        let result = store
-            .list(request.clone())
-            .await
+        let result = retry_transient_store_list(zone, &request.operation.operation_id, || {
+            store.list(request.clone())
+        })
+        .await
             .map_err(|_| ProcessResourceRuntimeError::Store)?;
         resources.extend(result.resources);
         let Some(cursor) = result.next_cursor else {
@@ -3583,9 +3585,10 @@ pub(crate) async fn list_process_resources_backend<S: ResourceStoreBackend>(
     let mut request = process_resource_list_request(zone);
     let mut resources = Vec::new();
     loop {
-        let result = store
-            .list(request.clone())
-            .await
+        let result = retry_transient_store_list(zone, &request.operation.operation_id, || {
+            store.list(request.clone())
+        })
+        .await
             .map_err(|_| ProcessResourceRuntimeError::Store)?;
         resources.extend(result.resources);
         let Some(cursor) = result.next_cursor else {
