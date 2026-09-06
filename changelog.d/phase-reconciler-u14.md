@@ -146,6 +146,10 @@
   changes, preventing stale U7/U6 fences from stopping their runners.
 - Scoped shared Provider assignment relists to each controller's exact
   provider selector so sibling Providers cannot rotate one another's fences.
+- Added bounded Provider-effect diagnostics for failed Guest and Volume
+  resource passes without weakening their retry or readiness behavior.
+- Provisioned the daemon-owned volume-local marker root through the storage
+  contract and host tmpfiles before Volume source resolution.
 
 ### Removed
 

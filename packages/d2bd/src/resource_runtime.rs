@@ -3745,7 +3745,14 @@ impl DaemonSharedProviderEffects {
                         resource.key().resource_ref(),
                     )
                     .await
-                    .map_err(|_| SharedProviderEffectError::Unavailable)?;
+                    .map_err(|error| {
+                        tracing::warn!(
+                            resource = %resource.key().resource_ref().to_canonical_string(),
+                            error = ?error,
+                            "U6 Cloud Hypervisor Guest effect failed",
+                        );
+                        SharedProviderEffectError::Unavailable
+                    })?;
                 let fresh = runtime
                     .committed_resource_value(
                         resource.key().resource_ref(),

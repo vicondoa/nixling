@@ -142,6 +142,7 @@ in
       "d /run/d2b/locks/usbip 0750 root d2bd -"
       "d /run/d2b/state 0700 d2bd d2bd -"
       "d /var/lib/d2b 0750 root d2bd -"
+      "d /var/lib/d2b/volume-local-markers 0700 d2bd d2bd -"
       "d /var/lib/d2b/daemon-state 0700 d2bd d2bd -"
       "d /var/cache/d2b 0750 root d2bd -"
       "d /etc/d2b 0750 root d2bd -"

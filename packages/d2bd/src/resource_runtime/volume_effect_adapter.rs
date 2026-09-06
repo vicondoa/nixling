@@ -131,8 +131,12 @@ impl ResolvedVolumeRoot {
     /// Move marker storage to an already anchored broker-owned marker root.
     pub fn with_marker_root(mut self, marker_root_fd: OwnedFd) -> Result<Self, VolumeLocalError> {
         validate_component(self.volume_uid.as_str())?;
+        let marker_root_stat =
+            fstat(&marker_root_fd).map_err(|_| VolumeLocalError::EffectFailed)?;
         self.marker_root_fd = Some(marker_root_fd);
         self.marker_name = self.volume_uid.as_str().to_owned();
+        self.marker_owner_uid = marker_root_stat.st_uid;
+        self.marker_group_gid = marker_root_stat.st_gid;
         Ok(self)
     }
 }
@@ -1455,4 +1459,37 @@ fn inspect_content_file(
         format!("0{:03o}", stat.st_mode as u32 & 0o777),
         bytes,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_root_fd_supplies_marker_file_ownership() {
+        let volume_root = tempfile::tempdir().expect("volume root");
+        let marker_root = tempfile::tempdir().expect("marker root");
+        let volume_fd = rustix::fs::open(
+            volume_root.path(),
+            OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open volume root");
+        let marker_fd = rustix::fs::open(
+            marker_root.path(),
+            OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open marker root");
+        let volume_uid =
+            ResourceUid::parse("123e4567-e89b-42d3-a456-426614174000").expect("volume UID");
+        let root = ResolvedVolumeRoot::new(volume_fd, volume_uid)
+            .expect("bind volume root")
+            .with_marker_root(marker_fd)
+            .expect("bind marker root");
+        let marker_stat = fstat(root.marker_root_fd.as_ref().expect("marker root fd"))
+            .expect("stat marker root");
+        assert_eq!(root.marker_owner_uid, marker_stat.st_uid);
+        assert_eq!(root.marker_group_gid, marker_stat.st_gid);
+    }
 }

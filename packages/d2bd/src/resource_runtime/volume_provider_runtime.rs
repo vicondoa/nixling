@@ -633,7 +633,14 @@ impl DaemonVolumeProviderEffects {
         let report = controller
             .reconcile(resource.key().uid(), &spec, provider, owner_ref.as_ref())
             .await
-            .map_err(|_| SharedVolumeEffectError::Unavailable)?;
+            .map_err(|error| {
+                tracing::warn!(
+                    resource = %resource.key().resource_ref().to_canonical_string(),
+                    error = ?error,
+                    "U7 VolumeLocal reconcile failed",
+                );
+                SharedVolumeEffectError::Unavailable
+            })?;
         let desired = self.volume_children(&self.zone, resource.key().resource_ref(), &spec)?;
         let owner = self.stored(&runtime, resource).await?;
         let client = runtime
@@ -650,7 +657,14 @@ impl DaemonVolumeProviderEffects {
             }],
         )
         .await
-        .map_err(|_| SharedVolumeEffectError::Unavailable)?;
+        .map_err(|error| {
+            tracing::warn!(
+                resource = %resource.key().resource_ref().to_canonical_string(),
+                error = ?error,
+                "U7 Volume child reconciliation failed",
+            );
+            SharedVolumeEffectError::Unavailable
+        })?;
         let phase = if report.layout_phase == d2b_provider_volume_local::LayoutPhase::Ready
             && converged.contains(resource.key().resource_ref())
         {
@@ -1150,8 +1164,8 @@ impl DaemonVolumeRootResolver {
     fn marker_root(&self) -> Result<OwnedFd, d2b_provider_volume_local::VolumeLocalError> {
         let marker_root = self
             .resolver
-            .find_storage_path_spec("path:state-root")
-            .map(|spec| PathBuf::from(spec.path_template.as_str()).join("volume-local-markers"))
+            .find_storage_path_spec("path:volume-local-markers")
+            .map(|spec| PathBuf::from(spec.path_template.as_str()))
             .ok_or(d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)?;
         open_anchored_directory(&marker_root)
             .map_err(|_| d2b_provider_volume_local::VolumeLocalError::SourceUnresolved)
@@ -1652,7 +1666,15 @@ impl ResourceReconciler for SharedVolumeResourceReconciler {
             .effects
             .reconcile_with_projection(self.kind, &self.effect_context(context), resource)
             .await
-            .map_err(SharedVolumeReconcileError::Effect)?;
+            .map_err(|error| {
+                tracing::warn!(
+                    resource = %resource.key().resource_ref().to_canonical_string(),
+                    provider = self.kind.provider_ref(),
+                    error = %error,
+                    "U7 volume effect failed",
+                );
+                SharedVolumeReconcileError::Effect(error)
+            })?;
         ReconcileResult::new(
             resource.revision(),
             resource.generation(),
