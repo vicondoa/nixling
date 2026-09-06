@@ -1,7 +1,7 @@
 //! Store-watch driven async controller loop.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -140,6 +140,7 @@ pub enum WatchEvent {
 pub enum WatchFailure {
     Disconnected,
     RevisionExpired,
+    Backpressure,
     Fatal,
 }
 
@@ -559,8 +560,9 @@ pub struct RunnerConfig {
     pub max_attempts: u32,
 }
 
-const WATCH_RECOVERY_MAX_CONFLICT_RETRIES: usize = 3;
+const WATCH_RECOVERY_MAX_RETRIES: usize = 3;
 const FAILURE_PERSISTENCE_MAX_ATTEMPTS: usize = 3;
+const SOURCE_RETRY_BACKOFF_TICKS: u64 = 1;
 
 /// Successful loop summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -917,19 +919,23 @@ where
             self.source.register(&descriptor),
         )
         .await?;
-        let initial = bounded_source(
+        let initial = retry_source_phase(
             self.clock.as_ref(),
             startup_deadline,
             &shutdown,
-            self.source.list_initial(&descriptor),
+            self.config.max_attempts,
+            || self.source.list_initial(&descriptor),
         )
         .await?;
-        bounded_source(
+        retry_source_phase(
             self.clock.as_ref(),
             startup_deadline,
             &shutdown,
-            self.source
-                .open_watch(&descriptor, initial.snapshot_revision),
+            self.config.max_attempts,
+            || {
+                self.source
+                    .open_watch(&descriptor, initial.snapshot_revision)
+            },
         )
         .await?;
         if let Some(startup) = startup.take() {
@@ -953,8 +959,11 @@ where
             shutdown.clone(),
         );
         let mut watch_closed = false;
-        let mut requeues = JoinSet::<(ResourceKey, ZoneRevision, OperationContext)>::new();
+        let mut requeues = JoinSet::<ScheduledQueueItem>::new();
         let mut scheduled_keys = HashSet::new();
+        let mut scheduled_watch_keys = HashSet::new();
+        let mut deferred_watch_hints: BTreeMap<(ResourceKey, bool), QueueHint> = BTreeMap::new();
+        let mut watch_generation = 0u64;
 
         loop {
             while let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() {
@@ -1024,7 +1033,11 @@ where
                                     let revision = completion.work.high_water_revision();
                                     requeues.spawn(async move {
                                         clock.sleep_until(at_tick).await;
-                                        (key, revision, operation)
+                                        ScheduledQueueItem::Retry {
+                                            key,
+                                            revision,
+                                            operation,
+                                        }
                                     });
                                 }
                             }
@@ -1064,7 +1077,9 @@ where
                                     FailurePersistence::Persisted
                                     | FailurePersistence::Skipped => {
                                         queue.finish(&key)?;
-                                        report.handler_failures += 1;
+                                        if reason != ReconcileReason::SourceBackpressure {
+                                            report.handler_failures += 1;
+                                        }
                                         observe_counter(
                                             self.observer.as_ref(),
                                             RunnerCounter::Exhaustion,
@@ -1072,6 +1087,8 @@ where
                                             RunnerOutcome::Exhausted,
                                             if reason == ReconcileReason::ConflictExhausted {
                                                 RunnerObservationReason::Conflict
+                                            } else if reason == ReconcileReason::SourceBackpressure {
+                                                RunnerObservationReason::Backpressure
                                             } else {
                                                 RunnerObservationReason::Handler
                                             },
@@ -1081,14 +1098,20 @@ where
                                     }
                                     FailurePersistence::Uncertain => {
                                         queue.finish(&key)?;
-                                        report.handler_failures += 1;
+                                        if reason != ReconcileReason::SourceBackpressure {
+                                            report.handler_failures += 1;
+                                        }
                                         report.persistence_uncertain += 1;
                                         observe_counter(
                                             self.observer.as_ref(),
                                             RunnerCounter::Exhaustion,
                                             Some(completion.work.lane()),
                                             RunnerOutcome::Exhausted,
-                                            RunnerObservationReason::Conflict,
+                                            if reason == ReconcileReason::SourceBackpressure {
+                                                RunnerObservationReason::Backpressure
+                                            } else {
+                                                RunnerObservationReason::Conflict
+                                            },
                                             queue.resource_count(),
                                             workers.len(),
                                         );
@@ -1112,6 +1135,8 @@ where
                                     RunnerOutcome::Retrying,
                                     if reason == ReconcileReason::ConflictExhausted {
                                         RunnerObservationReason::Conflict
+                                    } else if reason == ReconcileReason::SourceBackpressure {
+                                        RunnerObservationReason::Backpressure
                                     } else {
                                         RunnerObservationReason::Handler
                                     },
@@ -1193,29 +1218,77 @@ where
                     );
                 }
                 scheduled = requeues.join_next(), if !requeues.is_empty() => {
-                    let (key, revision, operation) = scheduled
+                    let scheduled = scheduled
                         .ok_or(RunnerError::TaskFailed)?
                         .map_err(|_| RunnerError::TaskFailed)?;
-                    let hint = QueueHint::new(
-                        key.clone(),
-                        revision,
-                        TriggerSet::new([TriggerReason::RetryDue]),
-                        PriorityLane::Ordinary,
-                        operation.clone(),
-                    )?;
-                    match queue.push(hint) {
-                        Ok(_) => {
-                            scheduled_keys.remove(&key);
+                    match scheduled {
+                        ScheduledQueueItem::Retry {
+                            key,
+                            revision,
+                            operation,
+                        } => {
+                            let hint = QueueHint::new(
+                                key.clone(),
+                                revision,
+                                TriggerSet::new([TriggerReason::RetryDue]),
+                                PriorityLane::Ordinary,
+                                operation.clone(),
+                            )?;
+                            match queue.push(hint) {
+                                Ok(_) => {
+                                    scheduled_keys.remove(&key);
+                                }
+                                Err(QueueError::Backpressure
+                                | QueueError::ExpeditedBackpressure) => {
+                                    schedule_queue_item(
+                                        &mut requeues,
+                                        Arc::clone(&self.clock),
+                                        ScheduledQueueItem::Retry {
+                                            key,
+                                            revision,
+                                            operation,
+                                        },
+                                    );
+                                }
+                                Err(error) => return Err(error.into()),
+                            }
                         }
-                        Err(QueueError::Backpressure) => {
-                            let clock = Arc::clone(&self.clock);
-                            requeues.spawn(async move {
-                                let retry_at = clock.now_tick().saturating_add(1);
-                                clock.sleep_until(retry_at).await;
-                                (key, revision, operation)
-                            });
+                        ScheduledQueueItem::Watch {
+                            key,
+                            expedited,
+                            generation,
+                        } => {
+                            if generation != watch_generation {
+                                continue;
+                            }
+                            let deferred_key = (key.clone(), expedited);
+                            let Some(hint) = deferred_watch_hints.remove(&deferred_key) else {
+                                scheduled_watch_keys.remove(&deferred_key);
+                                continue;
+                            };
+                            match queue.push(hint.clone()) {
+                                Ok(_) => {
+                                    scheduled_watch_keys.remove(&deferred_key);
+                                }
+                                Err(QueueError::Backpressure
+                                | QueueError::ExpeditedBackpressure) => {
+                                    deferred_watch_hints
+                                        .entry(deferred_key.clone())
+                                        .and_modify(|pending| pending.coalesce(&hint))
+                                        .or_insert(hint);
+                                    schedule_queue_item(
+                                        &mut requeues,
+                                        Arc::clone(&self.clock),
+                                        ScheduledQueueItem::Watch {
+                                            key,
+                                            expedited,
+                                            generation,
+                                        },
+                                    );
+                                }
+                                Err(error) => return Err(error.into()),
+                            }
                         }
-                        Err(error) => return Err(error.into()),
                     }
                     observe_gauge(
                         self.observer.as_ref(),
@@ -1233,7 +1306,12 @@ where
                         return Err(RunnerError::Source(SourceError::Integrity));
                     }
                     let lane = hint.lane;
-                    match queue.push((*hint).into_queue_hint()?) {
+                    let deferred_key = (
+                        hint.key.clone(),
+                        hint.lane == PriorityLane::Expedited,
+                    );
+                    let queue_hint = hint.into_queue_hint()?;
+                    match queue.push(queue_hint.clone()) {
                         Ok(outcome) => {
                             observe_counter(
                                 self.observer.as_ref(),
@@ -1250,6 +1328,34 @@ where
                                 queue.resource_count(),
                                 workers.len(),
                             );
+                        }
+                        Err(QueueError::Backpressure | QueueError::ExpeditedBackpressure) => {
+                            observe_counter(
+                                self.observer.as_ref(),
+                                RunnerCounter::QueueRejected,
+                                Some(lane),
+                                RunnerOutcome::Retrying,
+                                RunnerObservationReason::Backpressure,
+                                queue.resource_count(),
+                                workers.len(),
+                            );
+                            let first_deferred =
+                                scheduled_watch_keys.insert(deferred_key.clone());
+                            deferred_watch_hints
+                                .entry(deferred_key.clone())
+                                .and_modify(|pending| pending.coalesce(&queue_hint))
+                                .or_insert(queue_hint);
+                            if first_deferred {
+                                schedule_queue_item(
+                                    &mut requeues,
+                                    Arc::clone(&self.clock),
+                                    ScheduledQueueItem::Watch {
+                                        key: deferred_key.0.clone(),
+                                        expedited: deferred_key.1,
+                                        generation: watch_generation,
+                                    },
+                                );
+                            }
                         }
                         Err(error) => {
                             observe_counter(
@@ -1275,6 +1381,24 @@ where
                 Ok(WatchEvent::Closed) => {
                     watch_closed = true;
                 }
+                Err(WatchFailure::Backpressure) => {
+                    observe_counter(
+                        self.observer.as_ref(),
+                        RunnerCounter::WatchFailure,
+                        None,
+                        RunnerOutcome::Retrying,
+                        RunnerObservationReason::Backpressure,
+                        queue.resource_count(),
+                        workers.len(),
+                    );
+                    spawn_watch_after_delay(
+                        &mut watchers,
+                        Arc::clone(&self.source),
+                        Arc::clone(&self.clock),
+                        descriptor.execution().resync().resync_interval_ticks(),
+                        shutdown.clone(),
+                    );
+                }
                 Err(failure @ (WatchFailure::Disconnected | WatchFailure::RevisionExpired)) => {
                     observe_counter(
                         self.observer.as_ref(),
@@ -1284,12 +1408,15 @@ where
                         match failure {
                             WatchFailure::Disconnected => RunnerObservationReason::WatchDisconnected,
                             WatchFailure::RevisionExpired => RunnerObservationReason::RevisionExpired,
+                            WatchFailure::Backpressure => unreachable!(
+                                "watch backpressure is handled before relist recovery"
+                            ),
                             WatchFailure::Fatal => RunnerObservationReason::WatchFatal,
                         },
                         queue.resource_count(),
                         workers.len(),
                     );
-                    let mut conflict_retries = 0;
+                    let mut recovery_retries = 0;
                     let relist = loop {
                         let relist = match bounded_source(
                             self.clock.as_ref(),
@@ -1300,10 +1427,21 @@ where
                         .await
                         {
                             Ok(relist) => relist,
-                            Err(RunnerError::Source(SourceError::Conflict(_)))
-                                if conflict_retries < WATCH_RECOVERY_MAX_CONFLICT_RETRIES =>
+                            Err(error)
+                                if retryable_runner_source_error(&error)
+                                    && recovery_retries < WATCH_RECOVERY_MAX_RETRIES =>
                             {
-                                conflict_retries += 1;
+                                recovery_retries += 1;
+                                wait_for_source_retry(
+                                    self.clock.as_ref(),
+                                    phase_deadline(
+                                        self.clock.as_ref(),
+                                        self.config.deadline_tick,
+                                    ),
+                                    &shutdown,
+                                    recovery_retries,
+                                )
+                                .await?;
                                 continue;
                             }
                             Err(error) => return Err(error),
@@ -1317,15 +1455,29 @@ where
                         .await
                         {
                             Ok(()) => break relist,
-                            Err(RunnerError::Source(SourceError::Conflict(_)))
-                                if conflict_retries < WATCH_RECOVERY_MAX_CONFLICT_RETRIES =>
+                            Err(error)
+                                if retryable_runner_source_error(&error)
+                                    && recovery_retries < WATCH_RECOVERY_MAX_RETRIES =>
                             {
-                                conflict_retries += 1;
+                                recovery_retries += 1;
+                                wait_for_source_retry(
+                                    self.clock.as_ref(),
+                                    phase_deadline(
+                                        self.clock.as_ref(),
+                                        self.config.deadline_tick,
+                                    ),
+                                    &shutdown,
+                                    recovery_retries,
+                                )
+                                .await?;
                             }
                             Err(error) => return Err(error),
                         }
                     };
                     queue.rebuild(initial_hints(&descriptor, relist.resources)?)?;
+                    deferred_watch_hints.clear();
+                    scheduled_watch_keys.clear();
+                    watch_generation = watch_generation.wrapping_add(1);
                     report.relists += 1;
                     watch_closed = false;
                     observe_counter(
@@ -1482,6 +1634,20 @@ enum WorkerOutcome {
     },
 }
 
+#[derive(Clone)]
+enum ScheduledQueueItem {
+    Retry {
+        key: ResourceKey,
+        revision: ZoneRevision,
+        operation: OperationContext,
+    },
+    Watch {
+        key: ResourceKey,
+        expedited: bool,
+        generation: u64,
+    },
+}
+
 #[derive(Default)]
 struct OwnedWorkers {
     tasks: JoinSet<WorkerCompletion>,
@@ -1549,6 +1715,18 @@ impl OwnedWorkers {
                         generation: None,
                     }
                 }
+            };
+            let outcome = match outcome {
+                WorkerOutcome::SourceFailed { error, operation }
+                    if retryable_worker_source_failure(error, operation) =>
+                {
+                    WorkerOutcome::Retry {
+                        revision: work.high_water_revision(),
+                        generation: None,
+                        reason: source_retry_reason(error),
+                    }
+                }
+                outcome => outcome,
             };
             WorkerCompletion {
                 work,
@@ -1623,6 +1801,40 @@ fn spawn_watch<S>(
     });
 }
 
+fn spawn_watch_after_delay<S>(
+    watchers: &mut JoinSet<Result<WatchEvent, WatchFailure>>,
+    source: Arc<S>,
+    clock: Arc<dyn MonotonicClock>,
+    resync_interval_ticks: u64,
+    shutdown: Cancellation,
+) where
+    S: ControllerSource,
+{
+    watchers.spawn(async move {
+        let retry_at = clock
+            .now_tick()
+            .saturating_add(SOURCE_RETRY_BACKOFF_TICKS);
+        tokio::select! {
+            _ = shutdown.cancelled() => Err(WatchFailure::Fatal),
+            _ = clock.sleep_until(retry_at) => {
+                let deadline = clock.now_tick().saturating_add(resync_interval_ticks);
+                match bounded_phase(
+                    clock.as_ref(),
+                    deadline,
+                    &shutdown,
+                    source.receive_watch(),
+                )
+                .await
+                {
+                    Ok(event) => event,
+                    Err(PhaseStop::Deadline) => Err(WatchFailure::RevisionExpired),
+                    Err(PhaseStop::Cancelled) => Err(WatchFailure::Fatal),
+                }
+            }
+        }
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PhaseStop {
     Deadline,
@@ -1669,6 +1881,100 @@ where
         Err(PhaseStop::Deadline) => Err(RunnerError::Source(SourceError::Timeout)),
         Err(PhaseStop::Cancelled) => Err(RunnerError::Cancelled),
     }
+}
+
+fn retryable_source_error(error: SourceError) -> bool {
+    matches!(
+        error,
+        SourceError::Conflict(_)
+            | SourceError::Timeout
+            | SourceError::Backpressure
+            | SourceError::Unavailable
+    )
+}
+
+fn retryable_worker_source_failure(error: SourceError, operation: &'static str) -> bool {
+    operation == "read_fresh"
+        && matches!(
+            error,
+            SourceError::Conflict(_) | SourceError::Timeout | SourceError::Backpressure
+        )
+}
+
+fn retryable_runner_source_error(error: &RunnerError) -> bool {
+    matches!(error, RunnerError::Source(error) if retryable_source_error(*error))
+}
+
+fn source_retry_reason(error: SourceError) -> ReconcileReason {
+    match error {
+        SourceError::Conflict(_) => ReconcileReason::ConflictExhausted,
+        SourceError::Timeout => ReconcileReason::DeadlineExceeded,
+        SourceError::Backpressure => ReconcileReason::SourceBackpressure,
+        SourceError::Unavailable => ReconcileReason::HandlerRetryable,
+        SourceError::Cancelled | SourceError::Integrity => ReconcileReason::HandlerTerminal,
+    }
+}
+
+async fn wait_for_source_retry(
+    clock: &dyn MonotonicClock,
+    deadline_tick: u64,
+    cancellation: &Cancellation,
+    attempt: usize,
+) -> Result<(), RunnerError> {
+    let retry_at = clock.now_tick().saturating_add(
+        SOURCE_RETRY_BACKOFF_TICKS.saturating_mul(u64::try_from(attempt).unwrap_or(u64::MAX)),
+    );
+    match bounded_phase(clock, deadline_tick, cancellation, clock.sleep_until(retry_at)).await {
+        Ok(()) => Ok(()),
+        Err(stop) => Err(phase_runner_error(stop)),
+    }
+}
+
+async fn retry_source_phase<F, Fut, T>(
+    clock: &dyn MonotonicClock,
+    deadline_tick: u64,
+    cancellation: &Cancellation,
+    max_attempts: u32,
+    mut operation: F,
+) -> Result<T, RunnerError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, SourceError>> + Send,
+{
+    let attempts = max_attempts.max(1);
+    for attempt in 0..attempts {
+        match bounded_source(clock, deadline_tick, cancellation, operation()).await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if retryable_runner_source_error(&error)
+                    && attempt + 1 < attempts =>
+            {
+                wait_for_source_retry(
+                    clock,
+                    deadline_tick,
+                    cancellation,
+                    usize::try_from(attempt + 1).unwrap_or(usize::MAX),
+                )
+                .await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("at least one source attempt is always configured")
+}
+
+fn schedule_queue_item(
+    requeues: &mut JoinSet<ScheduledQueueItem>,
+    clock: Arc<dyn MonotonicClock>,
+    item: ScheduledQueueItem,
+) {
+    requeues.spawn(async move {
+        let retry_at = clock
+            .now_tick()
+            .saturating_add(SOURCE_RETRY_BACKOFF_TICKS);
+        clock.sleep_until(retry_at).await;
+        item
+    });
 }
 
 fn phase_runner_error(stop: PhaseStop) -> RunnerError {
@@ -2878,6 +3184,40 @@ mod tests {
         tokio::sync::mpsc::UnboundedSender<Result<WatchEvent, WatchFailure>>,
     );
 
+    #[derive(Default)]
+    struct ManualClock {
+        now: AtomicU64,
+        notify: tokio::sync::Notify,
+    }
+
+    impl ManualClock {
+        fn advance_to(&self, tick: u64) {
+            self.now.store(tick, Ordering::Release);
+            self.notify.notify_waiters();
+        }
+    }
+
+    impl MonotonicClock for ManualClock {
+        fn now_tick(&self) -> u64 {
+            self.now.load(Ordering::Acquire)
+        }
+
+        fn sleep_until(
+            &self,
+            deadline_tick: u64,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                loop {
+                    let notified = self.notify.notified();
+                    if self.now_tick() >= deadline_tick {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+        }
+    }
+
     fn block_on<F: Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(8)
@@ -2901,6 +3241,7 @@ mod tests {
         abort_expedited: AtomicBool,
         expedited_gate_error: AtomicBool,
         effect_acceptance_conflicts_remaining: AtomicUsize,
+        effect_acceptance_unavailable_remaining: AtomicUsize,
         accepted_operation_ids: Mutex<Vec<String>>,
         persistence_operation_ids: Mutex<Vec<String>>,
         conflicts_remaining: AtomicUsize,
@@ -2916,12 +3257,17 @@ mod tests {
         persist_timeouts_remaining: AtomicUsize,
         commit_timeouts_remaining: AtomicUsize,
         commit_backpressure_remaining: AtomicUsize,
+        complete_effect_backpressure_remaining: AtomicUsize,
         checkpoints: AtomicUsize,
         starting: AtomicUsize,
         requeues: AtomicUsize,
         watch_opens: AtomicUsize,
+        list_initial_calls: AtomicUsize,
+        fresh_backpressure_remaining: Mutex<BTreeMap<ResourceKey, usize>>,
         list_initial_conflicts_remaining: AtomicUsize,
+        list_initial_backpressure_remaining: AtomicUsize,
         watch_open_conflicts_remaining: AtomicUsize,
+        watch_open_backpressure_remaining: AtomicUsize,
     }
 
     impl FakeSource {
@@ -2946,6 +3292,7 @@ mod tests {
                     abort_expedited: AtomicBool::new(false),
                     expedited_gate_error: AtomicBool::new(false),
                     effect_acceptance_conflicts_remaining: AtomicUsize::new(0),
+                    effect_acceptance_unavailable_remaining: AtomicUsize::new(0),
                     accepted_operation_ids: Mutex::new(Vec::new()),
                     persistence_operation_ids: Mutex::new(Vec::new()),
                     conflicts_remaining: AtomicUsize::new(0),
@@ -2961,12 +3308,17 @@ mod tests {
                     persist_timeouts_remaining: AtomicUsize::new(0),
                     commit_timeouts_remaining: AtomicUsize::new(0),
                     commit_backpressure_remaining: AtomicUsize::new(0),
+                    complete_effect_backpressure_remaining: AtomicUsize::new(0),
                     checkpoints: AtomicUsize::new(0),
                     starting: AtomicUsize::new(0),
                     requeues: AtomicUsize::new(0),
                     watch_opens: AtomicUsize::new(0),
+                    list_initial_calls: AtomicUsize::new(0),
+                    fresh_backpressure_remaining: Mutex::new(BTreeMap::new()),
                     list_initial_conflicts_remaining: AtomicUsize::new(0),
+                    list_initial_backpressure_remaining: AtomicUsize::new(0),
                     watch_open_conflicts_remaining: AtomicUsize::new(0),
+                    watch_open_backpressure_remaining: AtomicUsize::new(0),
                 }),
                 watch_tx,
             )
@@ -2980,6 +3332,13 @@ mod tests {
         fn inject_watch_open_recovery_conflicts(&self, count: usize) {
             self.watch_open_conflicts_remaining
                 .store(count, Ordering::Release);
+        }
+
+        fn inject_fresh_backpressure(&self, key: ResourceKey, count: usize) {
+            self.fresh_backpressure_remaining
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(key, count);
         }
 
         fn persist_outcome_impl(
@@ -3050,6 +3409,20 @@ mod tests {
             &self,
             _descriptor: &ControllerDescriptor,
         ) -> impl Future<Output = Result<InitialList, SourceError>> + Send {
+            self.list_initial_calls.fetch_add(1, Ordering::SeqCst);
+            if self
+                .list_initial_backpressure_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return std::future::ready(Err(SourceError::Backpressure));
+            }
             if self
                 .list_initial_conflicts_remaining
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
@@ -3091,6 +3464,19 @@ mod tests {
             {
                 return std::future::ready(Err(SourceError::Conflict(ZoneRevision::new(2))));
             }
+            if self
+                .watch_open_backpressure_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return std::future::ready(Err(SourceError::Backpressure));
+            }
             std::future::ready(Ok(()))
         }
 
@@ -3111,6 +3497,16 @@ mod tests {
                     break;
                 }
                 notified.await;
+            }
+            if let Some(remaining) = self
+                .fresh_backpressure_remaining
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get_mut(key)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                return Err(SourceError::Backpressure);
             }
             self.fresh
                 .lock()
@@ -3133,6 +3529,19 @@ mod tests {
             context: &ReconcileContext,
             _plan: &ReconcilePlan,
         ) -> impl Future<Output = Result<(), SourceError>> + Send {
+            if self
+                .effect_acceptance_unavailable_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return std::future::ready(Err(SourceError::Unavailable));
+            }
             let remaining = self
                 .effect_acceptance_conflicts_remaining
                 .load(Ordering::SeqCst);
@@ -3248,6 +3657,27 @@ mod tests {
             self.expedited_completions.fetch_add(1, Ordering::SeqCst);
             if status_persistence == StatusPersistence::Pending {
                 self.pending_completions.fetch_add(1, Ordering::SeqCst);
+            }
+            std::future::ready(Ok(()))
+        }
+
+        fn complete_effect(
+            &self,
+            _context: &ReconcileContext,
+            _result: &ReconcileResult,
+        ) -> impl Future<Output = Result<(), SourceError>> + Send {
+            if self
+                .complete_effect_backpressure_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return std::future::ready(Err(SourceError::Backpressure));
             }
             std::future::ready(Ok(()))
         }
@@ -3751,6 +4181,24 @@ mod tests {
         initial_revision: u64,
         fresh_revision: u64,
     ) -> Harness {
+        harness_with_revisions_and_pending(keys, concurrency, initial_revision, fresh_revision, 32)
+    }
+
+    fn harness_with_pending(
+        keys: Vec<ResourceKey>,
+        concurrency: usize,
+        max_pending: usize,
+    ) -> Harness {
+        harness_with_revisions_and_pending(keys, concurrency, 1, 1, max_pending)
+    }
+
+    fn harness_with_revisions_and_pending(
+        keys: Vec<ResourceKey>,
+        concurrency: usize,
+        initial_revision: u64,
+        fresh_revision: u64,
+        max_pending: usize,
+    ) -> Harness {
         let fresh = keys
             .iter()
             .cloned()
@@ -3764,7 +4212,7 @@ mod tests {
                 identity(),
                 vec![ResourceTypeName::parse("Process").unwrap()],
                 concurrency,
-                32,
+                max_pending,
                 2,
                 16,
             )
@@ -4045,6 +4493,244 @@ mod tests {
         reconciler.release(1);
         watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
         runner.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn transient_source_backpressure_retries_one_resource_without_blocking_a_sibling() {
+        let first = key("first", 1);
+        let second = key("second", 2);
+        let (reconciler, _entered, source, watch_tx) =
+            harness(vec![first.clone(), second], 2);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source.inject_fresh_backpressure(first, 1);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+        let report = runner.join().unwrap().unwrap();
+        assert_eq!(report.dispatched, 3);
+        assert_eq!(report.handler_retries, 1);
+        assert_eq!(report.handler_failures, 0);
+        assert_eq!(report.checkpointed, 2);
+    }
+
+    #[test]
+    fn watch_hint_backpressure_is_deferred_until_a_worker_slot_drains() {
+        let first = key("first", 1);
+        let second = key("second", 2);
+        let (reconciler, entered, source, watch_tx) =
+            harness_with_pending(vec![first.clone()], 1, 1);
+        let observer = Arc::new(RecordingObserver::default());
+        let run_observer: Arc<dyn RunnerObserver> = observer.clone();
+        source
+            .fresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(second.clone(), resource(second.clone(), 1));
+        let run_reconciler = Arc::clone(&reconciler);
+        let run_source = Arc::clone(&source);
+        let runner = thread::spawn(move || {
+            block_on(
+                Runner::new(run_reconciler, run_source, config())
+                    .with_observer(run_observer)
+                    .run(),
+            )
+        });
+
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        watch_tx
+            .send(Ok(WatchEvent::Hint(Box::new(WatchHint::new(
+                second,
+                ZoneRevision::new(1),
+                TriggerSet::new([TriggerReason::DependencyChanged]),
+                PriorityLane::Ordinary,
+                OperationContext::new("watch", "watch", "watch", None).unwrap(),
+            )))))
+            .unwrap();
+        wait_for_counter(&observer, RunnerCounter::QueueRejected);
+        assert!(observer
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|observation| {
+                observation.counter == Some(RunnerCounter::QueueRejected)
+                    && observation.outcome == RunnerOutcome::Retrying
+                    && observation.reason == RunnerObservationReason::Backpressure
+            }));
+        assert!(!runner.is_finished(), "watch backpressure must not kill the runner");
+
+        reconciler.release(1);
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        reconciler.release(1);
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let report = runner.join().unwrap().unwrap();
+        assert_eq!(report.dispatched, 2);
+        assert_eq!(report.checkpointed, 2);
+    }
+
+    #[test]
+    fn unavailable_fresh_read_remains_a_fail_closed_source_failure() {
+        let target = key("unauthorized", 1);
+        let (reconciler, _entered, source, watch_tx) = harness(vec![target], 1);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source
+            .fresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let failure = runner.join().unwrap().unwrap_err();
+        assert_eq!(
+            failure.error(),
+            RunnerError::Source(SourceError::Unavailable)
+        );
+        assert_eq!(failure.failed_operation(), Some("read_fresh"));
+        assert_eq!(failure.report().dispatched, 1);
+        assert_eq!(reconciler.execute_effect_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn authorization_unavailable_remains_a_fail_closed_source_failure() {
+        let target = key("authorization", 1);
+        let (reconciler, _entered, source, watch_tx) = harness(vec![target], 1);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source
+            .effect_acceptance_unavailable_remaining
+            .store(usize::MAX, Ordering::SeqCst);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let failure = runner.join().unwrap().unwrap_err();
+        assert_eq!(
+            failure.error(),
+            RunnerError::Source(SourceError::Unavailable)
+        );
+        assert_eq!(failure.failed_operation(), Some("accept_effect"));
+        assert_eq!(failure.report().dispatched, 1);
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 0);
+        assert_eq!(reconciler.execute_effect_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn post_effect_backpressure_does_not_restart_the_handler_effect() {
+        let target = key("post-effect", 1);
+        let (reconciler, _entered, source, watch_tx) = harness(vec![target], 1);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source
+            .complete_effect_backpressure_remaining
+            .store(usize::MAX, Ordering::SeqCst);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let failure = runner.join().unwrap().unwrap_err();
+        assert_eq!(
+            failure.error(),
+            RunnerError::Source(SourceError::Backpressure)
+        );
+        assert_eq!(
+            failure.failed_operation(),
+            Some("complete_effect_after_pending_commit")
+        );
+        assert_eq!(failure.report().dispatched, 1);
+        assert_eq!(reconciler.execute_effect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(source.effect_acceptances.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn persistent_resource_backpressure_is_bounded_without_a_runner_hot_loop() {
+        let target = key("persistent", 1);
+        let (reconciler, _entered, source, watch_tx) = harness(vec![target], 1);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source.inject_fresh_backpressure(key("persistent", 1), usize::MAX);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+        let report = runner.join().unwrap().unwrap();
+        assert_eq!(report.dispatched, 3);
+        assert_eq!(report.handler_retries, 2);
+        assert_eq!(report.handler_failures, 0);
+        assert_eq!(report.persistence_uncertain, 1);
+    }
+
+    #[test]
+    fn startup_backpressure_retries_list_and_watch_within_the_attempt_bound() {
+        let (reconciler, _entered, source, watch_tx) = harness(vec![key("app", 1)], 1);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source
+            .list_initial_backpressure_remaining
+            .store(2, Ordering::Release);
+        source
+            .watch_open_backpressure_remaining
+            .store(1, Ordering::Release);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+        let report = runner.join().unwrap().unwrap();
+        assert_eq!(report.checkpointed, 1);
+        assert_eq!(source.list_initial_calls.load(Ordering::Acquire), 3);
+        assert_eq!(source.watch_opens.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn startup_backpressure_exhaustion_is_bounded() {
+        let (reconciler, _entered, source, _watch_tx) = harness(vec![key("app", 1)], 1);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source
+            .list_initial_backpressure_remaining
+            .store(usize::MAX, Ordering::Release);
+        let runner =
+            run_with_config_in_thread(Arc::clone(&reconciler), Arc::clone(&source), config());
+
+        let failure = runner.join().unwrap().unwrap_err();
+        assert_eq!(
+            failure.error(),
+            RunnerError::Source(SourceError::Backpressure)
+        );
+        assert_eq!(source.list_initial_calls.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn watch_backpressure_retries_receive_without_relisting_or_stopping_the_runner() {
+        let (reconciler, _entered, source, watch_tx) = harness(vec![key("app", 1)], 1);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+
+        watch_tx.send(Err(WatchFailure::Backpressure)).unwrap();
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let report = runner.join().unwrap().unwrap();
+        assert_eq!(report.relists, 0);
+        assert_eq!(report.checkpointed, 1);
+        assert_eq!(source.watch_opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn exhausted_source_backpressure_keeps_source_reason_and_not_handler_failure() {
+        let target = key("source-pressure", 1);
+        let (reconciler, _entered, source, watch_tx) = harness(vec![target.clone()], 1);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source.inject_fresh_backpressure(target, 1);
+        let mut runner_config = config();
+        runner_config.max_attempts = 1;
+        let runner = run_with_config_in_thread(
+            Arc::clone(&reconciler),
+            Arc::clone(&source),
+            runner_config,
+        );
+
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let report = runner.join().unwrap().unwrap();
+        assert_eq!(report.handler_failures, 0);
+        let outcomes = source
+            .persisted_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].reason_code(), "source-backpressure");
     }
 
     #[test]
@@ -5397,6 +6083,190 @@ mod tests {
         let report = runner.join().unwrap().unwrap();
         assert_eq!(report.relists, 1);
         assert_eq!(source.watch_opens.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn watch_recovery_retries_relist_backpressure_before_reopening() {
+        let target = key("app", 1);
+        let (reconciler, _entered, source, watch_tx) = harness(vec![target.clone()], 1);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        source
+            .initial
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(initial(std::slice::from_ref(&target)));
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+        for _ in 0..400 {
+            if source.watch_opens.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(source.watch_opens.load(Ordering::Acquire), 1);
+        source
+            .list_initial_backpressure_remaining
+            .store(1, Ordering::Release);
+
+        watch_tx.send(Err(WatchFailure::RevisionExpired)).unwrap();
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+
+        let report = runner
+            .join()
+            .expect("runner thread")
+            .expect("relist backpressure should recover");
+        assert_eq!(report.relists, 1);
+        assert_eq!(source.list_initial_calls.load(Ordering::Acquire), 3);
+        assert_eq!(source.watch_opens.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn watch_recovery_backpressure_exhaustion_is_typed_and_bounded() {
+        let (reconciler, _entered, source, watch_tx) = harness(vec![key("app", 1)], 1);
+        reconciler.block_handlers.store(false, Ordering::SeqCst);
+        let runner = run_in_thread(Arc::clone(&reconciler), Arc::clone(&source));
+        for _ in 0..400 {
+            if source.watch_opens.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(source.watch_opens.load(Ordering::Acquire), 1);
+        source
+            .list_initial_backpressure_remaining
+            .store(usize::MAX, Ordering::Release);
+
+        watch_tx.send(Err(WatchFailure::RevisionExpired)).unwrap();
+
+        let failure = runner
+            .join()
+            .expect("runner thread")
+            .expect_err("bounded relist recovery must retain source backpressure");
+        assert_eq!(
+            failure.error(),
+            RunnerError::Source(SourceError::Backpressure)
+        );
+        assert_eq!(failure.report().relists, 0);
+        assert_eq!(
+            source.list_initial_calls.load(Ordering::Acquire),
+            1 + WATCH_RECOVERY_MAX_RETRIES + 1
+        );
+        assert_eq!(source.watch_opens.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn relist_discards_deferred_watch_hints_but_keeps_fresh_relist_work() {
+        let first = key("first", 1);
+        let stale = key("stale", 2);
+        let fresh = key("fresh", 3);
+        let (reconciler, entered, source, watch_tx) =
+            harness_with_pending(vec![first.clone()], 1, 1);
+        source
+            .initial
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(initial(std::slice::from_ref(&fresh)));
+        source
+            .fresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend([
+                (stale.clone(), resource(stale.clone(), 1)),
+                (fresh.clone(), resource(fresh.clone(), 1)),
+            ]);
+        let observer = Arc::new(RecordingObserver::default());
+        let run_observer: Arc<dyn RunnerObserver> = observer.clone();
+        let clock = Arc::new(ManualClock::default());
+        let run_clock = Arc::clone(&clock);
+        let run_reconciler = Arc::clone(&reconciler);
+        let run_source = Arc::clone(&source);
+        let runner = thread::spawn(move || {
+            block_on(
+                Runner::new(run_reconciler, run_source, config())
+                    .with_clock(run_clock)
+                    .with_observer(run_observer)
+                    .run(),
+            )
+        });
+
+        assert_eq!(
+            entered.recv_timeout(Duration::from_secs(2)).unwrap().0,
+            first
+        );
+        watch_tx
+            .send(Ok(WatchEvent::Hint(Box::new(WatchHint::new(
+                stale.clone(),
+                ZoneRevision::new(1),
+                TriggerSet::new([TriggerReason::DependencyChanged]),
+                PriorityLane::Ordinary,
+                OperationContext::new("stale", "stale", "stale", None).unwrap(),
+            )))))
+            .unwrap();
+        wait_for_counter(observer.as_ref(), RunnerCounter::QueueRejected);
+        thread::sleep(Duration::from_millis(20));
+
+        reconciler.release(1);
+        let mut initial_idle = false;
+        for _ in 0..400 {
+            if observer
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|observation| {
+                    observation.counter.is_none()
+                        && observation.queue_depth == 0
+                        && observation.active_workers == 0
+                })
+            {
+                initial_idle = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(initial_idle, "initial work did not drain before relist");
+
+        reconciler.block_handlers.store(false, Ordering::Release);
+        watch_tx.send(Err(WatchFailure::RevisionExpired)).unwrap();
+        for _ in 0..400 {
+            if source.list_initial_calls.load(Ordering::Acquire) >= 2
+                && source.watch_opens.load(Ordering::Acquire) >= 2
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(source.list_initial_calls.load(Ordering::Acquire), 2);
+        assert_eq!(source.watch_opens.load(Ordering::Acquire), 2);
+
+        assert_eq!(
+            entered.recv_timeout(Duration::from_secs(2)).unwrap().0,
+            fresh
+        );
+        wait_for(&source.checkpoints, 2);
+        for _ in 0..400 {
+            if observer
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|observation| {
+                    observation.counter.is_none()
+                        && observation.queue_depth == 0
+                        && observation.active_workers == 0
+                })
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        clock.advance_to(100);
+        watch_tx.send(Ok(WatchEvent::Closed)).unwrap();
+        let report = runner.join().unwrap().unwrap();
+        assert_eq!(report.relists, 1);
+        assert_eq!(report.dispatched, 2);
+        assert_eq!(report.checkpointed, 2);
+        assert!(entered.try_recv().is_err(), "stale work was resurrected");
     }
 
     #[test]

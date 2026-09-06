@@ -1590,6 +1590,15 @@ impl RegisteredControllerApi for RedbRegisteredControllerApi {
                             self.watch_open.store(false, Ordering::Release);
                             return Err(WatchFailure::RevisionExpired);
                         }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                StoreErrorKind::Backpressure | StoreErrorKind::StoreBackpressure
+                            ) =>
+                        {
+                            self.watch_open.store(false, Ordering::Release);
+                            return Err(WatchFailure::Disconnected);
+                        }
                         Err(_) => {
                             self.watch_open.store(false, Ordering::Release);
                             return Err(WatchFailure::Disconnected);
@@ -2661,6 +2670,7 @@ const fn projection_state(
             if matches!(
                 reason,
                 d2b_core_controller::ReconcileReason::HandlerRetryable
+                    | d2b_core_controller::ReconcileReason::SourceBackpressure
                     | d2b_core_controller::ReconcileReason::DeadlineExceeded
                     | d2b_core_controller::ReconcileReason::Cancelled
                     | d2b_core_controller::ReconcileReason::ConflictExhausted
@@ -5185,6 +5195,13 @@ mod tests {
             projection_state(
                 d2b_core_controller::ProjectionDisposition::Failed,
                 d2b_core_controller::ReconcileReason::HandlerRetryable,
+            ),
+            d2b_resource_store_redb::AuthorityOperationState::EffectRetryable
+        );
+        assert_eq!(
+            projection_state(
+                d2b_core_controller::ProjectionDisposition::Failed,
+                d2b_core_controller::ReconcileReason::SourceBackpressure,
             ),
             d2b_resource_store_redb::AuthorityOperationState::EffectRetryable
         );

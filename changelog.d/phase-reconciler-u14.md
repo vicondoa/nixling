@@ -1,5 +1,24 @@
 ### Changed
 
+- Replaced only finished Core runner identities during reconciliation, keeping
+  healthy Core and Provider siblings live and ensuring every required runner
+  identity is present before reporting success.
+- Added bounded relist recovery coverage for transient source backpressure,
+  including typed exhaustion and the existing watch-backpressure no-relist
+  path.
+- Cleared deferred watch-hint state across relist recovery, fenced delayed
+  pre-relist watch tasks from resurrecting stale work, and cleaned up newly
+  spawned Core runners when task ownership is poisoned.
+- Bounded transient Core/Provider source backpressure retries across startup,
+  watch recovery, and per-resource passes; dead required Core runner tasks now
+  withhold readiness until the next lifecycle reconciliation replaces them,
+  with non-sensitive Zone/resource-operation diagnostics. Core admission
+  backpressure now retries the watch without relisting, while a closed store
+  watch maps to disconnect recovery; watch-hint queue pressure defers through
+  the runner scheduler without blocking worker joins. Source-pressure
+  exhaustion keeps its source classification instead of becoming a handler
+  failure, and per-resource source retries remain limited to fresh-read
+  recovery rather than authorization or post-effect persistence failures.
 - Finalized the Zone Provider cutover with target-scoped activation and
   telemetry reconciliation, exact 27-Provider composition proof, and
   Provider-filtered descriptor validation.

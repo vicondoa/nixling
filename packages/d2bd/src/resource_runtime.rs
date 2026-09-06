@@ -7516,8 +7516,35 @@ fn owned_child_intent(
 type SharedCoreControllerSource =
     CoreControllerSource<d2b_resource_api::registered::RedbRegisteredControllerApi>;
 
+#[derive(Clone, PartialEq, Eq)]
+struct CoreRunnerIdentity {
+    controller_ref: ResourceRef,
+    resource_type: String,
+}
+
+impl CoreRunnerIdentity {
+    fn new(controller_ref: ResourceRef, resource_type: impl Into<String>) -> Self {
+        Self {
+            controller_ref,
+            resource_type: resource_type.into(),
+        }
+    }
+}
+
+struct CoreRunnerTask {
+    identity: CoreRunnerIdentity,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl CoreRunnerTask {
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+}
+
 enum PreparedCoreRunner {
     Core {
+        identity: CoreRunnerIdentity,
         reconciler: Arc<CoreResourceReconciler>,
         source: Arc<SharedCoreControllerSource>,
         config: RunnerConfig,
@@ -7525,6 +7552,7 @@ enum PreparedCoreRunner {
         resource_type: &'static str,
     },
     Provider {
+        identity: CoreRunnerIdentity,
         reconciler: Arc<SharedProviderResourceReconciler>,
         source: Arc<SharedCoreControllerSource>,
         config: RunnerConfig,
@@ -7533,64 +7561,94 @@ enum PreparedCoreRunner {
     },
 }
 
-fn spawn_prepared_core_runner(prepared: PreparedCoreRunner) -> tokio::task::JoinHandle<()> {
+impl PreparedCoreRunner {
+    fn identity(&self) -> &CoreRunnerIdentity {
+        match self {
+            Self::Core { identity, .. } | Self::Provider { identity, .. } => identity,
+        }
+    }
+}
+
+fn spawn_prepared_core_runner(prepared: PreparedCoreRunner) -> CoreRunnerTask {
     match prepared {
         PreparedCoreRunner::Core {
+            identity,
             reconciler,
             source,
             config,
             handler,
             resource_type,
-        } => tokio::spawn(async move {
-            let runner = Runner::new(reconciler, source, config);
-            match runner.run().await {
-                Ok(report) => {
-                    tracing::debug!(
-                        handler,
-                        resource_type,
-                        dispatched = report.dispatched,
-                        relists = report.relists,
-                        "Core resource runner stopped",
-                    );
+        } => {
+            let handle = tokio::spawn(async move {
+                let zone = source.zone().clone();
+                let runner = Runner::new(reconciler, source, config);
+                match runner.run().await {
+                    Ok(report) => {
+                        tracing::debug!(
+                            handler,
+                            resource_type,
+                            dispatched = report.dispatched,
+                            relists = report.relists,
+                            "Core resource runner stopped",
+                        );
+                    }
+                    Err(error) => {
+                        let failed_resource_type = error
+                            .failed_key()
+                            .map(|key| key.resource_ref().resource_type().as_str());
+                        tracing::warn!(
+                            zone = %zone,
+                            handler,
+                            resource_type,
+                            failed_resource_type = ?failed_resource_type,
+                            failed_operation = ?error.failed_operation(),
+                            error = %error,
+                            "Core resource runner isolated failure",
+                        );
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        handler,
-                        resource_type,
-                        error = %error,
-                        "Core resource runner isolated failure",
-                    );
-                }
-            }
-        }),
+            });
+            CoreRunnerTask { identity, handle }
+        }
         PreparedCoreRunner::Provider {
+            identity,
             reconciler,
             source,
             config,
             controller_ref,
             resource_type,
-        } => tokio::spawn(async move {
-            let runner = Runner::new(reconciler, source, config);
-            match runner.run().await {
-                Ok(report) => {
-                    tracing::debug!(
-                        controller = %controller_ref,
-                        resource_type,
-                        dispatched = report.dispatched,
-                        relists = report.relists,
-                        "Shared Provider resource runner stopped",
-                    );
+        } => {
+            let handle = tokio::spawn(async move {
+                let zone = source.zone().clone();
+                let runner = Runner::new(reconciler, source, config);
+                match runner.run().await {
+                    Ok(report) => {
+                        tracing::debug!(
+                            controller = %controller_ref,
+                            resource_type,
+                            dispatched = report.dispatched,
+                            relists = report.relists,
+                            "Shared Provider resource runner stopped",
+                        );
+                    }
+                    Err(error) => {
+                        let failed_resource_type = error
+                            .failed_key()
+                            .map(|key| key.resource_ref().resource_type().as_str());
+                        tracing::warn!(
+                            zone = %zone,
+                            controller = %controller_ref,
+                            resource_type,
+                            failed_resource_type = ?failed_resource_type,
+                            failed_operation = ?error.failed_operation(),
+                            error = %error,
+                            "Shared Provider resource runner isolated failure",
+                        );
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        controller = %controller_ref,
-                        resource_type,
-                        error = %error,
-                        "Shared Provider resource runner isolated failure",
-                    );
-                }
-            }
-        }),
+            });
+            CoreRunnerTask { identity, handle }
+        }
     }
 }
 
@@ -8245,6 +8303,53 @@ async fn abort_controller_runner_tasks(tasks: &mut Vec<tokio::task::JoinHandle<(
         task.abort();
         let _ = task.await;
     }
+}
+
+async fn abort_core_runner_tasks(tasks: &mut Vec<CoreRunnerTask>) {
+    for task in tasks.drain(..) {
+        task.handle.abort();
+        let _ = task.handle.await;
+    }
+}
+
+async fn install_core_runner_tasks(
+    task_store: &Mutex<Vec<CoreRunnerTask>>,
+    mut new_tasks: Vec<CoreRunnerTask>,
+) -> Result<(), ResourceRuntimeError> {
+    let mut tasks = match task_store.lock() {
+        Ok(tasks) => tasks,
+        Err(_) => {
+            abort_core_runner_tasks(&mut new_tasks).await;
+            return Err(ResourceRuntimeError::WatchUnavailable);
+        }
+    };
+    tasks.append(&mut new_tasks);
+    Ok(())
+}
+
+async fn reap_finished_core_runner_tasks(
+    task_store: &Mutex<Vec<CoreRunnerTask>>,
+) -> Result<(), ResourceRuntimeError> {
+    let finished = {
+        let mut tasks = task_store
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        let mut finished = Vec::new();
+        let mut live = Vec::with_capacity(tasks.len());
+        for task in tasks.drain(..) {
+            if task.is_finished() {
+                finished.push(task);
+            } else {
+                live.push(task);
+            }
+        }
+        *tasks = live;
+        finished
+    };
+    for task in finished {
+        let _ = task.handle.await;
+    }
+    Ok(())
 }
 
 async fn abort_u9_runner_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
@@ -10515,7 +10620,7 @@ pub struct ZoneResourceRuntime {
         Arc<Mutex<Option<Arc<ResourceApiClient<RedbBackend, UnavailableUpgradeDispatcher>>>>>,
     core_controller_subject: Mutex<Option<AuthenticatedSubjectContext>>,
     system_core_rebind_pending: AtomicBool,
-    core_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    core_runner_tasks: Mutex<Vec<CoreRunnerTask>>,
     core_runner_lock: Arc<tokio::sync::Mutex<()>>,
     u12_runner_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     u12_runner_lock: Arc<tokio::sync::Mutex<()>>,
@@ -12857,8 +12962,8 @@ impl ZoneResourceRuntime {
             std::mem::take(&mut *tasks)
         };
         for task in tasks {
-            task.abort();
-            let _ = task.await;
+            task.handle.abort();
+            let _ = task.handle.await;
         }
         #[cfg(test)]
         self.core_runner_events
@@ -12989,19 +13094,12 @@ impl ZoneResourceRuntime {
                 Err(error) => return Err(error),
             }
         }
-        let stale = {
-            let mut tasks = self
-                .core_runner_tasks
-                .lock()
-                .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
-            if tasks.iter().any(|task| !task.is_finished()) {
-                return Ok(());
-            }
-            std::mem::take(&mut *tasks)
-        };
-        for task in stale {
-            let _ = task.await;
-        }
+        let had_existing_core_runners = !self
+            .core_runner_tasks
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
+            .is_empty();
+        reap_finished_core_runner_tasks(&self.core_runner_tasks).await?;
         let subject_context = self
             .core_controller_subject
             .lock()
@@ -13022,6 +13120,9 @@ impl ZoneResourceRuntime {
             assignment_authority,
         ) = match self.core_assignment_fences(rotate_epoch).await {
             Ok(value) => value,
+            Err(ResourceRuntimeError::HandlerNotReady) if had_existing_core_runners => {
+                return Err(ResourceRuntimeError::HandlerNotReady);
+            }
             Err(ResourceRuntimeError::HandlerNotReady) => return Ok(()),
             Err(error) => return Err(error),
         };
@@ -13118,7 +13219,12 @@ impl ZoneResourceRuntime {
                 .map_err(|_| ResourceRuntimeError::ResourceApiBindFailed)?;
             let api = api.with_assignment_fence_resolver(resolver);
             let source = CoreControllerSource::new(descriptor.clone(), Arc::new(api));
+            let runner_identity = CoreRunnerIdentity::new(
+                descriptor.identity().controller_ref().clone(),
+                registration.resource_type(),
+            );
             prepared.push(PreparedCoreRunner::Core {
+                identity: runner_identity,
                 reconciler: CoreResourceReconciler::for_handler(
                     descriptor,
                     registration.handler(),
@@ -13172,7 +13278,7 @@ impl ZoneResourceRuntime {
         let system_core_source =
             CoreControllerSource::new(system_core_descriptor.clone(), Arc::new(system_core_api));
         let system_core_runner = Runner::new(
-            SystemCoreResourceReconciler::new(system_core_descriptor),
+            SystemCoreResourceReconciler::new(system_core_descriptor.clone()),
             system_core_source,
             RunnerConfig {
                 policy_revision: authorization_state.snapshot.policy_revision,
@@ -13289,7 +13395,12 @@ impl ZoneResourceRuntime {
                     runner_descriptor.clone(),
                     Arc::new(api),
                 );
+            let runner_identity = CoreRunnerIdentity::new(
+                runner_descriptor.identity().controller_ref().clone(),
+                resource_type.clone(),
+            );
             prepared.push(PreparedCoreRunner::Provider {
+                identity: runner_identity,
                 reconciler: SharedProviderResourceReconciler::new(
                     descriptor,
                     kind,
@@ -13307,32 +13418,73 @@ impl ZoneResourceRuntime {
                 resource_type,
             });
         }
-        let mut new_tasks = prepared
-            .into_iter()
-            .map(spawn_prepared_core_runner)
+        if prepared.is_empty() {
+            return Err(ResourceRuntimeError::HandlerNotReady);
+        }
+        let system_core_runner_identity = CoreRunnerIdentity::new(
+            system_core_descriptor.identity().controller_ref().clone(),
+            "Host/User",
+        );
+        let mut required_identities = prepared
+            .iter()
+            .map(|runner| runner.identity().clone())
             .collect::<Vec<_>>();
-        new_tasks.push(tokio::spawn(async move {
-            match system_core_runner.run().await {
-                Ok(report) => tracing::debug!(
-                    dispatched = report.dispatched,
-                    relists = report.relists,
-                    "system-core Host/User shared runner stopped",
-                ),
-                Err(error) => tracing::warn!(
-                    error = %error,
-                    "system-core Host/User shared runner failed",
-                ),
+        required_identities.push(system_core_runner_identity.clone());
+
+        reap_finished_core_runner_tasks(&self.core_runner_tasks).await?;
+        let mut present_identities = self
+            .core_runner_tasks
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?
+            .iter()
+            .filter(|task| !task.is_finished())
+            .map(|task| task.identity.clone())
+            .collect::<Vec<_>>();
+        let mut new_tasks = Vec::new();
+        for runner in prepared {
+            let identity = runner.identity().clone();
+            if present_identities
+                .iter()
+                .any(|present| present == &identity)
+            {
+                continue;
             }
-        }));
-        match self.core_runner_tasks.lock() {
-            Ok(mut tasks) => tasks.append(&mut new_tasks),
-            Err(_) => {
-                for task in new_tasks {
-                    task.abort();
-                    let _ = task.await;
+            present_identities.push(identity);
+            new_tasks.push(spawn_prepared_core_runner(runner));
+        }
+        if !present_identities
+            .iter()
+            .any(|present| present == &system_core_runner_identity)
+        {
+            let handle = tokio::spawn(async move {
+                match system_core_runner.run().await {
+                    Ok(report) => tracing::debug!(
+                        dispatched = report.dispatched,
+                        relists = report.relists,
+                        "system-core Host/User shared runner stopped",
+                    ),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "system-core Host/User shared runner failed",
+                    ),
                 }
-                return Err(ResourceRuntimeError::WatchUnavailable);
-            }
+            });
+            new_tasks.push(CoreRunnerTask {
+                identity: system_core_runner_identity,
+                handle,
+            });
+        }
+        install_core_runner_tasks(&self.core_runner_tasks, new_tasks).await?;
+        let tasks = self
+            .core_runner_tasks
+            .lock()
+            .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
+        if required_identities.iter().any(|required| {
+            !tasks
+                .iter()
+                .any(|task| !task.is_finished() && &task.identity == required)
+        }) {
+            return Err(ResourceRuntimeError::HandlerNotReady);
         }
         Ok(())
     }
@@ -18562,6 +18714,14 @@ impl ZoneResourceRuntime {
             return Some(ResourceRuntimeError::ProviderPathUnavailable);
         }
         if self
+            .core_runner_tasks
+            .try_lock()
+            .map(|tasks| tasks.is_empty() || tasks.iter().any(|task| task.is_finished()))
+            .unwrap_or(true)
+        {
+            return Some(ResourceRuntimeError::HandlerNotReady);
+        }
+        if self
             .process_runner_failure
             .lock()
             .map(|failure| failure.is_some())
@@ -19284,8 +19444,8 @@ impl ZoneResourceRuntime {
             .into_inner()
             .map_err(|_| ResourceRuntimeError::WatchUnavailable)?;
         for task in core_runner_tasks {
-            task.abort();
-            let _ = task.await;
+            task.handle.abort();
+            let _ = task.handle.await;
         }
         let u12_runner_tasks = u12_runner_tasks
             .into_inner()
@@ -22891,7 +23051,7 @@ mod tests {
         os::fd::{AsRawFd, OwnedFd},
         sync::Arc,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use d2b_contracts_resource::v3::{
         CanonicalJsonObject, Timestamp,
@@ -24122,6 +24282,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poisoned_core_runner_task_lock_aborts_and_awaits_new_tasks() {
+        let task_store = Mutex::new(Vec::new());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = task_store.lock().unwrap();
+            panic!("poison Core runner task lock");
+        }));
+
+        struct DropMarker(Arc<AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_started = Arc::clone(&started);
+        let task_dropped = Arc::clone(&dropped);
+        let task = tokio::spawn(async move {
+            let _marker = DropMarker(task_dropped);
+            task_started.store(true, Ordering::Release);
+            std::future::pending::<()>().await;
+        });
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            install_core_runner_tasks(
+                &task_store,
+                vec![CoreRunnerTask {
+                    identity: CoreRunnerIdentity::new(
+                        ResourceRef::parse("Process/test-core-runner").unwrap(),
+                        "test",
+                    ),
+                    handle: task,
+                }],
+            )
+            .await,
+            Err(ResourceRuntimeError::WatchUnavailable)
+        );
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "poisoned task-list cleanup must await every spawned runner"
+        );
+    }
+
+    #[tokio::test]
     async fn u12_rebind_stop_clears_every_tracked_runner() {
         let fixture = PublicationStoreFixture::new().await;
         let bundle = publication_bundle(&fixture.zone, fixture.identity.zone_uid(), "u12-stop");
@@ -24759,11 +24968,17 @@ mod tests {
             .core_runner_tasks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(tokio::spawn(async {
-                loop {
-                    tokio::task::yield_now().await;
-                }
-            }));
+            .push(CoreRunnerTask {
+                identity: CoreRunnerIdentity::new(
+                    ResourceRef::parse("Process/test-core-runner").unwrap(),
+                    "test",
+                ),
+                handle: tokio::spawn(async {
+                    loop {
+                        tokio::task::yield_now().await;
+                    }
+                }),
+            });
         {
             let _runner_guard = runtime.core_runner_lock.lock().await;
             runtime.stop_core_controller_runners_locked().await.unwrap();
@@ -29204,17 +29419,11 @@ mod tests {
                 .len(),
             6
         );
+        runtime.readiness.resource_api_ready = true;
         runtime
             .start_core_controller_runners()
             .await
             .expect("sparse bundles must skip absent optional shared Providers");
-        {
-            let _runner_guard = runtime.core_runner_lock.lock().await;
-            runtime
-                .stop_core_controller_runners_locked()
-                .await
-                .expect("sparse runner fixture must stop cleanly");
-        }
         runtime
             .start_u10_controller_runners()
             .await
@@ -29226,6 +29435,130 @@ mod tests {
             .require_ready()
             .expect("sparse bundle must reach Host readiness");
         assert_eq!(runtime.interaction_state, InteractionState::Absent);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finished_core_runner_withholds_readiness_and_is_replaced_on_reconcile() {
+        let (_directory, mut runtime, _broker_evidence) =
+            open_production_guest_runtime_for_test().await;
+        let zone = runtime.zone.clone();
+        materialize_test_bundle(
+            &runtime,
+            vec![bundle_resource(
+                "Provider",
+                "network-local",
+                &zone,
+                r#"{"artifactId":"acceptance-provider","config":{}}"#,
+            )],
+        )
+        .await;
+        runtime.readiness.resource_api_ready = true;
+        runtime
+            .start_core_controller_runners()
+            .await
+            .expect("Core runners start for the required Provider");
+        let original_count = runtime
+            .core_runner_tasks
+            .lock()
+            .unwrap()
+            .len();
+        assert!(original_count > 1);
+        assert!(
+            runtime
+                .core_runner_tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|task| !task.is_finished())
+        );
+        runtime.set_provider_path_ready(true);
+        runtime
+            .require_ready()
+            .expect("live Core runners permit readiness");
+
+        let (failed_identity, healthy_identity) = {
+            let tasks = runtime.core_runner_tasks.lock().unwrap();
+            (
+                tasks[0].identity.clone(),
+                tasks[1].identity.clone(),
+            )
+        };
+        runtime.core_runner_tasks.lock().unwrap()[0].handle.abort();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            runtime.require_ready(),
+            Err(ResourceRuntimeError::HandlerNotReady)
+        );
+
+        let saved_authorization_state = runtime
+            .authorization_state
+            .lock()
+            .unwrap()
+            .take();
+        assert_eq!(
+            runtime.start_core_controller_runners().await,
+            Err(ResourceRuntimeError::AuthenticationUnavailable)
+        );
+        {
+            let tasks = runtime.core_runner_tasks.lock().unwrap();
+            assert_eq!(tasks.len(), original_count - 1);
+            assert!(
+                tasks
+                    .iter()
+                    .any(|task| task.identity == healthy_identity && !task.is_finished()),
+                "a failed replacement setup must retain live Core siblings"
+            );
+            assert!(
+                tasks.iter().all(|task| task.identity != failed_identity),
+                "the failed Core runner must be removed before replacement setup"
+            );
+        }
+        *runtime.authorization_state.lock().unwrap() = saved_authorization_state;
+
+        runtime
+            .start_core_controller_runners()
+            .await
+            .expect("next reconciliation replaces the finished Core runner");
+        let events = runtime.core_runner_events.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|event| *event == "stop-enter"),
+            "replacement must not stop healthy Core siblings: {events:?}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let tasks = runtime.core_runner_tasks.lock().unwrap();
+                if tasks.len() == original_count && tasks.iter().all(|task| !task.is_finished()) {
+                    break;
+                }
+                drop(tasks);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement Core runners become live");
+        {
+            let tasks = runtime.core_runner_tasks.lock().unwrap();
+            assert_eq!(
+                tasks
+                    .iter()
+                    .filter(|task| task.identity == healthy_identity)
+                    .count(),
+                1,
+                "healthy Core runner must not overlap with a duplicate"
+            );
+            assert_eq!(
+                tasks
+                    .iter()
+                    .filter(|task| task.identity == failed_identity)
+                    .count(),
+                1,
+                "the failed Core identity must have exactly one replacement"
+            );
+        }
+        runtime
+            .require_ready()
+            .expect("readiness returns only after replacement runners are live");
         runtime.shutdown().await.unwrap();
     }
 
@@ -29252,6 +29585,11 @@ mod tests {
             ],
         )
         .await;
+        runtime.readiness.resource_api_ready = true;
+        runtime
+            .start_core_controller_runners()
+            .await
+            .expect("Core runners must be live before U7 readiness");
         let state = Arc::new(crate::detached_exec_routing_tests::test_state(
             Default::default(),
         ));
@@ -29311,6 +29649,11 @@ mod tests {
                 .await
                 .expect("interaction presence scan")
         );
+        runtime.readiness.resource_api_ready = true;
+        runtime
+            .start_core_controller_runners()
+            .await
+            .expect("Core runners must be live before U9 readiness");
         runtime.interaction_state = InteractionState::Refused;
         let state = Arc::new(crate::detached_exec_routing_tests::test_state(
             Default::default(),

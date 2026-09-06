@@ -214,6 +214,7 @@ pub struct CoreControllerSource<A> {
     watch: Mutex<WatchState>,
     watch_signal_tx: tokio::sync::mpsc::Sender<()>,
     watch_signal_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<()>>,
+    pending_change: Mutex<Option<(ChangeRecord, OperationContext)>>,
     watch_stream_enabled: AtomicBool,
     admitted: AtomicUsize,
     coalesced: AtomicUsize,
@@ -244,6 +245,7 @@ where
             }),
             watch_signal_tx,
             watch_signal_rx: tokio::sync::Mutex::new(watch_signal_rx),
+            pending_change: Mutex::new(None),
             watch_stream_enabled: AtomicBool::new(false),
             admitted: AtomicUsize::new(0),
             coalesced: AtomicUsize::new(0),
@@ -401,6 +403,11 @@ where
             backpressure: self.backpressure.load(Ordering::Relaxed),
         }
     }
+
+    /// Borrow the Zone owned by this source.
+    pub const fn zone(&self) -> &d2b_contracts_resource::v3::ZoneId {
+        self.controller.zone()
+    }
 }
 
 impl<A> ControllerSource for CoreControllerSource<A>
@@ -475,17 +482,52 @@ where
             if let Some(event) = event {
                 return Ok(event);
             }
+            if let Some((change, operation)) = self
+                .pending_change
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                match self.dispatch_change(self.controller.clone(), change.clone(), operation.clone()) {
+                    Ok(CoreDispatchOutcome::Suppressed(_))
+                    | Ok(CoreDispatchOutcome::Admitted)
+                    | Ok(CoreDispatchOutcome::Coalesced) => continue,
+                    Err(CoreSourceError::WatchClosed) => return Ok(WatchEvent::Closed),
+                    Err(CoreSourceError::Hint(HintAdmissionError::Backpressure)) => {
+                        *self
+                            .pending_change
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some((change, operation));
+                        return Err(WatchFailure::Backpressure);
+                    }
+                    Err(_) => return Err(WatchFailure::Fatal),
+                }
+            }
             if self.watch_stream_enabled.load(Ordering::Acquire) {
                 let mut signal_rx = self.watch_signal_rx.lock().await;
                 tokio::select! {
+                    biased;
                     change = self.api.receive_watch_change() => {
                         match change? {
                             Some((change, operation)) => {
-                                match self.dispatch_change(self.controller.clone(), change, operation) {
+                                match self.dispatch_change(
+                                    self.controller.clone(),
+                                    change.clone(),
+                                    operation.clone(),
+                                ) {
                                     Ok(CoreDispatchOutcome::Suppressed(_))
                                     | Ok(CoreDispatchOutcome::Admitted)
                                     | Ok(CoreDispatchOutcome::Coalesced) => continue,
                                     Err(CoreSourceError::WatchClosed) => return Ok(WatchEvent::Closed),
+                                    Err(CoreSourceError::Hint(HintAdmissionError::Backpressure)) => {
+                                        *self
+                                            .pending_change
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                            Some((change, operation));
+                                        return Err(WatchFailure::Backpressure);
+                                    }
                                     Err(_) => return Err(WatchFailure::Fatal),
                                 }
                             }
@@ -1391,6 +1433,11 @@ mod tests {
         checkpoint_calls: AtomicUsize,
         checkpoint_notify: tokio::sync::Notify,
         outcomes: Mutex<VecDeque<(ResourceKey, ZoneRevision, ReconcileReason)>>,
+        watch_changes:
+            Mutex<VecDeque<Result<Option<(ChangeRecord, OperationContext)>, WatchFailure>>>,
+        watch_stream_enabled: AtomicBool,
+        watch_change_notify: tokio::sync::Notify,
+        watch_receive_started: tokio::sync::Notify,
     }
 
     impl TestRegisteredApi {
@@ -1405,7 +1452,33 @@ mod tests {
                 checkpoint_calls: AtomicUsize::new(0),
                 checkpoint_notify: tokio::sync::Notify::new(),
                 outcomes: Mutex::new(VecDeque::new()),
+                watch_changes: Mutex::new(VecDeque::new()),
+                watch_stream_enabled: AtomicBool::new(false),
+                watch_change_notify: tokio::sync::Notify::new(),
+                watch_receive_started: tokio::sync::Notify::new(),
             })
+        }
+
+        fn enable_watch_stream(
+            &self,
+            changes: Vec<Result<Option<(ChangeRecord, OperationContext)>, WatchFailure>>,
+        ) {
+            self.watch_changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend(changes);
+            self.watch_stream_enabled.store(true, Ordering::Release);
+        }
+
+        fn push_watch_change(
+            &self,
+            change: Result<Option<(ChangeRecord, OperationContext)>, WatchFailure>,
+        ) {
+            self.watch_changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_back(change);
+            self.watch_change_notify.notify_one();
         }
 
         fn starting_count(&self) -> usize {
@@ -1486,6 +1559,30 @@ mod tests {
             _after_revision: ZoneRevision,
         ) -> impl Future<Output = Result<(), SourceError>> + Send {
             std::future::ready(Ok(()))
+        }
+
+        fn has_watch_stream(&self) -> bool {
+            self.watch_stream_enabled.load(Ordering::Acquire)
+        }
+
+        fn receive_watch_change(
+            &self,
+        ) -> impl Future<Output = Result<Option<(ChangeRecord, OperationContext)>, WatchFailure>>
+        + Send {
+            async move {
+                loop {
+                    if let Some(change) = self
+                        .watch_changes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .pop_front()
+                    {
+                        return change;
+                    }
+                    self.watch_receive_started.notify_one();
+                    self.watch_change_notify.notified().await;
+                }
+            }
         }
 
         fn read_fresh(
@@ -2449,6 +2546,61 @@ mod tests {
                 .contains(TriggerReason::SpecGenerationChanged)
         );
         assert!(hint.reasons().contains(TriggerReason::DeletionRequested));
+    }
+
+    #[tokio::test]
+    async fn core_watch_backpressure_retains_the_unadmitted_change() {
+        let descriptor = descriptor(1);
+        let first = key("stream-first", 6);
+        let second = key("stream-second", 7);
+        let api = TestRegisteredApi::new(
+            InitialList {
+                resources: Vec::new(),
+                snapshot_revision: ZoneRevision::new(1),
+            },
+            BTreeMap::new(),
+        );
+        api.enable_watch_stream(Vec::new());
+        let source = CoreControllerSource::new(descriptor.clone(), Arc::clone(&api));
+        source
+            .open_watch(&descriptor, ZoneRevision::new(1))
+            .await
+            .unwrap();
+
+        let waiting_source = Arc::clone(&source);
+        let pending = tokio::spawn(async move { waiting_source.receive_watch().await });
+        api.watch_receive_started.notified().await;
+        source.dispatch_change(
+            controller_key(),
+            change(
+                first.clone(),
+                2,
+                BTreeSet::from([CoreTriggerReason::SpecGenerationChanged]),
+            ),
+            operation("stream-first"),
+        )
+        .unwrap();
+        api.push_watch_change(Ok(Some((
+            change(
+                second.clone(),
+                3,
+                BTreeSet::from([CoreTriggerReason::DeletionRequested]),
+            ),
+            operation("stream-second"),
+        ))));
+        assert_eq!(
+            pending.await.unwrap(),
+            Err(WatchFailure::Backpressure)
+        );
+        let WatchEvent::Hint(first_hint) = source.receive_watch().await.unwrap() else {
+            panic!("the admitted stream change must remain available");
+        };
+        assert_eq!(first_hint.key(), &first);
+        let WatchEvent::Hint(second_hint) = source.receive_watch().await.unwrap() else {
+            panic!("the backpressured stream change must be retried");
+        };
+        assert_eq!(second_hint.key(), &second);
+        assert_eq!(second_hint.revision(), ZoneRevision::new(3));
     }
 
     #[tokio::test]

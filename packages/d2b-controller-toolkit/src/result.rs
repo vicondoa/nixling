@@ -227,6 +227,7 @@ pub enum ReconcileReason {
     ReconcilePass,
     HandlerRetryable,
     HandlerExhausted,
+    SourceBackpressure,
     HandlerTerminal,
     DeadlineExceeded,
     Cancelled,
@@ -243,6 +244,7 @@ impl ReconcileReason {
             Self::ReconcilePass => "reconcile-pass",
             Self::HandlerRetryable => "handler-retryable",
             Self::HandlerExhausted => "handler-exhausted",
+            Self::SourceBackpressure => "source-backpressure",
             Self::HandlerTerminal => "handler-terminal",
             Self::DeadlineExceeded => "deadline-exceeded",
             Self::Cancelled => "cancelled",
@@ -259,6 +261,9 @@ impl ReconcileReason {
             Self::HandlerRetryable => "check controller health and retry reconciliation",
             Self::HandlerExhausted => {
                 "check controller health before explicitly retrying reconciliation"
+            }
+            Self::SourceBackpressure => {
+                "retry reconciliation after resource-plane backpressure subsides"
             }
             Self::HandlerTerminal => "check controller configuration before retrying",
             Self::DeadlineExceeded => "check controller dependencies and retry reconciliation",
