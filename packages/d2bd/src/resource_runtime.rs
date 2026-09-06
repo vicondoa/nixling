@@ -14772,6 +14772,17 @@ impl ZoneResourceRuntime {
         ResourceRuntimeError,
     > {
         let resource_types = descriptor.resource_types().cloned().collect::<Vec<_>>();
+        let provider_selector = descriptor
+            .watch_selectors()
+            .iter()
+            .find(|selector| selector.field() == SelectorField::Spec)
+            .and_then(|selector| selector.exact_value())
+            .map(str::to_owned);
+        let assignment_projection = if provider_selector.is_some() {
+            StoreProjection::BaseOnly
+        } else {
+            StoreProjection::MetadataOnly
+        };
         let mut resources = Vec::new();
         let mut cursor = None;
         loop {
@@ -14789,7 +14800,7 @@ impl ZoneResourceRuntime {
                     filters: Vec::new(),
                     page_size: 256,
                     cursor: cursor.clone(),
-                    projection: StoreProjection::MetadataOnly,
+                    projection: assignment_projection,
                 };
             let page = retry_transient_store_list(
                 &self.zone,
@@ -14809,7 +14820,18 @@ impl ZoneResourceRuntime {
         }
         let target = ResourceRef::parse(&format!("Zone/{}", self.zone.as_str()))
             .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-        let current_epoch = self.core_assignment_epoch.load(Ordering::Acquire);
+        let resources = resources
+            .into_iter()
+            .filter(|resource| {
+                let Some(expected_provider) = provider_selector.as_deref() else {
+                    return true;
+                };
+                ResourceEnvelope::from_json(&resource.canonical_json)
+                    .ok()
+                    .and_then(|envelope| envelope.spec().provider_ref().cloned())
+                    .is_some_and(|provider| provider.to_canonical_string() == expected_provider)
+            })
+            .collect::<Vec<_>>();
         let mut durable_epoch = 0;
         let mut authority_mismatch = false;
         for resource in &resources {
@@ -14822,33 +14844,27 @@ impl ZoneResourceRuntime {
                 continue;
             };
             durable_epoch = durable_epoch.max(stored.epoch);
-            let comparison_epoch = current_epoch.max(1);
-            if stored.epoch >= comparison_epoch
-                && (stored.provider_generation != provider_generation
-                    || stored.controller_generation != controller_generation
-                    || stored.controller_role != controller_ref
-                    || stored.target != target
-                    || stored.session_generation != session_generation)
+            if stored.provider_generation != provider_generation
+                || stored.controller_generation != controller_generation
+                || stored.controller_role != controller_ref
+                || stored.target != target
+                || stored.session_generation != session_generation
             {
                 authority_mismatch = true;
             }
         }
-        let floor = current_epoch.max(durable_epoch).max(1);
-        let epoch = if authority_mismatch || durable_epoch > current_epoch {
+        let floor = durable_epoch.max(1);
+        let epoch = if authority_mismatch {
             let epoch = self
                 .assignments
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .reserve_epoch_after(floor)
                 .map_err(|_| ResourceRuntimeError::HandlerNotReady)?;
-            self.core_assignment_epoch.store(epoch, Ordering::Release);
             epoch
-        } else if current_epoch == 0 {
-            1
         } else {
-            current_epoch
+            floor
         };
-        self.core_assignment_epoch.store(epoch, Ordering::Release);
         let authority = Arc::new(CoreAssignmentAuthority {
             provider_generation,
             controller_generation,

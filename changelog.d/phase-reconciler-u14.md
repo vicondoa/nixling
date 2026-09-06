@@ -142,8 +142,10 @@
   client.
 - Preserved durable controller-session evidence when later Process status
   projections are committed from stale snapshots.
-- Rotated shared Provider assignment epochs when controller-session authority
+- Rotated per-Provider assignment epochs when controller-session authority
   changes, preventing stale U7/U6 fences from stopping their runners.
+- Scoped shared Provider assignment relists to each controller's exact
+  provider selector so sibling Providers cannot rotate one another's fences.
 
 ### Removed
 
